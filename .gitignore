@@ -1,0 +1,25 @@
+# Go build and test artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# IDE and editor settings
+.idea/
+.vscode/
+.worktrees/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
