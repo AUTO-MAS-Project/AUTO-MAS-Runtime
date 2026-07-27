@@ -1,3 +1,4 @@
+// Command auto-mas-runtime manages the local AUTO-MAS runtime.
 package main
 
 import (
