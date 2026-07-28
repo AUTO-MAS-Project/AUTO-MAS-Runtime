@@ -61,7 +61,12 @@ func validateEnvelope(command string, terminal Terminal, events []parsedEvent) [
 			issues = append(issues, issueForEvent(command, terminal, event, "type must be a string"))
 		} else {
 			if _, known := knownEventTypes[eventType]; !known {
-				issues = append(issues, issueForEvent(command, terminal, event, fmt.Sprintf("unknown event type %q", eventType)))
+				issues = append(issues, issueForEvent(
+					command,
+					terminal,
+					event,
+					fmt.Sprintf("unknown event type %q", boundedTypeName(eventType)),
+				))
 			}
 			if eventType == string(protocol.TypeHello) {
 				helloCount++

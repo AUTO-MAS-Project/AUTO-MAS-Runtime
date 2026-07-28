@@ -7,6 +7,13 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+)
+
+const (
+	maxTypeLabelBytes          = 64
+	maxTypeSummaryBytes        = 256
+	diagnosticTruncationMarker = "...(truncated)"
 )
 
 type parsedEvent struct {
@@ -81,6 +88,20 @@ func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]par
 			issues = append(issues, newIssue(command, terminal, lineNumber, line, "physical line contains CR"))
 			continue
 		}
+		if !utf8.Valid(line) {
+			issues = append(issues, newIssue(command, terminal, lineNumber, line, "physical line contains invalid UTF-8"))
+			continue
+		}
+		if name, duplicate := duplicateJSONObjectName(line); duplicate {
+			issues = append(issues, newIssue(
+				command,
+				terminal,
+				lineNumber,
+				line,
+				fmt.Sprintf("duplicate JSON object name %q", name),
+			))
+			continue
+		}
 
 		decoder := json.NewDecoder(bytes.NewReader(line))
 		decoder.UseNumber()
@@ -115,6 +136,64 @@ func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]par
 	return events, issues
 }
 
+func duplicateJSONObjectName(line []byte) (string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	name, duplicate, err := scanJSONValue(decoder)
+	if err != nil {
+		return "", false
+	}
+	return name, duplicate
+}
+
+func scanJSONValue(decoder *json.Decoder) (string, bool, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", false, err
+	}
+	delimiter, structured := token.(json.Delim)
+	if !structured {
+		return "", false, nil
+	}
+
+	switch delimiter {
+	case '{':
+		names := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return "", false, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return "", false, fmt.Errorf("JSON object name has type %T", keyToken)
+			}
+			if _, exists := names[key]; exists {
+				return key, true, nil
+			}
+			names[key] = struct{}{}
+			if name, duplicate, err := scanJSONValue(decoder); err != nil || duplicate {
+				return name, duplicate, err
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return "", false, err
+		}
+	case '[':
+		for decoder.More() {
+			if name, duplicate, err := scanJSONValue(decoder); err != nil || duplicate {
+				return name, duplicate, err
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return "", false, err
+		}
+	default:
+		return "", false, fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	return "", false, nil
+}
+
 func newIssue(command string, terminal Terminal, line int, raw []byte, message string) contractIssue {
 	return contractIssue{
 		command:  command,
@@ -129,23 +208,74 @@ func summarizeTypes(events []parsedEvent) string {
 	if len(events) == 0 {
 		return "[]"
 	}
-	types := make([]string, len(events))
+
+	var summary strings.Builder
+	summary.Grow(maxTypeSummaryBytes)
+	summary.WriteByte('[')
 	for index, event := range events {
-		value, ok := event.object["type"]
-		switch value := value.(type) {
-		case string:
-			types[index] = value
-		case nil:
-			types[index] = "<missing>"
-		default:
-			if !ok {
-				types[index] = "<missing>"
-			} else {
-				types[index] = fmt.Sprintf("<%T>", value)
-			}
+		label := summarizeEventType(event)
+		separatorLength := 0
+		if index != 0 {
+			separatorLength = 1
 		}
+		required := separatorLength + len(label) + 1
+		if index != len(events)-1 {
+			required += 1 + len(diagnosticTruncationMarker)
+		}
+		if summary.Len()+required > maxTypeSummaryBytes {
+			if index != 0 {
+				summary.WriteByte(',')
+			}
+			summary.WriteString(diagnosticTruncationMarker)
+			summary.WriteByte(']')
+			return summary.String()
+		}
+		if index != 0 {
+			summary.WriteByte(',')
+		}
+		summary.WriteString(label)
 	}
-	return "[" + strings.Join(types, ",") + "]"
+	summary.WriteByte(']')
+	return summary.String()
+}
+
+func summarizeEventType(event parsedEvent) string {
+	value, exists := event.object["type"]
+	switch value := value.(type) {
+	case string:
+		return boundedTypeName(value)
+	case nil:
+		return "<missing>"
+	default:
+		if !exists {
+			return "<missing>"
+		}
+		return fmt.Sprintf("<%T>", value)
+	}
+}
+
+func boundedTypeName(value string) string {
+	return truncateUTF8String(value, maxTypeLabelBytes)
+}
+
+func truncateUTF8String(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	prefixLimit := maxBytes - len(diagnosticTruncationMarker)
+	prefix := validUTF8Prefix([]byte(value), prefixLimit)
+	return string(prefix) + diagnosticTruncationMarker
+}
+
+func validUTF8Prefix(value []byte, maxBytes int) []byte {
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.Valid(value[:end]) {
+		end--
+	}
+	return value[:end]
 }
 
 func quoteRaw(raw []byte) string {
@@ -153,5 +283,9 @@ func quoteRaw(raw []byte) string {
 	if len(raw) <= maxRawBytes {
 		return strconv.Quote(string(raw))
 	}
-	return strconv.Quote(string(raw[:maxRawBytes])) + "...(truncated)"
+	prefix := raw[:maxRawBytes]
+	if utf8.Valid(raw) {
+		prefix = validUTF8Prefix(raw, maxRawBytes)
+	}
+	return strconv.Quote(string(prefix)) + diagnosticTruncationMarker
 }

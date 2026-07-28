@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 const (
@@ -62,6 +63,69 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 	}
 	if !bytes.Equal(issue.raw, wantRaw) {
 		t.Errorf("missing-LF issue raw = %q, want final physical line %q", issue.raw, wantRaw)
+	}
+
+	t.Run("invalid UTF-8 is rejected before JSON decoding", func(t *testing.T) {
+		stdout := replaceRawOnce(
+			t,
+			validTranscript(),
+			[]byte(`"message":"done"`),
+			[]byte{'"', 'm', 'e', 's', 's', 'a', 'g', 'e', '"', ':', '"', 0xff, '"'},
+		)
+		_, issues := inspect(testCommand, TerminalSuccess, stdout)
+		requireIssue(t, issues, "invalid UTF-8")
+	})
+
+	for _, test := range []struct {
+		name    string
+		stdout  func(*testing.T) []byte
+		old     string
+		replace string
+		key     string
+	}{
+		{
+			name: "top-level type",
+			stdout: func(*testing.T) []byte {
+				return validTranscript()
+			},
+			old:     `"type":"hello"`,
+			replace: `"type":"hello","type":"hello"`,
+			key:     "type",
+		},
+		{
+			name: "top-level success",
+			stdout: func(*testing.T) []byte {
+				return validTranscript()
+			},
+			old:     `"success":true`,
+			replace: `"success":true,"success":true`,
+			key:     "success",
+		},
+		{
+			name: "warning summary",
+			stdout: func(t *testing.T) []byte {
+				return encodeTranscript(t, warningObjects(1))
+			},
+			old:     `"warnings":[{"code":"WARN_000"`,
+			replace: `"warnings":[{"code":"WARN_000","code":"WARN_000"`,
+			key:     "code",
+		},
+		{
+			name: "warning summary nested details",
+			stdout: func(t *testing.T) []byte {
+				return encodeTranscript(t, warningObjects(1))
+			},
+			old:     `"warnings":[{"code":"WARN_000","details":{"index":0`,
+			replace: `"warnings":[{"code":"WARN_000","details":{"index":0,"index":0`,
+			key:     "index",
+		},
+	} {
+		test := test
+		t.Run("duplicate object name "+test.name, func(t *testing.T) {
+			stdout := replaceRawOnce(t, test.stdout(t), []byte(test.old), []byte(test.replace))
+			_, issues := inspect(testCommand, TerminalSuccess, stdout)
+			requireIssue(t, issues, fmt.Sprintf("duplicate JSON object name %q", test.key))
+		})
 	}
 }
 
@@ -253,6 +317,12 @@ func TestContract_ResultPlacement(t *testing.T) {
 func TestContract_Diagnostics(t *testing.T) {
 	t.Parallel()
 
+	validEvents, validIssues := inspect(testCommand, TerminalSuccess, validTranscript())
+	requireNoIssues(t, validIssues)
+	if summary := summarizeTypes(validEvents); summary != "[hello,result]" {
+		t.Errorf("normal type summary = %q, want %q", summary, "[hello,result]")
+	}
+
 	_, issues := inspect("dependencies sync", TerminalFailure, []byte(
 		`{"protocol":1,"type":"hello","operationId":"bad","sequence":1,"timestamp":"2026-07-28T08:00:00Z"}`+"\n"+
 			`{"protocol":1,"type":"mystery","operationId":"bad","sequence":2,"timestamp":"2026-07-28T08:00:00Z"}`+"\n",
@@ -289,6 +359,42 @@ func TestContract_Diagnostics(t *testing.T) {
 			t.Errorf("truncated diagnostic %q does not contain %q", truncatedDiagnostic, want)
 		}
 	}
+	unicodeRaw := quoteRaw(bytes.Repeat([]byte("界"), 100))
+	if strings.Contains(unicodeRaw, `\x`) || !utf8.ValidString(unicodeRaw) {
+		t.Errorf("unicode raw truncation splits a UTF-8 rune: %q", unicodeRaw)
+	}
+
+	t.Run("very long unknown type is bounded without invalid UTF-8", func(t *testing.T) {
+		events := validObjects()
+		events[1]["type"] = strings.Repeat("界", 1<<18)
+		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
+		diagnostic := findIssue(t, issues, "unknown event type").Error()
+		if len(diagnostic) > 1024 {
+			t.Fatalf("long-type diagnostic length = %d, want at most 1024", len(diagnostic))
+		}
+		if !strings.Contains(diagnostic, "(truncated)") {
+			t.Errorf("long-type diagnostic lacks truncated marker: %q", diagnostic)
+		}
+		if !utf8.ValidString(diagnostic) {
+			t.Errorf("long-type diagnostic is invalid UTF-8: %q", diagnostic)
+		}
+	})
+
+	t.Run("many event types have bounded summary", func(t *testing.T) {
+		events := make([]map[string]any, 0, 514)
+		events = append(events, helloObject())
+		for sequence := 2; sequence <= 513; sequence++ {
+			events = append(events, eventObject("log", sequence))
+		}
+		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
+		diagnostic := findIssue(t, issues, "result must appear exactly once").Error()
+		if len(diagnostic) > 1024 {
+			t.Fatalf("many-types diagnostic length = %d, want at most 1024", len(diagnostic))
+		}
+		if !strings.Contains(diagnostic, "types=[hello,log") || !strings.Contains(diagnostic, "(truncated)") {
+			t.Errorf("many-types diagnostic lacks bounded type summary: %q", diagnostic)
+		}
+	})
 }
 
 func TestContract_TerminalSemantics(t *testing.T) {
@@ -884,6 +990,14 @@ func encodeObject(t *testing.T, event map[string]any) []byte {
 
 func joinPhysicalLines(lines ...[]byte) []byte {
 	return append(bytes.Join(lines, []byte{'\n'}), '\n')
+}
+
+func replaceRawOnce(t *testing.T, stdout []byte, old []byte, replacement []byte) []byte {
+	t.Helper()
+	if !bytes.Contains(stdout, old) {
+		t.Fatalf("stdout does not contain replacement target %q", old)
+	}
+	return bytes.Replace(stdout, old, replacement, 1)
 }
 
 func requireIssue(t *testing.T, issues []contractIssue, want string) {
