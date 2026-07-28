@@ -96,6 +96,20 @@ func (m *LifecycleMachine) RestartUsed() bool {
 	return m.restartUsed
 }
 
+// RollbackPreparation restores the stable initial state before managed state changes.
+func (m *LifecycleMachine) RollbackPreparation() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	switch m.current {
+	case StatePreparingUV, StateSyncingRepository:
+		m.current = m.initial
+		return nil
+	default:
+		return fmt.Errorf("cannot roll back lifecycle preparation from %q", m.current)
+	}
+}
+
 // Transition moves the machine to next when the static transition table allows it.
 func (m *LifecycleMachine) Transition(next StateStatus) error {
 	m.mu.Lock()
@@ -105,11 +119,23 @@ func (m *LifecycleMachine) Transition(next StateStatus) error {
 	if !IsKnownStateStatus(current) || !IsKnownStateStatus(next) {
 		return fmt.Errorf("invalid lifecycle transition: from=%q to=%q: unknown state", current, next)
 	}
+	if current == StateBackendFailed || current == StateStopped {
+		return fmt.Errorf("invalid lifecycle transition: from=%q to=%q: current state is terminal", current, next)
+	}
 	if current == next {
 		return fmt.Errorf("invalid lifecycle transition: from=%q to=%q: self-loop", current, next)
 	}
 	if !IsKnownLifecycleTransition(current, next) {
 		return fmt.Errorf("invalid lifecycle transition: from=%q to=%q: edge is not allowed", current, next)
+	}
+	if current == StateRunning && next == StateRestarting {
+		if m.restartUsed {
+			return fmt.Errorf("automatic backend restart already used")
+		}
+		m.restartUsed = true
+	}
+	if current == StateRunning && next == StateBackendFailed && !m.restartUsed {
+		return fmt.Errorf("backend must use its automatic restart before failing")
 	}
 
 	m.current = next
