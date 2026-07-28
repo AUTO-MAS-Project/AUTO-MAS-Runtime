@@ -21,6 +21,7 @@ const (
 
 	maxControlPayloadBytes  = 4096
 	controlReaderBufferSize = maxControlPayloadBytes + 2
+	controlLedgerCapacity   = 1024
 	invalidControlMessage   = "已忽略无效的 stdin 控制命令"
 )
 
@@ -60,6 +61,10 @@ type ControlReader struct {
 	warnings ControlWarningEmitter
 	handler  ControlHandler
 	allowed  map[ControlKind]struct{}
+	seen     map[string]ControlKind
+	order    [controlLedgerCapacity]string
+	next     int
+	size     int
 }
 
 // NewControlReader constructs a bounded stdin control reader.
@@ -98,6 +103,7 @@ func NewControlReader(
 		warnings: warnings,
 		handler:  handler,
 		allowed:  allowedSet,
+		seen:     make(map[string]ControlKind, controlLedgerCapacity),
 	}, nil
 }
 
@@ -213,24 +219,68 @@ func (r *ControlReader) drainOverlongLine(first []byte) (
 }
 
 func (r *ControlReader) dispatch(command ControlCommand) error {
+	if originalCommand, exists := r.seen[command.CommandID]; exists {
+		if originalCommand == command.Command {
+			return nil
+		}
+		return r.emitInvalidControl(WithControlCommandID(map[string]any{
+			"reason":          "command_id_reused",
+			"command":         command.Command,
+			"originalCommand": originalCommand,
+		}, command.CommandID))
+	}
+	r.remember(command)
+
+	if _, allowed := r.allowed[command.Command]; !allowed {
+		return r.emitCommandNotApplicable(command)
+	}
+
 	disposition, action, err := r.handler.PrepareControl(command)
 	if err != nil {
 		return fmt.Errorf("prepare stdin control %q: %w", command.Command, err)
 	}
-	if disposition != ControlAccepted {
+	switch disposition {
+	case ControlAccepted:
+		if action == nil {
+			return fmt.Errorf("prepare stdin control %q: accepted command returned nil action", command.Command)
+		}
+		if err := action(); err != nil {
+			return fmt.Errorf("apply stdin control %q: %w", command.Command, err)
+		}
+		return nil
+	case ControlNotApplicable:
+		if action != nil {
+			return fmt.Errorf(
+				"prepare stdin control %q: not-applicable command returned non-nil action",
+				command.Command,
+			)
+		}
+		return r.emitCommandNotApplicable(command)
+	default:
 		return fmt.Errorf(
 			"prepare stdin control %q: disposition %d is not supported",
 			command.Command,
 			disposition,
 		)
 	}
-	if action == nil {
-		return fmt.Errorf("prepare stdin control %q: accepted command returned nil action", command.Command)
+}
+
+func (r *ControlReader) remember(command ControlCommand) {
+	if r.size == controlLedgerCapacity {
+		delete(r.seen, r.order[r.next])
+	} else {
+		r.size++
 	}
-	if err := action(); err != nil {
-		return fmt.Errorf("apply stdin control %q: %w", command.Command, err)
-	}
-	return nil
+	r.order[r.next] = command.CommandID
+	r.next = (r.next + 1) % controlLedgerCapacity
+	r.seen[command.CommandID] = command.Command
+}
+
+func (r *ControlReader) emitCommandNotApplicable(command ControlCommand) error {
+	return r.emitInvalidControl(WithControlCommandID(map[string]any{
+		"reason":  "command_not_applicable",
+		"command": command.Command,
+	}, command.CommandID))
 }
 
 func (r *ControlReader) emitInvalidControl(details map[string]any) error {

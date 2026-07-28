@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -60,6 +61,85 @@ var (
 	_ ControlHandler        = (*controlContractHandler)(nil)
 	_ ControlWarningEmitter = (*controlContractWarningEmitter)(nil)
 )
+
+type controlResultHandler struct {
+	disposition ControlDisposition
+	action      ControlAction
+	prepareErr  error
+	stage       Stage
+	prepared    []ControlCommand
+}
+
+func (h *controlResultHandler) PrepareControl(command ControlCommand) (ControlDisposition, ControlAction, error) {
+	h.prepared = append(h.prepared, command)
+	return h.disposition, h.action, h.prepareErr
+}
+
+func (h *controlResultHandler) CurrentControlStage() Stage {
+	return h.stage
+}
+
+type latchingControlHandler struct {
+	cancelPrepared   int
+	cancelActions    int
+	cancelEffects    int
+	cancelLatched    bool
+	shutdownPrepared int
+	shutdownActions  int
+	statusPrepared   int
+	statusSnapshots  []string
+}
+
+func (h *latchingControlHandler) PrepareControl(command ControlCommand) (ControlDisposition, ControlAction, error) {
+	switch command.Command {
+	case ControlCancel:
+		h.cancelPrepared++
+		return ControlAccepted, func() error {
+			h.cancelActions++
+			if !h.cancelLatched {
+				h.cancelLatched = true
+				h.cancelEffects++
+			}
+			return nil
+		}, nil
+	case ControlShutdown:
+		h.shutdownPrepared++
+		return ControlAccepted, func() error {
+			h.shutdownActions++
+			return nil
+		}, nil
+	case ControlStatus:
+		h.statusPrepared++
+		return ControlAccepted, func() error {
+			h.statusSnapshots = append(h.statusSnapshots, command.CommandID)
+			return nil
+		}, nil
+	default:
+		panic(fmt.Sprintf("unexpected control command %q", command.Command))
+	}
+}
+
+func (*latchingControlHandler) CurrentControlStage() Stage {
+	return StageBackendRun
+}
+
+func controlTestID(index int) string {
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	id := []byte("01J00000000000000000000000")
+	for offset := len(id) - 1; index > 0; offset-- {
+		id[offset] = alphabet[index%len(alphabet)]
+		index /= len(alphabet)
+	}
+	return string(id)
+}
+
+func controlTestLine(command ControlKind, commandID string) string {
+	return fmt.Sprintf(
+		`{"protocol":1,"command":%q,"commandId":%q}`,
+		command,
+		commandID,
+	)
+}
 
 func TestControlContract_Kinds(t *testing.T) {
 	tests := []struct {
@@ -345,37 +425,368 @@ func TestControlReader_FramingAndAcceptedCancel(t *testing.T) {
 	}
 }
 
-func TestControlReader_Task2RejectsNonAcceptedDisposition(t *testing.T) {
-	const commandLine = `{"protocol":1,"command":"cancel","commandId":"01J00000000000000000000000"}`
+func TestControlReader_DispatchesAllCommandsAndReturnsEveryStatusSnapshot(t *testing.T) {
+	handler := &latchingControlHandler{}
+	warnings := &controlContractWarningEmitter{}
+	input := strings.Join([]string{
+		controlTestLine(ControlCancel, controlTestID(1)),
+		controlTestLine(ControlShutdown, controlTestID(2)),
+		controlTestLine(ControlStatus, controlTestID(3)),
+		controlTestLine(ControlStatus, controlTestID(4)),
+	}, "\n") + "\n"
+	reader, err := NewControlReader(
+		strings.NewReader(input),
+		warnings,
+		handler,
+		ControlCancel,
+		ControlShutdown,
+		ControlStatus,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	if err := reader.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if handler.cancelPrepared != 1 || handler.cancelActions != 1 || handler.cancelEffects != 1 {
+		t.Fatalf(
+			"cancel prepared/actions/effects = %d/%d/%d, want 1/1/1",
+			handler.cancelPrepared,
+			handler.cancelActions,
+			handler.cancelEffects,
+		)
+	}
+	if handler.shutdownPrepared != 1 || handler.shutdownActions != 1 {
+		t.Fatalf(
+			"shutdown prepared/actions = %d/%d, want 1/1",
+			handler.shutdownPrepared,
+			handler.shutdownActions,
+		)
+	}
+	if handler.statusPrepared != 2 {
+		t.Fatalf("status prepared = %d, want 2", handler.statusPrepared)
+	}
+	if want := []string{controlTestID(3), controlTestID(4)}; !reflect.DeepEqual(handler.statusSnapshots, want) {
+		t.Fatalf("status snapshots = %#v, want %#v", handler.statusSnapshots, want)
+	}
+	if len(warnings.warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings.warnings)
+	}
+}
+
+func TestControlReader_ApplicabilityWarnsOnceAndRecovers(t *testing.T) {
+	t.Run("static disallow and bad input recover to allowed command", func(t *testing.T) {
+		const disallowedID = "01J00000000000000000000001"
+		handler := &latchingControlHandler{}
+		warnings := &controlContractWarningEmitter{}
+		input := "{bad json}\n" +
+			controlTestLine(ControlStatus, disallowedID) + "\n" +
+			controlTestLine(ControlStatus, disallowedID) + "\n" +
+			controlTestLine(ControlCancel, controlTestID(2)) + "\n"
+		reader, err := NewControlReader(strings.NewReader(input), warnings, handler, ControlCancel)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if handler.statusPrepared != 0 {
+			t.Fatalf("status prepared = %d, want 0", handler.statusPrepared)
+		}
+		if handler.cancelActions != 1 {
+			t.Fatalf("cancel actions = %d, want 1", handler.cancelActions)
+		}
+		if len(warnings.warnings) != 2 {
+			t.Fatalf("warning count = %d, want 2: %#v", len(warnings.warnings), warnings.warnings)
+		}
+		assertInvalidControlWarning(t, warnings.warnings[1], map[string]any{
+			"reason":           "command_not_applicable",
+			"command":          ControlStatus,
+			"controlCommandId": disallowedID,
+		})
+	})
+
+	t.Run("dynamic not applicable is recorded before warning", func(t *testing.T) {
+		const commandID = "01J00000000000000000000003"
+		handler := &controlResultHandler{
+			disposition: ControlNotApplicable,
+			stage:       StageBackendRun,
+		}
+		warnings := &controlContractWarningEmitter{}
+		line := controlTestLine(ControlShutdown, commandID)
+		reader, err := NewControlReader(
+			strings.NewReader(line+"\n"+line+"\n"),
+			warnings,
+			handler,
+			ControlShutdown,
+		)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if len(handler.prepared) != 1 {
+			t.Fatalf("prepared commands = %d, want 1", len(handler.prepared))
+		}
+		if len(warnings.warnings) != 1 {
+			t.Fatalf("warning count = %d, want 1", len(warnings.warnings))
+		}
+		assertInvalidControlWarning(t, warnings.warnings[0], map[string]any{
+			"reason":           "command_not_applicable",
+			"command":          ControlShutdown,
+			"controlCommandId": commandID,
+		})
+	})
+}
+
+func TestControlReader_IdempotencyUsesBoundedFIFOLedger(t *testing.T) {
+	t.Run("same ID is silent and conflicting reuse reports original command", func(t *testing.T) {
+		const commandID = "01J00000000000000000000001"
+		handler := &latchingControlHandler{}
+		warnings := &controlContractWarningEmitter{}
+		input := controlTestLine(ControlCancel, commandID) + "\n" +
+			controlTestLine(ControlCancel, commandID) + "\n" +
+			controlTestLine(ControlStatus, commandID) + "\n"
+		reader, err := NewControlReader(
+			strings.NewReader(input),
+			warnings,
+			handler,
+			ControlCancel,
+			ControlStatus,
+		)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if handler.cancelPrepared != 1 || handler.cancelActions != 1 {
+			t.Fatalf(
+				"cancel prepared/actions = %d/%d, want 1/1",
+				handler.cancelPrepared,
+				handler.cancelActions,
+			)
+		}
+		if handler.statusPrepared != 0 {
+			t.Fatalf("status prepared = %d, want 0", handler.statusPrepared)
+		}
+		if len(warnings.warnings) != 1 {
+			t.Fatalf("warning count = %d, want 1", len(warnings.warnings))
+		}
+		assertInvalidControlWarning(t, warnings.warnings[0], map[string]any{
+			"reason":           "command_id_reused",
+			"command":          ControlStatus,
+			"controlCommandId": commandID,
+			"originalCommand":  ControlCancel,
+		})
+	})
+
+	t.Run("cancel latch survives different IDs and ledger eviction", func(t *testing.T) {
+		handler := &latchingControlHandler{}
+		warnings := &controlContractWarningEmitter{}
+		var input strings.Builder
+		firstCancelID := controlTestID(1)
+		input.WriteString(controlTestLine(ControlCancel, firstCancelID))
+		input.WriteByte('\n')
+		input.WriteString(controlTestLine(ControlCancel, controlTestID(2)))
+		input.WriteByte('\n')
+		for i := 3; i <= 1025; i++ {
+			input.WriteString(controlTestLine(ControlStatus, controlTestID(i)))
+			input.WriteByte('\n')
+		}
+		input.WriteString(controlTestLine(ControlCancel, firstCancelID))
+		input.WriteByte('\n')
+
+		reader, err := NewControlReader(
+			strings.NewReader(input.String()),
+			warnings,
+			handler,
+			ControlCancel,
+			ControlStatus,
+		)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if handler.cancelPrepared != 3 || handler.cancelActions != 3 {
+			t.Fatalf(
+				"cancel prepared/actions = %d/%d, want 3/3",
+				handler.cancelPrepared,
+				handler.cancelActions,
+			)
+		}
+		if handler.cancelEffects != 1 {
+			t.Fatalf("cancel side effects = %d, want 1", handler.cancelEffects)
+		}
+		if len(warnings.warnings) != 0 {
+			t.Fatalf("warnings = %#v, want none", warnings.warnings)
+		}
+	})
+
+	t.Run("1024 status commands do not block a new shutdown", func(t *testing.T) {
+		handler := &latchingControlHandler{}
+		warnings := &controlContractWarningEmitter{}
+		var input strings.Builder
+		for i := 1; i <= 1024; i++ {
+			input.WriteString(controlTestLine(ControlStatus, controlTestID(i)))
+			input.WriteByte('\n')
+		}
+		input.WriteString(controlTestLine(ControlShutdown, controlTestID(1025)))
+		input.WriteByte('\n')
+
+		reader, err := NewControlReader(
+			strings.NewReader(input.String()),
+			warnings,
+			handler,
+			ControlStatus,
+			ControlShutdown,
+		)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if handler.statusPrepared != 1024 || len(handler.statusSnapshots) != 1024 {
+			t.Fatalf(
+				"status prepared/snapshots = %d/%d, want 1024/1024",
+				handler.statusPrepared,
+				len(handler.statusSnapshots),
+			)
+		}
+		if handler.shutdownPrepared != 1 || handler.shutdownActions != 1 {
+			t.Fatalf(
+				"shutdown prepared/actions = %d/%d, want 1/1",
+				handler.shutdownPrepared,
+				handler.shutdownActions,
+			)
+		}
+	})
+}
+
+func TestControlReader_ErrorsPropagateExactly(t *testing.T) {
+	prepareErr := errors.New("prepare failed")
+	actionErr := errors.New("action failed")
+	warningErr := errors.New("warning failed")
 	tests := []struct {
-		name        string
-		disposition ControlDisposition
-		wantErr     string
+		name       string
+		handler    ControlHandler
+		warnings   *controlContractWarningEmitter
+		input      string
+		allowed    []ControlKind
+		wantErr    string
+		wantTarget error
 	}{
 		{
-			name:        "not applicable remains pending for Task 3",
-			disposition: ControlNotApplicable,
-			wantErr:     `prepare stdin control "cancel": disposition 2 is not supported`,
+			name: "prepare error",
+			handler: &controlResultHandler{
+				disposition: ControlDispositionUnknown,
+				prepareErr:  prepareErr,
+				stage:       StageBackendRun,
+			},
+			warnings:   &controlContractWarningEmitter{},
+			input:      controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:    []ControlKind{ControlCancel},
+			wantErr:    `prepare stdin control "cancel": prepare failed`,
+			wantTarget: prepareErr,
 		},
 		{
-			name:        "unknown remains pending for Task 3",
-			disposition: ControlDispositionUnknown,
-			wantErr:     `prepare stdin control "cancel": disposition 0 is not supported`,
+			name: "action error",
+			handler: &controlResultHandler{
+				disposition: ControlAccepted,
+				action:      func() error { return actionErr },
+				stage:       StageBackendRun,
+			},
+			warnings:   &controlContractWarningEmitter{},
+			input:      controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:    []ControlKind{ControlCancel},
+			wantErr:    `apply stdin control "cancel": action failed`,
+			wantTarget: actionErr,
+		},
+		{
+			name: "zero disposition",
+			handler: &controlResultHandler{
+				disposition: ControlDispositionUnknown,
+				stage:       StageBackendRun,
+			},
+			warnings: &controlContractWarningEmitter{},
+			input:    controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:  []ControlKind{ControlCancel},
+			wantErr:  `prepare stdin control "cancel": disposition 0 is not supported`,
+		},
+		{
+			name: "unknown disposition",
+			handler: &controlResultHandler{
+				disposition: ControlDisposition(99),
+				stage:       StageBackendRun,
+			},
+			warnings: &controlContractWarningEmitter{},
+			input:    controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:  []ControlKind{ControlCancel},
+			wantErr:  `prepare stdin control "cancel": disposition 99 is not supported`,
+		},
+		{
+			name: "accepted nil action",
+			handler: &controlResultHandler{
+				disposition: ControlAccepted,
+				stage:       StageBackendRun,
+			},
+			warnings: &controlContractWarningEmitter{},
+			input:    controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:  []ControlKind{ControlCancel},
+			wantErr:  `prepare stdin control "cancel": accepted command returned nil action`,
+		},
+		{
+			name: "not applicable with action",
+			handler: &controlResultHandler{
+				disposition: ControlNotApplicable,
+				action:      func() error { return nil },
+				stage:       StageBackendRun,
+			},
+			warnings: &controlContractWarningEmitter{},
+			input:    controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:  []ControlKind{ControlCancel},
+			wantErr:  `prepare stdin control "cancel": not-applicable command returned non-nil action`,
+		},
+		{
+			name: "unknown warning stage",
+			handler: &controlResultHandler{
+				disposition: ControlNotApplicable,
+				stage:       Stage("future_stage"),
+			},
+			warnings: &controlContractWarningEmitter{},
+			input:    controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:  []ControlKind{ControlCancel},
+			wantErr:  `emit invalid stdin control warning: unknown current stage "future_stage"`,
+		},
+		{
+			name: "warning sink error",
+			handler: &controlResultHandler{
+				disposition: ControlNotApplicable,
+				stage:       StageBackendRun,
+			},
+			warnings:   &controlContractWarningEmitter{err: warningErr},
+			input:      controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			allowed:    []ControlKind{ControlCancel},
+			wantErr:    "emit invalid stdin control warning: warning failed",
+			wantTarget: warningErr,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var handler ControlHandler = &controlContractHandler{disposition: tt.disposition}
-			if tt.disposition == ControlDispositionUnknown {
-				handler = &controlContractHandlerReturningUnknown{}
-			}
-			warnings := &controlContractWarningEmitter{}
 			reader, err := NewControlReader(
-				strings.NewReader(commandLine+"\n"),
-				warnings,
-				handler,
-				ControlCancel,
+				strings.NewReader(tt.input),
+				tt.warnings,
+				tt.handler,
+				tt.allowed...,
 			)
 			if err != nil {
 				t.Fatalf("NewControlReader() error = %v", err)
@@ -385,24 +796,11 @@ func TestControlReader_Task2RejectsNonAcceptedDisposition(t *testing.T) {
 			if err == nil || err.Error() != tt.wantErr {
 				t.Fatalf("Run() error = %v, want %q", err, tt.wantErr)
 			}
-			if len(warnings.warnings) != 0 {
-				t.Fatalf("warnings = %#v, want none", warnings.warnings)
+			if tt.wantTarget != nil && !errors.Is(err, tt.wantTarget) {
+				t.Fatalf("Run() error = %v, want wrapping %v", err, tt.wantTarget)
 			}
 		})
 	}
-}
-
-type controlContractHandlerReturningUnknown struct {
-	prepared []ControlCommand
-}
-
-func (h *controlContractHandlerReturningUnknown) PrepareControl(command ControlCommand) (ControlDisposition, ControlAction, error) {
-	h.prepared = append(h.prepared, command)
-	return ControlDispositionUnknown, nil, nil
-}
-
-func (*controlContractHandlerReturningUnknown) CurrentControlStage() Stage {
-	return StageBackendRun
 }
 
 func TestControlReader_InvalidLinesWarnOnceAndRecover(t *testing.T) {
