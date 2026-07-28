@@ -31,8 +31,11 @@ func TestNewEmitterEmitsHelloFirst(t *testing.T) {
 	var output flushingBuffer
 	now := time.Date(2026, 7, 28, 14, 10, 0, 123_000_000, time.FixedZone("CST", 8*60*60))
 
-	emitter, err := protocol.NewEmitter(
-		&output,
+	processOutput, err := protocol.NewProcessOutput(&output)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	emitter, err := processOutput.NewEmitter(
 		"v1.0.0",
 		"bootstrap",
 		[]string{"stdin.cancel", "state.v1", "log.stream"},
@@ -238,9 +241,13 @@ func TestGeneratedOperationIDIsULID(t *testing.T) {
 	t.Parallel()
 
 	var output bytes.Buffer
-	emitter, err := protocol.NewEmitter(&output, "v1.0.0", "doctor", nil)
+	processOutput, err := protocol.NewProcessOutput(&output)
 	if err != nil {
-		t.Fatalf("NewEmitter() error = %v", err)
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	emitter, err := processOutput.NewEmitter("v1.0.0", "doctor", nil)
+	if err != nil {
+		t.Fatalf("ProcessOutput.NewEmitter() error = %v", err)
 	}
 
 	const ulidPattern = `^[0-7][0-9A-HJKMNP-TV-Z]{25}$`
@@ -249,18 +256,47 @@ func TestGeneratedOperationIDIsULID(t *testing.T) {
 	}
 }
 
+func TestProcessOutputRejectsSecondEmitter(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	processOutput, err := protocol.NewProcessOutput(&output)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	if _, err := processOutput.NewEmitter(
+		"v1.0.0",
+		"doctor",
+		nil,
+		protocol.WithOperationID(testOperationID),
+	); err != nil {
+		t.Fatalf("first ProcessOutput.NewEmitter() error = %v", err)
+	}
+	if _, err := processOutput.NewEmitter(
+		"v1.0.0",
+		"bootstrap",
+		nil,
+		protocol.WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+	); err == nil {
+		t.Fatal("second ProcessOutput.NewEmitter() error = nil, want process-output ownership error")
+	}
+}
+
 func newTestEmitter(t *testing.T, output *flushingBuffer) *protocol.Emitter {
 	t.Helper()
 
-	emitter, err := protocol.NewEmitter(
-		output,
+	processOutput, err := protocol.NewProcessOutput(output)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	emitter, err := processOutput.NewEmitter(
 		"v1.0.0",
 		"bootstrap",
 		nil,
 		protocol.WithOperationID(testOperationID),
 	)
 	if err != nil {
-		t.Fatalf("NewEmitter() error = %v", err)
+		t.Fatalf("ProcessOutput.NewEmitter() error = %v", err)
 	}
 	return emitter
 }

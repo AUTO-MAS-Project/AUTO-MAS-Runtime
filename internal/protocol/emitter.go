@@ -10,15 +10,22 @@ import (
 	"time"
 )
 
-// Emitter is the serialized, flush-on-every-line outlet for NDJSON events.
+// ProcessOutput owns the process-wide NDJSON destination, sequence, and write
+// lock. The process entry point must create exactly one instance for stdout.
+type ProcessOutput struct {
+	mu             sync.Mutex
+	writer         *bufio.Writer
+	destination    io.Writer
+	nextSequence   uint64
+	writeErr       error
+	emitterCreated bool
+}
+
+// Emitter writes typed protocol events through a ProcessOutput.
 type Emitter struct {
-	mu           sync.Mutex
-	writer       *bufio.Writer
-	destination  io.Writer
-	operationID  string
-	nextSequence uint64
-	clock        func() time.Time
-	writeErr     error
+	output      *ProcessOutput
+	operationID string
+	clock       func() time.Time
 }
 
 type emitterOptions struct {
@@ -51,19 +58,27 @@ func WithClock(clock func() time.Time) Option {
 	}
 }
 
-// NewEmitter creates an emitter and immediately writes the required first
-// hello event.
-func NewEmitter(
-	output io.Writer,
+// NewProcessOutput creates the process-wide owner of the NDJSON destination.
+func NewProcessOutput(output io.Writer) (*ProcessOutput, error) {
+	if output == nil {
+		return nil, errors.New("protocol output must not be nil")
+	}
+	return &ProcessOutput{
+		writer:       bufio.NewWriter(output),
+		destination:  output,
+		nextSequence: 1,
+	}, nil
+}
+
+// NewEmitter reserves this process output for one operation and immediately
+// writes the required first hello event. A ProcessOutput cannot create a
+// second emitter.
+func (o *ProcessOutput) NewEmitter(
 	runtimeVersion string,
 	command string,
 	capabilities []string,
 	options ...Option,
 ) (*Emitter, error) {
-	if output == nil {
-		return nil, errors.New("protocol output must not be nil")
-	}
-
 	settings := emitterOptions{clock: time.Now}
 	for _, option := range options {
 		if option == nil {
@@ -82,12 +97,18 @@ func NewEmitter(
 		settings.operationID = operationID
 	}
 
+	o.mu.Lock()
+	if o.emitterCreated {
+		o.mu.Unlock()
+		return nil, errors.New("protocol process output already has an emitter")
+	}
+	o.emitterCreated = true
+	o.mu.Unlock()
+
 	emitter := &Emitter{
-		writer:       bufio.NewWriter(output),
-		destination:  output,
-		operationID:  settings.operationID,
-		nextSequence: 1,
-		clock:        settings.clock,
+		output:      o,
+		operationID: settings.operationID,
+		clock:       settings.clock,
 	}
 
 	if capabilities == nil {
@@ -139,18 +160,18 @@ func (e *Emitter) EmitResult(event ResultEvent) error {
 }
 
 func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.output.mu.Lock()
+	defer e.output.mu.Unlock()
 
-	if e.writeErr != nil {
-		return e.writeErr
+	if e.output.writeErr != nil {
+		return e.output.writeErr
 	}
 
 	event.setCommon(Common{
 		Protocol:    Version,
 		Type:        eventType,
 		OperationID: e.operationID,
-		Sequence:    e.nextSequence,
+		Sequence:    e.output.nextSequence,
 		Timestamp:   e.clock().Format(time.RFC3339Nano),
 	})
 	encoded, err := json.Marshal(event)
@@ -158,23 +179,23 @@ func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
 		return fmt.Errorf("encode %s event: %w", eventType, err)
 	}
 	encoded = append(encoded, '\n')
-	if _, err := e.writer.Write(encoded); err != nil {
-		return e.rememberWriteError(err)
+	if _, err := e.output.writer.Write(encoded); err != nil {
+		return e.output.rememberWriteError(err)
 	}
-	if err := e.writer.Flush(); err != nil {
-		return e.rememberWriteError(err)
+	if err := e.output.writer.Flush(); err != nil {
+		return e.output.rememberWriteError(err)
 	}
-	if err := flushDestination(e.destination); err != nil {
-		return e.rememberWriteError(err)
+	if err := flushDestination(e.output.destination); err != nil {
+		return e.output.rememberWriteError(err)
 	}
 
-	e.nextSequence++
+	e.output.nextSequence++
 	return nil
 }
 
-func (e *Emitter) rememberWriteError(err error) error {
-	e.writeErr = fmt.Errorf("write protocol event: %w", err)
-	return e.writeErr
+func (o *ProcessOutput) rememberWriteError(err error) error {
+	o.writeErr = fmt.Errorf("write protocol event: %w", err)
+	return o.writeErr
 }
 
 type eventWithCommon interface {
