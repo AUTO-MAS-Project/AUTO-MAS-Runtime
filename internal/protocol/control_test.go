@@ -1749,6 +1749,123 @@ func (input errorControlInput) Read([]byte) (int, error) {
 	return 0, input.err
 }
 
+type controlReadStep struct {
+	data []byte
+	err  error
+}
+
+type steppedControlInput struct {
+	steps []controlReadStep
+}
+
+func (input *steppedControlInput) Read(buffer []byte) (int, error) {
+	if len(input.steps) == 0 {
+		return 0, io.EOF
+	}
+	step := input.steps[0]
+	input.steps = input.steps[1:]
+	if len(step.data) > len(buffer) {
+		panic("control read step exceeds destination buffer")
+	}
+	return copy(buffer, step.data), step.err
+}
+
+func TestControlReader_SynchronousReadErrorsPrecedeBufferedData(t *testing.T) {
+	readErr := errors.New("synchronous read failed")
+	validCancel := controlTestLine(ControlCancel, controlTestID(1)) + "\n"
+	validShutdown := controlTestLine(ControlShutdown, controlTestID(2)) + "\n"
+
+	tests := []struct {
+		name    string
+		input   *steppedControlInput
+		allowed []ControlKind
+	}{
+		{
+			name: "cancel line and error",
+			input: &steppedControlInput{steps: []controlReadStep{
+				{data: []byte(validCancel), err: readErr},
+			}},
+			allowed: []ControlKind{ControlCancel},
+		},
+		{
+			name: "invalid JSON and error",
+			input: &steppedControlInput{steps: []controlReadStep{
+				{data: []byte("{bad json}\n"), err: readErr},
+			}},
+			allowed: []ControlKind{ControlCancel},
+		},
+		{
+			name: "overlong tail with LF and error",
+			input: &steppedControlInput{steps: []controlReadStep{
+				{data: bytes.Repeat([]byte{'x'}, controlReaderBufferSize)},
+				{data: []byte("x\n"), err: readErr},
+			}},
+			allowed: []ControlKind{ControlCancel},
+		},
+		{
+			name: "shutdown line and error",
+			input: &steppedControlInput{steps: []controlReadStep{
+				{data: []byte(validShutdown), err: readErr},
+			}},
+			allowed: []ControlKind{ControlShutdown},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &controlContractHandler{}
+			warnings := &controlContractWarningEmitter{}
+			reader, err := NewControlReader(tt.input, warnings, handler, tt.allowed...)
+			if err != nil {
+				t.Fatalf("NewControlReader() error = %v", err)
+			}
+
+			err = reader.Run(context.Background())
+			if !errors.Is(err, readErr) {
+				t.Fatalf("Run() error = %v, want wrapping %v", err, readErr)
+			}
+			if handler.actions != 0 {
+				t.Fatalf("action calls = %d, want 0", handler.actions)
+			}
+			if len(warnings.warnings) != 0 {
+				t.Fatalf("warnings = %#v, want none", warnings.warnings)
+			}
+		})
+	}
+}
+
+func TestControlReader_SynchronousEOFProcessesAllBufferedLines(t *testing.T) {
+	input := strings.Join([]string{
+		controlTestLine(ControlCancel, controlTestID(1)),
+		controlTestLine(ControlStatus, controlTestID(2)),
+		controlTestLine(ControlCancel, controlTestID(3)),
+	}, "\n")
+	handler := &controlContractHandler{}
+	warnings := &controlContractWarningEmitter{}
+	reader, err := NewControlReader(
+		&steppedControlInput{steps: []controlReadStep{
+			{data: []byte(input), err: io.EOF},
+		}},
+		warnings,
+		handler,
+		ControlCancel,
+		ControlStatus,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	if err := reader.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if handler.actions != 3 {
+		t.Fatalf("action calls = %d, want 3", handler.actions)
+	}
+	if len(warnings.warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings.warnings)
+	}
+}
+
 func assertInvalidControlWarning(t *testing.T, got WarningEvent, wantDetails map[string]any) {
 	t.Helper()
 	if got.Code != string(CodeInvalidControlCommand) {

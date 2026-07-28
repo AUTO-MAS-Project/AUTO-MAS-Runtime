@@ -66,6 +66,7 @@ type ControlReader struct {
 	started  bool
 	stopped  bool
 	input    *bufio.Reader
+	read     *controlReadTracker
 	warnings ControlWarningEmitter
 	handler  ControlHandler
 	allowed  map[ControlKind]struct{}
@@ -106,8 +107,10 @@ func NewControlReader(
 		allowedSet[command] = struct{}{}
 	}
 
+	trackedInput := &controlReadTracker{input: input}
 	return &ControlReader{
-		input:    bufio.NewReaderSize(struct{ io.Reader }{Reader: input}, controlReaderBufferSize),
+		input:    bufio.NewReaderSize(trackedInput, controlReaderBufferSize),
+		read:     trackedInput,
 		warnings: warnings,
 		handler:  handler,
 		allowed:  allowedSet,
@@ -207,6 +210,9 @@ func (r *ControlReader) readPhysicalLine() (
 	err error,
 ) {
 	fragment, readErr := r.input.ReadSlice('\n')
+	if err := r.read.synchronousError(); err != nil {
+		return nil, 0, false, false, false, err
+	}
 	switch {
 	case readErr == nil:
 		line = fragment[:len(fragment)-1]
@@ -239,6 +245,9 @@ func (r *ControlReader) drainOverlongLine(first []byte) (
 
 	for {
 		fragment, readErr := r.input.ReadSlice('\n')
+		if err := r.read.synchronousError(); err != nil {
+			return nil, 0, false, false, false, err
+		}
 		totalBytes += len(fragment)
 		switch {
 		case readErr == nil:
@@ -261,6 +270,26 @@ func (r *ControlReader) drainOverlongLine(first []byte) (
 			return nil, 0, false, false, false, readErr
 		}
 	}
+}
+
+type controlReadTracker struct {
+	input      io.Reader
+	pendingErr error
+}
+
+func (r *controlReadTracker) Read(buffer []byte) (int, error) {
+	n, err := r.input.Read(buffer)
+	if err != nil {
+		r.pendingErr = err
+	}
+	return n, err
+}
+
+func (r *controlReadTracker) synchronousError() error {
+	if errors.Is(r.pendingErr, io.EOF) {
+		return nil
+	}
+	return r.pendingErr
 }
 
 func (r *ControlReader) dispatch(command ControlCommand) error {
