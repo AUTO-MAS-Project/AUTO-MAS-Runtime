@@ -8,7 +8,8 @@ type OperationEmitter interface {
 	EmitResult(ResultEvent) error
 }
 
-// LifecycleEmitter emits operation events and lifecycle state transitions.
+// LifecycleEmitter emits operation events plus lifecycle transitions or
+// read-only state snapshots.
 type LifecycleEmitter interface {
 	OperationEmitter
 	EmitState(StateEvent) error

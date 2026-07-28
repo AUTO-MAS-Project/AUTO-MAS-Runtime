@@ -1,2 +1,3 @@
-// Package protocol defines the public NDJSON event and error contracts.
+// Package protocol defines the public event, error, lifecycle, rendering, and
+// stdin control contracts for one Runtime operation.
 package protocol

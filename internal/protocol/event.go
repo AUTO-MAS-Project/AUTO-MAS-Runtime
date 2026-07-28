@@ -44,7 +44,7 @@ type ProgressEvent struct {
 	Message string         `json:"message"`
 }
 
-// StateEvent reports a product lifecycle state transition.
+// StateEvent reports a lifecycle transition or a read-only status snapshot.
 type StateEvent struct {
 	Common
 	Stage   Stage          `json:"stage"`
