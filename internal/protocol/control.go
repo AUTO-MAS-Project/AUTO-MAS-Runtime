@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -46,6 +47,8 @@ type ControlAction func() error
 
 // ControlHandler prepares control commands without applying their side effects.
 type ControlHandler interface {
+	// PrepareControl and its returned action must not call StopAccepting on the
+	// ControlReader that invoked them.
 	PrepareControl(ControlCommand) (ControlDisposition, ControlAction, error)
 	CurrentControlStage() Stage
 }
@@ -57,6 +60,9 @@ type ControlWarningEmitter interface {
 
 // ControlReader reads and dispatches newline-delimited stdin controls.
 type ControlReader struct {
+	mu       sync.Mutex
+	started  bool
+	stopped  bool
 	input    *bufio.Reader
 	warnings ControlWarningEmitter
 	handler  ControlHandler
@@ -108,25 +114,50 @@ func NewControlReader(
 }
 
 // Run reads controls synchronously until EOF or an infrastructure error.
+// A ControlReader is one-shot: concurrent or subsequent calls return an error.
 func (r *ControlReader) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("control context must not be nil")
 	}
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	r.mu.Lock()
+	if r.started {
+		r.mu.Unlock()
+		return fmt.Errorf("control reader Run is one-shot")
+	}
+	r.started = true
+	r.mu.Unlock()
 
-		line, lineBytes, tooLong, hasLine, reachedEOF, err := r.readPhysicalLine()
-		if err != nil {
-			return fmt.Errorf("read stdin control: %w", err)
-		}
-		if !hasLine {
+	for {
+		r.mu.Lock()
+		if r.stopped {
+			r.mu.Unlock()
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
 			return err
+		}
+		r.mu.Unlock()
+
+		line, lineBytes, tooLong, hasLine, reachedEOF, err := r.readPhysicalLine()
+
+		r.mu.Lock()
+		if r.stopped {
+			r.mu.Unlock()
+			return nil
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			r.mu.Unlock()
+			return contextErr
+		}
+		if err != nil {
+			r.mu.Unlock()
+			return fmt.Errorf("read stdin control: %w", err)
+		}
+		if !hasLine {
+			r.mu.Unlock()
+			return nil
 		}
 
 		if tooLong {
@@ -134,23 +165,35 @@ func (r *ControlReader) Run(ctx context.Context) error {
 				"reason":    "line_too_long",
 				"lineBytes": lineBytes,
 			}); err != nil {
+				r.mu.Unlock()
 				return err
 			}
 		} else {
 			command, invalidDetails := parseControlCommand(line)
 			if invalidDetails != nil {
 				if err := r.emitInvalidControl(invalidDetails); err != nil {
+					r.mu.Unlock()
 					return err
 				}
 			} else if err := r.dispatch(command); err != nil {
+				r.mu.Unlock()
 				return err
 			}
 		}
+		r.mu.Unlock()
 
 		if reachedEOF {
 			return nil
 		}
 	}
+}
+
+// StopAccepting prevents subsequent control handling and waits for in-flight
+// prepare, action, or warning work. It does not interrupt a blocked stdin read.
+func (r *ControlReader) StopAccepting() {
+	r.mu.Lock()
+	r.stopped = true
+	r.mu.Unlock()
 }
 
 func (r *ControlReader) readPhysicalLine() (
@@ -243,6 +286,9 @@ func (r *ControlReader) dispatch(command ControlCommand) error {
 	case ControlAccepted:
 		if action == nil {
 			return fmt.Errorf("prepare stdin control %q: accepted command returned nil action", command.Command)
+		}
+		if command.Command == ControlShutdown {
+			r.stopped = true
 		}
 		if err := action(); err != nil {
 			return fmt.Errorf("apply stdin control %q: %w", command.Command, err)

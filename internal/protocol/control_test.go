@@ -10,7 +10,9 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type controlContractHandler struct {
@@ -120,6 +122,132 @@ func (h *latchingControlHandler) PrepareControl(command ControlCommand) (Control
 }
 
 func (*latchingControlHandler) CurrentControlStage() Stage {
+	return StageBackendRun
+}
+
+type blockingControlHandler struct {
+	prepareEntered chan struct{}
+	releasePrepare chan struct{}
+	actionEntered  chan struct{}
+	releaseAction  chan struct{}
+	once           sync.Once
+}
+
+func (h *blockingControlHandler) PrepareControl(ControlCommand) (ControlDisposition, ControlAction, error) {
+	h.once.Do(func() { close(h.prepareEntered) })
+	if h.releasePrepare != nil {
+		<-h.releasePrepare
+	}
+	return ControlAccepted, func() error {
+		if h.actionEntered != nil {
+			close(h.actionEntered)
+		}
+		if h.releaseAction != nil {
+			<-h.releaseAction
+		}
+		return nil
+	}, nil
+}
+
+func (*blockingControlHandler) CurrentControlStage() Stage {
+	return StageBackendRun
+}
+
+type blockingControlWarningEmitter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingControlWarningEmitter) EmitWarning(WarningEvent) error {
+	close(e.entered)
+	<-e.release
+	return nil
+}
+
+type countingControlInput struct {
+	reads int
+}
+
+func (input *countingControlInput) Read([]byte) (int, error) {
+	input.reads++
+	return 0, io.EOF
+}
+
+type signalingControlInput struct {
+	reader  io.Reader
+	started chan struct{}
+	once    sync.Once
+}
+
+func (input *signalingControlInput) Read(buffer []byte) (int, error) {
+	input.once.Do(func() { close(input.started) })
+	return input.reader.Read(buffer)
+}
+
+func waitControlDone(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control reader")
+		return nil
+	}
+}
+
+func assertControlBlocked(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("operation returned before release: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+type correlatedControlHandler struct {
+	machine          *LifecycleMachine
+	cancelOriginal   map[string]any
+	shutdownOriginal map[string]any
+	statusOriginal   map[string]any
+	results          []ResultEvent
+	states           []StateEvent
+}
+
+func (h *correlatedControlHandler) PrepareControl(command ControlCommand) (ControlDisposition, ControlAction, error) {
+	switch command.Command {
+	case ControlCancel:
+		return ControlAccepted, func() error {
+			h.results = append(h.results, ResultEvent{
+				Stage:   StageBackendRun,
+				Status:  "cancelled",
+				Details: WithControlCommandID(h.cancelOriginal, command.CommandID),
+			})
+			return nil
+		}, nil
+	case ControlShutdown:
+		return ControlAccepted, func() error {
+			h.states = append(h.states, StateEvent{
+				Stage:   StageBackendRun,
+				Status:  StateStoppingBackend,
+				Details: WithControlCommandID(h.shutdownOriginal, command.CommandID),
+			})
+			return nil
+		}, nil
+	case ControlStatus:
+		return ControlAccepted, func() error {
+			h.states = append(h.states, StateEvent{
+				Stage:   StageBackendRun,
+				Status:  h.machine.Current(),
+				Details: WithControlCommandID(h.statusOriginal, command.CommandID),
+			})
+			return nil
+		}, nil
+	default:
+		panic(fmt.Sprintf("unexpected control command %q", command.Command))
+	}
+}
+
+func (*correlatedControlHandler) CurrentControlStage() Stage {
 	return StageBackendRun
 }
 
@@ -430,9 +558,9 @@ func TestControlReader_DispatchesAllCommandsAndReturnsEveryStatusSnapshot(t *tes
 	warnings := &controlContractWarningEmitter{}
 	input := strings.Join([]string{
 		controlTestLine(ControlCancel, controlTestID(1)),
-		controlTestLine(ControlShutdown, controlTestID(2)),
+		controlTestLine(ControlStatus, controlTestID(2)),
 		controlTestLine(ControlStatus, controlTestID(3)),
-		controlTestLine(ControlStatus, controlTestID(4)),
+		controlTestLine(ControlShutdown, controlTestID(4)),
 	}, "\n") + "\n"
 	reader, err := NewControlReader(
 		strings.NewReader(input),
@@ -467,7 +595,7 @@ func TestControlReader_DispatchesAllCommandsAndReturnsEveryStatusSnapshot(t *tes
 	if handler.statusPrepared != 2 {
 		t.Fatalf("status prepared = %d, want 2", handler.statusPrepared)
 	}
-	if want := []string{controlTestID(3), controlTestID(4)}; !reflect.DeepEqual(handler.statusSnapshots, want) {
+	if want := []string{controlTestID(2), controlTestID(3)}; !reflect.DeepEqual(handler.statusSnapshots, want) {
 		t.Fatalf("status snapshots = %#v, want %#v", handler.statusSnapshots, want)
 	}
 	if len(warnings.warnings) != 0 {
@@ -669,6 +797,436 @@ func TestControlReader_IdempotencyUsesBoundedFIFOLedger(t *testing.T) {
 			)
 		}
 	})
+}
+
+func TestControlReader_StopAcceptingWaitsForInFlightWork(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		handler  *blockingControlHandler
+		warnings ControlWarningEmitter
+		entered  func(*blockingControlHandler) <-chan struct{}
+		release  func(*blockingControlHandler)
+	}{
+		{
+			name:  "prepare",
+			input: controlTestLine(ControlCancel, controlTestID(1)) + "\n",
+			handler: &blockingControlHandler{
+				prepareEntered: make(chan struct{}),
+				releasePrepare: make(chan struct{}),
+			},
+			warnings: &controlContractWarningEmitter{},
+			entered: func(h *blockingControlHandler) <-chan struct{} {
+				return h.prepareEntered
+			},
+			release: func(h *blockingControlHandler) {
+				close(h.releasePrepare)
+			},
+		},
+		{
+			name:  "action",
+			input: controlTestLine(ControlCancel, controlTestID(2)) + "\n",
+			handler: &blockingControlHandler{
+				prepareEntered: make(chan struct{}),
+				actionEntered:  make(chan struct{}),
+				releaseAction:  make(chan struct{}),
+			},
+			warnings: &controlContractWarningEmitter{},
+			entered: func(h *blockingControlHandler) <-chan struct{} {
+				return h.actionEntered
+			},
+			release: func(h *blockingControlHandler) {
+				close(h.releaseAction)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader, err := NewControlReader(
+				strings.NewReader(tt.input),
+				tt.warnings,
+				tt.handler,
+				ControlCancel,
+			)
+			if err != nil {
+				t.Fatalf("NewControlReader() error = %v", err)
+			}
+
+			runDone := make(chan error, 1)
+			go func() { runDone <- reader.Run(context.Background()) }()
+			select {
+			case <-tt.entered(tt.handler):
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for handler")
+			}
+
+			stopDone := make(chan struct{})
+			go func() {
+				reader.StopAccepting()
+				close(stopDone)
+			}()
+			select {
+			case <-stopDone:
+				t.Fatal("StopAccepting returned while handler was in flight")
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			tt.release(tt.handler)
+			select {
+			case <-stopDone:
+			case <-time.After(time.Second):
+				t.Fatal("StopAccepting did not return after handler completed")
+			}
+			if err := waitControlDone(t, runDone); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+		})
+	}
+
+	t.Run("warning", func(t *testing.T) {
+		warnings := &blockingControlWarningEmitter{
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		handler := &controlContractHandler{}
+		reader, err := NewControlReader(
+			strings.NewReader("not-json\n"),
+			warnings,
+			handler,
+			ControlCancel,
+		)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+
+		runDone := make(chan error, 1)
+		go func() { runDone <- reader.Run(context.Background()) }()
+		select {
+		case <-warnings.entered:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for warning emitter")
+		}
+		stopDone := make(chan struct{})
+		go func() {
+			reader.StopAccepting()
+			close(stopDone)
+		}()
+		select {
+		case <-stopDone:
+			t.Fatal("StopAccepting returned while warning was in flight")
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(warnings.release)
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("StopAccepting did not return after warning completed")
+		}
+		if err := waitControlDone(t, runDone); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	})
+}
+
+func TestControlReader_StopAcceptingDoesNotInterruptReadAndSuppressesNextLine(t *testing.T) {
+	pipeReader, pipeWriter := io.Pipe()
+	input := &signalingControlInput{
+		reader:  pipeReader,
+		started: make(chan struct{}),
+	}
+	handler := &controlContractHandler{}
+	warnings := &controlContractWarningEmitter{}
+	reader, err := NewControlReader(input, warnings, handler, ControlCancel)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- reader.Run(context.Background()) }()
+	select {
+	case <-input.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin read")
+	}
+	reader.StopAccepting()
+	assertControlBlocked(t, runDone)
+
+	if _, err := io.WriteString(pipeWriter, "not-json\n"); err != nil {
+		t.Fatalf("write complete line: %v", err)
+	}
+	if err := waitControlDone(t, runDone); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(handler.prepared) != 0 {
+		t.Fatalf("prepared commands = %#v, want none", handler.prepared)
+	}
+	if len(warnings.warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings.warnings)
+	}
+	if err := pipeWriter.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+}
+
+func TestControlReader_StopAcceptingMakesOwnerCloseReturnNil(t *testing.T) {
+	pipeReader, pipeWriter := io.Pipe()
+	input := &signalingControlInput{
+		reader:  pipeReader,
+		started: make(chan struct{}),
+	}
+	reader, err := NewControlReader(
+		input,
+		&controlContractWarningEmitter{},
+		&controlContractHandler{},
+		ControlCancel,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- reader.Run(context.Background()) }()
+	select {
+	case <-input.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin read")
+	}
+	reader.StopAccepting()
+	closeErr := errors.New("owner closed stdin")
+	if err := pipeReader.CloseWithError(closeErr); err != nil {
+		t.Fatalf("CloseWithError() error = %v", err)
+	}
+	if err := waitControlDone(t, runDone); err != nil {
+		t.Fatalf("Run() error = %v, want nil after stop", err)
+	}
+	if err := pipeWriter.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+}
+
+func TestControlReader_StopAcceptingBeforeRunIsIdempotent(t *testing.T) {
+	input := &countingControlInput{}
+	reader, err := NewControlReader(
+		input,
+		&controlContractWarningEmitter{},
+		&controlContractHandler{},
+		ControlCancel,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	reader.StopAccepting()
+	reader.StopAccepting()
+	if err := reader.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if input.reads != 0 {
+		t.Fatalf("input reads = %d, want 0", input.reads)
+	}
+}
+
+func TestControlReader_ContextCanceledBeforeRunDoesNotProcessInput(t *testing.T) {
+	handler := &controlContractHandler{}
+	reader, err := NewControlReader(
+		strings.NewReader(controlTestLine(ControlCancel, controlTestID(1))+"\n"),
+		&controlContractWarningEmitter{},
+		handler,
+		ControlCancel,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := reader.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	if len(handler.prepared) != 0 {
+		t.Fatalf("prepared commands = %#v, want none", handler.prepared)
+	}
+}
+
+func TestControlReader_RunIsOneShot(t *testing.T) {
+	pipeReader, pipeWriter := io.Pipe()
+	input := &signalingControlInput{
+		reader:  pipeReader,
+		started: make(chan struct{}),
+	}
+	reader, err := NewControlReader(
+		input,
+		&controlContractWarningEmitter{},
+		&controlContractHandler{},
+		ControlCancel,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- reader.Run(context.Background()) }()
+	select {
+	case <-input.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first Run")
+	}
+	const wantErr = "control reader Run is one-shot"
+	if err := reader.Run(context.Background()); err == nil || err.Error() != wantErr {
+		t.Fatalf("concurrent Run() error = %v, want %q", err, wantErr)
+	}
+
+	reader.StopAccepting()
+	if err := pipeReader.Close(); err != nil {
+		t.Fatalf("close pipe reader: %v", err)
+	}
+	if err := waitControlDone(t, firstDone); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	if err := reader.Run(context.Background()); err == nil || err.Error() != wantErr {
+		t.Fatalf("second Run() error = %v, want %q", err, wantErr)
+	}
+	if err := pipeWriter.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+}
+
+func TestControlReader_StopAcceptingOnShutdownBeforeAction(t *testing.T) {
+	actionErr := errors.New("shutdown failed")
+	var reader *ControlReader
+	stoppedDuringAction := false
+	handler := &controlResultHandler{
+		disposition: ControlAccepted,
+		action: func() error {
+			stoppedDuringAction = reader.stopped
+			return actionErr
+		},
+		stage: StageBackendRun,
+	}
+	var err error
+	reader, err = NewControlReader(
+		strings.NewReader(
+			controlTestLine(ControlShutdown, controlTestID(1))+"\n"+
+				controlTestLine(ControlShutdown, controlTestID(2))+"\n",
+		),
+		&controlContractWarningEmitter{},
+		handler,
+		ControlShutdown,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+
+	err = reader.Run(context.Background())
+	if !errors.Is(err, actionErr) {
+		t.Fatalf("Run() error = %v, want wrapping %v", err, actionErr)
+	}
+	reader.mu.Lock()
+	stopped := reader.stopped
+	reader.mu.Unlock()
+	if !stopped {
+		t.Fatal("shutdown action failed without leaving reader stopped")
+	}
+	if !stoppedDuringAction {
+		t.Fatal("shutdown action started before reader was stopped")
+	}
+	if len(handler.prepared) != 1 {
+		t.Fatalf("prepared commands = %d, want 1", len(handler.prepared))
+	}
+}
+
+func TestControlReader_StopAcceptingOnShutdownSkipsBufferedCommands(t *testing.T) {
+	handler := &latchingControlHandler{}
+	reader, err := NewControlReader(
+		strings.NewReader(
+			controlTestLine(ControlShutdown, controlTestID(1))+"\n"+
+				controlTestLine(ControlShutdown, controlTestID(2))+"\n"+
+				controlTestLine(ControlStatus, controlTestID(3))+"\n",
+		),
+		&controlContractWarningEmitter{},
+		handler,
+		ControlShutdown,
+		ControlStatus,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+	if err := reader.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if handler.shutdownPrepared != 1 || handler.shutdownActions != 1 {
+		t.Fatalf(
+			"shutdown prepared/actions = %d/%d, want 1/1",
+			handler.shutdownPrepared,
+			handler.shutdownActions,
+		)
+	}
+	if handler.statusPrepared != 0 {
+		t.Fatalf("status prepared = %d, want 0", handler.statusPrepared)
+	}
+}
+
+func TestControlReader_StatusSnapshotKeepsLifecycleAndCorrelatesEvents(t *testing.T) {
+	machine, err := NewLifecycleMachine(StateReadyToStart)
+	if err != nil {
+		t.Fatalf("NewLifecycleMachine() error = %v", err)
+	}
+	handler := &correlatedControlHandler{
+		machine:          machine,
+		cancelOriginal:   map[string]any{"outcome": "cancelled"},
+		shutdownOriginal: map[string]any{"state": "stopping"},
+		statusOriginal:   map[string]any{"snapshot": true},
+	}
+	before := machine.Current()
+	cancelID := controlTestID(1)
+	statusID := controlTestID(2)
+	shutdownID := controlTestID(3)
+	reader, err := NewControlReader(
+		strings.NewReader(
+			controlTestLine(ControlCancel, cancelID)+"\n"+
+				controlTestLine(ControlStatus, statusID)+"\n"+
+				controlTestLine(ControlShutdown, shutdownID)+"\n",
+		),
+		&controlContractWarningEmitter{},
+		handler,
+		ControlCancel,
+		ControlStatus,
+		ControlShutdown,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+	if err := reader.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if after := machine.Current(); after != before {
+		t.Fatalf("lifecycle current = %q, want unchanged %q", after, before)
+	}
+	if len(handler.results) != 1 || len(handler.states) != 2 {
+		t.Fatalf("results/states = %d/%d, want 1/2", len(handler.results), len(handler.states))
+	}
+	if got := handler.results[0].Details["controlCommandId"]; got != cancelID {
+		t.Fatalf("cancel result controlCommandId = %#v, want %q", got, cancelID)
+	}
+	if got := handler.states[0].Details["controlCommandId"]; got != statusID {
+		t.Fatalf("status state controlCommandId = %#v, want %q", got, statusID)
+	}
+	if handler.states[0].Status != before {
+		t.Fatalf("status snapshot = %q, want %q", handler.states[0].Status, before)
+	}
+	if got := handler.states[1].Details["controlCommandId"]; got != shutdownID {
+		t.Fatalf("shutdown state controlCommandId = %#v, want %q", got, shutdownID)
+	}
+	if !reflect.DeepEqual(handler.cancelOriginal, map[string]any{"outcome": "cancelled"}) {
+		t.Fatalf("cancel details mutated: %#v", handler.cancelOriginal)
+	}
+	if !reflect.DeepEqual(handler.shutdownOriginal, map[string]any{"state": "stopping"}) {
+		t.Fatalf("shutdown details mutated: %#v", handler.shutdownOriginal)
+	}
+	if !reflect.DeepEqual(handler.statusOriginal, map[string]any{"snapshot": true}) {
+		t.Fatalf("status details mutated: %#v", handler.statusOriginal)
+	}
 }
 
 func TestControlReader_ErrorsPropagateExactly(t *testing.T) {
