@@ -3,6 +3,7 @@ package contracttest
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"time"
@@ -81,7 +82,244 @@ func validateEnvelope(command string, terminal Terminal, events []parsedEvent) [
 		resultEvent := eventAtPhysicalLine(events, resultLines[0])
 		issues = append(issues, issueForEvent(command, terminal, resultEvent, "result must be the last event"))
 	}
+	if len(resultLines) == 1 {
+		resultEvent := eventAtPhysicalLine(events, resultLines[0])
+		issues = append(issues, validateTerminal(command, terminal, events, resultEvent)...)
+		issues = append(issues, validateWarningSummary(command, terminal, events, resultEvent)...)
+	}
 	return issues
+}
+
+func validateTerminal(
+	command string,
+	terminal Terminal,
+	events []parsedEvent,
+	result parsedEvent,
+) []contractIssue {
+	var issues []contractIssue
+	success, successOK := result.object["success"].(bool)
+	code, codeOK := result.object["code"].(string)
+	status, statusOK := result.object["status"].(string)
+	retryable, retryableOK := result.object["retryable"].(bool)
+
+	switch terminal {
+	case TerminalSuccess:
+		if !successOK || !success {
+			issues = append(issues, issueForEvent(command, terminal, result, "success result must have success=true"))
+		}
+		if !codeOK || code != string(protocol.CodeOK) {
+			issues = append(issues, issueForEvent(command, terminal, result, "success result code must be OK"))
+		}
+		if !retryableOK || retryable {
+			issues = append(issues, issueForEvent(command, terminal, result, "success result must not be retryable"))
+		}
+		if !statusOK || status == "cancelled" {
+			issues = append(issues, issueForEvent(command, terminal, result, "success result status must not be cancelled"))
+		}
+		if hasPriorEventType(events, result.line, string(protocol.TypeError)) {
+			issues = append(issues, issueForEvent(command, terminal, result, "success transcript must not contain error before result"))
+		}
+	case TerminalFailure:
+		if !successOK || success {
+			issues = append(issues, issueForEvent(command, terminal, result, "failure result must have success=false"))
+		}
+		if !codeOK || code == string(protocol.CodeOK) || code == string(protocol.CodeOperationCancelled) {
+			issues = append(issues, issueForEvent(
+				command,
+				terminal,
+				result,
+				"failure result code must not be OK or OPERATION_CANCELLED",
+			))
+		}
+		if !statusOK || status == "cancelled" {
+			issues = append(issues, issueForEvent(command, terminal, result, "failure result status must not be cancelled"))
+		}
+		if !hasMatchingPriorError(events, result) {
+			issues = append(issues, issueForEvent(command, terminal, result, "failure result must match a prior error"))
+		}
+	case TerminalCancelled:
+		if !successOK || success {
+			issues = append(issues, issueForEvent(command, terminal, result, "cancelled result must have success=false"))
+		}
+		if !codeOK || code != string(protocol.CodeOperationCancelled) {
+			issues = append(issues, issueForEvent(command, terminal, result, "cancelled result code must be OPERATION_CANCELLED"))
+		}
+		if !statusOK || status != "cancelled" {
+			issues = append(issues, issueForEvent(command, terminal, result, "cancelled result status must be cancelled"))
+		}
+		if !hasMatchingPriorError(events, result) {
+			issues = append(issues, issueForEvent(command, terminal, result, "cancelled result must match a prior error"))
+		}
+	default:
+		issues = append(issues, issueForEvent(command, terminal, result, fmt.Sprintf("unknown terminal scenario %q", terminal)))
+	}
+	return issues
+}
+
+func validateWarningSummary(
+	command string,
+	terminal Terminal,
+	events []parsedEvent,
+	result parsedEvent,
+) []contractIssue {
+	warnings := priorEventsOfType(events, result.line, string(protocol.TypeWarning))
+	details, detailsOK := result.object["details"].(map[string]any)
+	if len(warnings) == 0 {
+		if detailsOK && hasAnyWarningSummaryKey(details) {
+			return []contractIssue{issueForEvent(
+				command,
+				terminal,
+				result,
+				"result warning summary keys must be absent when there are no warnings",
+			)}
+		}
+		return nil
+	}
+
+	var issues []contractIssue
+	if !detailsOK {
+		return []contractIssue{issueForEvent(command, terminal, result, "result details must be an object when warnings exist")}
+	}
+
+	summariesValue, summariesPresent := details["warnings"]
+	summaries, summariesOK := summariesValue.([]any)
+	if !summariesPresent || !summariesOK {
+		issues = append(issues, issueForEvent(command, terminal, result, "result warnings must be present as an array"))
+	} else {
+		expected := expectedWarningSummaries(warnings)
+		if !reflect.DeepEqual(summaries, expected) {
+			issues = append(issues, issueForEvent(
+				command,
+				terminal,
+				result,
+				"result warnings must equal the earliest warning events in order",
+			))
+		}
+	}
+
+	countValue, countPresent := details["warningCount"]
+	if !countPresent {
+		issues = append(issues, issueForEvent(command, terminal, result, "result warningCount must be present"))
+	} else if count, ok := jsonUint64(countValue); !ok || count != uint64(len(warnings)) {
+		issues = append(issues, issueForEvent(
+			command,
+			terminal,
+			result,
+			fmt.Sprintf("result warningCount must equal %d", len(warnings)),
+		))
+	}
+
+	truncatedValue, truncatedPresent := details["warningsTruncated"]
+	expectedTruncated := len(warnings) > protocol.MaxResultWarningSummaries
+	if !truncatedPresent {
+		issues = append(issues, issueForEvent(command, terminal, result, "result warningsTruncated must be present"))
+	} else if truncated, ok := truncatedValue.(bool); !ok || truncated != expectedTruncated {
+		issues = append(issues, issueForEvent(
+			command,
+			terminal,
+			result,
+			fmt.Sprintf("result warningsTruncated must equal %t", expectedTruncated),
+		))
+	}
+	return issues
+}
+
+func hasPriorEventType(events []parsedEvent, resultLine int, eventType string) bool {
+	return len(priorEventsOfType(events, resultLine, eventType)) != 0
+}
+
+func priorEventsOfType(events []parsedEvent, resultLine int, eventType string) []parsedEvent {
+	var matches []parsedEvent
+	for _, event := range events {
+		if event.line >= resultLine {
+			continue
+		}
+		if currentType, ok := event.object["type"].(string); ok && currentType == eventType {
+			matches = append(matches, event)
+		}
+	}
+	return matches
+}
+
+func hasMatchingPriorError(events []parsedEvent, result parsedEvent) bool {
+	for _, event := range priorEventsOfType(events, result.line, string(protocol.TypeError)) {
+		if tupleMatches(event.object, result.object) {
+			return true
+		}
+	}
+	return false
+}
+
+func tupleMatches(left map[string]any, right map[string]any) bool {
+	leftCode, leftCodeOK := left["code"].(string)
+	rightCode, rightCodeOK := right["code"].(string)
+	leftStage, leftStageOK := left["stage"].(string)
+	rightStage, rightStageOK := right["stage"].(string)
+	leftRetryable, leftRetryableOK := left["retryable"].(bool)
+	rightRetryable, rightRetryableOK := right["retryable"].(bool)
+	leftRemediation, leftRemediationOK := left["remediation"]
+	rightRemediation, rightRemediationOK := right["remediation"]
+	if !leftCodeOK || !rightCodeOK ||
+		!leftStageOK || !rightStageOK ||
+		!leftRetryableOK || !rightRetryableOK ||
+		!leftRemediationOK || !rightRemediationOK ||
+		!validRemediation(leftRemediation) || !validRemediation(rightRemediation) {
+		return false
+	}
+	return leftCode == rightCode &&
+		leftStage == rightStage &&
+		leftRetryable == rightRetryable &&
+		reflect.DeepEqual(leftRemediation, rightRemediation)
+}
+
+func validRemediation(value any) bool {
+	if value == nil {
+		return true
+	}
+	remediation, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range remediation {
+		if _, ok := item.(string); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func expectedWarningSummaries(warnings []parsedEvent) []any {
+	count := len(warnings)
+	if count > protocol.MaxResultWarningSummaries {
+		count = protocol.MaxResultWarningSummaries
+	}
+	summaries := make([]any, count)
+	for index := 0; index < count; index++ {
+		summary := make(map[string]any, 6)
+		for _, field := range []string{"code", "stage", "message", "retryable", "remediation", "details"} {
+			summary[field] = warnings[index].object[field]
+		}
+		summaries[index] = summary
+	}
+	return summaries
+}
+
+func hasAnyWarningSummaryKey(details map[string]any) bool {
+	for _, key := range []string{"warnings", "warningCount", "warningsTruncated"} {
+		if _, exists := details[key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonUint64(value any) (uint64, bool) {
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	count, err := strconv.ParseUint(number.String(), 10, 64)
+	return count, err == nil
 }
 
 func validateSequence(command string, terminal Terminal, event parsedEvent, issues *[]contractIssue) {

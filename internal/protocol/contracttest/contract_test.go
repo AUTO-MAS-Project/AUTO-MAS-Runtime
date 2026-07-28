@@ -291,6 +291,244 @@ func TestContract_Diagnostics(t *testing.T) {
 	}
 }
 
+func TestContract_TerminalSemantics(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		terminal Terminal
+		events   []map[string]any
+	}{
+		{name: "success", terminal: TerminalSuccess, events: successObjects()},
+		{name: "success with warning", terminal: TerminalSuccess, events: warningObjects(1)},
+		{name: "failure", terminal: TerminalFailure, events: failureObjects()},
+		{name: "cancelled", terminal: TerminalCancelled, events: cancelledObjects()},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, issues := inspect(testCommand, test.terminal, encodeTranscript(t, test.events))
+			requireNoIssues(t, issues)
+		})
+	}
+
+	tests := []struct {
+		name     string
+		terminal Terminal
+		events   func() []map[string]any
+		mutate   func([]map[string]any)
+		want     string
+	}{
+		{
+			name: "success flag false", terminal: TerminalSuccess, events: successObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["success"] = false },
+			want:   "success result must have success=true",
+		},
+		{
+			name: "success code", terminal: TerminalSuccess, events: successObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["code"] = "FAILED" },
+			want:   "success result code must be OK",
+		},
+		{
+			name: "success retryable", terminal: TerminalSuccess, events: successObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["retryable"] = true },
+			want:   "success result must not be retryable",
+		},
+		{
+			name: "success cancelled status", terminal: TerminalSuccess, events: successObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["status"] = "cancelled" },
+			want:   "success result status must not be cancelled",
+		},
+		{
+			name: "success preceded by error", terminal: TerminalSuccess,
+			events: func() []map[string]any {
+				return []map[string]any{
+					helloObject(),
+					errorObject(2, "FAILED", "doctor", false, []string{"retry"}),
+					successResultObject(3),
+				}
+			},
+			mutate: func([]map[string]any) {},
+			want:   "success transcript must not contain error",
+		},
+		{
+			name: "failure flag true", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["success"] = true },
+			want:   "failure result must have success=false",
+		},
+		{
+			name: "failure OK code", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["code"] = "OK" },
+			want:   "failure result code must not be OK or OPERATION_CANCELLED",
+		},
+		{
+			name: "failure cancellation code", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["code"] = "OPERATION_CANCELLED" },
+			want:   "failure result code must not be OK or OPERATION_CANCELLED",
+		},
+		{
+			name: "failure cancelled status", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["status"] = "cancelled" },
+			want:   "failure result status must not be cancelled",
+		},
+		{
+			name: "failure missing matching error", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) { events[1]["code"] = "OTHER_FAILURE" },
+			want:   "failure result must match a prior error",
+		},
+		{
+			name: "failure partial tuple match", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) { events[1]["remediation"] = []string{"different"} },
+			want:   "failure result must match a prior error",
+		},
+		{
+			name: "failure tuple field missing from both events", terminal: TerminalFailure, events: failureObjects,
+			mutate: func(events []map[string]any) {
+				delete(events[1], "remediation")
+				delete(lastObject(events), "remediation")
+			},
+			want: "failure result must match a prior error",
+		},
+		{
+			name: "cancelled flag true", terminal: TerminalCancelled, events: cancelledObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["success"] = true },
+			want:   "cancelled result must have success=false",
+		},
+		{
+			name: "cancelled wrong code", terminal: TerminalCancelled, events: cancelledObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["code"] = "FAILED" },
+			want:   "cancelled result code must be OPERATION_CANCELLED",
+		},
+		{
+			name: "cancelled wrong status", terminal: TerminalCancelled, events: cancelledObjects,
+			mutate: func(events []map[string]any) { lastObject(events)["status"] = "failed" },
+			want:   "cancelled result status must be cancelled",
+		},
+		{
+			name: "cancelled missing matching error", terminal: TerminalCancelled, events: cancelledObjects,
+			mutate: func(events []map[string]any) { events[1]["retryable"] = true },
+			want:   "cancelled result must match a prior error",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			events := test.events()
+			test.mutate(events)
+			_, issues := inspect(testCommand, test.terminal, encodeTranscript(t, events))
+			requireIssue(t, issues, test.want)
+		})
+	}
+}
+
+func TestContract_WarningSummary(t *testing.T) {
+	t.Parallel()
+
+	for _, count := range []int{0, 1, 256, 257} {
+		count := count
+		t.Run(fmt.Sprintf("%d warnings", count), func(t *testing.T) {
+			t.Parallel()
+			_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, warningObjects(count)))
+			requireNoIssues(t, issues)
+		})
+	}
+
+	tests := []struct {
+		name   string
+		count  int
+		mutate func(map[string]any)
+		want   string
+	}{
+		{
+			name: "missing warnings", count: 1,
+			mutate: func(details map[string]any) { delete(details, "warnings") },
+			want:   "result warnings must be present",
+		},
+		{
+			name: "missing warning count", count: 1,
+			mutate: func(details map[string]any) { delete(details, "warningCount") },
+			want:   "result warningCount must be present",
+		},
+		{
+			name: "missing truncated", count: 1,
+			mutate: func(details map[string]any) { delete(details, "warningsTruncated") },
+			want:   "result warningsTruncated must be present",
+		},
+		{
+			name: "missing summary", count: 2,
+			mutate: func(details map[string]any) {
+				summaries := details["warnings"].([]any)
+				details["warnings"] = summaries[:1]
+			},
+			want: "result warnings must equal the earliest warning events",
+		},
+		{
+			name: "extra summary", count: 1,
+			mutate: func(details map[string]any) {
+				summaries := details["warnings"].([]any)
+				details["warnings"] = append(summaries, warningSummaryObject(99))
+			},
+			want: "result warnings must equal the earliest warning events",
+		},
+		{
+			name: "reordered summaries", count: 2,
+			mutate: func(details map[string]any) {
+				summaries := details["warnings"].([]any)
+				summaries[0], summaries[1] = summaries[1], summaries[0]
+			},
+			want: "result warnings must equal the earliest warning events",
+		},
+		{
+			name: "summary field differs", count: 1,
+			mutate: func(details map[string]any) {
+				summary := details["warnings"].([]any)[0].(map[string]any)
+				summary["message"] = "forged"
+			},
+			want: "result warnings must equal the earliest warning events",
+		},
+		{
+			name: "wrong count", count: 1,
+			mutate: func(details map[string]any) { details["warningCount"] = 2 },
+			want:   "result warningCount must equal 1",
+		},
+		{
+			name: "wrong truncated at limit", count: 256,
+			mutate: func(details map[string]any) { details["warningsTruncated"] = true },
+			want:   "result warningsTruncated must equal false",
+		},
+		{
+			name: "wrong truncated above limit", count: 257,
+			mutate: func(details map[string]any) { details["warningsTruncated"] = false },
+			want:   "result warningsTruncated must equal true",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			events := warningObjects(test.count)
+			test.mutate(lastObject(events)["details"].(map[string]any))
+			_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
+			requireIssue(t, issues, test.want)
+		})
+	}
+
+	t.Run("forged summary without warnings", func(t *testing.T) {
+		t.Parallel()
+		events := warningObjects(0)
+		lastObject(events)["details"] = map[string]any{
+			"warnings":          []any{warningSummaryObject(0)},
+			"warningCount":      1,
+			"warningsTruncated": false,
+		}
+		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
+		requireIssue(t, issues, "result warning summary keys must be absent when there are no warnings")
+	})
+}
+
 func validTranscript() []byte {
 	events := validObjects()
 	var builder strings.Builder
@@ -309,21 +547,116 @@ func validObjects() []map[string]any {
 	return []map[string]any{helloObject(), resultObject(2)}
 }
 
+func successObjects() []map[string]any {
+	return []map[string]any{helloObject(), successResultObject(2)}
+}
+
+func failureObjects() []map[string]any {
+	return []map[string]any{
+		helloObject(),
+		errorObject(2, "DOCTOR_FAILED", "doctor", true, []string{"retry", "open-log"}),
+		terminalResultObject(3, false, "DOCTOR_FAILED", "doctor", "failed", true, []string{"retry", "open-log"}),
+	}
+}
+
+func cancelledObjects() []map[string]any {
+	return []map[string]any{
+		helloObject(),
+		errorObject(2, "OPERATION_CANCELLED", "doctor", false, []string{"retry"}),
+		terminalResultObject(3, false, "OPERATION_CANCELLED", "doctor", "cancelled", false, []string{"retry"}),
+	}
+}
+
+func warningObjects(count int) []map[string]any {
+	events := make([]map[string]any, 0, count+2)
+	events = append(events, helloObject())
+	summaries := make([]any, 0, min(count, 256))
+	for index := 0; index < count; index++ {
+		events = append(events, warningObject(index+2, index))
+		if index < 256 {
+			summaries = append(summaries, warningSummaryObject(index))
+		}
+	}
+	result := successResultObject(count + 2)
+	if count > 0 {
+		result["details"] = map[string]any{
+			"warnings":          summaries,
+			"warningCount":      count,
+			"warningsTruncated": count > 256,
+		}
+	}
+	events = append(events, result)
+	return events
+}
+
 func helloObject() map[string]any {
 	return eventObject("hello", 1)
 }
 
 func resultObject(sequence int) map[string]any {
+	return successResultObject(sequence)
+}
+
+func successResultObject(sequence int) map[string]any {
+	return terminalResultObject(sequence, true, "OK", "doctor", "succeeded", false, []string{})
+}
+
+func terminalResultObject(
+	sequence int,
+	success bool,
+	code string,
+	stage string,
+	status string,
+	retryable bool,
+	remediation []string,
+) map[string]any {
 	event := eventObject("result", sequence)
-	event["success"] = true
-	event["code"] = "OK"
-	event["stage"] = "doctor"
-	event["status"] = "succeeded"
+	event["success"] = success
+	event["code"] = code
+	event["stage"] = stage
+	event["status"] = status
 	event["message"] = "done"
-	event["retryable"] = false
-	event["remediation"] = []string{}
+	event["retryable"] = retryable
+	event["remediation"] = remediation
 	event["details"] = map[string]any{}
 	return event
+}
+
+func errorObject(sequence int, code string, stage string, retryable bool, remediation []string) map[string]any {
+	event := eventObject("error", sequence)
+	event["code"] = code
+	event["stage"] = stage
+	event["message"] = "failed"
+	event["retryable"] = retryable
+	event["remediation"] = remediation
+	event["details"] = map[string]any{}
+	return event
+}
+
+func warningObject(sequence int, index int) map[string]any {
+	event := eventObject("warning", sequence)
+	for key, value := range warningSummaryObject(index) {
+		event[key] = value
+	}
+	return event
+}
+
+func warningSummaryObject(index int) map[string]any {
+	return map[string]any{
+		"code":        fmt.Sprintf("WARN_%03d", index),
+		"stage":       "doctor",
+		"message":     fmt.Sprintf("warning %d", index),
+		"retryable":   index%2 == 0,
+		"remediation": []string{fmt.Sprintf("action-%d", index)},
+		"details": map[string]any{
+			"index":  index,
+			"nested": []any{fmt.Sprintf("value-%d", index), index%3 == 0},
+		},
+	}
+}
+
+func lastObject(events []map[string]any) map[string]any {
+	return events[len(events)-1]
 }
 
 func eventObject(eventType string, sequence int) map[string]any {
@@ -381,6 +714,13 @@ func requireNoIssue(t *testing.T, issues []contractIssue, forbidden string) {
 		if strings.Contains(issue.Error(), forbidden) {
 			t.Fatalf("issues = %v, want none containing %q", issues, forbidden)
 		}
+	}
+}
+
+func requireNoIssues(t *testing.T, issues []contractIssue) {
+	t.Helper()
+	if len(issues) != 0 {
+		t.Fatalf("inspect() issues = %#v, want none", issues)
 	}
 }
 
