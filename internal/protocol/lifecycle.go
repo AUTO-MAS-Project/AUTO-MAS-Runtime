@@ -130,12 +130,12 @@ func (m *LifecycleMachine) Transition(next StateStatus) error {
 	}
 	if current == StateRunning && next == StateRestarting {
 		if m.restartUsed {
-			return fmt.Errorf("automatic backend restart already used")
+			return fmt.Errorf("invalid lifecycle transition: from=%q to=%q: automatic backend restart already used", current, next)
 		}
 		m.restartUsed = true
 	}
 	if current == StateRunning && next == StateBackendFailed && !m.restartUsed {
-		return fmt.Errorf("backend must use its automatic restart before failing")
+		return fmt.Errorf("invalid lifecycle transition: from=%q to=%q: backend must use its automatic restart before failing", current, next)
 	}
 
 	m.current = next

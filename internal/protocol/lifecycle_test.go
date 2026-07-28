@@ -456,14 +456,29 @@ func TestLifecycleMachineRestart(t *testing.T) {
 		t.Fatalf("Transition(restarting -> running) error = %v", err)
 	}
 
-	if err := machine.Transition(protocol.StateRestarting); err == nil {
+	before := machine.Current()
+	initial := machine.Initial()
+	restartUsed := machine.RestartUsed()
+	err := machine.Transition(protocol.StateRestarting)
+	if err == nil {
 		t.Fatal("second Transition(running -> restarting) error = nil, want error")
 	}
-	if got := machine.Current(); got != protocol.StateRunning {
-		t.Errorf("Current() = %q after rejected second restart, want unchanged %q", got, protocol.StateRunning)
+	for _, detail := range []string{
+		fmt.Sprintf("from=%q", before),
+		fmt.Sprintf("to=%q", protocol.StateRestarting),
+	} {
+		if !strings.Contains(err.Error(), detail) {
+			t.Errorf("Transition error %q does not contain %q", err, detail)
+		}
 	}
-	if !machine.RestartUsed() {
-		t.Error("RestartUsed() = false after rejected second restart, want true")
+	if got := machine.Current(); got != before {
+		t.Errorf("Current() = %q after rejected second restart, want unchanged %q", got, before)
+	}
+	if got := machine.Initial(); got != initial {
+		t.Errorf("Initial() = %q after rejected second restart, want unchanged %q", got, initial)
+	}
+	if got := machine.RestartUsed(); got != restartUsed {
+		t.Errorf("RestartUsed() = %t after rejected second restart, want unchanged %t", got, restartUsed)
 	}
 }
 
@@ -475,14 +490,29 @@ func TestLifecycleMachineRunningFailureRequiresRestart(t *testing.T) {
 	}
 
 	machine := newLifecycleMachineAt(t, protocol.StateRunning)
-	if err := machine.Transition(protocol.StateBackendFailed); err == nil {
+	before := machine.Current()
+	initial := machine.Initial()
+	restartUsed := machine.RestartUsed()
+	err := machine.Transition(protocol.StateBackendFailed)
+	if err == nil {
 		t.Fatal("Transition(running -> backend_failed) before restart error = nil, want error")
 	}
-	if got := machine.Current(); got != protocol.StateRunning {
-		t.Errorf("Current() = %q after premature backend failure, want unchanged %q", got, protocol.StateRunning)
+	for _, detail := range []string{
+		fmt.Sprintf("from=%q", before),
+		fmt.Sprintf("to=%q", protocol.StateBackendFailed),
+	} {
+		if !strings.Contains(err.Error(), detail) {
+			t.Errorf("Transition error %q does not contain %q", err, detail)
+		}
 	}
-	if machine.RestartUsed() {
-		t.Error("RestartUsed() = true after premature backend failure, want false")
+	if got := machine.Current(); got != before {
+		t.Errorf("Current() = %q after premature backend failure, want unchanged %q", got, before)
+	}
+	if got := machine.Initial(); got != initial {
+		t.Errorf("Initial() = %q after premature backend failure, want unchanged %q", got, initial)
+	}
+	if got := machine.RestartUsed(); got != restartUsed {
+		t.Errorf("RestartUsed() = %t after premature backend failure, want unchanged %t", got, restartUsed)
 	}
 
 	for _, next := range []protocol.StateStatus{
