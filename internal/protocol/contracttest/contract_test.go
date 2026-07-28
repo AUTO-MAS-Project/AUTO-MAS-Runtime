@@ -294,6 +294,11 @@ func TestContract_Diagnostics(t *testing.T) {
 func TestContract_TerminalSemantics(t *testing.T) {
 	t.Parallel()
 
+	nullFailure := failureObjects()
+	nullFailure[1]["remediation"] = nil
+	nullFailure[1]["details"] = nil
+	lastObject(nullFailure)["remediation"] = nil
+	lastObject(nullFailure)["details"] = nil
 	for _, test := range []struct {
 		name     string
 		terminal Terminal
@@ -302,6 +307,7 @@ func TestContract_TerminalSemantics(t *testing.T) {
 		{name: "success", terminal: TerminalSuccess, events: successObjects()},
 		{name: "success with warning", terminal: TerminalSuccess, events: warningObjects(1)},
 		{name: "failure", terminal: TerminalFailure, events: failureObjects()},
+		{name: "failure with null containers", terminal: TerminalFailure, events: nullFailure},
 		{name: "cancelled", terminal: TerminalCancelled, events: cancelledObjects()},
 	} {
 		test := test
@@ -309,6 +315,71 @@ func TestContract_TerminalSemantics(t *testing.T) {
 			t.Parallel()
 			_, issues := inspect(testCommand, test.terminal, encodeTranscript(t, test.events))
 			requireNoIssues(t, issues)
+		})
+	}
+
+	resultSchemaTests := []struct {
+		name   string
+		field  string
+		mutate func(map[string]any)
+		want   string
+	}{
+		{name: "missing success", field: "success", mutate: deleteField("success"), want: "a boolean"},
+		{name: "wrong success type", field: "success", mutate: setField("success", "true"), want: "a boolean"},
+		{name: "missing code", field: "code", mutate: deleteField("code"), want: "a string"},
+		{name: "wrong code type", field: "code", mutate: setField("code", true), want: "a string"},
+		{name: "missing stage", field: "stage", mutate: deleteField("stage"), want: "a string"},
+		{name: "wrong stage type", field: "stage", mutate: setField("stage", 7), want: "a string"},
+		{name: "missing status", field: "status", mutate: deleteField("status"), want: "a string"},
+		{name: "wrong status type", field: "status", mutate: setField("status", false), want: "a string"},
+		{name: "missing message", field: "message", mutate: deleteField("message"), want: "a string"},
+		{name: "wrong message type", field: "message", mutate: setField("message", 9), want: "a string"},
+		{name: "missing retryable", field: "retryable", mutate: deleteField("retryable"), want: "a boolean"},
+		{name: "wrong retryable type", field: "retryable", mutate: setField("retryable", "false"), want: "a boolean"},
+		{name: "missing remediation", field: "remediation", mutate: deleteField("remediation"), want: "an array of strings or null"},
+		{name: "wrong remediation type", field: "remediation", mutate: setField("remediation", "retry"), want: "an array of strings or null"},
+		{name: "wrong remediation item", field: "remediation", mutate: setField("remediation", []any{"retry", 1}), want: "an array of strings or null"},
+		{name: "missing details", field: "details", mutate: deleteField("details"), want: "an object or null"},
+		{name: "wrong details type", field: "details", mutate: setField("details", []any{}), want: "an object or null"},
+	}
+	for _, test := range resultSchemaTests {
+		test := test
+		t.Run("result schema "+test.name, func(t *testing.T) {
+			t.Parallel()
+			events := successObjects()
+			test.mutate(lastObject(events))
+			_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
+			requireIssue(t, issues, fmt.Sprintf("result field %q must be %s", test.field, test.want))
+		})
+	}
+
+	errorSchemaTests := []struct {
+		name   string
+		field  string
+		mutate func(map[string]any)
+		want   string
+	}{
+		{name: "missing code", field: "code", mutate: deleteField("code"), want: "a string"},
+		{name: "wrong code type", field: "code", mutate: setField("code", false), want: "a string"},
+		{name: "missing stage", field: "stage", mutate: deleteField("stage"), want: "a string"},
+		{name: "wrong stage type", field: "stage", mutate: setField("stage", 3), want: "a string"},
+		{name: "missing message", field: "message", mutate: deleteField("message"), want: "a string"},
+		{name: "wrong message type", field: "message", mutate: setField("message", true), want: "a string"},
+		{name: "missing retryable", field: "retryable", mutate: deleteField("retryable"), want: "a boolean"},
+		{name: "wrong retryable type", field: "retryable", mutate: setField("retryable", "true"), want: "a boolean"},
+		{name: "missing remediation", field: "remediation", mutate: deleteField("remediation"), want: "an array of strings or null"},
+		{name: "wrong remediation type", field: "remediation", mutate: setField("remediation", []any{1}), want: "an array of strings or null"},
+		{name: "missing details", field: "details", mutate: deleteField("details"), want: "an object or null"},
+		{name: "wrong details type", field: "details", mutate: setField("details", "details"), want: "an object or null"},
+	}
+	for _, test := range errorSchemaTests {
+		test := test
+		t.Run("error schema "+test.name, func(t *testing.T) {
+			t.Parallel()
+			events := failureObjects()
+			test.mutate(events[1])
+			_, issues := inspect(testCommand, TerminalFailure, encodeTranscript(t, events))
+			requireIssue(t, issues, fmt.Sprintf("error field %q must be %s", test.field, test.want))
 		})
 	}
 
@@ -426,6 +497,12 @@ func TestContract_TerminalSemantics(t *testing.T) {
 func TestContract_WarningSummary(t *testing.T) {
 	t.Parallel()
 
+	nullWarning := warningObjects(1)
+	nullWarning[1]["remediation"] = nil
+	nullWarning[1]["details"] = nil
+	nullSummary := lastObject(nullWarning)["details"].(map[string]any)["warnings"].([]any)[0].(map[string]any)
+	nullSummary["remediation"] = nil
+	nullSummary["details"] = nil
 	for _, count := range []int{0, 1, 256, 257} {
 		count := count
 		t.Run(fmt.Sprintf("%d warnings", count), func(t *testing.T) {
@@ -434,6 +511,11 @@ func TestContract_WarningSummary(t *testing.T) {
 			requireNoIssues(t, issues)
 		})
 	}
+	t.Run("null warning containers", func(t *testing.T) {
+		t.Parallel()
+		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, nullWarning))
+		requireNoIssues(t, issues)
+	})
 
 	tests := []struct {
 		name   string
@@ -527,6 +609,106 @@ func TestContract_WarningSummary(t *testing.T) {
 		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
 		requireIssue(t, issues, "result warning summary keys must be absent when there are no warnings")
 	})
+
+	warningSchemaTests := []struct {
+		name       string
+		mutate     func(map[string]any, map[string]any)
+		want       string
+		wantSecond string
+	}{
+		{
+			name: "warning missing field while summary is null",
+			mutate: func(warning map[string]any, summary map[string]any) {
+				delete(warning, "remediation")
+				summary["remediation"] = nil
+			},
+			want: `warning field "remediation" must be an array of strings or null`,
+		},
+		{
+			name: "summary missing field while warning is null",
+			mutate: func(warning map[string]any, summary map[string]any) {
+				warning["details"] = nil
+				delete(summary, "details")
+			},
+			want: `result warning summary 1 field "details" must be an object or null`,
+		},
+		{
+			name: "both retryable fields have wrong type",
+			mutate: func(warning map[string]any, summary map[string]any) {
+				warning["retryable"] = "false"
+				summary["retryable"] = "false"
+			},
+			want:       `warning field "retryable" must be a boolean`,
+			wantSecond: `result warning summary 1 field "retryable" must be a boolean`,
+		},
+		{
+			name: "both remediation arrays contain non strings",
+			mutate: func(warning map[string]any, summary map[string]any) {
+				warning["remediation"] = []any{1}
+				summary["remediation"] = []any{1}
+			},
+			want:       `warning field "remediation" must be an array of strings or null`,
+			wantSecond: `result warning summary 1 field "remediation" must be an array of strings or null`,
+		},
+		{
+			name: "summary is not object",
+			mutate: func(_ map[string]any, summary map[string]any) {
+				for key := range summary {
+					delete(summary, key)
+				}
+				summary["replace-with-scalar"] = true
+			},
+			want: "result warning summary 1 must be an object",
+		},
+		{
+			name: "summary contains an extra field",
+			mutate: func(_ map[string]any, summary map[string]any) {
+				summary["forged"] = true
+			},
+			want: "result warnings must equal the earliest warning events",
+		},
+	}
+	for _, test := range warningSchemaTests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			events := warningObjects(1)
+			summary := lastObject(events)["details"].(map[string]any)["warnings"].([]any)[0].(map[string]any)
+			test.mutate(events[1], summary)
+			if test.name == "summary is not object" {
+				lastObject(events)["details"].(map[string]any)["warnings"] = []any{"not-an-object"}
+			}
+			_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, events))
+			requireIssue(t, issues, test.want)
+			if test.wantSecond != "" {
+				requireIssue(t, issues, test.wantSecond)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name  string
+		value any
+	}{
+		{name: "negative", value: json.Number("-1")},
+		{name: "decimal", value: json.Number("1.0")},
+		{name: "exponent", value: json.Number("1e0")},
+		{name: "uint64 overflow", value: json.Number("18446744073709551616")},
+		{name: "string", value: "1"},
+	} {
+		test := test
+		t.Run("warningCount "+test.name, func(t *testing.T) {
+			t.Parallel()
+			events := warningObjects(1)
+			lastObject(events)["details"].(map[string]any)["warningCount"] = test.value
+			stdout := encodeTranscript(t, events)
+			if number, ok := test.value.(json.Number); ok && !bytes.Contains(stdout, []byte(`"warningCount":`+number.String())) {
+				t.Fatalf("stdout does not preserve warningCount token %q", number)
+			}
+			_, issues := inspect(testCommand, TerminalSuccess, stdout)
+			requireIssue(t, issues, "result warningCount must equal 1")
+		})
+	}
 }
 
 func validTranscript() []byte {
@@ -657,6 +839,18 @@ func warningSummaryObject(index int) map[string]any {
 
 func lastObject(events []map[string]any) map[string]any {
 	return events[len(events)-1]
+}
+
+func deleteField(field string) func(map[string]any) {
+	return func(object map[string]any) {
+		delete(object, field)
+	}
+}
+
+func setField(field string, value any) func(map[string]any) {
+	return func(object map[string]any) {
+		object[field] = value
+	}
 }
 
 func eventObject(eventType string, sequence int) map[string]any {
