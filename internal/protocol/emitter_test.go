@@ -80,6 +80,28 @@ func TestNewEmitterEmitsHelloFirst(t *testing.T) {
 	}
 }
 
+func TestNewProcessOutputStillUsesNDJSON(t *testing.T) {
+	var output bytes.Buffer
+	now := time.Date(2026, 7, 28, 15, 30, 0, 0, time.UTC)
+	processOutput, err := protocol.NewProcessOutput(&output)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	if _, err := processOutput.NewEmitter(
+		"v1.0.0",
+		"doctor",
+		nil,
+		protocol.WithOperationID(testOperationID),
+		protocol.WithClock(func() time.Time { return now }),
+	); err != nil {
+		t.Fatalf("NewEmitter() error = %v", err)
+	}
+	want := `{"protocol":1,"type":"hello","operationId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","sequence":1,"timestamp":"2026-07-28T15:30:00Z","runtimeVersion":"v1.0.0","command":"doctor","capabilities":[]}` + "\n"
+	if got := output.String(); got != want {
+		t.Errorf("NDJSON output = %q, want %q", got, want)
+	}
+}
+
 func TestEmitterSerializesAllEventTypesWithGlobalSequence(t *testing.T) {
 	t.Parallel()
 

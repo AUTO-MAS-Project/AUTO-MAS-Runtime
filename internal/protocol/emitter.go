@@ -1,8 +1,6 @@
 package protocol
 
 import (
-	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +12,7 @@ import (
 // lock. The process entry point must create exactly one instance for stdout.
 type ProcessOutput struct {
 	mu             sync.Mutex
-	writer         *bufio.Writer
-	destination    io.Writer
+	renderer       EventRenderer
 	nextSequence   uint64
 	writeErr       error
 	emitterCreated bool
@@ -60,14 +57,20 @@ func WithClock(clock func() time.Time) Option {
 
 // NewProcessOutput creates the process-wide owner of the NDJSON destination.
 func NewProcessOutput(output io.Writer) (*ProcessOutput, error) {
-	if output == nil {
-		return nil, errors.New("protocol output must not be nil")
+	renderer, err := NewNDJSONRenderer(output)
+	if err != nil {
+		return nil, err
 	}
-	return &ProcessOutput{
-		writer:       bufio.NewWriter(output),
-		destination:  output,
-		nextSequence: 1,
-	}, nil
+	return NewProcessOutputWithRenderer(renderer)
+}
+
+// NewProcessOutputWithRenderer creates a ProcessOutput whose events are
+// projected by renderer instead of written to an NDJSON destination.
+func NewProcessOutputWithRenderer(renderer EventRenderer) (*ProcessOutput, error) {
+	if interfaceIsNil(renderer) {
+		return nil, errors.New("protocol renderer must not be nil")
+	}
+	return &ProcessOutput{renderer: renderer, nextSequence: 1}, nil
 }
 
 // NewEmitter reserves this process output for one operation and immediately
@@ -174,18 +177,11 @@ func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
 		Sequence:    e.output.nextSequence,
 		Timestamp:   e.clock().Format(time.RFC3339Nano),
 	})
-	encoded, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("encode %s event: %w", eventType, err)
-	}
-	encoded = append(encoded, '\n')
-	if _, err := e.output.writer.Write(encoded); err != nil {
-		return e.output.rememberWriteError(err)
-	}
-	if err := e.output.writer.Flush(); err != nil {
-		return e.output.rememberWriteError(err)
-	}
-	if err := flushDestination(e.output.destination); err != nil {
+	if err := renderEvent(e.output.renderer, event); err != nil {
+		var nonSticky *nonStickyRenderError
+		if errors.As(err, &nonSticky) {
+			return nonSticky.err
+		}
 		return e.output.rememberWriteError(err)
 	}
 
@@ -228,22 +224,4 @@ func (e *ErrorEvent) setCommon(common Common) {
 
 func (e *ResultEvent) setCommon(common Common) {
 	e.Common = common
-}
-
-type errorFlusher interface {
-	Flush() error
-}
-
-type flusher interface {
-	Flush()
-}
-
-func flushDestination(destination io.Writer) error {
-	switch value := destination.(type) {
-	case errorFlusher:
-		return value.Flush()
-	case flusher:
-		value.Flush()
-	}
-	return nil
 }
