@@ -54,7 +54,15 @@ func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]par
 
 	var issues []contractIssue
 	if stdout[len(stdout)-1] != '\n' {
-		issues = append(issues, newIssue(command, terminal, 1, stdout, "transcript must end with LF"))
+		lastLF := bytes.LastIndexByte(stdout, '\n')
+		lineNumber := bytes.Count(stdout, []byte{'\n'}) + 1
+		issues = append(issues, newIssue(
+			command,
+			terminal,
+			lineNumber,
+			stdout[lastLF+1:],
+			"transcript must end with LF",
+		))
 	}
 
 	content := stdout

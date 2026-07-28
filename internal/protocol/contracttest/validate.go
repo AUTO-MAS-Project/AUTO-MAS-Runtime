@@ -77,7 +77,7 @@ func validateEnvelope(command string, terminal Terminal, events []parsedEvent) [
 	}
 	if len(resultLines) != 1 {
 		issues = append(issues, issueForTranscript(command, terminal, events, "result must appear exactly once"))
-	} else if resultLines[0] != len(events) {
+	} else if resultLines[0] != events[len(events)-1].line {
 		resultEvent := eventAtPhysicalLine(events, resultLines[0])
 		issues = append(issues, issueForEvent(command, terminal, resultEvent, "result must be the last event"))
 	}

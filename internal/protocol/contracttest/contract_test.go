@@ -1,8 +1,10 @@
 package contracttest
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -48,6 +50,18 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 	}
 	if sequence, ok := events[1].object["sequence"].(json.Number); !ok || sequence.String() != "2" {
 		t.Fatalf("result sequence = %#v (%T), want json.Number(2)", events[1].object["sequence"], events[1].object["sequence"])
+	}
+
+	withoutFinalLF := bytes.TrimSuffix(validTranscript(), []byte{'\n'})
+	lastLF := bytes.LastIndexByte(withoutFinalLF, '\n')
+	wantRaw := withoutFinalLF[lastLF+1:]
+	_, issues = inspect(testCommand, TerminalSuccess, withoutFinalLF)
+	issue := findIssue(t, issues, "must end with LF")
+	if issue.line != 2 {
+		t.Errorf("missing-LF issue line = %d, want 2", issue.line)
+	}
+	if !bytes.Equal(issue.raw, wantRaw) {
+		t.Errorf("missing-LF issue raw = %q, want final physical line %q", issue.raw, wantRaw)
 	}
 }
 
@@ -198,6 +212,42 @@ func TestContract_ResultPlacement(t *testing.T) {
 			requireIssue(t, issues, test.want)
 		})
 	}
+
+	t.Run("invalid line before result does not hide a later event", func(t *testing.T) {
+		stdout := joinPhysicalLines(
+			encodeObject(t, helloObject()),
+			[]byte("not-json"),
+			encodeObject(t, resultObject(3)),
+			encodeObject(t, eventObject("log", 4)),
+		)
+		_, issues := inspect(testCommand, TerminalSuccess, stdout)
+		requireIssue(t, issues, "result must be the last event")
+	})
+
+	t.Run("invalid line before a final result does not create false placement issue", func(t *testing.T) {
+		stdout := joinPhysicalLines(
+			encodeObject(t, helloObject()),
+			[]byte("not-json"),
+			encodeObject(t, resultObject(3)),
+		)
+		_, issues := inspect(testCommand, TerminalSuccess, stdout)
+		requireIssue(t, issues, "invalid JSON")
+		requireNoIssue(t, issues, "result must be the last event")
+	})
+
+	t.Run("invalid line after result is reported at its physical position", func(t *testing.T) {
+		stdout := joinPhysicalLines(
+			encodeObject(t, helloObject()),
+			encodeObject(t, resultObject(2)),
+			[]byte("not-json"),
+		)
+		_, issues := inspect(testCommand, TerminalSuccess, stdout)
+		issue := findIssue(t, issues, "invalid JSON")
+		if issue.line != 3 || string(issue.raw) != "not-json" {
+			t.Errorf("invalid trailing line issue = line %d raw %q, want line 3 raw %q", issue.line, issue.raw, "not-json")
+		}
+		requireNoIssue(t, issues, "result must be the last event")
+	})
 }
 
 func TestContract_Diagnostics(t *testing.T) {
@@ -210,16 +260,33 @@ func TestContract_Diagnostics(t *testing.T) {
 	if len(issues) == 0 {
 		t.Fatal("inspect() issues = nil, want diagnostics")
 	}
-	diagnostic := issues[0].Error()
+	diagnostic := findIssue(t, issues, `unknown event type "mystery"`).Error()
 	for _, want := range []string{
 		"command=\"dependencies sync\"",
 		"scenario=\"failure\"",
-		"line=",
+		"line=2",
 		"raw=",
-		"types=",
+		"types=[hello,mystery]",
 	} {
 		if !strings.Contains(diagnostic, want) {
 			t.Errorf("diagnostic %q does not contain %q", diagnostic, want)
+		}
+	}
+
+	raw := append([]byte("prefix\t\"quoted\"\\path-"), bytes.Repeat([]byte{'x'}, 200)...)
+	truncated := newIssue("doctor", TerminalCancelled, 7, raw, "bad output")
+	truncated.types = "[hello,result]"
+	truncatedDiagnostic := truncated.Error()
+	wantQuotedRaw := strconv.Quote(string(raw[:160])) + "...(truncated)"
+	for _, want := range []string{
+		"command=\"doctor\"",
+		"scenario=\"cancelled\"",
+		"line=7",
+		"raw=" + wantQuotedRaw,
+		"types=[hello,result]",
+	} {
+		if !strings.Contains(truncatedDiagnostic, want) {
+			t.Errorf("truncated diagnostic %q does not contain %q", truncatedDiagnostic, want)
 		}
 	}
 }
@@ -273,24 +340,48 @@ func encodeTranscript(t *testing.T, events []map[string]any) []byte {
 	t.Helper()
 	var builder strings.Builder
 	for _, event := range events {
-		encoded, err := json.Marshal(event)
-		if err != nil {
-			t.Fatalf("Marshal(event) error = %v", err)
-		}
-		builder.Write(encoded)
+		builder.Write(encodeObject(t, event))
 		builder.WriteByte('\n')
 	}
 	return []byte(builder.String())
 }
 
+func encodeObject(t *testing.T, event map[string]any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal(event) error = %v", err)
+	}
+	return encoded
+}
+
+func joinPhysicalLines(lines ...[]byte) []byte {
+	return append(bytes.Join(lines, []byte{'\n'}), '\n')
+}
+
 func requireIssue(t *testing.T, issues []contractIssue, want string) {
+	t.Helper()
+	_ = findIssue(t, issues, want)
+}
+
+func findIssue(t *testing.T, issues []contractIssue, want string) contractIssue {
 	t.Helper()
 	for _, issue := range issues {
 		if strings.Contains(issue.Error(), want) {
-			return
+			return issue
 		}
 	}
 	t.Fatalf("issues = %v, want one containing %q", issues, want)
+	return contractIssue{}
+}
+
+func requireNoIssue(t *testing.T, issues []contractIssue, forbidden string) {
+	t.Helper()
+	for _, issue := range issues {
+		if strings.Contains(issue.Error(), forbidden) {
+			t.Fatalf("issues = %v, want none containing %q", issues, forbidden)
+		}
+	}
 }
 
 func (i contractIssue) GoString() string {
