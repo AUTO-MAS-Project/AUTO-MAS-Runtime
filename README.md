@@ -10,6 +10,10 @@ the source of truth:
 - [Architecture](doc/架构设计.md)
 - [Implementation tasks](doc/任务拆分.md)
 
+Contributors and AI agents must read [AGENTS.md](AGENTS.md) before making
+changes. It covers the toolchain, workflow, coding standards, and hard
+constraints of this repository.
+
 ## Responsibilities
 
 Runtime owns local environment setup, managed backend repository updates,
