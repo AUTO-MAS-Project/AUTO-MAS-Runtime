@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+var (
+	// ErrResultAlreadyEmitted reports an attempt to emit a second terminal result.
+	ErrResultAlreadyEmitted = errors.New("protocol result already emitted")
+	// ErrEventAfterResult reports an attempt to emit a non-result event after the terminal result.
+	ErrEventAfterResult = errors.New("protocol event emitted after result")
+)
+
 // ProcessOutput owns the process-wide event renderer, sequence, serialization
 // lock, and single-emitter reservation.
 type ProcessOutput struct {
@@ -16,6 +23,7 @@ type ProcessOutput struct {
 	nextSequence   uint64
 	writeErr       error
 	emitterCreated bool
+	terminal       bool
 }
 
 // Emitter writes typed protocol events through a ProcessOutput.
@@ -166,6 +174,12 @@ func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
 	e.output.mu.Lock()
 	defer e.output.mu.Unlock()
 
+	if e.output.terminal {
+		if eventType == TypeResult {
+			return ErrResultAlreadyEmitted
+		}
+		return ErrEventAfterResult
+	}
 	if e.output.writeErr != nil {
 		return e.output.writeErr
 	}
@@ -186,6 +200,9 @@ func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
 	}
 
 	e.output.nextSequence++
+	if eventType == TypeResult {
+		e.output.terminal = true
+	}
 	return nil
 }
 

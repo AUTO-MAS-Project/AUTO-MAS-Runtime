@@ -1,9 +1,12 @@
 package protocol
 
 import (
+	"bytes"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 type internalFailingRenderer struct {
@@ -24,6 +27,144 @@ func (r *internalFailingRenderer) render(eventType EventType) error {
 		return r.err
 	}
 	return nil
+}
+
+type internalCountingRenderer struct {
+	delegate EventRenderer
+	calls    []EventType
+}
+
+func (r *internalCountingRenderer) RenderHello(event HelloEvent) error {
+	r.calls = append(r.calls, TypeHello)
+	return r.delegate.RenderHello(event)
+}
+
+func (r *internalCountingRenderer) RenderProgress(event ProgressEvent) error {
+	r.calls = append(r.calls, TypeProgress)
+	return r.delegate.RenderProgress(event)
+}
+
+func (r *internalCountingRenderer) RenderState(event StateEvent) error {
+	r.calls = append(r.calls, TypeState)
+	return r.delegate.RenderState(event)
+}
+
+func (r *internalCountingRenderer) RenderLog(event LogEvent) error {
+	r.calls = append(r.calls, TypeLog)
+	return r.delegate.RenderLog(event)
+}
+
+func (r *internalCountingRenderer) RenderWarning(event WarningEvent) error {
+	r.calls = append(r.calls, TypeWarning)
+	return r.delegate.RenderWarning(event)
+}
+
+func (r *internalCountingRenderer) RenderError(event ErrorEvent) error {
+	r.calls = append(r.calls, TypeError)
+	return r.delegate.RenderError(event)
+}
+
+func (r *internalCountingRenderer) RenderResult(event ResultEvent) error {
+	r.calls = append(r.calls, TypeResult)
+	return r.delegate.RenderResult(event)
+}
+
+func TestEmitter_TerminalRejectsEveryEvent(t *testing.T) {
+	var destination bytes.Buffer
+	ndjson, err := NewNDJSONRenderer(&destination)
+	if err != nil {
+		t.Fatalf("NewNDJSONRenderer() error = %v", err)
+	}
+	renderer := &internalCountingRenderer{delegate: ndjson}
+	output, err := NewProcessOutputWithRenderer(renderer)
+	if err != nil {
+		t.Fatalf("NewProcessOutputWithRenderer() error = %v", err)
+	}
+	clockCalls := 0
+	emitter, err := output.NewEmitter(
+		"v1.0.0",
+		"doctor",
+		nil,
+		WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+		WithClock(func() time.Time {
+			clockCalls++
+			return time.Date(2026, 7, 28, 18, 0, 0, 0, time.UTC)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewEmitter() error = %v", err)
+	}
+	if err := emitter.EmitResult(ResultEvent{
+		Success: true,
+		Code:    "OK",
+		Stage:   StageDoctor,
+		Status:  "succeeded",
+		Message: "done",
+		Details: map[string]any{},
+	}); err != nil {
+		t.Fatalf("EmitResult() error = %v", err)
+	}
+	if !output.terminal {
+		t.Fatal("terminal = false after successful result")
+	}
+
+	baselineOutput := destination.String()
+	baselineCalls := append([]EventType(nil), renderer.calls...)
+	baselineSequence := output.nextSequence
+	baselineClockCalls := clockCalls
+	output.writeErr = errors.New("sticky error must not hide terminal rejection")
+
+	progress := ProgressEvent{Common: Common{Sequence: 91}, Message: "progress"}
+	progressBefore := progress
+	state := StateEvent{Common: Common{Sequence: 92}, Message: "state"}
+	stateBefore := state
+	logEvent := LogEvent{Common: Common{Sequence: 93}, Message: "log"}
+	logBefore := logEvent
+	warning := WarningEvent{Common: Common{Sequence: 94}, Message: "warning"}
+	warningBefore := warning
+	errorEvent := ErrorEvent{Common: Common{Sequence: 95}, Message: "error"}
+	errorBefore := errorEvent
+	result := ResultEvent{Common: Common{Sequence: 96}, Message: "result"}
+	resultBefore := result
+	hello := &HelloEvent{Common: Common{Sequence: 97}, Command: "internal"}
+	helloBefore := *hello
+
+	tests := []struct {
+		name      string
+		emit      func() error
+		wantError error
+		unchanged func() bool
+	}{
+		{name: "progress", emit: func() error { return emitter.EmitProgress(progress) }, wantError: ErrEventAfterResult, unchanged: func() bool { return reflect.DeepEqual(progress, progressBefore) }},
+		{name: "state", emit: func() error { return emitter.EmitState(state) }, wantError: ErrEventAfterResult, unchanged: func() bool { return reflect.DeepEqual(state, stateBefore) }},
+		{name: "log", emit: func() error { return emitter.EmitLog(logEvent) }, wantError: ErrEventAfterResult, unchanged: func() bool { return reflect.DeepEqual(logEvent, logBefore) }},
+		{name: "warning", emit: func() error { return emitter.EmitWarning(warning) }, wantError: ErrEventAfterResult, unchanged: func() bool { return reflect.DeepEqual(warning, warningBefore) }},
+		{name: "error", emit: func() error { return emitter.EmitError(errorEvent) }, wantError: ErrEventAfterResult, unchanged: func() bool { return reflect.DeepEqual(errorEvent, errorBefore) }},
+		{name: "result", emit: func() error { return emitter.EmitResult(result) }, wantError: ErrResultAlreadyEmitted, unchanged: func() bool { return reflect.DeepEqual(result, resultBefore) }},
+		{name: "internal hello", emit: func() error { return emitter.emit(TypeHello, hello) }, wantError: ErrEventAfterResult, unchanged: func() bool { return reflect.DeepEqual(*hello, helloBefore) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.emit(); !errors.Is(err, test.wantError) {
+				t.Fatalf("rejected emit error = %v, want %v", err, test.wantError)
+			}
+			if !test.unchanged() {
+				t.Error("rejected emit modified its input")
+			}
+			if got := destination.String(); got != baselineOutput {
+				t.Errorf("destination changed after rejected emit: %q", got)
+			}
+			if !reflect.DeepEqual(renderer.calls, baselineCalls) {
+				t.Errorf("renderer calls = %v, want unchanged %v", renderer.calls, baselineCalls)
+			}
+			if output.nextSequence != baselineSequence {
+				t.Errorf("nextSequence = %d, want unchanged %d", output.nextSequence, baselineSequence)
+			}
+			if clockCalls != baselineClockCalls {
+				t.Errorf("clock calls = %d, want unchanged %d", clockCalls, baselineClockCalls)
+			}
+		})
+	}
 }
 
 func TestRendererFailureDoesNotAdvanceSequence(t *testing.T) {

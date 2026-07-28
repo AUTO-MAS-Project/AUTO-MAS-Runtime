@@ -247,18 +247,20 @@ func TestHumanRendererRoutesLogsAndResults(t *testing.T) {
 	if err := emitter.EmitResult(protocol.ResultEvent{Success: true, Code: "OK", Stage: protocol.StageDoctor, Status: "ready", Message: "success", Retryable: true}); err != nil {
 		t.Fatalf("EmitResult(success) error = %v", err)
 	}
-	if err := emitter.EmitResult(protocol.ResultEvent{Success: false, Code: "FAILED", Stage: protocol.StageDoctor, Status: "failed", Message: "failure"}); err != nil {
+	failureStdout, failureStderr, failureEmitter := newHumanEmitter(t, "v1.0.0", "doctor", nil)
+	failureStdout.Reset()
+	if err := failureEmitter.EmitResult(protocol.ResultEvent{Success: false, Code: "FAILED", Stage: protocol.StageDoctor, Status: "failed", Message: "failure"}); err != nil {
 		t.Fatalf("EmitResult(failure) error = %v", err)
 	}
 	wantStdout := "LOG [backend:stdout] — out\n" +
 		"RESULT success=true code=OK stage=doctor status=ready retryable=true remediation=- — success\n"
-	if got := stdout.String(); got != wantStdout {
+	if got := stdout.String() + failureStdout.String(); got != wantStdout {
 		t.Errorf("stdout = %q, want %q", got, wantStdout)
 	}
 	wantStderr := "LOG [backend:stderr] — err\n" +
 		"LOG [backend:unknown] — unknown\n" +
 		"RESULT success=false code=FAILED stage=doctor status=failed retryable=false remediation=- — failure\n"
-	if got := stderr.String(); got != wantStderr {
+	if got := stderr.String() + failureStderr.String(); got != wantStderr {
 		t.Errorf("stderr = %q, want %q", got, wantStderr)
 	}
 }
@@ -308,22 +310,24 @@ func TestHumanRendererContractMatrix(t *testing.T) {
 		if err := emitter.EmitResult(protocol.ResultEvent{Success: true, Code: "unknown-code", Stage: "unknown-stage", Status: "unknown-status", Message: "success", Retryable: false, Details: map[string]any{"hidden": "value"}}); err != nil {
 			t.Fatalf("EmitResult(success) error = %v", err)
 		}
-		if err := emitter.EmitResult(protocol.ResultEvent{Success: false, Code: "unknown-code", Stage: "unknown-stage", Status: "unknown-status", Message: "failure", Retryable: true, Details: map[string]any{"hidden": "value"}}); err != nil {
+		failureStdout, failureStderr, failureEmitter := newHumanEmitter(t, "", "", nil)
+		failureStdout.Reset()
+		if err := failureEmitter.EmitResult(protocol.ResultEvent{Success: false, Code: "unknown-code", Stage: "unknown-stage", Status: "unknown-status", Message: "failure", Retryable: true, Details: map[string]any{"hidden": "value"}}); err != nil {
 			t.Fatalf("EmitResult(failure) error = %v", err)
 		}
 		wantStdout := "HELLO runtime=- command=- capabilities=-\n" +
 			"PROGRESS [unknown\\rstage] unknown\\nstatus percent=0.000000001% — progress\n" +
 			"RESULT success=true code=unknown-code stage=unknown-stage status=unknown-status retryable=false remediation=- — success\n"
-		if got := stdout.String(); got != wantStdout {
+		if got := stdout.String() + failureStdout.String(); got != wantStdout {
 			t.Errorf("stdout = %q, want %q", got, wantStdout)
 		}
 		wantStderr := "WARNING [unknown-stage] unknown-code retryable=true remediation=- — warning\n" +
 			"ERROR [unknown-stage] unknown-code retryable=false remediation=- — error\n" +
 			"RESULT success=false code=unknown-code stage=unknown-stage status=unknown-status retryable=true remediation=- — failure\n"
-		if got := stderr.String(); got != wantStderr {
+		if got := stderr.String() + failureStderr.String(); got != wantStderr {
 			t.Errorf("stderr = %q, want %q", got, wantStderr)
 		}
-		if strings.Contains(stdout.String()+stderr.String(), "hidden") {
+		if strings.Contains(stdout.String()+failureStdout.String()+stderr.String()+failureStderr.String(), "hidden") {
 			t.Error("details appeared in human output")
 		}
 	})

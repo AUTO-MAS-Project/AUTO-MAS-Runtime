@@ -3,6 +3,7 @@ package protocol_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -256,6 +257,118 @@ func TestEmitterIsSafeForConcurrentEmission(t *testing.T) {
 		if common.Sequence != uint64(i+1) {
 			t.Errorf("line %d sequence = %d, want %d", i+1, common.Sequence, i+1)
 		}
+	}
+}
+
+func TestEmitter_ConcurrentResults(t *testing.T) {
+	var output flushingBuffer
+	emitter := newTestEmitter(t, &output)
+
+	start := make(chan struct{})
+	ready := make(chan struct{}, 2)
+	results := make(chan error, 2)
+	for index := range 2 {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			results <- emitter.EmitResult(protocol.ResultEvent{
+				Success: true,
+				Code:    "OK",
+				Stage:   protocol.StageDoctor,
+				Status:  "succeeded",
+				Message: fmt.Sprintf("result-%d", index),
+				Details: map[string]any{},
+			})
+		}()
+	}
+	readyTimeout := time.NewTimer(2 * time.Second)
+	defer readyTimeout.Stop()
+	for range 2 {
+		select {
+		case <-ready:
+		case <-readyTimeout.C:
+			t.Fatal("concurrent EmitResult() barrier timed out")
+		}
+	}
+	close(start)
+
+	var succeeded, rejected int
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for range 2 {
+		select {
+		case err := <-results:
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, protocol.ErrResultAlreadyEmitted):
+				rejected++
+			default:
+				t.Fatalf("concurrent EmitResult() error = %v", err)
+			}
+		case <-timeout.C:
+			t.Fatal("concurrent EmitResult() timed out")
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("concurrent result outcomes = %d success, %d rejected; want 1 each", succeeded, rejected)
+	}
+
+	lines := ndjsonLines(t, output.String())
+	if len(lines) != 2 {
+		t.Fatalf("line count = %d, want hello and one result", len(lines))
+	}
+	var common protocol.Common
+	if err := json.Unmarshal([]byte(lines[1]), &common); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if common.Type != protocol.TypeResult || common.Sequence != 2 {
+		t.Fatalf("terminal common = %#v, want result sequence 2", common)
+	}
+}
+
+func TestEmitter_ResultRetryAfterEncodeFailure(t *testing.T) {
+	var output flushingBuffer
+	emitter := newTestEmitter(t, &output)
+	hello := output.String()
+
+	event := protocol.ResultEvent{
+		Common:  protocol.Common{Sequence: 99},
+		Success: true,
+		Code:    "OK",
+		Stage:   protocol.StageDoctor,
+		Status:  "succeeded",
+		Message: "done",
+		Details: map[string]any{"invalid": func() {}},
+	}
+	if err := emitter.EmitResult(event); err == nil || !strings.Contains(err.Error(), "encode result event") {
+		t.Fatalf("first EmitResult() error = %v, want encode error", err)
+	}
+	if got := output.String(); got != hello {
+		t.Fatalf("output after encode failure = %q, want unchanged %q", got, hello)
+	}
+	if event.Common.Sequence != 99 {
+		t.Fatalf("input sequence after encode failure = %d, want 99", event.Common.Sequence)
+	}
+
+	event.Details = map[string]any{"attempt": 2}
+	if err := emitter.EmitResult(event); err != nil {
+		t.Fatalf("retry EmitResult() error = %v", err)
+	}
+	if err := emitter.EmitResult(protocol.ResultEvent{}); !errors.Is(err, protocol.ErrResultAlreadyEmitted) {
+		t.Fatalf("EmitResult() after successful retry error = %v, want ErrResultAlreadyEmitted", err)
+	}
+
+	lines := ndjsonLines(t, output.String())
+	if len(lines) != 2 {
+		t.Fatalf("line count = %d, want hello and one result", len(lines))
+	}
+	var result protocol.ResultEvent
+	if err := json.Unmarshal([]byte(lines[1]), &result); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if result.Sequence != 2 || result.Details["attempt"] != float64(2) {
+		t.Fatalf("retried result = %#v, want sequence 2 and attempt 2", result)
 	}
 }
 
