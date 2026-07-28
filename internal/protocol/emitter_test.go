@@ -95,7 +95,7 @@ func TestEmitterSerializesAllEventTypesWithGlobalSequence(t *testing.T) {
 			emit: func() error {
 				current, total, percent := int64(18), int64(42), 42.86
 				return emitter.EmitProgress(protocol.ProgressEvent{
-					Stage: "dependencies.sync", Status: "running",
+					Stage: protocol.StageDependenciesSync, Status: protocol.ProgressRunning,
 					Current: &current, Total: &total, Percent: &percent,
 					Message: "正在安装 Python 依赖",
 				})
@@ -105,7 +105,7 @@ func TestEmitterSerializesAllEventTypesWithGlobalSequence(t *testing.T) {
 			name: "state",
 			emit: func() error {
 				return emitter.EmitState(protocol.StateEvent{
-					Stage: "dependencies.sync", Status: "syncing_environment",
+					Stage: protocol.StageDependenciesSync, Status: protocol.StateSyncingEnvironment,
 					Message: "正在精确同步 Python 环境", Details: map[string]any{},
 				})
 			},
@@ -122,7 +122,7 @@ func TestEmitterSerializesAllEventTypesWithGlobalSequence(t *testing.T) {
 			name: "warning",
 			emit: func() error {
 				return emitter.EmitWarning(protocol.WarningEvent{
-					Code: "BACKEND_FORCE_TERMINATED", Stage: "backend.shutdown",
+					Code: "BACKEND_FORCE_TERMINATED", Stage: protocol.StageBackendShutdown,
 					Message: "后端已被强制终止", Retryable: false,
 					Remediation: []string{"open-log"}, Details: map[string]any{"exitCode": 1},
 				})
@@ -132,7 +132,7 @@ func TestEmitterSerializesAllEventTypesWithGlobalSequence(t *testing.T) {
 			name: "error",
 			emit: func() error {
 				return emitter.EmitError(protocol.ErrorEvent{
-					Code: "DEPENDENCY_SYNC_FAILED", Stage: "dependencies.sync",
+					Code: "DEPENDENCY_SYNC_FAILED", Stage: protocol.StageDependenciesSync,
 					Message: "Python 依赖安装失败", Retryable: true,
 					Remediation: []string{"retry-sync", "open-log"}, Details: map[string]any{"exitCode": 1},
 				})
@@ -143,7 +143,7 @@ func TestEmitterSerializesAllEventTypesWithGlobalSequence(t *testing.T) {
 			emit: func() error {
 				return emitter.EmitResult(protocol.ResultEvent{
 					Success: false, Code: "DEPENDENCY_SYNC_FAILED",
-					Stage: "dependencies.sync", Status: "environment_broken",
+					Stage: protocol.StageDependenciesSync, Status: "environment_broken",
 					Message: "Python 依赖同步失败", Retryable: true,
 					Remediation: []string{"retry-sync", "open-log"},
 					Details:     map[string]any{"logPath": "logs/runtime/dependencies-20260728.log"},

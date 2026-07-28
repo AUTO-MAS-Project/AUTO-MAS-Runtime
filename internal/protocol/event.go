@@ -36,19 +36,19 @@ type HelloEvent struct {
 // ProgressEvent reports progress for a stable stage.
 type ProgressEvent struct {
 	Common
-	Stage   string   `json:"stage"`
-	Status  string   `json:"status"`
-	Current *int64   `json:"current,omitempty"`
-	Total   *int64   `json:"total,omitempty"`
-	Percent *float64 `json:"percent,omitempty"`
-	Message string   `json:"message"`
+	Stage   Stage          `json:"stage"`
+	Status  ProgressStatus `json:"status"`
+	Current *int64         `json:"current,omitempty"`
+	Total   *int64         `json:"total,omitempty"`
+	Percent *float64       `json:"percent,omitempty"`
+	Message string         `json:"message"`
 }
 
 // StateEvent reports a product lifecycle state transition.
 type StateEvent struct {
 	Common
-	Stage   string         `json:"stage"`
-	Status  string         `json:"status"`
+	Stage   Stage          `json:"stage"`
+	Status  StateStatus    `json:"status"`
 	Message string         `json:"message"`
 	Details map[string]any `json:"details"`
 }
@@ -65,7 +65,7 @@ type LogEvent struct {
 type WarningEvent struct {
 	Common
 	Code        string         `json:"code"`
-	Stage       string         `json:"stage"`
+	Stage       Stage          `json:"stage"`
 	Message     string         `json:"message"`
 	Retryable   bool           `json:"retryable"`
 	Remediation []string       `json:"remediation"`
@@ -76,7 +76,7 @@ type WarningEvent struct {
 type ErrorEvent struct {
 	Common
 	Code        string         `json:"code"`
-	Stage       string         `json:"stage"`
+	Stage       Stage          `json:"stage"`
 	Message     string         `json:"message"`
 	Retryable   bool           `json:"retryable"`
 	Remediation []string       `json:"remediation"`
@@ -88,7 +88,7 @@ type ResultEvent struct {
 	Common
 	Success     bool           `json:"success"`
 	Code        string         `json:"code"`
-	Stage       string         `json:"stage"`
+	Stage       Stage          `json:"stage"`
 	Status      string         `json:"status"`
 	Message     string         `json:"message"`
 	Retryable   bool           `json:"retryable"`

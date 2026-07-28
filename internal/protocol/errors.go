@@ -193,7 +193,7 @@ func AllRemediations() []Remediation {
 }
 
 // NewErrorEvent constructs an error event from the stable definition for code.
-func NewErrorEvent(code Code, stage, message string, details map[string]any) (ErrorEvent, error) {
+func NewErrorEvent(code Code, stage Stage, message string, details map[string]any) (ErrorEvent, error) {
 	definition, ok := LookupErrorDefinition(code)
 	if !ok {
 		return ErrorEvent{}, fmt.Errorf("unknown protocol error code %q", code)
@@ -209,7 +209,7 @@ func NewErrorEvent(code Code, stage, message string, details map[string]any) (Er
 }
 
 // NewWarningEvent constructs a warning event from the stable definition for code.
-func NewWarningEvent(code Code, stage, message string, details map[string]any) (WarningEvent, error) {
+func NewWarningEvent(code Code, stage Stage, message string, details map[string]any) (WarningEvent, error) {
 	definition, ok := LookupErrorDefinition(code)
 	if !ok {
 		return WarningEvent{}, fmt.Errorf("unknown protocol error code %q", code)
@@ -239,7 +239,7 @@ func NewFailureResult(primary ErrorEvent, status, message string, details map[st
 }
 
 // NewSuccessResult constructs a successful result.
-func NewSuccessResult(stage, status, message string, details map[string]any) ResultEvent {
+func NewSuccessResult(stage Stage, status string, message string, details map[string]any) ResultEvent {
 	return ResultEvent{
 		Success:     true,
 		Code:        string(CodeOK),

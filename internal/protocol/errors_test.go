@@ -174,7 +174,7 @@ func TestEventConstructorsUseStableErrorDefinition(t *testing.T) {
 
 	primary, err := protocol.NewErrorEvent(
 		protocol.CodeDependencySyncFailed,
-		"dependencies.sync",
+		protocol.StageDependenciesSync,
 		"Python 依赖安装失败",
 		map[string]any{"exitCode": 1},
 	)
@@ -207,7 +207,7 @@ func TestEventConstructorsUseStableErrorDefinition(t *testing.T) {
 
 	warning, err := protocol.NewWarningEvent(
 		protocol.CodeBackendForceTerminated,
-		"backend.shutdown",
+		protocol.StageBackendShutdown,
 		"后端已被强制终止",
 		nil,
 	)
@@ -220,7 +220,7 @@ func TestEventConstructorsUseStableErrorDefinition(t *testing.T) {
 		t.Errorf("warning = %#v", warning)
 	}
 
-	success := protocol.NewSuccessResult("doctor", "ready_to_start", "检查通过", nil)
+	success := protocol.NewSuccessResult(protocol.StageDoctor, "ready_to_start", "检查通过", nil)
 	if !success.Success || success.Code != string(protocol.CodeOK) || success.Retryable {
 		t.Errorf("success result = %#v", success)
 	}
@@ -233,10 +233,10 @@ func TestEventConstructorsRejectUnknownCode(t *testing.T) {
 	t.Parallel()
 
 	const unknown protocol.Code = "FUTURE_UNKNOWN_CODE"
-	if _, err := protocol.NewErrorEvent(unknown, "doctor", "unknown", nil); err == nil {
+	if _, err := protocol.NewErrorEvent(unknown, protocol.StageDoctor, "unknown", nil); err == nil {
 		t.Error("NewErrorEvent() error = nil, want unknown-code error")
 	}
-	if _, err := protocol.NewWarningEvent(unknown, "doctor", "unknown", nil); err == nil {
+	if _, err := protocol.NewWarningEvent(unknown, protocol.StageDoctor, "unknown", nil); err == nil {
 		t.Error("NewWarningEvent() error = nil, want unknown-code error")
 	}
 	if _, ok := protocol.LookupErrorDefinition(unknown); ok {
