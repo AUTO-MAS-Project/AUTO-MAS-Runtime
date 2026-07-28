@@ -98,7 +98,7 @@ func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]par
 				terminal,
 				lineNumber,
 				line,
-				fmt.Sprintf("duplicate JSON object name %q", name),
+				fmt.Sprintf("duplicate JSON object name %q", truncateUTF8String(name, maxTypeLabelBytes)),
 			))
 			continue
 		}

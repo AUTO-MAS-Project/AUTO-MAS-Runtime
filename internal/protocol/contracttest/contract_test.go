@@ -127,6 +127,32 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 			requireIssue(t, issues, fmt.Sprintf("duplicate JSON object name %q", test.key))
 		})
 	}
+
+	t.Run("long Unicode duplicate object name has bounded diagnostic", func(t *testing.T) {
+		name := strings.Repeat("界", 1<<18)
+		encodedName, err := json.Marshal(name)
+		if err != nil {
+			t.Fatalf("Marshal(name) error = %v", err)
+		}
+		var stdout bytes.Buffer
+		stdout.WriteString(`{"nested":{`)
+		stdout.Write(encodedName)
+		stdout.WriteString(`:1,`)
+		stdout.Write(encodedName)
+		stdout.WriteString(`:2}}` + "\n")
+
+		_, issues := inspect(testCommand, TerminalSuccess, stdout.Bytes())
+		diagnostic := findIssue(t, issues, "duplicate JSON object name").Error()
+		if len(diagnostic) > 1024 {
+			t.Fatalf("long duplicate-name diagnostic length = %d, want at most 1024", len(diagnostic))
+		}
+		if !strings.Contains(diagnostic, "(truncated)") {
+			t.Errorf("long duplicate-name diagnostic lacks truncated marker: %q", diagnostic)
+		}
+		if !utf8.ValidString(diagnostic) {
+			t.Errorf("long duplicate-name diagnostic is invalid UTF-8: %q", diagnostic)
+		}
+	})
 }
 
 func TestContract_Envelope(t *testing.T) {
