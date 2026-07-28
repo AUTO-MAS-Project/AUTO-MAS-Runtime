@@ -631,7 +631,36 @@ func TestEmitter_WarningSummaryLimit(t *testing.T) {
 			}
 			wantStored := min(warningCount, protocol.MaxResultWarningSummaries)
 			if len(summaries) != wantStored {
-				t.Errorf("stored warnings = %d, want %d", len(summaries), wantStored)
+				t.Fatalf("stored warnings = %d, want %d", len(summaries), wantStored)
+			}
+			for index, rawSummary := range summaries {
+				summary, ok := rawSummary.(map[string]any)
+				if !ok {
+					t.Fatalf("warning[%d] type = %T, want map[string]any", index, rawSummary)
+				}
+				wantCode := fmt.Sprintf("WARN_%03d", index)
+				if got := summary["code"]; got != wantCode {
+					t.Errorf("warning[%d].code = %#v, want %q", index, got, wantCode)
+				}
+				details, ok := summary["details"].(map[string]any)
+				if !ok {
+					t.Fatalf("warning[%d].details type = %T, want map[string]any", index, summary["details"])
+				}
+				if got := details["index"]; got != json.Number(fmt.Sprint(index)) {
+					t.Errorf("warning[%d].details.index = %#v, want %d", index, got, index)
+				}
+			}
+			if warningCount == protocol.MaxResultWarningSummaries+1 {
+				last := summaries[protocol.MaxResultWarningSummaries-1].(map[string]any)
+				if got := last["code"]; got != "WARN_255" {
+					t.Errorf("last retained warning code = %#v, want WARN_255", got)
+				}
+				for index, rawSummary := range summaries {
+					summary := rawSummary.(map[string]any)
+					if summary["code"] == "WARN_256" {
+						t.Errorf("warning[%d] unexpectedly retained WARN_256", index)
+					}
+				}
 			}
 			if got := result.Details["warningCount"]; got != json.Number(fmt.Sprint(warningCount)) {
 				t.Errorf("warningCount = %#v, want %d", got, warningCount)
