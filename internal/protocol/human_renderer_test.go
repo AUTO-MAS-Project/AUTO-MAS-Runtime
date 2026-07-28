@@ -21,9 +21,11 @@ func TestHumanRendererGolden(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EmitProgress() error = %v", err)
 	}
+	const stateDetailsMarker = "state-details-must-not-appear"
 	if err := emitter.EmitState(protocol.StateEvent{
 		Stage: protocol.StageDependenciesSync, Status: protocol.StateSyncingEnvironment,
 		Message: "正在精确同步 Python 环境",
+		Details: map[string]any{"marker": stateDetailsMarker},
 	}); err != nil {
 		t.Fatalf("EmitState() error = %v", err)
 	}
@@ -66,6 +68,9 @@ func TestHumanRendererGolden(t *testing.T) {
 	if got := stderr.String(); got != wantStderr {
 		t.Errorf("stderr = %q, want %q", got, wantStderr)
 	}
+	if strings.Contains(stdout.String()+stderr.String(), stateDetailsMarker) {
+		t.Errorf("human output contains state details marker %q", stateDetailsMarker)
+	}
 }
 
 func TestHumanRendererRoutesLogsAndResults(t *testing.T) {
@@ -80,14 +85,14 @@ func TestHumanRendererRoutesLogsAndResults(t *testing.T) {
 	if err := emitter.EmitLog(protocol.LogEvent{Source: "backend", Stream: "unknown", Message: "unknown"}); err != nil {
 		t.Fatalf("EmitLog(unknown) error = %v", err)
 	}
-	if err := emitter.EmitResult(protocol.ResultEvent{Success: true, Code: "OK", Stage: protocol.StageDoctor, Status: "ready", Message: "success"}); err != nil {
+	if err := emitter.EmitResult(protocol.ResultEvent{Success: true, Code: "OK", Stage: protocol.StageDoctor, Status: "ready", Message: "success", Retryable: true}); err != nil {
 		t.Fatalf("EmitResult(success) error = %v", err)
 	}
 	if err := emitter.EmitResult(protocol.ResultEvent{Success: false, Code: "FAILED", Stage: protocol.StageDoctor, Status: "failed", Message: "failure"}); err != nil {
 		t.Fatalf("EmitResult(failure) error = %v", err)
 	}
 	wantStdout := "LOG [backend:stdout] — out\n" +
-		"RESULT success=true code=OK stage=doctor status=ready retryable=false remediation=- — success\n"
+		"RESULT success=true code=OK stage=doctor status=ready retryable=true remediation=- — success\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Errorf("stdout = %q, want %q", got, wantStdout)
 	}
@@ -110,6 +115,9 @@ func TestHumanRendererProgressOptions(t *testing.T) {
 		{"current", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Current: &current, Message: "checking"}, "PROGRESS [doctor] running current=18 — checking\n"},
 		{"total", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Total: &total, Message: "checking"}, "PROGRESS [doctor] running total=42 — checking\n"},
 		{"percent", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Percent: &percent, Message: "checking"}, "PROGRESS [doctor] running percent=42.86% — checking\n"},
+		{"current and total", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Current: &current, Total: &total, Message: "checking"}, "PROGRESS [doctor] running current=18 total=42 — checking\n"},
+		{"current and percent", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Current: &current, Percent: &percent, Message: "checking"}, "PROGRESS [doctor] running current=18 percent=42.86% — checking\n"},
+		{"total and percent", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Total: &total, Percent: &percent, Message: "checking"}, "PROGRESS [doctor] running total=42 percent=42.86% — checking\n"},
 		{"all", protocol.ProgressEvent{Stage: protocol.StageDoctor, Status: protocol.ProgressRunning, Current: &current, Total: &total, Percent: &percent, Message: "checking"}, "PROGRESS [doctor] running current=18 total=42 percent=42.86% — checking\n"},
 	}
 	for _, test := range tests {
