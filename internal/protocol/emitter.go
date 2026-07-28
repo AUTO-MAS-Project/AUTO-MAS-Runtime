@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// ProcessOutput owns the process-wide NDJSON destination, sequence, and write
-// lock. The process entry point must create exactly one instance for stdout.
+// ProcessOutput owns the process-wide event renderer, sequence, serialization
+// lock, and single-emitter reservation.
 type ProcessOutput struct {
 	mu             sync.Mutex
 	renderer       EventRenderer

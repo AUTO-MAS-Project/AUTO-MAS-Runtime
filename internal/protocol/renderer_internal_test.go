@@ -47,6 +47,43 @@ func TestRendererFailureDoesNotAdvanceSequence(t *testing.T) {
 	}
 }
 
+func TestUnknownInternalEventIsNonStickyAndDoesNotAdvanceSequence(t *testing.T) {
+	output, err := NewProcessOutputWithRenderer(&internalFailingRenderer{})
+	if err != nil {
+		t.Fatalf("NewProcessOutputWithRenderer() error = %v", err)
+	}
+	emitter, err := output.NewEmitter("v1.0.0", "doctor", nil, WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+	if err != nil {
+		t.Fatalf("NewEmitter() error = %v", err)
+	}
+
+	unknown := &internalUnknownEvent{}
+	err = emitter.emit(TypeState, unknown)
+	if err == nil || err.Error() != "render protocol event: unsupported event type" {
+		t.Fatalf("emit unknown event error = %v, want unsupported-type error", err)
+	}
+	if output.writeErr != nil {
+		t.Errorf("writeErr = %v, want nil after non-sticky renderer error", output.writeErr)
+	}
+	if output.nextSequence != 2 {
+		t.Errorf("nextSequence after unsupported event = %d, want 2", output.nextSequence)
+	}
+	if err := emitter.EmitLog(LogEvent{Message: "after unsupported event"}); err != nil {
+		t.Fatalf("EmitLog() after unsupported event error = %v", err)
+	}
+	if output.nextSequence != 3 {
+		t.Errorf("nextSequence after subsequent log = %d, want 3", output.nextSequence)
+	}
+}
+
+type internalUnknownEvent struct {
+	Common
+}
+
+func (e *internalUnknownEvent) setCommon(common Common) {
+	e.Common = common
+}
+
 func TestNDJSONWriteFailuresDoNotAdvanceSequence(t *testing.T) {
 	tests := []struct {
 		name        string

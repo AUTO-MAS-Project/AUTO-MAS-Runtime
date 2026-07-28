@@ -277,11 +277,12 @@ type flushFailWriter struct {
 	flushes   int
 	err       error
 	failFlush int
+	accepted  bytes.Buffer
 }
 
 func (w *flushFailWriter) Write(data []byte) (int, error) {
 	w.writes++
-	return len(data), nil
+	return w.accepted.Write(data)
 }
 
 func (w *flushFailWriter) Flush() error {
@@ -298,16 +299,19 @@ func testNDJSONWriteFailureIsSticky(t *testing.T, name, message string, destinat
 	var writer io.Writer
 	var writes func() int
 	var flushes func() int
+	var contents func() string
 	if destinationFlush {
 		value := &flushFailWriter{err: sentinel, failFlush: 2}
 		writer = value
 		writes = func() int { return value.writes }
 		flushes = func() int { return value.flushes }
+		contents = func() string { return value.accepted.String() }
 	} else {
 		value := &failingWriter{err: sentinel, failOn: 2}
 		writer = value
 		writes = func() int { return value.writes }
 		flushes = func() int { return 0 }
+		contents = func() string { return value.accepted.String() }
 	}
 
 	output, err := protocol.NewProcessOutput(writer)
@@ -321,6 +325,14 @@ func testNDJSONWriteFailureIsSticky(t *testing.T, name, message string, destinat
 	firstErr := emitter.EmitLog(protocol.LogEvent{Message: message})
 	if firstErr == nil || !errors.Is(firstErr, sentinel) || firstErr.Error() != "write protocol event: "+sentinel.Error() {
 		t.Fatalf("EmitLog() error = %v, want wrapped sentinel", firstErr)
+	}
+	lines := ndjsonLines(t, contents())
+	if destinationFlush {
+		if len(lines) != 2 || !strings.Contains(lines[1], message) {
+			t.Fatalf("destination output = %q, want hello plus the complete failed event before destination Flush() failed", contents())
+		}
+	} else if len(lines) != 1 || strings.Contains(contents(), message) {
+		t.Fatalf("destination output = %q, want only the successful hello", contents())
 	}
 	beforeWrites, beforeFlushes := writes(), flushes()
 	secondErr := emitter.EmitProgress(protocol.ProgressEvent{})
