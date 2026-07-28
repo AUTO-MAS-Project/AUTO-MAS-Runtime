@@ -2,14 +2,173 @@ package protocol_test
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
+
+type controlledWriter struct {
+	bytes.Buffer
+	writeErr    error
+	flushErr    error
+	failWriteAt int
+	failFlushAt int
+	writes      int
+	flushes     int
+}
+
+func (w *controlledWriter) Write(data []byte) (int, error) {
+	w.writes++
+	if w.failWriteAt > 0 && w.writes == w.failWriteAt {
+		return 0, w.writeErr
+	}
+	return w.Buffer.Write(data)
+}
+
+func (w *controlledWriter) WriteString(data string) (int, error) {
+	return w.Write([]byte(data))
+}
+
+func (w *controlledWriter) Flush() error {
+	w.flushes++
+	if w.failFlushAt > 0 && w.flushes == w.failFlushAt {
+		return w.flushErr
+	}
+	return nil
+}
+
+func TestHumanRendererWritesAndFlushesOnlyTarget(t *testing.T) {
+	stdout, stderr := &controlledWriter{}, &controlledWriter{}
+	emitter := newHumanEmitterWithWriters(t, stdout, stderr)
+	if stdout.writes != 1 || stdout.flushes != 1 || stderr.writes != 0 || stderr.flushes != 0 {
+		t.Fatalf(
+			"I/O counts after hello = stdout(%d writes, %d flushes), stderr(%d writes, %d flushes), want stdout(1, 1), stderr(0, 0)",
+			stdout.writes, stdout.flushes, stderr.writes, stderr.flushes,
+		)
+	}
+
+	beforeStdoutWrites, beforeStdoutFlushes := stdout.writes, stdout.flushes
+	if err := emitter.EmitWarning(protocol.WarningEvent{Message: "warning"}); err != nil {
+		t.Fatalf("EmitWarning() error = %v", err)
+	}
+	if stdout.writes != beforeStdoutWrites || stdout.flushes != beforeStdoutFlushes {
+		t.Errorf(
+			"stdout I/O changed for stderr warning: writes %d -> %d, flushes %d -> %d",
+			beforeStdoutWrites, stdout.writes, beforeStdoutFlushes, stdout.flushes,
+		)
+	}
+	if stderr.writes != 1 || stderr.flushes != 1 {
+		t.Errorf("stderr I/O after warning = %d writes, %d flushes, want 1 write, 1 flush", stderr.writes, stderr.flushes)
+	}
+
+	beforeStderrWrites, beforeStderrFlushes := stderr.writes, stderr.flushes
+	if err := emitter.EmitProgress(protocol.ProgressEvent{Message: "progress"}); err != nil {
+		t.Fatalf("EmitProgress() error = %v", err)
+	}
+	if stderr.writes != beforeStderrWrites || stderr.flushes != beforeStderrFlushes {
+		t.Errorf(
+			"stderr I/O changed for stdout progress: writes %d -> %d, flushes %d -> %d",
+			beforeStderrWrites, stderr.writes, beforeStderrFlushes, stderr.flushes,
+		)
+	}
+	if stdout.writes != beforeStdoutWrites+1 || stdout.flushes != beforeStdoutFlushes+1 {
+		t.Errorf(
+			"stdout I/O after progress = %d writes, %d flushes, want %d writes, %d flushes",
+			stdout.writes, stdout.flushes, beforeStdoutWrites+1, beforeStdoutFlushes+1,
+		)
+	}
+}
+
+func TestHumanRendererStdoutFailureIsSticky(t *testing.T) {
+	testHumanRendererFailureIsSticky(t, "stdout", func(emitter *protocol.Emitter, message string) error {
+		return emitter.EmitProgress(protocol.ProgressEvent{Message: message})
+	}, func(emitter *protocol.Emitter) error {
+		return emitter.EmitWarning(protocol.WarningEvent{Message: "after stdout failure"})
+	})
+}
+
+func TestHumanRendererStderrFailureIsStickyAcrossStdout(t *testing.T) {
+	testHumanRendererFailureIsSticky(t, "stderr", func(emitter *protocol.Emitter, message string) error {
+		return emitter.EmitWarning(protocol.WarningEvent{Message: message})
+	}, func(emitter *protocol.Emitter) error {
+		return emitter.EmitProgress(protocol.ProgressEvent{Message: "after stderr failure"})
+	})
+}
+
+func TestHumanRendererConcurrentBlocksDoNotInterleave(t *testing.T) {
+	stdout, stderr, emitter := newHumanEmitter(t, "v1.0.0", "doctor", nil)
+	const eventCount = 100
+	var waitGroup sync.WaitGroup
+	errorsChannel := make(chan error, eventCount)
+	for eventNumber := 0; eventNumber < eventCount; eventNumber++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			message := fmt.Sprintf("event-%03d-first\nevent-%03d-second", eventNumber, eventNumber)
+			errorsChannel <- emitter.EmitLog(protocol.LogEvent{Source: "runtime", Stream: "stdout", Message: message})
+		}()
+	}
+	waitGroup.Wait()
+	close(errorsChannel)
+	for err := range errorsChannel {
+		if err != nil {
+			t.Errorf("EmitLog() error = %v", err)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+
+	output := strings.TrimSuffix(stdout.String(), "\n")
+	lines := strings.Split(output, "\n")
+	if len(lines) != 1+eventCount*2 {
+		t.Fatalf("physical line count = %d, want %d; output = %q", len(lines), 1+eventCount*2, output)
+	}
+	if wantHello := "HELLO runtime=v1.0.0 command=doctor capabilities=-"; lines[0] != wantHello {
+		t.Errorf("hello line = %q, want %q", lines[0], wantHello)
+	}
+
+	const firstPrefix = "LOG [runtime:stdout] — "
+	const secondPrefix = "LOG [runtime:stdout] | "
+	seen := make(map[string]int, eventCount)
+	for lineIndex := 1; lineIndex < len(lines); lineIndex += 2 {
+		firstLine, secondLine := lines[lineIndex], lines[lineIndex+1]
+		if !strings.HasPrefix(firstLine, "LOG [runtime:stdout]") || !strings.HasPrefix(secondLine, "LOG [runtime:stdout]") {
+			t.Errorf("event block contains unprefixed line: %q / %q", firstLine, secondLine)
+			continue
+		}
+		if !strings.HasPrefix(firstLine, firstPrefix) || !strings.HasPrefix(secondLine, secondPrefix) {
+			t.Errorf("event block prefixes differ from contract: %q / %q", firstLine, secondLine)
+			continue
+		}
+		firstPayload := strings.TrimPrefix(firstLine, firstPrefix)
+		secondPayload := strings.TrimPrefix(secondLine, secondPrefix)
+		if !strings.HasSuffix(firstPayload, "-first") || !strings.HasSuffix(secondPayload, "-second") {
+			t.Errorf("event block suffixes = %q / %q, want first / second", firstPayload, secondPayload)
+			continue
+		}
+		firstID := strings.TrimSuffix(firstPayload, "-first")
+		secondID := strings.TrimSuffix(secondPayload, "-second")
+		if firstID != secondID {
+			t.Errorf("interleaved event block IDs = %q / %q", firstID, secondID)
+			continue
+		}
+		seen[firstID]++
+	}
+	for eventNumber := 0; eventNumber < eventCount; eventNumber++ {
+		eventID := fmt.Sprintf("event-%03d", eventNumber)
+		if seen[eventID] != 1 {
+			t.Errorf("%s occurrence count = %d, want 1", eventID, seen[eventID])
+		}
+	}
+}
 
 func TestHumanRendererGolden(t *testing.T) {
 	stdout, stderr, emitter := newHumanEmitter(t, "v1.0.0", "bootstrap", []string{"stdin.cancel", "state.v1"})
@@ -261,6 +420,24 @@ func TestHumanRendererConstructorsRejectNilWriters(t *testing.T) {
 func newHumanEmitter(t *testing.T, runtimeVersion, command string, capabilities []string) (*bytes.Buffer, *bytes.Buffer, *protocol.Emitter) {
 	t.Helper()
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	emitter := newHumanEmitterWithSettings(t, stdout, stderr, runtimeVersion, command, capabilities)
+	return stdout, stderr, emitter
+}
+
+func newHumanEmitterWithWriters(t *testing.T, stdout, stderr io.Writer) *protocol.Emitter {
+	t.Helper()
+	return newHumanEmitterWithSettings(t, stdout, stderr, "v1.0.0", "doctor", nil)
+}
+
+func newHumanEmitterWithSettings(
+	t *testing.T,
+	stdout io.Writer,
+	stderr io.Writer,
+	runtimeVersion string,
+	command string,
+	capabilities []string,
+) *protocol.Emitter {
+	t.Helper()
 	renderer, err := protocol.NewHumanRenderer(stdout, stderr)
 	if err != nil {
 		t.Fatalf("NewHumanRenderer() error = %v", err)
@@ -278,7 +455,72 @@ func newHumanEmitter(t *testing.T, runtimeVersion, command string, capabilities 
 	if err != nil {
 		t.Fatalf("NewEmitter() error = %v", err)
 	}
-	return stdout, stderr, emitter
+	return emitter
+}
+
+func testHumanRendererFailureIsSticky(
+	t *testing.T,
+	target string,
+	fail func(*protocol.Emitter, string) error,
+	afterFailure func(*protocol.Emitter) error,
+) {
+	t.Helper()
+	tests := []struct {
+		name                     string
+		message                  string
+		failWrite                bool
+		failFlush                bool
+		failedBlockMustBeWritten bool
+	}{
+		{name: "direct write", message: strings.Repeat("x", 8192), failWrite: true},
+		{name: "buffered flush", message: "short", failWrite: true},
+		{name: "destination flush", message: "short", failFlush: true, failedBlockMustBeWritten: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout, stderr := &controlledWriter{}, &controlledWriter{}
+			emitter := newHumanEmitterWithWriters(t, stdout, stderr)
+			destination := stdout
+			if target == "stderr" {
+				destination = stderr
+			}
+			sentinel := errors.New(target + " " + test.name + " sentinel")
+			if test.failWrite {
+				destination.writeErr = sentinel
+				destination.failWriteAt = destination.writes + 1
+			}
+			if test.failFlush {
+				destination.flushErr = sentinel
+				destination.failFlushAt = destination.flushes + 1
+			}
+
+			firstErr := fail(emitter, test.message)
+			if firstErr == nil || !errors.Is(firstErr, sentinel) || firstErr.Error() != "write protocol event: "+sentinel.Error() {
+				t.Fatalf("first failed emit error = %v, want exactly one wrapped sentinel", firstErr)
+			}
+			if strings.Contains(destination.String(), test.message) != test.failedBlockMustBeWritten {
+				t.Errorf(
+					"failed block presence = %t, want %t; destination = %q",
+					strings.Contains(destination.String(), test.message), test.failedBlockMustBeWritten, destination.String(),
+				)
+			}
+
+			stdoutWrites, stdoutFlushes := stdout.writes, stdout.flushes
+			stderrWrites, stderrFlushes := stderr.writes, stderr.flushes
+			secondErr := afterFailure(emitter)
+			if secondErr != firstErr {
+				t.Errorf("subsequent error = %v, want same sticky error value %v", secondErr, firstErr)
+			}
+			if stdout.writes != stdoutWrites || stdout.flushes != stdoutFlushes ||
+				stderr.writes != stderrWrites || stderr.flushes != stderrFlushes {
+				t.Errorf(
+					"I/O counts changed after sticky error: stdout (%d, %d) -> (%d, %d), stderr (%d, %d) -> (%d, %d)",
+					stdoutWrites, stdoutFlushes, stdout.writes, stdout.flushes,
+					stderrWrites, stderrFlushes, stderr.writes, stderr.flushes,
+				)
+			}
+		})
+	}
 }
 
 func float64Pointer(value float64) *float64 {

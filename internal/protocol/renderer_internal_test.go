@@ -124,6 +124,67 @@ func TestNDJSONWriteFailuresDoNotAdvanceSequence(t *testing.T) {
 	}
 }
 
+func TestHumanRendererFailureDoesNotAdvanceSequence(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		message   string
+		failWrite bool
+		failFlush bool
+	}{
+		{name: "stdout direct write", target: "stdout", message: strings.Repeat("x", 8192), failWrite: true},
+		{name: "stdout buffered flush", target: "stdout", message: "short", failWrite: true},
+		{name: "stdout destination flush", target: "stdout", message: "short", failFlush: true},
+		{name: "stderr direct write", target: "stderr", message: strings.Repeat("x", 8192), failWrite: true},
+		{name: "stderr buffered flush", target: "stderr", message: "short", failWrite: true},
+		{name: "stderr destination flush", target: "stderr", message: "short", failFlush: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sentinel := errors.New(test.name + " sentinel")
+			stdout := &internalFailingDestination{err: sentinel}
+			stderr := &internalFailingDestination{err: sentinel}
+			renderer, err := NewHumanRenderer(stdout, stderr)
+			if err != nil {
+				t.Fatalf("NewHumanRenderer() error = %v", err)
+			}
+			output, err := NewProcessOutputWithRenderer(renderer)
+			if err != nil {
+				t.Fatalf("NewProcessOutputWithRenderer() error = %v", err)
+			}
+			emitter, err := output.NewEmitter("v1.0.0", "doctor", nil, WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+			if err != nil {
+				t.Fatalf("NewEmitter() error = %v", err)
+			}
+			if output.nextSequence != 2 {
+				t.Fatalf("nextSequence after hello = %d, want 2", output.nextSequence)
+			}
+
+			destination := stdout
+			if test.target == "stderr" {
+				destination = stderr
+			}
+			if test.failWrite {
+				destination.failWriteAt = destination.writes + 1
+			}
+			if test.failFlush {
+				destination.failFlushAt = destination.flushes + 1
+			}
+			if test.target == "stdout" {
+				err = emitter.EmitProgress(ProgressEvent{Message: test.message})
+			} else {
+				err = emitter.EmitWarning(WarningEvent{Message: test.message})
+			}
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("failed emit error = %v, want sentinel", err)
+			}
+			if output.nextSequence != 2 {
+				t.Errorf("nextSequence after human renderer failure = %d, want 2", output.nextSequence)
+			}
+		})
+	}
+}
+
 type internalFailingDestination struct {
 	err         error
 	writes      int
