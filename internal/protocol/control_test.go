@@ -1072,7 +1072,7 @@ func TestControlReader_RunIsOneShot(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for first Run")
 	}
-	const wantErr = "control reader Run is one-shot"
+	const wantErr = "protocol control reader already started"
 	if err := reader.Run(context.Background()); err == nil || err.Error() != wantErr {
 		t.Fatalf("concurrent Run() error = %v, want %q", err, wantErr)
 	}

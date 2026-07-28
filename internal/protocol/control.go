@@ -46,14 +46,16 @@ const (
 type ControlAction func() error
 
 // ControlHandler prepares control commands without applying their side effects.
+// PrepareControl, its returned action, and CurrentControlStage run while the
+// reader gate is held and must not call StopAccepting on the invoking reader.
 type ControlHandler interface {
-	// PrepareControl and its returned action must not call StopAccepting on the
-	// ControlReader that invoked them.
 	PrepareControl(ControlCommand) (ControlDisposition, ControlAction, error)
 	CurrentControlStage() Stage
 }
 
 // ControlWarningEmitter emits warnings caused by invalid control input.
+// EmitWarning runs while the reader gate is held and must not call
+// StopAccepting on the invoking reader.
 type ControlWarningEmitter interface {
 	EmitWarning(WarningEvent) error
 }
@@ -123,7 +125,7 @@ func (r *ControlReader) Run(ctx context.Context) error {
 	r.mu.Lock()
 	if r.started {
 		r.mu.Unlock()
-		return fmt.Errorf("control reader Run is one-shot")
+		return fmt.Errorf("protocol control reader already started")
 	}
 	r.started = true
 	r.mu.Unlock()
