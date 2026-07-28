@@ -213,37 +213,24 @@ func (r *ControlReader) drainOverlongLine(first []byte) (
 }
 
 func (r *ControlReader) dispatch(command ControlCommand) error {
-	if _, allowed := r.allowed[command.Command]; !allowed {
-		return r.emitInvalidControl(WithControlCommandID(map[string]any{
-			"reason":  "command_not_applicable",
-			"command": command.Command,
-		}, command.CommandID))
-	}
-
 	disposition, action, err := r.handler.PrepareControl(command)
 	if err != nil {
 		return fmt.Errorf("prepare stdin control %q: %w", command.Command, err)
 	}
-	switch disposition {
-	case ControlAccepted:
-		if action == nil {
-			return fmt.Errorf("prepare stdin control %q: accepted command returned nil action", command.Command)
-		}
-		if err := action(); err != nil {
-			return fmt.Errorf("apply stdin control %q: %w", command.Command, err)
-		}
-		return nil
-	case ControlNotApplicable:
-		if action != nil {
-			return fmt.Errorf("prepare stdin control %q: not-applicable command returned an action", command.Command)
-		}
-		return r.emitInvalidControl(WithControlCommandID(map[string]any{
-			"reason":  "command_not_applicable",
-			"command": command.Command,
-		}, command.CommandID))
-	default:
-		return fmt.Errorf("prepare stdin control %q: unknown disposition %d", command.Command, disposition)
+	if disposition != ControlAccepted {
+		return fmt.Errorf(
+			"prepare stdin control %q: disposition %d is not supported",
+			command.Command,
+			disposition,
+		)
 	}
+	if action == nil {
+		return fmt.Errorf("prepare stdin control %q: accepted command returned nil action", command.Command)
+	}
+	if err := action(); err != nil {
+		return fmt.Errorf("apply stdin control %q: %w", command.Command, err)
+	}
+	return nil
 }
 
 func (r *ControlReader) emitInvalidControl(details map[string]any) error {

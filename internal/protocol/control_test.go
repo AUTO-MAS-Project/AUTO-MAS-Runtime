@@ -345,6 +345,66 @@ func TestControlReader_FramingAndAcceptedCancel(t *testing.T) {
 	}
 }
 
+func TestControlReader_Task2RejectsNonAcceptedDisposition(t *testing.T) {
+	const commandLine = `{"protocol":1,"command":"cancel","commandId":"01J00000000000000000000000"}`
+	tests := []struct {
+		name        string
+		disposition ControlDisposition
+		wantErr     string
+	}{
+		{
+			name:        "not applicable remains pending for Task 3",
+			disposition: ControlNotApplicable,
+			wantErr:     `prepare stdin control "cancel": disposition 2 is not supported`,
+		},
+		{
+			name:        "unknown remains pending for Task 3",
+			disposition: ControlDispositionUnknown,
+			wantErr:     `prepare stdin control "cancel": disposition 0 is not supported`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var handler ControlHandler = &controlContractHandler{disposition: tt.disposition}
+			if tt.disposition == ControlDispositionUnknown {
+				handler = &controlContractHandlerReturningUnknown{}
+			}
+			warnings := &controlContractWarningEmitter{}
+			reader, err := NewControlReader(
+				strings.NewReader(commandLine+"\n"),
+				warnings,
+				handler,
+				ControlCancel,
+			)
+			if err != nil {
+				t.Fatalf("NewControlReader() error = %v", err)
+			}
+
+			err = reader.Run(context.Background())
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("Run() error = %v, want %q", err, tt.wantErr)
+			}
+			if len(warnings.warnings) != 0 {
+				t.Fatalf("warnings = %#v, want none", warnings.warnings)
+			}
+		})
+	}
+}
+
+type controlContractHandlerReturningUnknown struct {
+	prepared []ControlCommand
+}
+
+func (h *controlContractHandlerReturningUnknown) PrepareControl(command ControlCommand) (ControlDisposition, ControlAction, error) {
+	h.prepared = append(h.prepared, command)
+	return ControlDispositionUnknown, nil, nil
+}
+
+func (*controlContractHandlerReturningUnknown) CurrentControlStage() Stage {
+	return StageBackendRun
+}
+
 func TestControlReader_InvalidLinesWarnOnceAndRecover(t *testing.T) {
 	const validCancel = `{"protocol":1,"command":"cancel","commandId":"01J00000000000000000000000"}`
 	tests := []struct {
@@ -462,6 +522,33 @@ func TestControlReader_InvalidLinesWarnOnceAndRecover(t *testing.T) {
 			wantDetails: map[string]any{"reason": "unsupported_command", "command": ControlKind("pause"), "controlCommandId": "01J00000000000000000000001"},
 		},
 	}
+	const canonicalID = "01J00000000000000000000000"
+	invalidCommandIDs := []struct {
+		name string
+		id   string
+	}{
+		{name: "command ID has 25 bytes", id: canonicalID[:25]},
+		{name: "command ID has 27 bytes", id: canonicalID + "0"},
+		{name: "command ID first character exceeds seven", id: "8" + canonicalID[1:]},
+		{name: "command ID contains I", id: canonicalID[:5] + "I" + canonicalID[6:]},
+		{name: "command ID contains L", id: canonicalID[:5] + "L" + canonicalID[6:]},
+		{name: "command ID contains O", id: canonicalID[:5] + "O" + canonicalID[6:]},
+		{name: "command ID contains U", id: canonicalID[:5] + "U" + canonicalID[6:]},
+		{name: "command ID contains lowercase", id: canonicalID[:5] + "a" + canonicalID[6:]},
+	}
+	for _, invalid := range invalidCommandIDs {
+		tests = append(tests, struct {
+			name        string
+			line        []byte
+			wantReason  string
+			wantDetails map[string]any
+		}{
+			name:        invalid.name,
+			line:        []byte(`{"protocol":1,"command":"cancel","commandId":"` + invalid.id + `"}`),
+			wantReason:  "invalid_command_id",
+			wantDetails: map[string]any{"reason": "invalid_command_id", "field": "commandId"},
+		})
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -486,6 +573,61 @@ func TestControlReader_InvalidLinesWarnOnceAndRecover(t *testing.T) {
 			if got := warnings.warnings[0].Details["reason"]; got != tt.wantReason {
 				t.Fatalf("warning reason = %#v, want %q", got, tt.wantReason)
 			}
+		})
+	}
+}
+
+func TestControlReader_InvalidFieldTypesWarnAndRecover(t *testing.T) {
+	const (
+		validCancel = `{"protocol":1,"command":"cancel","commandId":"01J00000000000000000000000"}`
+		validID     = `"01J00000000000000000000000"`
+	)
+	tests := []struct {
+		name  string
+		field string
+		line  string
+	}{
+		{name: "protocol fractional number", field: "protocol", line: `{"protocol":1.5,"command":"cancel","commandId":` + validID + `}`},
+		{name: "protocol boolean", field: "protocol", line: `{"protocol":true,"command":"cancel","commandId":` + validID + `}`},
+		{name: "protocol object", field: "protocol", line: `{"protocol":{},"command":"cancel","commandId":` + validID + `}`},
+		{name: "protocol array", field: "protocol", line: `{"protocol":[],"command":"cancel","commandId":` + validID + `}`},
+		{name: "command number", field: "command", line: `{"protocol":1,"command":1,"commandId":` + validID + `}`},
+		{name: "command boolean", field: "command", line: `{"protocol":1,"command":true,"commandId":` + validID + `}`},
+		{name: "command object", field: "command", line: `{"protocol":1,"command":{},"commandId":` + validID + `}`},
+		{name: "command array", field: "command", line: `{"protocol":1,"command":[],"commandId":` + validID + `}`},
+		{name: "command ID number", field: "commandId", line: `{"protocol":1,"command":"cancel","commandId":1}`},
+		{name: "command ID boolean", field: "commandId", line: `{"protocol":1,"command":"cancel","commandId":true}`},
+		{name: "command ID object", field: "commandId", line: `{"protocol":1,"command":"cancel","commandId":{}}`},
+		{name: "command ID array", field: "commandId", line: `{"protocol":1,"command":"cancel","commandId":[]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &controlContractHandler{}
+			warnings := &controlContractWarningEmitter{}
+			reader, err := NewControlReader(
+				strings.NewReader(tt.line+"\n"+validCancel+"\n"),
+				warnings,
+				handler,
+				ControlCancel,
+			)
+			if err != nil {
+				t.Fatalf("NewControlReader() error = %v", err)
+			}
+
+			if err := reader.Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if handler.actions != 1 {
+				t.Fatalf("action calls = %d, want 1 after recovery", handler.actions)
+			}
+			if len(warnings.warnings) != 1 {
+				t.Fatalf("warning count = %d, want 1", len(warnings.warnings))
+			}
+			assertInvalidControlWarning(t, warnings.warnings[0], map[string]any{
+				"reason": "invalid_field",
+				"field":  tt.field,
+			})
 		})
 	}
 }
