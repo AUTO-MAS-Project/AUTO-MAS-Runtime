@@ -188,6 +188,165 @@ func TestRendererFailureDoesNotAdvanceSequence(t *testing.T) {
 	}
 }
 
+func TestEmitter_WarningSnapshotFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		renderer func(t *testing.T) EventRenderer
+	}{
+		{
+			name: "NDJSON",
+			renderer: func(t *testing.T) EventRenderer {
+				t.Helper()
+				renderer, err := NewNDJSONRenderer(&bytes.Buffer{})
+				if err != nil {
+					t.Fatalf("NewNDJSONRenderer() error = %v", err)
+				}
+				return renderer
+			},
+		},
+		{
+			name: "human",
+			renderer: func(t *testing.T) EventRenderer {
+				t.Helper()
+				renderer, err := NewHumanRenderer(&bytes.Buffer{}, &bytes.Buffer{})
+				if err != nil {
+					t.Fatalf("NewHumanRenderer() error = %v", err)
+				}
+				return renderer
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			counting := &internalCountingRenderer{delegate: test.renderer(t)}
+			output, err := NewProcessOutputWithRenderer(counting)
+			if err != nil {
+				t.Fatalf("NewProcessOutputWithRenderer() error = %v", err)
+			}
+			emitter, err := output.NewEmitter("v1.0.0", "doctor", nil, WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+			if err != nil {
+				t.Fatalf("NewEmitter() error = %v", err)
+			}
+			input := WarningEvent{
+				Common:  Common{Sequence: 99},
+				Code:    "WARN",
+				Stage:   StageDoctor,
+				Message: "invalid",
+				Details: map[string]any{"notJSON": func() {}},
+			}
+			if err := emitter.EmitWarning(input); err == nil || !strings.Contains(err.Error(), "encode warning event") {
+				t.Fatalf("EmitWarning() error = %v, want encode warning event error", err)
+			}
+			if input.Sequence != 99 {
+				t.Errorf("input sequence = %d, want unchanged 99", input.Sequence)
+			}
+			if got := counting.calls; !reflect.DeepEqual(got, []EventType{TypeHello}) {
+				t.Errorf("renderer calls = %v, want hello only", got)
+			}
+			if output.nextSequence != 2 || output.warningCount != 0 || len(output.warnings) != 0 || output.terminal {
+				t.Errorf(
+					"state after snapshot failure = sequence %d, warningCount %d, warnings %d, terminal %v",
+					output.nextSequence, output.warningCount, len(output.warnings), output.terminal,
+				)
+			}
+			if output.writeErr != nil {
+				t.Errorf("writeErr = %v, want nil for non-sticky snapshot failure", output.writeErr)
+			}
+			if err := emitter.EmitWarning(WarningEvent{Code: "VALID", Stage: StageDoctor, Message: "valid", Details: map[string]any{}}); err != nil {
+				t.Fatalf("valid EmitWarning() after snapshot failure error = %v", err)
+			}
+			if output.nextSequence != 3 || output.warningCount != 1 || len(output.warnings) != 1 {
+				t.Errorf(
+					"state after valid retry = sequence %d, warningCount %d, warnings %d",
+					output.nextSequence, output.warningCount, len(output.warnings),
+				)
+			}
+		})
+	}
+}
+
+func TestEmitter_WarningLedgerFailureBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		message   string
+		newOutput func(t *testing.T, sentinel error) (*ProcessOutput, func())
+	}{
+		{
+			name:    "renderer",
+			message: "warning",
+			newOutput: func(t *testing.T, sentinel error) (*ProcessOutput, func()) {
+				t.Helper()
+				output, err := NewProcessOutputWithRenderer(&internalFailingRenderer{errAt: TypeWarning, err: sentinel})
+				if err != nil {
+					t.Fatalf("NewProcessOutputWithRenderer() error = %v", err)
+				}
+				return output, func() {}
+			},
+		},
+		{
+			name:    "direct write",
+			message: strings.Repeat("x", 8192),
+			newOutput: func(t *testing.T, sentinel error) (*ProcessOutput, func()) {
+				t.Helper()
+				destination := &internalFailingDestination{err: sentinel}
+				output, err := NewProcessOutput(destination)
+				if err != nil {
+					t.Fatalf("NewProcessOutput() error = %v", err)
+				}
+				return output, func() { destination.failWriteAt = destination.writes + 1 }
+			},
+		},
+		{
+			name:    "buffered flush",
+			message: "warning",
+			newOutput: func(t *testing.T, sentinel error) (*ProcessOutput, func()) {
+				t.Helper()
+				destination := &internalFailingDestination{err: sentinel}
+				output, err := NewProcessOutput(destination)
+				if err != nil {
+					t.Fatalf("NewProcessOutput() error = %v", err)
+				}
+				return output, func() { destination.failWriteAt = destination.writes + 1 }
+			},
+		},
+		{
+			name:    "destination flush",
+			message: "warning",
+			newOutput: func(t *testing.T, sentinel error) (*ProcessOutput, func()) {
+				t.Helper()
+				destination := &internalFailingDestination{err: sentinel}
+				output, err := NewProcessOutput(destination)
+				if err != nil {
+					t.Fatalf("NewProcessOutput() error = %v", err)
+				}
+				return output, func() { destination.failFlushAt = destination.flushes + 1 }
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sentinel := errors.New(test.name + " sentinel")
+			output, arm := test.newOutput(t, sentinel)
+			emitter, err := output.NewEmitter("v1.0.0", "doctor", nil, WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+			if err != nil {
+				t.Fatalf("NewEmitter() error = %v", err)
+			}
+			arm()
+			if err := emitter.EmitWarning(WarningEvent{
+				Code: "WARN", Stage: StageDoctor, Message: test.message, Details: map[string]any{},
+			}); !errors.Is(err, sentinel) {
+				t.Fatalf("EmitWarning() error = %v, want sentinel", err)
+			}
+			if output.nextSequence != 2 || output.warningCount != 0 || len(output.warnings) != 0 || output.terminal {
+				t.Errorf(
+					"state after failed warning = sequence %d, warningCount %d, warnings %d, terminal %v",
+					output.nextSequence, output.warningCount, len(output.warnings), output.terminal,
+				)
+			}
+		})
+	}
+}
+
 func TestUnknownInternalEventIsNonStickyAndDoesNotAdvanceSequence(t *testing.T) {
 	output, err := NewProcessOutputWithRenderer(&internalFailingRenderer{})
 	if err != nil {

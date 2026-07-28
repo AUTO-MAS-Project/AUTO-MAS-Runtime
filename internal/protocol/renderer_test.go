@@ -154,7 +154,14 @@ func TestNewProcessOutputWithRendererEmitsTypedSequence(t *testing.T) {
 		{Type: protocol.TypeLog, Value: protocol.LogEvent{Common: common(protocol.TypeLog, 4), Source: "runtime", Stream: "stdout", Message: "line"}},
 		{Type: protocol.TypeWarning, Value: protocol.WarningEvent{Common: common(protocol.TypeWarning, 5), Code: "WARN", Stage: protocol.StageDoctor, Message: "warning", Remediation: []string{"open-log"}, Details: map[string]any{}}},
 		{Type: protocol.TypeError, Value: protocol.ErrorEvent{Common: common(protocol.TypeError, 6), Code: "ERROR", Stage: protocol.StageDoctor, Message: "error", Retryable: true, Remediation: []string{"retry"}, Details: map[string]any{}}},
-		{Type: protocol.TypeResult, Value: protocol.ResultEvent{Common: common(protocol.TypeResult, 7), Success: false, Code: "ERROR", Stage: protocol.StageDoctor, Status: "failed", Message: "result", Retryable: true, Remediation: []string{"retry"}, Details: map[string]any{}}},
+		{Type: protocol.TypeResult, Value: protocol.ResultEvent{Common: common(protocol.TypeResult, 7), Success: false, Code: "ERROR", Stage: protocol.StageDoctor, Status: "failed", Message: "result", Retryable: true, Remediation: []string{"retry"}, Details: map[string]any{
+			"warnings": []protocol.WarningSummary{{
+				Code: "WARN", Stage: protocol.StageDoctor, Message: "warning",
+				Remediation: []string{"open-log"}, Details: map[string]any{},
+			}},
+			"warningCount":      uint64(1),
+			"warningsTruncated": false,
+		}}},
 	}
 	if len(renderer.events) != len(wantTypes) {
 		t.Fatalf("recorded events = %d, want %d", len(renderer.events), len(wantTypes))
@@ -211,7 +218,7 @@ func TestRenderersReceiveEquivalentSemanticEvents(t *testing.T) {
 		"{\"protocol\":1,\"type\":\"log\",\"operationId\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":4,\"timestamp\":\"2026-07-28T17:00:00Z\",\"source\":\"backend\",\"stream\":\"stdout\",\"message\":\"first\\nsecond\"}\n" +
 		"{\"protocol\":1,\"type\":\"warning\",\"operationId\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":5,\"timestamp\":\"2026-07-28T17:00:00Z\",\"code\":\"BACKEND_FORCE_TERMINATED\",\"stage\":\"backend.shutdown\",\"message\":\"forced\",\"retryable\":false,\"remediation\":[\"open-log\"],\"details\":{\"signal\":\"kill\"}}\n" +
 		"{\"protocol\":1,\"type\":\"error\",\"operationId\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":6,\"timestamp\":\"2026-07-28T17:00:00Z\",\"code\":\"DEPENDENCY_SYNC_FAILED\",\"stage\":\"dependencies.sync\",\"message\":\"sync failed\",\"retryable\":true,\"remediation\":[\"retry-sync\",\"open-log\"],\"details\":{\"attempt\":2}}\n" +
-		"{\"protocol\":1,\"type\":\"result\",\"operationId\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":7,\"timestamp\":\"2026-07-28T17:00:00Z\",\"success\":false,\"code\":\"DEPENDENCY_SYNC_FAILED\",\"stage\":\"dependencies.sync\",\"status\":\"environment_broken\",\"message\":\"failed\",\"retryable\":true,\"remediation\":[\"retry-sync\",\"open-log\"],\"details\":{\"cause\":\"network\"}}\n"
+		"{\"protocol\":1,\"type\":\"result\",\"operationId\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"sequence\":7,\"timestamp\":\"2026-07-28T17:00:00Z\",\"success\":false,\"code\":\"DEPENDENCY_SYNC_FAILED\",\"stage\":\"dependencies.sync\",\"status\":\"environment_broken\",\"message\":\"failed\",\"retryable\":true,\"remediation\":[\"retry-sync\",\"open-log\"],\"details\":{\"cause\":\"network\",\"warningCount\":1,\"warnings\":[{\"code\":\"BACKEND_FORCE_TERMINATED\",\"stage\":\"backend.shutdown\",\"message\":\"forced\",\"retryable\":false,\"remediation\":[\"open-log\"],\"details\":{\"signal\":\"kill\"}}],\"warningsTruncated\":false}}\n"
 	if got := ndjsonOutput.String(); got != wantNDJSON {
 		t.Errorf("NDJSON golden = %q, want %q", got, wantNDJSON)
 	}

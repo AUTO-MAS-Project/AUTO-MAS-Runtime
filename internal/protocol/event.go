@@ -72,6 +72,21 @@ type WarningEvent struct {
 	Details     map[string]any `json:"details"`
 }
 
+// MaxResultWarningSummaries is the maximum number of warning snapshots kept
+// in a terminal result. warningCount still reports every emitted warning.
+const MaxResultWarningSummaries = 256
+
+// WarningSummary is the immutable business-field snapshot of an emitted
+// warning that is included in the terminal result.
+type WarningSummary struct {
+	Code        string         `json:"code"`
+	Stage       Stage          `json:"stage"`
+	Message     string         `json:"message"`
+	Retryable   bool           `json:"retryable"`
+	Remediation []string       `json:"remediation"`
+	Details     map[string]any `json:"details"`
+}
+
 // ErrorEvent reports the primary failure of an operation.
 type ErrorEvent struct {
 	Common

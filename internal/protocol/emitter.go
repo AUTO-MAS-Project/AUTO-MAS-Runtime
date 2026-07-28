@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +26,8 @@ type ProcessOutput struct {
 	writeErr       error
 	emitterCreated bool
 	terminal       bool
+	warnings       []WarningSummary
+	warningCount   uint64
 }
 
 // Emitter writes typed protocol events through a ProcessOutput.
@@ -157,7 +161,24 @@ func (e *Emitter) EmitLog(event LogEvent) error {
 
 // EmitWarning emits a non-terminal warning.
 func (e *Emitter) EmitWarning(event WarningEvent) error {
-	return e.emit(TypeWarning, &event)
+	e.output.mu.Lock()
+	defer e.output.mu.Unlock()
+
+	if err := e.output.rejectLocked(TypeWarning); err != nil {
+		return err
+	}
+	canonical, ledger, err := snapshotWarning(event)
+	if err != nil {
+		return err
+	}
+	if err := e.emitPreparedLocked(TypeWarning, &canonical); err != nil {
+		return err
+	}
+	e.output.warningCount++
+	if len(e.output.warnings) < MaxResultWarningSummaries {
+		e.output.warnings = append(e.output.warnings, ledger)
+	}
+	return nil
 }
 
 // EmitError emits an operation error.
@@ -167,23 +188,40 @@ func (e *Emitter) EmitError(event ErrorEvent) error {
 
 // EmitResult emits an operation result.
 func (e *Emitter) EmitResult(event ResultEvent) error {
-	return e.emit(TypeResult, &event)
+	e.output.mu.Lock()
+	defer e.output.mu.Unlock()
+
+	if err := e.output.rejectLocked(TypeResult); err != nil {
+		return err
+	}
+	event.Details = e.output.resultDetails(event.Details)
+	return e.emitPreparedLocked(TypeResult, &event)
 }
 
 func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
 	e.output.mu.Lock()
 	defer e.output.mu.Unlock()
 
-	if e.output.terminal {
+	if err := e.output.rejectLocked(eventType); err != nil {
+		return err
+	}
+	return e.emitPreparedLocked(eventType, event)
+}
+
+func (o *ProcessOutput) rejectLocked(eventType EventType) error {
+	if o.terminal {
 		if eventType == TypeResult {
 			return ErrResultAlreadyEmitted
 		}
 		return ErrEventAfterResult
 	}
-	if e.output.writeErr != nil {
-		return e.output.writeErr
+	if o.writeErr != nil {
+		return o.writeErr
 	}
+	return nil
+}
 
+func (e *Emitter) emitPreparedLocked(eventType EventType, event eventWithCommon) error {
 	event.setCommon(Common{
 		Protocol:    Version,
 		Type:        eventType,
@@ -204,6 +242,107 @@ func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
 		e.output.terminal = true
 	}
 	return nil
+}
+
+func snapshotWarning(event WarningEvent) (WarningEvent, WarningSummary, error) {
+	businessFields := WarningSummary{
+		Code:        event.Code,
+		Stage:       event.Stage,
+		Message:     event.Message,
+		Retryable:   event.Retryable,
+		Remediation: event.Remediation,
+		Details:     event.Details,
+	}
+	encoded, err := json.Marshal(businessFields)
+	if err != nil {
+		return WarningEvent{}, WarningSummary{}, fmt.Errorf("encode warning event: %w", err)
+	}
+	canonicalSummary, err := decodeWarningSummary(encoded)
+	if err != nil {
+		return WarningEvent{}, WarningSummary{}, fmt.Errorf("decode canonical warning snapshot: %w", err)
+	}
+	ledgerSummary, err := decodeWarningSummary(encoded)
+	if err != nil {
+		return WarningEvent{}, WarningSummary{}, fmt.Errorf("decode warning ledger snapshot: %w", err)
+	}
+	canonical := WarningEvent{
+		Code:        canonicalSummary.Code,
+		Stage:       canonicalSummary.Stage,
+		Message:     canonicalSummary.Message,
+		Retryable:   canonicalSummary.Retryable,
+		Remediation: canonicalSummary.Remediation,
+		Details:     canonicalSummary.Details,
+	}
+	return canonical, ledgerSummary, nil
+}
+
+func decodeWarningSummary(encoded []byte) (WarningSummary, error) {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var summary WarningSummary
+	if err := decoder.Decode(&summary); err != nil {
+		return WarningSummary{}, err
+	}
+	return summary, nil
+}
+
+func (o *ProcessOutput) resultDetails(details map[string]any) map[string]any {
+	if details == nil && o.warningCount == 0 {
+		return nil
+	}
+	copied := make(map[string]any, len(details)+3)
+	for key, value := range details {
+		copied[key] = value
+	}
+	delete(copied, "warnings")
+	delete(copied, "warningCount")
+	delete(copied, "warningsTruncated")
+	if o.warningCount == 0 {
+		return copied
+	}
+
+	summaries := make([]WarningSummary, len(o.warnings))
+	for index, warning := range o.warnings {
+		summaries[index] = cloneWarningSummary(warning)
+	}
+	copied["warnings"] = summaries
+	copied["warningCount"] = o.warningCount
+	copied["warningsTruncated"] = o.warningCount > MaxResultWarningSummaries
+	return copied
+}
+
+func cloneWarningSummary(summary WarningSummary) WarningSummary {
+	cloned := summary
+	if summary.Remediation != nil {
+		cloned.Remediation = append([]string{}, summary.Remediation...)
+	}
+	if summary.Details != nil {
+		cloned.Details = cloneJSONObject(summary.Details)
+	}
+	return cloned
+}
+
+func cloneJSONObject(object map[string]any) map[string]any {
+	cloned := make(map[string]any, len(object))
+	for key, value := range object {
+		cloned[key] = cloneJSONValue(value)
+	}
+	return cloned
+}
+
+func cloneJSONValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneJSONObject(value)
+	case []any:
+		cloned := make([]any, len(value))
+		for index, item := range value {
+			cloned[index] = cloneJSONValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 func (o *ProcessOutput) rememberWriteError(err error) error {
