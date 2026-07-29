@@ -32,7 +32,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | 里程碑 | 状态 |
 | --- | --- |
 | M0 工程基础与最小 CI | T0.1/T0.2 完成；**T0.3/T0.4 受阻**（等待用户明确授权推送、远端 CI 全绿证据待补） |
-| M1 协议层 `internal/protocol` | **已完成** ✅ `7e09824` |
+| M1 协议层 `internal/protocol` | T1.0~T1.6 **已完成** ✅ `7e09824`；追加的 T1.7~T1.9 收口与审查任务见 `doc/任务拆分.md` |
 | M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | 未开始 ← **下一步** |
 | M3~M7、M9 | 未开始 |
 
@@ -43,9 +43,10 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 - `internal/cli/cli.go` 是骨架，`Run()` 固定返回 `"auto-mas-runtime dev"`；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
 
-Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`，
-`origin/main` 与本地 `main` 同为 `0c8c165`。特性分支 `codex/runtime-implementation`
-在 `.worktrees/codex-runtime-implementation` 下（与 main 同一提交）。
+Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`。
+本地 `main` 与 `origin/main` 的实际关系以 `git status -sb` / `git log --oneline -5` 为准，
+**不要依赖本文件里的哈希**（它会随每次提交过期）；T0.3 的推送授权状态见 `doc/任务拆分.md`。
+特性分支 `codex/runtime-implementation` 在 `.worktrees/codex-runtime-implementation` 下。
 
 ---
 
@@ -100,48 +101,63 @@ doc/                   权威文档
 ### 5.1 工具链
 
 - Windows 10/11 + **PowerShell 7（`pwsh`）**；
-- **Go 1.26**（`go.mod` 声明 `go 1.26`）；
+- **Go 1.26**（`go.mod` 声明 `go 1.26`；本机当前为 Go 1.26.5）；
+- MSYS2 UCRT64 **GCC/G++ 16.1.0**，`CGO_ENABLED=1`；
 - golangci-lint 2.12.2+（可选，本机当前未安装）。
 
-⚠️ **本机 Go 不在 PATH 上。** `go`、`gofmt`、`golangci-lint` 在 PowerShell 与 bash 里都无法直接调用，
-必须用绝对路径（现有 `doc/计划-T*.md` 也是这么写的）：
+本机的 `go`、`gofmt`、`gcc`、`g++` 均可由 PowerShell 7 直接从 `PATH` 解析，命令和文档不得
+固化用户目录下的工具绝对路径。运行 CGO 或 race detector 前，应把实际 GCC 目录提升到当前
+会话的 `PATH` 首位，避免 PostgreSQL 等软件目录中的同名 `libwinpthread` / `zlib` DLL 被优先加载：
 
 ```powershell
-$go    = "C:\Users\10163\sdk\go1.26.5\bin\go.exe"
-$gofmt = "C:\Users\10163\sdk\go1.26.5\bin\gofmt.exe"
+$gccBin = Split-Path -Parent (Get-Command gcc -ErrorAction Stop).Source
+$env:PATH = "$gccBin;$env:PATH"
 ```
 
 ### 5.2 标准验证门（提交前必须全绿）
 
 ```powershell
-$go    = "C:\Users\10163\sdk\go1.26.5\bin\go.exe"
-$gofmt = "C:\Users\10163\sdk\go1.26.5\bin\gofmt.exe"
 $env:GOCACHE = Join-Path $env:TEMP "auto-mas-runtime-verify"
 
-$unformatted = & $gofmt -l .
+$unformatted = & gofmt -l .
+if ($LASTEXITCODE -ne 0) { throw "gofmt failed" }
 if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
-& $go vet ./...                  ; if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
-& $go build -buildvcs=false ./...; if ($LASTEXITCODE -ne 0) { throw "build failed" }
-& $go test ./... -count=1        ; if ($LASTEXITCODE -ne 0) { throw "tests failed" }
-git diff --check                 ; if ($LASTEXITCODE -ne 0) { throw "diff check failed" }
+& go vet ./...                  ; if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
+& go build -buildvcs=false ./...; if ($LASTEXITCODE -ne 0) { throw "build failed" }
+& go test ./... -count=1        ; if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+& git diff --check              ; if ($LASTEXITCODE -ne 0) { throw "diff check failed" }
 ```
 
-并发相关改动追加重复跑：`& $go test ./internal/protocol -count=100`。
+并发相关改动追加重复跑：
+`& go test ./internal/protocol -count=100; if ($LASTEXITCODE -ne 0) { throw "repeated tests failed" }`，
+并执行 5.3 的 race detector。
 
 **每个命令后必须检查 `$LASTEXITCODE`**：PowerShell 不会因原生命令失败而中断脚本，
 漏检会导致“测试没跑却宣称通过”。
 
-### 5.3 已知限制
+### 5.3 race detector 与已知限制
 
-- **`-race` 在本机不可用**：`CGO_ENABLED=0` 且无 C 编译器，`go test -race` 直接报
-  `-race requires cgo`。**不得声称“race detector 通过”**；只能记录未执行原因。
+- 本机已具备 CGO 和 C 编译器；提升 GCC 目录优先级后执行完整 race 验证：
+
+  ```powershell
+  $gccBin = Split-Path -Parent (Get-Command gcc -ErrorAction Stop).Source
+  $env:PATH = "$gccBin;$env:PATH"
+  $env:GOCACHE = Join-Path $env:TEMP "auto-mas-runtime-race"
+  & go test -race ./... -count=1
+  if ($LASTEXITCODE -ne 0) { throw "race tests failed" }
+  ```
+
+- 当前 Codex 受管沙箱可能同时注入大小写不同的 `PATH` / `Path`，Go 重建 cgo 子进程环境时会使
+  旧顺序重新生效，表象仅为 `runtime/cgo: ... cgo.exe: exit status 2`。确认 GCC 路径与 DLL
+  优先级正确后，应获批在沙箱外重跑同一命令；只有退出码为 0 的完整输出才能作为 race 通过证据；
 - `golangci-lint` 本机未安装，只在需要时按 README 安装固定版本。
 
 ### 5.4 CI
 
 `.github/workflows/ci.yml`：push / PR 触发，`windows-latest` + `pwsh`，
 步骤 = checkout → setup-go（读 `go.mod`）→ gofmt 检查 → `go vet` → `go build` → `go test`。
-本地验证门与 CI 保持一致，不要出现“本地过、CI 挂”的差异。
+本地基础验证门与 CI 保持一致；race detector 是并发相关改动的本地追加门，当前 CI 未覆盖，
+不得把本机 race 结果表述成 CI 证据。
 
 ---
 
@@ -188,7 +204,7 @@ git diff --check                 ; if ($LASTEXITCODE -ne 0) { throw "diff check 
 ### 6.6 分支与 worktree
 
 特性开发在 `.worktrees/<name>` 下的 worktree 里进行（`.worktrees/` 已被 `.gitignore` 忽略），
-完成后回 `D:\Github\AUTO-MAS-Runtime` 执行 `git merge --ff-only <branch>`，
+完成后回 AUTO-MAS Runtime 主 worktree 根目录执行 `git merge --ff-only <branch>`，
 并确认 `git rev-list --left-right --count main...<branch>` 为 `0 0`。
 
 ### 6.7 🚩 推送与外发需要明确授权
@@ -342,6 +358,7 @@ func NewProcessOutput(output io.Writer) (*ProcessOutput, error) { ... }
 
   ```powershell
   rg -n 'os\.Stdout|fmt\.F?Print|log\.Print|json\.NewEncoder' --glob '*.go' .
+  if ($LASTEXITCODE -gt 1) { throw "stdout ownership scan failed" }
   ```
 
 ### 8.10 协议不变量
@@ -411,13 +428,16 @@ Go 测试惯例（[Go Code Review Comments](https://go.dev/wiki/CodeReviewCommen
 6. 自动流程删除用户数据、诊断日志、插件目录或受管根之外的路径；
 7. 先删旧 `repo` 再下载新版本（必须先克隆校验完成再整体替换）；
 8. 靠解析自然语言输出判断业务状态；
-9. 宣称“测试通过 / race 通过”却没有实际输出证据（`-race` 本机不可用，见 5.3）。
+9. 宣称“测试通过 / race 通过”却没有当次完整命令和退出码证据（工具可用不等于测试通过）。
 
 ---
 
 ## 11. 常见陷阱
 
-- **Go 不在 PATH**：用 5.1 的绝对路径；顺手 `$env:GOCACHE` 指到临时目录避免污染。
+- **工具从 PATH 解析**：不要固化本机绝对路径；顺手把 `$env:GOCACHE` 指到临时目录，
+  避免权限问题和工作区污染。
+- **GCC 能找到但 cgo 失败**：先按 5.1 把 UCRT64 `gcc.exe` 所在目录提升到 `PATH` 首位，
+  排除同名 DLL 冲突；Codex 沙箱内仍失败则按 5.3 获批在沙箱外复跑。
 - **`$LASTEXITCODE` 不检查等于没跑测试**：PowerShell 不会自动中断。
 - **`-run` 打错正则 → `[no tests to run]` 却退出码 0**：计划文档里的模板会同时校验
   “退出码为 0”“输出不含 `[no tests to run]`”“出现 `--- PASS:`”，照抄这个模式。

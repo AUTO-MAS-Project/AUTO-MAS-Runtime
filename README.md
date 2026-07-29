@@ -26,6 +26,7 @@ traffic, manage Python plugins, or update its own executable.
 - Windows 10 or Windows 11
 - [PowerShell 7](https://learn.microsoft.com/powershell/) (`pwsh`)
 - Go 1.26 or newer
+- MSYS2 UCRT64 GCC/G++ (for CGO and the race detector)
 - golangci-lint 2.12.2 or newer
 
 The commands below use PowerShell 7 syntax.
@@ -33,14 +34,17 @@ The commands below use PowerShell 7 syntax.
 Install the pinned lint tool when it is not already available:
 
 ```powershell
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+& go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+if ($LASTEXITCODE -ne 0) { throw "golangci-lint installation failed" }
 ```
 
 ## Build and run
 
 ```powershell
-go build ./...
-go run ./cmd/auto-mas-runtime
+& go build ./...
+if ($LASTEXITCODE -ne 0) { throw "build failed" }
+& go run ./cmd/auto-mas-runtime
+if ($LASTEXITCODE -ne 0) { throw "run failed" }
 ```
 
 The current scaffold prints a development version placeholder:
@@ -52,23 +56,39 @@ auto-mas-runtime dev
 ## Test and lint
 
 ```powershell
-go test ./...
-go vet ./...
-golangci-lint run
+& go test ./...
+if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+& go vet ./...
+if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
+& golangci-lint run
+if ($LASTEXITCODE -ne 0) { throw "golangci-lint failed" }
+```
+
+Before running the race detector, move the directory containing `gcc.exe` to
+the front of the current session's `PATH`. This prevents similarly named
+MinGW DLLs from other software directories from loading first:
+
+```powershell
+$gccBin = Split-Path -Parent (Get-Command gcc -ErrorAction Stop).Source
+$env:PATH = "$gccBin;$env:PATH"
+& go test -race ./... -count=1
+if ($LASTEXITCODE -ne 0) { throw "race tests failed" }
 ```
 
 Check formatting without changing files:
 
 ```powershell
 $goFiles = Get-ChildItem -LiteralPath . -Recurse -Filter "*.go" -File
-gofmt -d $goFiles.FullName
+& gofmt -d $goFiles.FullName
+if ($LASTEXITCODE -ne 0) { throw "gofmt check failed" }
 ```
 
 Format the project:
 
 ```powershell
 $goFiles = Get-ChildItem -LiteralPath . -Recurse -Filter "*.go" -File
-gofmt -w $goFiles.FullName
+& gofmt -w $goFiles.FullName
+if ($LASTEXITCODE -ne 0) { throw "gofmt failed" }
 ```
 
 ## Repository layout
