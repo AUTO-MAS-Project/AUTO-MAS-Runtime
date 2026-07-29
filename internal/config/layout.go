@@ -10,6 +10,7 @@ import (
 type Layout struct {
 	appRoot     string
 	identityKey string
+	paths       layoutPaths
 }
 
 // NewLayout 以显式绝对 base 解析 app root，不访问文件系统。
@@ -42,6 +43,7 @@ func NewLayout(appRoot, base string) (*Layout, error) {
 	return &Layout{
 		appRoot:     resolved,
 		identityKey: identityKey(resolved),
+		paths:       newLayoutPaths(resolved),
 	}, nil
 }
 
