@@ -18,11 +18,11 @@ func documentedLifecycleTransitions(t *testing.T) []protocol.LifecycleTransition
 	preparation := docSection(t, content, "### 环境准备与恢复迁移", "### 后端监督迁移")
 	backend := docSection(t, content, "### 后端监督迁移", "### 迁移验证 API")
 
-	transitions := make([]protocol.LifecycleTransition, 0, 25)
-	transitions = append(transitions, parseLifecycleTransitionSection(t, preparation, 13)...)
+	transitions := make([]protocol.LifecycleTransition, 0, 28)
+	transitions = append(transitions, parseLifecycleTransitionSection(t, preparation, 16)...)
 	transitions = append(transitions, parseLifecycleTransitionSection(t, backend, 12)...)
-	if len(transitions) != 25 {
-		t.Fatalf("documented lifecycle transition count = %d, want 25", len(transitions))
+	if len(transitions) != 28 {
+		t.Fatalf("documented lifecycle transition count = %d, want 28", len(transitions))
 	}
 
 	seen := make(map[protocol.LifecycleTransition]struct{}, len(transitions))
@@ -112,8 +112,8 @@ func TestLifecycleTransitionsMatchSpecification(t *testing.T) {
 	if got := protocol.AllLifecycleTransitions(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("AllLifecycleTransitions() = %#v, documented %#v", got, want)
 	}
-	if got := len(protocol.AllLifecycleTransitions()); got != 25 {
-		t.Fatalf("len(AllLifecycleTransitions()) = %d, want 25", got)
+	if got := len(protocol.AllLifecycleTransitions()); got != 28 {
+		t.Fatalf("len(AllLifecycleTransitions()) = %d, want 28", got)
 	}
 
 	for _, transition := range want {
@@ -335,6 +335,84 @@ func TestLifecycleMachineMainPaths(t *testing.T) {
 				if got := machine.Initial(); got != test.initial {
 					t.Fatalf("Initial() = %q, want %q", got, test.initial)
 				}
+			}
+		})
+	}
+}
+
+func TestLifecycleMachine_StandaloneWorkspaceSync(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		initial    protocol.StateStatus
+		actualSwap bool
+		want       protocol.StateStatus
+	}{
+		{
+			name:    "uninitialized_no_op",
+			initial: protocol.StateUninitialized,
+			want:    protocol.StateUninitialized,
+		},
+		{
+			name:       "uninitialized_actual_swap",
+			initial:    protocol.StateUninitialized,
+			actualSwap: true,
+			want:       protocol.StateEnvironmentBroken,
+		},
+		{
+			name:    "environment_broken_no_op",
+			initial: protocol.StateEnvironmentBroken,
+			want:    protocol.StateEnvironmentBroken,
+		},
+		{
+			name:       "environment_broken_actual_swap",
+			initial:    protocol.StateEnvironmentBroken,
+			actualSwap: true,
+			want:       protocol.StateEnvironmentBroken,
+		},
+		{
+			name:    "ready_to_start_no_op",
+			initial: protocol.StateReadyToStart,
+			want:    protocol.StateReadyToStart,
+		},
+		{
+			name:       "ready_to_start_actual_swap",
+			initial:    protocol.StateReadyToStart,
+			actualSwap: true,
+			want:       protocol.StateEnvironmentBroken,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			machine := newLifecycleMachine(t, test.initial)
+			if err := machine.Transition(protocol.StateSyncingRepository); err != nil {
+				t.Fatalf("Transition(%q -> %q) error = %v", test.initial, protocol.StateSyncingRepository, err)
+			}
+			if got := machine.Current(); got != protocol.StateSyncingRepository {
+				t.Fatalf("Current() = %q after entering standalone sync, want %q", got, protocol.StateSyncingRepository)
+			}
+
+			if test.actualSwap {
+				if err := machine.Transition(protocol.StateEnvironmentBroken); err != nil {
+					t.Fatalf("Transition(%q -> %q) error = %v", protocol.StateSyncingRepository, protocol.StateEnvironmentBroken, err)
+				}
+			} else if err := machine.RollbackPreparation(); err != nil {
+				t.Fatalf("RollbackPreparation() error = %v", err)
+			}
+
+			if got := machine.Current(); got != test.want {
+				t.Fatalf("Current() = %q after standalone sync, want %q", got, test.want)
+			}
+			if got := machine.Initial(); got != test.initial {
+				t.Fatalf("Initial() = %q after standalone sync, want %q", got, test.initial)
+			}
+			if machine.RestartUsed() {
+				t.Fatal("RestartUsed() = true after standalone sync, want false")
 			}
 		})
 	}
