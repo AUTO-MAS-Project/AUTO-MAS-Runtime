@@ -34,6 +34,7 @@ func TestErrorDefinitionsMatchArchitectureDocument(t *testing.T) {
 		protocol.CodeMutationInProgress,
 		protocol.CodeBackendAlreadyRunning,
 		protocol.CodeBackendStillRunning,
+		protocol.CodeMutexOperationFailed,
 		protocol.CodeStateWriteFailed,
 		protocol.CodeUpdateStateAmbiguous,
 		protocol.CodeNetworkUnavailable,

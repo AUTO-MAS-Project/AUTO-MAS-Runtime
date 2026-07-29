@@ -23,6 +23,7 @@ const (
 	CodeMutationInProgress        Code = "MUTATION_IN_PROGRESS"
 	CodeBackendAlreadyRunning     Code = "BACKEND_ALREADY_RUNNING"
 	CodeBackendStillRunning       Code = "BACKEND_STILL_RUNNING"
+	CodeMutexOperationFailed      Code = "MUTEX_OPERATION_FAILED"
 	CodeStateWriteFailed          Code = "STATE_WRITE_FAILED"
 	CodeUpdateStateAmbiguous      Code = "UPDATE_STATE_AMBIGUOUS"
 	CodeNetworkUnavailable        Code = "NETWORK_UNAVAILABLE"
@@ -117,6 +118,7 @@ var errorDefinitions = []ErrorDefinition{
 	{Code: CodeMutationInProgress, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry}},
 	{Code: CodeBackendAlreadyRunning, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{}},
 	{Code: CodeBackendStillRunning, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationStopBackend}},
+	{Code: CodeMutexOperationFailed, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationRunDoctor}},
 	{Code: CodeStateWriteFailed, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationRunDoctor}},
 	{Code: CodeUpdateStateAmbiguous, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{RemediationRunDoctor, RemediationContactSupport}},
 	{Code: CodeNetworkUnavailable, ExitCode: ExitCodeNetworkFailure, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationRunDoctor}},
