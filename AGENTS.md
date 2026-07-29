@@ -32,13 +32,13 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | 里程碑 | 状态 |
 | --- | --- |
 | M0 工程基础与最小 CI | T0.1/T0.2 完成；**T0.3/T0.4 受阻**（等待用户明确授权推送、远端 CI 全绿证据待补） |
-| M1 协议层 `internal/protocol` | T1.0~T1.6 **已完成** ✅ `7e09824`；追加的 T1.7~T1.9 收口与审查任务见 `doc/任务拆分.md` |
+| M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** ✅ `7235163` |
 | M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | 未开始 ← **下一步** |
 | M3~M7、M9 | 未开始 |
 
 代码现状：
 
-- `internal/protocol`（含 `contracttest` 子包）是**唯一有实现的包**，约 9.7k 行（含测试）；
+- `internal/protocol`（含 `contracttest` 子包）是**唯一有实现的包**，约 11.5k 行（含测试）；
 - 其余 `internal/*` 只有 `doc.go` 占位；
 - `internal/cli/cli.go` 是骨架，`Run()` 固定返回 `"auto-mas-runtime dev"`；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
