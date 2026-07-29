@@ -25,6 +25,11 @@ func TestNewLayout_ResolvesExplicitBase(t *testing.T) {
 			want:    filepath.Join(base, "AUTO-MAS"),
 		},
 		{
+			name:    "mixed separators with parent and trailing separator",
+			appRoot: `nested/..\AUTO-MAS/`,
+			want:    filepath.Join(base, "AUTO-MAS"),
+		},
+		{
 			name:    "absolute",
 			appRoot: filepath.Join(base, "AbsoluteRoot"),
 			want:    filepath.Join(base, "AbsoluteRoot"),
@@ -99,6 +104,17 @@ func TestNewLayout_DoesNotExpandShellSyntax(t *testing.T) {
 
 func TestNewLayout_DoesNotReadCurrentDirectory(t *testing.T) {
 	base := t.TempDir()
+	layout, err := config.NewLayout("AUTO-MAS", base)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	wantAppRoot := layout.AppRoot()
+	wantRepoDir := layout.RepoDir()
+	wantRepoUpdateDir, err := layout.RepoUpdateDir("Op-ID_1")
+	if err != nil {
+		t.Fatalf("RepoUpdateDir() error = %v", err)
+	}
+
 	originalWorkingDirectory, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd() error = %v", err)
@@ -112,12 +128,18 @@ func TestNewLayout_DoesNotReadCurrentDirectory(t *testing.T) {
 		t.Fatalf("Chdir() error = %v", err)
 	}
 
-	layout, err := config.NewLayout("AUTO-MAS", base)
-	if err != nil {
-		t.Fatalf("NewLayout() error = %v", err)
+	if got := layout.AppRoot(); got != wantAppRoot {
+		t.Fatalf("AppRoot() = %q, want %q", got, wantAppRoot)
 	}
-	if got, want := layout.AppRoot(), filepath.Join(base, "AUTO-MAS"); got != want {
-		t.Fatalf("AppRoot() = %q, want %q", got, want)
+	if got := layout.RepoDir(); got != wantRepoDir {
+		t.Fatalf("RepoDir() = %q, want %q", got, wantRepoDir)
+	}
+	gotRepoUpdateDir, err := layout.RepoUpdateDir("Op-ID_1")
+	if err != nil {
+		t.Fatalf("RepoUpdateDir() error = %v", err)
+	}
+	if gotRepoUpdateDir != wantRepoUpdateDir {
+		t.Fatalf("RepoUpdateDir() = %q, want %q", gotRepoUpdateDir, wantRepoUpdateDir)
 	}
 }
 
