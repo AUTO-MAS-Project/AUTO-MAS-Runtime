@@ -384,6 +384,8 @@ func (e *internalUnknownEvent) setCommon(common Common) {
 	e.Common = common
 }
 
+func (e *internalUnknownEvent) normalize() {}
+
 func TestNDJSONWriteFailuresDoNotAdvanceSequence(t *testing.T) {
 	tests := []struct {
 		name        string

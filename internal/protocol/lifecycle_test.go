@@ -10,45 +10,113 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
-var wantLifecycleTransitions = []protocol.LifecycleTransition{
-	{From: protocol.StateUninitialized, To: protocol.StatePreparingUV},
-	{From: protocol.StateEnvironmentBroken, To: protocol.StatePreparingUV},
-	{From: protocol.StateReadyToStart, To: protocol.StatePreparingUV},
-	{From: protocol.StateEnvironmentBroken, To: protocol.StateSyncingEnvironment},
-	{From: protocol.StateReadyToStart, To: protocol.StateSyncingEnvironment},
-	{From: protocol.StatePreparingUV, To: protocol.StateSyncingRepository},
-	{From: protocol.StatePreparingUV, To: protocol.StatePreparingPython},
-	{From: protocol.StateSyncingRepository, To: protocol.StatePreparingPython},
-	{From: protocol.StateSyncingRepository, To: protocol.StateEnvironmentBroken},
-	{From: protocol.StatePreparingPython, To: protocol.StateSyncingEnvironment},
-	{From: protocol.StatePreparingPython, To: protocol.StateEnvironmentBroken},
-	{From: protocol.StateSyncingEnvironment, To: protocol.StateReadyToStart},
-	{From: protocol.StateSyncingEnvironment, To: protocol.StateEnvironmentBroken},
-	{From: protocol.StateReadyToStart, To: protocol.StateStartingBackend},
-	{From: protocol.StateStartingBackend, To: protocol.StateRunning},
-	{From: protocol.StateStartingBackend, To: protocol.StateStoppingBackend},
-	{From: protocol.StateStartingBackend, To: protocol.StateBackendFailed},
-	{From: protocol.StateRunning, To: protocol.StateStoppingBackend},
-	{From: protocol.StateRunning, To: protocol.StateRestarting},
-	{From: protocol.StateRunning, To: protocol.StateBackendFailed},
-	{From: protocol.StateRestarting, To: protocol.StateRunning},
-	{From: protocol.StateRestarting, To: protocol.StateStoppingBackend},
-	{From: protocol.StateRestarting, To: protocol.StateBackendFailed},
-	{From: protocol.StateStoppingBackend, To: protocol.StateStopped},
-	{From: protocol.StateStoppingBackend, To: protocol.StateBackendFailed},
+// documentedLifecycleTransitions 从 T1.3 设计文档的两张迁移表读取权威顺序。
+func documentedLifecycleTransitions(t *testing.T) []protocol.LifecycleTransition {
+	t.Helper()
+
+	content := readDoc(t, "设计-T1.3-生命周期状态机.md")
+	preparation := docSection(t, content, "### 环境准备与恢复迁移", "### 后端监督迁移")
+	backend := docSection(t, content, "### 后端监督迁移", "### 迁移验证 API")
+
+	transitions := make([]protocol.LifecycleTransition, 0, 25)
+	transitions = append(transitions, parseLifecycleTransitionSection(t, preparation, 13)...)
+	transitions = append(transitions, parseLifecycleTransitionSection(t, backend, 12)...)
+	if len(transitions) != 25 {
+		t.Fatalf("documented lifecycle transition count = %d, want 25", len(transitions))
+	}
+
+	seen := make(map[protocol.LifecycleTransition]struct{}, len(transitions))
+	for _, transition := range transitions {
+		if _, exists := seen[transition]; exists {
+			t.Fatalf("documented lifecycle transitions contain duplicate %q -> %q", transition.From, transition.To)
+		}
+		seen[transition] = struct{}{}
+	}
+	return transitions
+}
+
+func parseLifecycleTransitionSection(
+	t *testing.T,
+	section string,
+	wantCount int,
+) []protocol.LifecycleTransition {
+	t.Helper()
+
+	const (
+		tableHeader    = "| From | To | 使用场景 |"
+		tableSeparator = "| --- | --- | --- |"
+	)
+
+	lines := strings.Split(strings.ReplaceAll(section, "\r\n", "\n"), "\n")
+	headerIndex := -1
+	for i, rawLine := range lines {
+		if strings.TrimSpace(rawLine) == tableHeader {
+			headerIndex = i
+			break
+		}
+	}
+	if headerIndex < 0 {
+		t.Fatalf("lifecycle transition table missing header %q", tableHeader)
+	}
+	if headerIndex+1 >= len(lines) || strings.TrimSpace(lines[headerIndex+1]) != tableSeparator {
+		t.Fatalf("lifecycle transition table missing separator %q after header", tableSeparator)
+	}
+
+	transitions := make([]protocol.LifecycleTransition, 0, wantCount)
+	for lineNumber := headerIndex + 2; lineNumber < len(lines); lineNumber++ {
+		rawLine := lines[lineNumber]
+		line := strings.TrimSpace(rawLine)
+		if line == "" || !strings.HasPrefix(line, "|") {
+			break
+		}
+
+		cells := strings.Split(line, "|")
+		if len(cells) != 5 {
+			t.Fatalf("malformed lifecycle transition row at section line %d: %q", lineNumber+1, rawLine)
+		}
+		from, ok := parseLifecycleStateCell(cells[1])
+		if !ok {
+			t.Fatalf("malformed lifecycle transition source at section line %d: %q", lineNumber+1, rawLine)
+		}
+		to, ok := parseLifecycleStateCell(cells[2])
+		if !ok {
+			t.Fatalf("malformed lifecycle transition target at section line %d: %q", lineNumber+1, rawLine)
+		}
+		if !protocol.IsKnownStateStatus(from) || !protocol.IsKnownStateStatus(to) {
+			t.Fatalf("documented lifecycle transition uses unknown state at section line %d: %q", lineNumber+1, rawLine)
+		}
+		transitions = append(transitions, protocol.LifecycleTransition{From: from, To: to})
+	}
+	if len(transitions) != wantCount {
+		t.Fatalf("documented lifecycle transition rows = %d, want %d", len(transitions), wantCount)
+	}
+	return transitions
+}
+
+func parseLifecycleStateCell(cell string) (protocol.StateStatus, bool) {
+	value := strings.TrimSpace(cell)
+	if len(value) < 2 || !strings.HasPrefix(value, "`") || !strings.HasSuffix(value, "`") {
+		return "", false
+	}
+	value = strings.TrimSuffix(strings.TrimPrefix(value, "`"), "`")
+	if value == "" || strings.Contains(value, "`") {
+		return "", false
+	}
+	return protocol.StateStatus(value), true
 }
 
 func TestLifecycleTransitionsMatchSpecification(t *testing.T) {
 	t.Parallel()
 
-	if got := protocol.AllLifecycleTransitions(); !reflect.DeepEqual(got, wantLifecycleTransitions) {
-		t.Fatalf("AllLifecycleTransitions() = %#v, want %#v", got, wantLifecycleTransitions)
+	want := documentedLifecycleTransitions(t)
+	if got := protocol.AllLifecycleTransitions(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("AllLifecycleTransitions() = %#v, documented %#v", got, want)
 	}
 	if got := len(protocol.AllLifecycleTransitions()); got != 25 {
 		t.Fatalf("len(AllLifecycleTransitions()) = %d, want 25", got)
 	}
 
-	for _, transition := range wantLifecycleTransitions {
+	for _, transition := range want {
 		if !protocol.IsKnownLifecycleTransition(transition.From, transition.To) {
 			t.Errorf("IsKnownLifecycleTransition(%q, %q) = false, want true", transition.From, transition.To)
 		}
@@ -68,14 +136,18 @@ func TestLifecycleTransitionsMatchSpecification(t *testing.T) {
 func TestAllLifecycleTransitionsReturnsDefensiveCopy(t *testing.T) {
 	t.Parallel()
 
+	want := documentedLifecycleTransitions(t)
 	got := protocol.AllLifecycleTransitions()
+	if len(got) == 0 {
+		t.Fatal("AllLifecycleTransitions() returned no transitions")
+	}
 	got[0] = protocol.LifecycleTransition{
 		From: protocol.StateStopped,
 		To:   protocol.StateUninitialized,
 	}
 
-	if fresh := protocol.AllLifecycleTransitions(); !reflect.DeepEqual(fresh, wantLifecycleTransitions) {
-		t.Fatalf("mutating returned transitions changed source: got %#v, want %#v", fresh, wantLifecycleTransitions)
+	if fresh := protocol.AllLifecycleTransitions(); !reflect.DeepEqual(fresh, want) {
+		t.Fatalf("mutating returned transitions changed source: got %#v, documented %#v", fresh, want)
 	}
 }
 
@@ -136,12 +208,13 @@ func TestNewLifecycleMachineAcceptsOnlyStableInitialStates(t *testing.T) {
 func TestLifecycleMachineExecutesEveryRegularTransition(t *testing.T) {
 	t.Parallel()
 
-	for _, transition := range wantLifecycleTransitions {
+	transitions := documentedLifecycleTransitions(t)
+	for _, transition := range transitions {
 		transition := transition
 		t.Run(fmt.Sprintf("%s_to_%s", transition.From, transition.To), func(t *testing.T) {
 			t.Parallel()
 
-			initial, prefix, ok := pathToLifecycleState(transition.From)
+			initial, prefix, ok := pathToLifecycleState(transition.From, transitions)
 			if !ok {
 				t.Fatalf("test specification has no path to %q", transition.From)
 			}
@@ -567,6 +640,8 @@ func TestLifecycleMachineTerminalStates(t *testing.T) {
 	}
 }
 
+// 这些并发读写只为 race detector 覆盖同一 LifecycleMachine 的锁域，
+// 不把 goroutine 的实际调度顺序当作确定性交错证明。
 func TestLifecycleMachineConcurrentReaders(t *testing.T) {
 	machine := newLifecycleMachine(t, protocol.StateReadyToStart)
 	start := make(chan struct{})
@@ -619,6 +694,7 @@ func TestLifecycleMachineConcurrentReaders(t *testing.T) {
 	}
 }
 
+// 并发 restart 尝试覆盖 restartUsed 与 current 的联合锁域；精确调度仍由锁域审查保证。
 func TestLifecycleMachineConcurrentRestartGuard(t *testing.T) {
 	machine := newLifecycleMachineAt(t, protocol.StateRunning)
 	start := make(chan struct{})
@@ -668,7 +744,7 @@ func newLifecycleMachine(t *testing.T, initial protocol.StateStatus) *protocol.L
 func newLifecycleMachineAt(t *testing.T, target protocol.StateStatus) *protocol.LifecycleMachine {
 	t.Helper()
 
-	initial, path, ok := pathToLifecycleState(target)
+	initial, path, ok := pathToLifecycleState(target, protocol.AllLifecycleTransitions())
 	if !ok {
 		t.Fatalf("test specification has no path to %q", target)
 	}
@@ -681,7 +757,10 @@ func newLifecycleMachineAt(t *testing.T, target protocol.StateStatus) *protocol.
 	return machine
 }
 
-func pathToLifecycleState(target protocol.StateStatus) (protocol.StateStatus, []protocol.StateStatus, bool) {
+func pathToLifecycleState(
+	target protocol.StateStatus,
+	transitions []protocol.LifecycleTransition,
+) (protocol.StateStatus, []protocol.StateStatus, bool) {
 	stable := []protocol.StateStatus{
 		protocol.StateUninitialized,
 		protocol.StateEnvironmentBroken,
@@ -705,7 +784,7 @@ func pathToLifecycleState(target protocol.StateStatus) (protocol.StateStatus, []
 		if current.current == target {
 			return current.initial, current.path, true
 		}
-		for _, transition := range wantLifecycleTransitions {
+		for _, transition := range transitions {
 			if transition.From != current.current || visited[transition.To] {
 				continue
 			}

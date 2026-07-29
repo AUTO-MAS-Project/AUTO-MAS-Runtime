@@ -15,14 +15,13 @@ type humanDestination struct {
 	destination io.Writer
 }
 
-// HumanRenderer projects protocol events as deterministic human-readable text.
+// HumanRenderer 把协议事件投影为确定性的人类可读文本。
 type HumanRenderer struct {
 	stdout humanDestination
 	stderr humanDestination
 }
 
-// NewHumanRenderer creates a human renderer that routes events to stdout and
-// stderr according to the protocol's human-output contract.
+// NewHumanRenderer 创建 human renderer，并按 human 输出契约把事件路由到 stdout 或 stderr。
 func NewHumanRenderer(stdout, stderr io.Writer) (*HumanRenderer, error) {
 	if interfaceIsNil(stdout) {
 		return nil, errors.New("human stdout must not be nil")
@@ -36,7 +35,7 @@ func NewHumanRenderer(stdout, stderr io.Writer) (*HumanRenderer, error) {
 	}, nil
 }
 
-// RenderHello renders a hello event to stdout.
+// RenderHello 把 hello 事件渲染到 stdout。
 func (r *HumanRenderer) RenderHello(event HelloEvent) error {
 	var builder strings.Builder
 	builder.WriteString("HELLO runtime=")
@@ -49,7 +48,7 @@ func (r *HumanRenderer) RenderHello(event HelloEvent) error {
 	return r.stdout.write(builder.String())
 }
 
-// RenderProgress renders a progress event to stdout.
+// RenderProgress 把 progress 事件渲染到 stdout。
 func (r *HumanRenderer) RenderProgress(event ProgressEvent) error {
 	var builder strings.Builder
 	builder.WriteString("PROGRESS [")
@@ -74,13 +73,13 @@ func (r *HumanRenderer) RenderProgress(event ProgressEvent) error {
 	return r.stdout.write(builder.String())
 }
 
-// RenderState renders a state event to stdout.
+// RenderState 把 state 事件渲染到 stdout。
 func (r *HumanRenderer) RenderState(event StateEvent) error {
 	prefix := "STATE [" + humanScalar(string(event.Stage)) + "] " + humanScalar(string(event.Status))
 	return r.stdout.write(humanMessageBlock(prefix, event.Message))
 }
 
-// RenderLog renders a log event to stdout only for the stdout stream.
+// RenderLog 仅把 stdout stream 写到 stdout，其他 stream 写到 stderr。
 func (r *HumanRenderer) RenderLog(event LogEvent) error {
 	prefix := "LOG [" + humanScalar(event.Source) + ":" + humanScalar(event.Stream) + "]"
 	destination := &r.stderr
@@ -90,21 +89,21 @@ func (r *HumanRenderer) RenderLog(event LogEvent) error {
 	return destination.write(humanMessageBlock(prefix, event.Message))
 }
 
-// RenderWarning renders a warning event to stderr.
+// RenderWarning 把 warning 事件渲染到 stderr。
 func (r *HumanRenderer) RenderWarning(event WarningEvent) error {
 	prefix := "WARNING [" + humanScalar(string(event.Stage)) + "] " + humanScalar(event.Code) +
 		" retryable=" + strconv.FormatBool(event.Retryable) + " remediation=" + humanList(event.Remediation)
 	return r.stderr.write(humanMessageBlock(prefix, event.Message))
 }
 
-// RenderError renders an error event to stderr.
+// RenderError 把 error 事件渲染到 stderr。
 func (r *HumanRenderer) RenderError(event ErrorEvent) error {
 	prefix := "ERROR [" + humanScalar(string(event.Stage)) + "] " + humanScalar(event.Code) +
 		" retryable=" + strconv.FormatBool(event.Retryable) + " remediation=" + humanList(event.Remediation)
 	return r.stderr.write(humanMessageBlock(prefix, event.Message))
 }
 
-// RenderResult renders a successful result to stdout and a failed result to stderr.
+// RenderResult 把成功 result 渲染到 stdout，把失败 result 渲染到 stderr。
 func (r *HumanRenderer) RenderResult(event ResultEvent) error {
 	prefix := "RESULT success=" + strconv.FormatBool(event.Success) +
 		" code=" + humanScalar(event.Code) +

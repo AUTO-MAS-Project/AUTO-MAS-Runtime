@@ -1,8 +1,11 @@
 package protocol
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
-// Code is a stable machine-readable protocol result or error code.
+// Code 是稳定且机器可读的协议结果码或错误码。
 type Code string
 
 const (
@@ -58,7 +61,7 @@ const (
 	CodeBackendForceTerminated    Code = "BACKEND_FORCE_TERMINATED"
 )
 
-// ExitCode is a coarse process outcome classification.
+// ExitCode 是进程结果的粗粒度分类。
 type ExitCode = int
 
 const (
@@ -74,7 +77,7 @@ const (
 	ExitCodeOperationCancelled ExitCode = 130
 )
 
-// Remediation is a stable action identifier exposed to protocol consumers.
+// Remediation 是向协议消费方公开的稳定处置动作标识。
 type Remediation string
 
 const (
@@ -92,7 +95,7 @@ const (
 	RemediationContactSupport     Remediation = "contact-support"
 )
 
-// ErrorDefinition contains the stable behavior associated with an error code.
+// ErrorDefinition 包含错误码对应的稳定行为四元组。
 type ErrorDefinition struct {
 	Code        Code
 	ExitCode    int
@@ -101,55 +104,55 @@ type ErrorDefinition struct {
 }
 
 var errorDefinitions = []ErrorDefinition{
-	{CodeInvalidArgument, ExitCodeInvalidArgument, false, []Remediation{RemediationRunDoctor}},
-	{CodeInvalidControlCommand, ExitCodeSuccess, false, []Remediation{RemediationUpdateDesktop}},
-	{CodeInvalidVersion, ExitCodeInvalidArgument, false, []Remediation{RemediationSelectVersion}},
-	{CodeUnsupportedMode, ExitCodeInvalidArgument, false, []Remediation{RemediationUpdateDesktop}},
-	{CodeProtocolMismatch, ExitCodeProtocolMismatch, false, []Remediation{RemediationUpdateDesktop}},
-	{CodeOperationCancelled, ExitCodeOperationCancelled, true, []Remediation{RemediationRetry}},
-	{CodeOutputWriteFailed, ExitCodePreconditionFailed, false, []Remediation{RemediationOpenLog, RemediationContactSupport}},
-	{CodePathOutsideManagedRoot, ExitCodeOperationConflict, false, []Remediation{RemediationRunDoctor}},
-	{CodeUnsafeReparsePoint, ExitCodeOperationConflict, false, []Remediation{RemediationContactSupport}},
-	{CodeDirectoryOccupied, ExitCodeOperationConflict, true, []Remediation{RemediationRetry}},
-	{CodeMutationInProgress, ExitCodeOperationConflict, true, []Remediation{RemediationRetry}},
-	{CodeBackendAlreadyRunning, ExitCodeOperationConflict, false, []Remediation{}},
-	{CodeBackendStillRunning, ExitCodeOperationConflict, true, []Remediation{RemediationStopBackend}},
-	{CodeStateWriteFailed, ExitCodeOperationConflict, true, []Remediation{RemediationRetry, RemediationRunDoctor}},
-	{CodeUpdateStateAmbiguous, ExitCodeOperationConflict, false, []Remediation{RemediationRunDoctor, RemediationContactSupport}},
-	{CodeNetworkUnavailable, ExitCodeNetworkFailure, true, []Remediation{RemediationRetry, RemediationRunDoctor}},
-	{CodeMirrorExhausted, ExitCodeNetworkFailure, true, []Remediation{RemediationRetryOtherMirror}},
-	{CodeGitBranchNotFound, ExitCodeGitFailure, false, []Remediation{RemediationSelectVersion}},
-	{CodeGitRemoteResolveFailed, ExitCodeNetworkFailure, true, []Remediation{RemediationRetryOtherMirror}},
-	{CodeGitCloneFailed, ExitCodeNetworkFailure, true, []Remediation{RemediationRetryOtherMirror}},
-	{CodeGitRepositoryInvalid, ExitCodeGitFailure, true, []Remediation{RemediationRetrySync}},
-	{CodeGitVersionMismatch, ExitCodeGitFailure, false, []Remediation{RemediationContactSupport}},
-	{CodeGitRepoSwapFailed, ExitCodeGitFailure, true, []Remediation{RemediationRetry, RemediationRunDoctor}},
-	{CodeGitRepoCleanupFailed, ExitCodeGitFailure, true, []Remediation{RemediationCleanup, RemediationOpenLog}},
-	{CodeUVDownloadFailed, ExitCodeNetworkFailure, true, []Remediation{RemediationRetryOtherMirror}},
-	{CodeUVChecksumMismatch, ExitCodeGitFailure, true, []Remediation{RemediationRetryOtherMirror, RemediationContactSupport}},
-	{CodeUVVersionMismatch, ExitCodePreconditionFailed, false, []Remediation{RemediationUpdateDesktop}},
-	{CodeUVExecFailed, ExitCodeEnvironmentFailure, true, []Remediation{RemediationRunDoctor, RemediationOpenLog}},
-	{CodePythonVersionFileMissing, ExitCodePreconditionFailed, false, []Remediation{RemediationContactSupport}},
-	{CodePythonVersionInvalid, ExitCodePreconditionFailed, false, []Remediation{RemediationContactSupport}},
-	{CodePythonVersionUnsupported, ExitCodePreconditionFailed, false, []Remediation{RemediationUpdateDesktop}},
-	{CodePythonVersionIncompatible, ExitCodePreconditionFailed, false, []Remediation{RemediationContactSupport}},
-	{CodePythonInstallFailed, ExitCodeEnvironmentFailure, true, []Remediation{RemediationRetryOtherMirror, RemediationOpenLog}},
-	{CodePythonVersionMismatch, ExitCodeEnvironmentFailure, true, []Remediation{RemediationRebuildEnvironment}},
-	{CodeLockfileMissing, ExitCodePreconditionFailed, false, []Remediation{RemediationContactSupport}},
-	{CodeLockfileOutdated, ExitCodePreconditionFailed, false, []Remediation{RemediationContactSupport}},
-	{CodeDependencySyncFailed, ExitCodeEnvironmentFailure, true, []Remediation{RemediationRetrySync, RemediationRebuildEnvironment, RemediationOpenLog}},
-	{CodeEnvironmentBroken, ExitCodeEnvironmentFailure, true, []Remediation{RemediationRetrySync, RemediationRebuildEnvironment}},
-	{CodeEnvironmentRebuildFailed, ExitCodeEnvironmentFailure, true, []Remediation{RemediationRunDoctor, RemediationOpenLog}},
-	{CodeBackendEntryNotFound, ExitCodePreconditionFailed, false, []Remediation{RemediationRetrySync, RemediationContactSupport}},
-	{CodeBackendSpawnFailed, ExitCodeBackendFailure, true, []Remediation{RemediationRunDoctor, RemediationOpenLog}},
-	{CodeBackendExitedBeforeReady, ExitCodeBackendFailure, true, []Remediation{RemediationRestartBackend, RemediationOpenLog}},
-	{CodeBackendHealthTimeout, ExitCodeBackendFailure, true, []Remediation{RemediationRestartBackend, RemediationOpenLog}},
-	{CodeBackendHealthInvalid, ExitCodeBackendFailure, true, []Remediation{RemediationRestartBackend, RemediationOpenLog}},
-	{CodeBackendIdentityMismatch, ExitCodeBackendFailure, false, []Remediation{RemediationRetrySync, RemediationContactSupport}},
-	{CodeBackendExitedUnexpectedly, ExitCodeBackendFailure, true, []Remediation{RemediationRestartBackend, RemediationOpenLog}},
-	{CodeBackendRestartFailed, ExitCodeBackendFailure, true, []Remediation{RemediationRestartBackend, RemediationRebuildEnvironment}},
-	{CodeBackendShutdownFailed, ExitCodeBackendFailure, true, []Remediation{RemediationRetry, RemediationOpenLog}},
-	{CodeBackendForceTerminated, ExitCodeSuccess, false, []Remediation{RemediationOpenLog}},
+	{Code: CodeInvalidArgument, ExitCode: ExitCodeInvalidArgument, Retryable: false, Remediation: []Remediation{RemediationRunDoctor}},
+	{Code: CodeInvalidControlCommand, ExitCode: ExitCodeSuccess, Retryable: false, Remediation: []Remediation{RemediationUpdateDesktop}},
+	{Code: CodeInvalidVersion, ExitCode: ExitCodeInvalidArgument, Retryable: false, Remediation: []Remediation{RemediationSelectVersion}},
+	{Code: CodeUnsupportedMode, ExitCode: ExitCodeInvalidArgument, Retryable: false, Remediation: []Remediation{RemediationUpdateDesktop}},
+	{Code: CodeProtocolMismatch, ExitCode: ExitCodeProtocolMismatch, Retryable: false, Remediation: []Remediation{RemediationUpdateDesktop}},
+	{Code: CodeOperationCancelled, ExitCode: ExitCodeOperationCancelled, Retryable: true, Remediation: []Remediation{RemediationRetry}},
+	{Code: CodeOutputWriteFailed, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationOpenLog, RemediationContactSupport}},
+	{Code: CodePathOutsideManagedRoot, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{RemediationRunDoctor}},
+	{Code: CodeUnsafeReparsePoint, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodeDirectoryOccupied, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry}},
+	{Code: CodeMutationInProgress, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry}},
+	{Code: CodeBackendAlreadyRunning, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{}},
+	{Code: CodeBackendStillRunning, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationStopBackend}},
+	{Code: CodeStateWriteFailed, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationRunDoctor}},
+	{Code: CodeUpdateStateAmbiguous, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{RemediationRunDoctor, RemediationContactSupport}},
+	{Code: CodeNetworkUnavailable, ExitCode: ExitCodeNetworkFailure, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationRunDoctor}},
+	{Code: CodeMirrorExhausted, ExitCode: ExitCodeNetworkFailure, Retryable: true, Remediation: []Remediation{RemediationRetryOtherMirror}},
+	{Code: CodeGitBranchNotFound, ExitCode: ExitCodeGitFailure, Retryable: false, Remediation: []Remediation{RemediationSelectVersion}},
+	{Code: CodeGitRemoteResolveFailed, ExitCode: ExitCodeNetworkFailure, Retryable: true, Remediation: []Remediation{RemediationRetryOtherMirror}},
+	{Code: CodeGitCloneFailed, ExitCode: ExitCodeNetworkFailure, Retryable: true, Remediation: []Remediation{RemediationRetryOtherMirror}},
+	{Code: CodeGitRepositoryInvalid, ExitCode: ExitCodeGitFailure, Retryable: true, Remediation: []Remediation{RemediationRetrySync}},
+	{Code: CodeGitVersionMismatch, ExitCode: ExitCodeGitFailure, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodeGitRepoSwapFailed, ExitCode: ExitCodeGitFailure, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationRunDoctor}},
+	{Code: CodeGitRepoCleanupFailed, ExitCode: ExitCodeGitFailure, Retryable: true, Remediation: []Remediation{RemediationCleanup, RemediationOpenLog}},
+	{Code: CodeUVDownloadFailed, ExitCode: ExitCodeNetworkFailure, Retryable: true, Remediation: []Remediation{RemediationRetryOtherMirror}},
+	{Code: CodeUVChecksumMismatch, ExitCode: ExitCodeGitFailure, Retryable: true, Remediation: []Remediation{RemediationRetryOtherMirror, RemediationContactSupport}},
+	{Code: CodeUVVersionMismatch, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationUpdateDesktop}},
+	{Code: CodeUVExecFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRunDoctor, RemediationOpenLog}},
+	{Code: CodePythonVersionFileMissing, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodePythonVersionInvalid, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodePythonVersionUnsupported, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationUpdateDesktop}},
+	{Code: CodePythonVersionIncompatible, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodePythonInstallFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRetryOtherMirror, RemediationOpenLog}},
+	{Code: CodePythonVersionMismatch, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRebuildEnvironment}},
+	{Code: CodeLockfileMissing, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodeLockfileOutdated, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodeDependencySyncFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRetrySync, RemediationRebuildEnvironment, RemediationOpenLog}},
+	{Code: CodeEnvironmentBroken, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRetrySync, RemediationRebuildEnvironment}},
+	{Code: CodeEnvironmentRebuildFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRunDoctor, RemediationOpenLog}},
+	{Code: CodeBackendEntryNotFound, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationRetrySync, RemediationContactSupport}},
+	{Code: CodeBackendSpawnFailed, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRunDoctor, RemediationOpenLog}},
+	{Code: CodeBackendExitedBeforeReady, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
+	{Code: CodeBackendHealthTimeout, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
+	{Code: CodeBackendHealthInvalid, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
+	{Code: CodeBackendIdentityMismatch, ExitCode: ExitCodeBackendFailure, Retryable: false, Remediation: []Remediation{RemediationRetrySync, RemediationContactSupport}},
+	{Code: CodeBackendExitedUnexpectedly, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
+	{Code: CodeBackendRestartFailed, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationRebuildEnvironment}},
+	{Code: CodeBackendShutdownFailed, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationOpenLog}},
+	{Code: CodeBackendForceTerminated, ExitCode: ExitCodeSuccess, Retryable: false, Remediation: []Remediation{RemediationOpenLog}},
 }
 
 var errorDefinitionByCode = buildErrorDefinitionIndex(errorDefinitions)
@@ -169,7 +172,7 @@ var remediations = []Remediation{
 	RemediationContactSupport,
 }
 
-// AllErrorDefinitions returns every stable error definition in document order.
+// AllErrorDefinitions 按文档顺序返回全部稳定错误定义的防御性副本。
 func AllErrorDefinitions() []ErrorDefinition {
 	definitions := make([]ErrorDefinition, len(errorDefinitions))
 	for i, definition := range errorDefinitions {
@@ -178,7 +181,7 @@ func AllErrorDefinitions() []ErrorDefinition {
 	return definitions
 }
 
-// LookupErrorDefinition returns the stable definition for code.
+// LookupErrorDefinition 返回 code 对应的稳定定义及是否存在。
 func LookupErrorDefinition(code Code) (ErrorDefinition, bool) {
 	definition, ok := errorDefinitionByCode[code]
 	if !ok {
@@ -187,16 +190,33 @@ func LookupErrorDefinition(code Code) (ErrorDefinition, bool) {
 	return cloneErrorDefinition(definition), true
 }
 
-// AllRemediations returns every stable remediation action.
+// AllRemediations 返回全部稳定处置动作的防御性副本。
 func AllRemediations() []Remediation {
 	return append([]Remediation(nil), remediations...)
 }
 
-// NewErrorEvent constructs an error event from the stable definition for code.
+// IsKnownCode 报告 value 是否为 OK 或错误定义中的稳定错误码。
+func IsKnownCode(value Code) bool {
+	if value == CodeOK {
+		return true
+	}
+	_, ok := errorDefinitionByCode[value]
+	return ok
+}
+
+// IsKnownRemediation 报告 value 是否为稳定处置动作。
+func IsKnownRemediation(value Remediation) bool {
+	return slices.Contains(remediations, value)
+}
+
+// NewErrorEvent 根据 code 的稳定定义构造 error 事件。
 func NewErrorEvent(code Code, stage Stage, message string, details map[string]any) (ErrorEvent, error) {
 	definition, ok := LookupErrorDefinition(code)
 	if !ok {
 		return ErrorEvent{}, fmt.Errorf("unknown protocol error code %q", code)
+	}
+	if definition.ExitCode == ExitCodeSuccess {
+		return ErrorEvent{}, fmt.Errorf("protocol code %q is warning-only", code)
 	}
 	return ErrorEvent{
 		Code:        string(code),
@@ -208,7 +228,7 @@ func NewErrorEvent(code Code, stage Stage, message string, details map[string]an
 	}, nil
 }
 
-// NewWarningEvent constructs a warning event from the stable definition for code.
+// NewWarningEvent 根据 code 的稳定定义构造 warning 事件。
 func NewWarningEvent(code Code, stage Stage, message string, details map[string]any) (WarningEvent, error) {
 	definition, ok := LookupErrorDefinition(code)
 	if !ok {
@@ -224,7 +244,7 @@ func NewWarningEvent(code Code, stage Stage, message string, details map[string]
 	}, nil
 }
 
-// NewFailureResult constructs a failed result that repeats the primary error tuple.
+// NewFailureResult 构造失败 result，并复述主错误的稳定四元组。
 func NewFailureResult(primary ErrorEvent, status, message string, details map[string]any) ResultEvent {
 	return ResultEvent{
 		Success:     false,
@@ -238,7 +258,7 @@ func NewFailureResult(primary ErrorEvent, status, message string, details map[st
 	}
 }
 
-// NewSuccessResult constructs a successful result.
+// NewSuccessResult 构造成功 result。
 func NewSuccessResult(stage Stage, status string, message string, details map[string]any) ResultEvent {
 	return ResultEvent{
 		Success:     true,

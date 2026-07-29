@@ -334,21 +334,32 @@ func TestHumanRendererContractMatrix(t *testing.T) {
 }
 
 func TestHumanRendererNormalizesMessages(t *testing.T) {
-	stdout, stderr, emitter := newHumanEmitter(t, "v\\ersion\r\nnext", "com\rmand\nnext", []string{"cap\\ability\r\nnext", string([]byte{'b', 'a', 'd', 0xff})})
-	if err := emitter.EmitLog(protocol.LogEvent{
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	renderer, err := protocol.NewHumanRenderer(stdout, stderr)
+	if err != nil {
+		t.Fatalf("NewHumanRenderer() error = %v", err)
+	}
+	if err := renderer.RenderHello(protocol.HelloEvent{
+		RuntimeVersion: "v\\ersion\r\nnext",
+		Command:        "com\rmand\nnext",
+		Capabilities:   []string{"cap\\ability\r\nnext", string([]byte{'b', 'a', 'd', 0xff})},
+	}); err != nil {
+		t.Fatalf("RenderHello() error = %v", err)
+	}
+	if err := renderer.RenderLog(protocol.LogEvent{
 		Source: "so\\urce\r\nnext", Stream: "st\rream\nnext",
 		Message: "first\r\nsecond\r\n\rthird\\slash\x1b\x00\u0085" + string([]byte{0xff}) + "\n",
 	}); err != nil {
-		t.Fatalf("EmitLog() error = %v", err)
+		t.Fatalf("RenderLog() error = %v", err)
 	}
-	if err := emitter.EmitError(protocol.ErrorEvent{
+	if err := renderer.RenderError(protocol.ErrorEvent{
 		Stage: "st\r\nage", Code: "co\rde\nnext", Message: "error",
 		Remediation: []string{"re\rmedy\nnext"},
 	}); err != nil {
-		t.Fatalf("EmitError() error = %v", err)
+		t.Fatalf("RenderError() error = %v", err)
 	}
-	if err := emitter.EmitState(protocol.StateEvent{Stage: "state", Status: "empty", Message: ""}); err != nil {
-		t.Fatalf("EmitState() error = %v", err)
+	if err := renderer.RenderState(protocol.StateEvent{Stage: "state", Status: "empty", Message: ""}); err != nil {
+		t.Fatalf("RenderState() error = %v", err)
 	}
 	wantStdout := "HELLO runtime=v\\\\ersion\\r\\nnext command=com\\rmand\\nnext capabilities=cap\\\\ability\\r\\nnext,bad�\n"
 	wantStdout += "STATE [state] empty — \n"
@@ -384,9 +395,22 @@ func TestHumanRendererEscapesScalarControls(t *testing.T) {
 }
 
 func TestHumanRendererNeverEmitsANSIControls(t *testing.T) {
-	stdout, stderr, emitter := newHumanEmitter(t, "\x1b[31m", "\u009b31m", []string{"\x00", "\u0085"})
-	if err := emitter.EmitLog(protocol.LogEvent{Source: "\x1b", Stream: "stdout", Message: "\x1b[2J\x00\u0085"}); err != nil {
-		t.Fatalf("EmitLog() error = %v", err)
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	renderer, err := protocol.NewHumanRenderer(stdout, stderr)
+	if err != nil {
+		t.Fatalf("NewHumanRenderer() error = %v", err)
+	}
+	if err := renderer.RenderHello(protocol.HelloEvent{
+		RuntimeVersion: "\x1b[31m",
+		Command:        "\u009b31m",
+		Capabilities:   []string{"\x00", "\u0085"},
+	}); err != nil {
+		t.Fatalf("RenderHello() error = %v", err)
+	}
+	if err := renderer.RenderLog(protocol.LogEvent{
+		Source: "\x1b", Stream: "stdout", Message: "\x1b[2J\x00\u0085",
+	}); err != nil {
+		t.Fatalf("RenderLog() error = %v", err)
 	}
 	output := stdout.String() + stderr.String()
 	for _, runeValue := range output {

@@ -12,7 +12,7 @@ import (
 	"unicode/utf8"
 )
 
-// ControlKind identifies a stdin control command.
+// ControlKind 标识一种 stdin 控制命令。
 type ControlKind string
 
 const (
@@ -26,14 +26,14 @@ const (
 	invalidControlMessage   = "已忽略无效的 stdin 控制命令"
 )
 
-// ControlCommand is a versioned stdin control request.
+// ControlCommand 是带协议版本的 stdin 控制请求。
 type ControlCommand struct {
 	Protocol  int         `json:"protocol"`
 	Command   ControlKind `json:"command"`
 	CommandID string      `json:"commandId"`
 }
 
-// ControlDisposition reports whether a prepared command can be accepted.
+// ControlDisposition 表示预处理后的命令能否被接受。
 type ControlDisposition uint8
 
 const (
@@ -42,26 +42,26 @@ const (
 	ControlNotApplicable
 )
 
-// ControlAction commits an accepted control command.
+// ControlAction 提交一个已接受的控制命令。
 type ControlAction func() error
 
-// ControlHandler prepares control commands without applying their side effects.
-// PrepareControl, its returned action, and CurrentControlStage run while the
-// reader gate is held and must not call StopAccepting on the invoking reader.
+// ControlHandler 预处理控制命令，但不立即施加副作用。
+// PrepareControl、其返回的 action 与 CurrentControlStage 都在 ControlReader.mu 持有期间运行，
+// 因此不得回调当前 ControlReader 的 StopAccepting。
 type ControlHandler interface {
 	PrepareControl(ControlCommand) (ControlDisposition, ControlAction, error)
 	CurrentControlStage() Stage
 }
 
-// ControlWarningEmitter emits warnings caused by invalid control input.
-// EmitWarning runs while the reader gate is held and must not call
-// StopAccepting on the invoking reader.
+// ControlWarningEmitter 发射无效控制输入产生的 warning。
+// EmitWarning 在 ControlReader.mu 持有期间运行，因此不得回调当前 ControlReader 的 StopAccepting。
 type ControlWarningEmitter interface {
 	EmitWarning(WarningEvent) error
 }
 
-// ControlReader reads and dispatches newline-delimited stdin controls.
+// ControlReader 读取并分派以换行符分隔的 stdin 控制命令。
 type ControlReader struct {
+	// mu 保护一次性运行状态和 commandId 去重账本，同时串行化 prepare、action 与 warning。
 	mu       sync.Mutex
 	started  bool
 	stopped  bool
@@ -76,7 +76,7 @@ type ControlReader struct {
 	size     int
 }
 
-// NewControlReader constructs a bounded stdin control reader.
+// NewControlReader 构造带输入与去重上限的 stdin 控制读取器。
 func NewControlReader(
 	input io.Reader,
 	warnings ControlWarningEmitter,
@@ -118,8 +118,8 @@ func NewControlReader(
 	}, nil
 }
 
-// Run reads controls synchronously until EOF or an infrastructure error.
-// A ControlReader is one-shot: concurrent or subsequent calls return an error.
+// Run 同步读取控制命令，直到 EOF 或基础设施错误。
+// ControlReader 只能运行一次；并发或后续调用都会返回错误。
 func (r *ControlReader) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("control context must not be nil")
@@ -193,8 +193,8 @@ func (r *ControlReader) Run(ctx context.Context) error {
 	}
 }
 
-// StopAccepting prevents subsequent control handling and waits for in-flight
-// prepare, action, or warning work. It does not interrupt a blocked stdin read.
+// StopAccepting 阻止后续控制处理，并等待执行中的 prepare、action 或 warning 完成。
+// 它不会中断正在阻塞的 stdin 读取。
 func (r *ControlReader) StopAccepting() {
 	r.mu.Lock()
 	r.stopped = true
@@ -232,6 +232,7 @@ func (r *ControlReader) readPhysicalLine() (
 	}
 }
 
+// drainOverlongLine 丢弃超长行的剩余片段，只累计长度，避免为恶意输入继续分配内存。
 func (r *ControlReader) drainOverlongLine(first []byte) (
 	line []byte,
 	lineBytes int,
@@ -272,6 +273,7 @@ func (r *ControlReader) drainOverlongLine(first []byte) (
 	}
 }
 
+// controlReadTracker 保留底层 reader 与数据同时返回的非 EOF 错误，防止 bufio 延后后将其掩盖。
 type controlReadTracker struct {
 	input      io.Reader
 	pendingErr error
@@ -342,6 +344,7 @@ func (r *ControlReader) dispatch(command ControlCommand) error {
 	}
 }
 
+// remember 用固定容量环形账本保存最近的 commandId，限制长期 supervise 进程的内存占用。
 func (r *ControlReader) remember(command ControlCommand) {
 	if r.size == controlLedgerCapacity {
 		delete(r.seen, r.order[r.next])
@@ -446,6 +449,7 @@ func parseControlCommand(line []byte) (ControlCommand, map[string]any) {
 	return command, nil
 }
 
+// decodeControlFields 使用 token 流拒绝重复字段和未知字段，避免普通 Unmarshal 的覆盖语义。
 func decodeControlFields(line []byte) (map[string]json.RawMessage, map[string]any) {
 	decoder := json.NewDecoder(bytes.NewReader(line))
 	first, err := decoder.Token()
@@ -531,7 +535,7 @@ func isKnownControlKind(command ControlKind) bool {
 	}
 }
 
-// WithControlCommandID copies details and associates them with a control command.
+// WithControlCommandID 复制 details，并把副本关联到一个控制命令。
 func WithControlCommandID(details map[string]any, commandID string) map[string]any {
 	copied := make(map[string]any, len(details)+1)
 	for key, value := range details {

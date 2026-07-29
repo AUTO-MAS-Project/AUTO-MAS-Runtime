@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 const (
@@ -42,7 +44,7 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 		})
 	}
 
-	events, issues := inspect(testCommand, TerminalSuccess, validTranscript())
+	events, issues := inspect(testCommand, TerminalSuccess, validTranscript(t))
 	if len(issues) != 0 {
 		t.Fatalf("valid transcript issues = %v", issues)
 	}
@@ -53,7 +55,7 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 		t.Fatalf("result sequence = %#v (%T), want json.Number(2)", events[1].object["sequence"], events[1].object["sequence"])
 	}
 
-	withoutFinalLF := bytes.TrimSuffix(validTranscript(), []byte{'\n'})
+	withoutFinalLF := bytes.TrimSuffix(validTranscript(t), []byte{'\n'})
 	lastLF := bytes.LastIndexByte(withoutFinalLF, '\n')
 	wantRaw := withoutFinalLF[lastLF+1:]
 	_, issues = inspect(testCommand, TerminalSuccess, withoutFinalLF)
@@ -68,7 +70,7 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 	t.Run("invalid UTF-8 is rejected before JSON decoding", func(t *testing.T) {
 		stdout := replaceRawOnce(
 			t,
-			validTranscript(),
+			validTranscript(t),
 			[]byte(`"message":"done"`),
 			[]byte{'"', 'm', 'e', 's', 's', 'a', 'g', 'e', '"', ':', '"', 0xff, '"'},
 		)
@@ -85,8 +87,8 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 	}{
 		{
 			name: "top-level type",
-			stdout: func(*testing.T) []byte {
-				return validTranscript()
+			stdout: func(t *testing.T) []byte {
+				return validTranscript(t)
 			},
 			old:     `"type":"hello"`,
 			replace: `"type":"hello","type":"hello"`,
@@ -94,8 +96,8 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 		},
 		{
 			name: "top-level success",
-			stdout: func(*testing.T) []byte {
-				return validTranscript()
+			stdout: func(t *testing.T) []byte {
+				return validTranscript(t)
 			},
 			old:     `"success":true`,
 			replace: `"success":true,"success":true`,
@@ -106,8 +108,8 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 			stdout: func(t *testing.T) []byte {
 				return encodeTranscript(t, warningObjects(1))
 			},
-			old:     `"warnings":[{"code":"WARN_000"`,
-			replace: `"warnings":[{"code":"WARN_000","code":"WARN_000"`,
+			old:     `"warnings":[{"code":"INVALID_CONTROL_COMMAND"`,
+			replace: `"warnings":[{"code":"INVALID_CONTROL_COMMAND","code":"INVALID_CONTROL_COMMAND"`,
 			key:     "code",
 		},
 		{
@@ -115,8 +117,8 @@ func TestContract_ParsePhysicalLines(t *testing.T) {
 			stdout: func(t *testing.T) []byte {
 				return encodeTranscript(t, warningObjects(1))
 			},
-			old:     `"warnings":[{"code":"WARN_000","details":{"index":0`,
-			replace: `"warnings":[{"code":"WARN_000","details":{"index":0,"index":0`,
+			old:     `"warnings":[{"code":"INVALID_CONTROL_COMMAND","details":{"index":0`,
+			replace: `"warnings":[{"code":"INVALID_CONTROL_COMMAND","details":{"index":0,"index":0`,
 			key:     "index",
 		},
 	} {
@@ -343,7 +345,7 @@ func TestContract_ResultPlacement(t *testing.T) {
 func TestContract_Diagnostics(t *testing.T) {
 	t.Parallel()
 
-	validEvents, validIssues := inspect(testCommand, TerminalSuccess, validTranscript())
+	validEvents, validIssues := inspect(testCommand, TerminalSuccess, validTranscript(t))
 	requireNoIssues(t, validIssues)
 	if summary := summarizeTypes(validEvents); summary != "[hello,result]" {
 		t.Errorf("normal type summary = %q, want %q", summary, "[hello,result]")
@@ -439,7 +441,6 @@ func TestContract_TerminalSemantics(t *testing.T) {
 		{name: "success", terminal: TerminalSuccess, events: successObjects()},
 		{name: "success with warning", terminal: TerminalSuccess, events: warningObjects(1)},
 		{name: "failure", terminal: TerminalFailure, events: failureObjects()},
-		{name: "failure with null containers", terminal: TerminalFailure, events: nullFailure},
 		{name: "cancelled", terminal: TerminalCancelled, events: cancelledObjects()},
 	} {
 		test := test
@@ -449,6 +450,14 @@ func TestContract_TerminalSemantics(t *testing.T) {
 			requireNoIssues(t, issues)
 		})
 	}
+	t.Run("failure with null containers", func(t *testing.T) {
+		t.Parallel()
+		_, issues := inspect(testCommand, TerminalFailure, encodeTranscript(t, nullFailure))
+		requireIssue(t, issues, `error field "remediation" must be an array of strings`)
+		requireIssue(t, issues, `error field "details" must be an object`)
+		requireIssue(t, issues, `result field "remediation" must be an array of strings`)
+		requireIssue(t, issues, `result field "details" must be an object`)
+	})
 
 	resultSchemaTests := []struct {
 		name   string
@@ -468,11 +477,11 @@ func TestContract_TerminalSemantics(t *testing.T) {
 		{name: "wrong message type", field: "message", mutate: setField("message", 9), want: "a string"},
 		{name: "missing retryable", field: "retryable", mutate: deleteField("retryable"), want: "a boolean"},
 		{name: "wrong retryable type", field: "retryable", mutate: setField("retryable", "false"), want: "a boolean"},
-		{name: "missing remediation", field: "remediation", mutate: deleteField("remediation"), want: "an array of strings or null"},
-		{name: "wrong remediation type", field: "remediation", mutate: setField("remediation", "retry"), want: "an array of strings or null"},
-		{name: "wrong remediation item", field: "remediation", mutate: setField("remediation", []any{"retry", 1}), want: "an array of strings or null"},
-		{name: "missing details", field: "details", mutate: deleteField("details"), want: "an object or null"},
-		{name: "wrong details type", field: "details", mutate: setField("details", []any{}), want: "an object or null"},
+		{name: "missing remediation", field: "remediation", mutate: deleteField("remediation"), want: "an array of strings"},
+		{name: "wrong remediation type", field: "remediation", mutate: setField("remediation", "retry"), want: "an array of strings"},
+		{name: "wrong remediation item", field: "remediation", mutate: setField("remediation", []any{"retry", 1}), want: "an array of strings"},
+		{name: "missing details", field: "details", mutate: deleteField("details"), want: "an object"},
+		{name: "wrong details type", field: "details", mutate: setField("details", []any{}), want: "an object"},
 	}
 	for _, test := range resultSchemaTests {
 		test := test
@@ -499,10 +508,10 @@ func TestContract_TerminalSemantics(t *testing.T) {
 		{name: "wrong message type", field: "message", mutate: setField("message", true), want: "a string"},
 		{name: "missing retryable", field: "retryable", mutate: deleteField("retryable"), want: "a boolean"},
 		{name: "wrong retryable type", field: "retryable", mutate: setField("retryable", "true"), want: "a boolean"},
-		{name: "missing remediation", field: "remediation", mutate: deleteField("remediation"), want: "an array of strings or null"},
-		{name: "wrong remediation type", field: "remediation", mutate: setField("remediation", []any{1}), want: "an array of strings or null"},
-		{name: "missing details", field: "details", mutate: deleteField("details"), want: "an object or null"},
-		{name: "wrong details type", field: "details", mutate: setField("details", "details"), want: "an object or null"},
+		{name: "missing remediation", field: "remediation", mutate: deleteField("remediation"), want: "an array of strings"},
+		{name: "wrong remediation type", field: "remediation", mutate: setField("remediation", []any{1}), want: "an array of strings"},
+		{name: "missing details", field: "details", mutate: deleteField("details"), want: "an object"},
+		{name: "wrong details type", field: "details", mutate: setField("details", "details"), want: "an object"},
 	}
 	for _, test := range errorSchemaTests {
 		test := test
@@ -609,7 +618,7 @@ func TestContract_TerminalSemantics(t *testing.T) {
 		},
 		{
 			name: "cancelled missing matching error", terminal: TerminalCancelled, events: cancelledObjects,
-			mutate: func(events []map[string]any) { events[1]["retryable"] = true },
+			mutate: func(events []map[string]any) { events[1]["retryable"] = false },
 			want:   "cancelled result must match a prior error",
 		},
 	}
@@ -646,7 +655,10 @@ func TestContract_WarningSummary(t *testing.T) {
 	t.Run("null warning containers", func(t *testing.T) {
 		t.Parallel()
 		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, nullWarning))
-		requireNoIssues(t, issues)
+		requireIssue(t, issues, `warning field "remediation" must be an array of strings`)
+		requireIssue(t, issues, `warning field "details" must be an object`)
+		requireIssue(t, issues, `result warning summary 1 field "remediation" must be an array of strings`)
+		requireIssue(t, issues, `result warning summary 1 field "details" must be an object`)
 	})
 
 	tests := []struct {
@@ -749,20 +761,20 @@ func TestContract_WarningSummary(t *testing.T) {
 		wantSecond string
 	}{
 		{
-			name: "warning missing field while summary is null",
+			name: "warning missing field while summary is invalid",
 			mutate: func(warning map[string]any, summary map[string]any) {
 				delete(warning, "remediation")
 				summary["remediation"] = nil
 			},
-			want: `warning field "remediation" must be an array of strings or null`,
+			want: `warning field "remediation" must be an array of strings`,
 		},
 		{
-			name: "summary missing field while warning is null",
+			name: "summary missing field while warning is invalid",
 			mutate: func(warning map[string]any, summary map[string]any) {
 				warning["details"] = nil
 				delete(summary, "details")
 			},
-			want: `result warning summary 1 field "details" must be an object or null`,
+			want: `result warning summary 1 field "details" must be an object`,
 		},
 		{
 			name: "both retryable fields have wrong type",
@@ -779,8 +791,8 @@ func TestContract_WarningSummary(t *testing.T) {
 				warning["remediation"] = []any{1}
 				summary["remediation"] = []any{1}
 			},
-			want:       `warning field "remediation" must be an array of strings or null`,
-			wantSecond: `result warning summary 1 field "remediation" must be an array of strings or null`,
+			want:       `warning field "remediation" must be an array of strings`,
+			wantSecond: `result warning summary 1 field "remediation" must be an array of strings`,
 		},
 		{
 			name: "summary is not object",
@@ -843,18 +855,9 @@ func TestContract_WarningSummary(t *testing.T) {
 	}
 }
 
-func validTranscript() []byte {
-	events := validObjects()
-	var builder strings.Builder
-	for _, event := range events {
-		encoded, err := json.Marshal(event)
-		if err != nil {
-			panic(err)
-		}
-		builder.Write(encoded)
-		builder.WriteByte('\n')
-	}
-	return []byte(builder.String())
+func validTranscript(t *testing.T) []byte {
+	t.Helper()
+	return encodeTranscript(t, validObjects())
 }
 
 func validObjects() []map[string]any {
@@ -866,18 +869,50 @@ func successObjects() []map[string]any {
 }
 
 func failureObjects() []map[string]any {
+	remediation := []string{
+		string(protocol.RemediationRunDoctor),
+		string(protocol.RemediationContactSupport),
+	}
 	return []map[string]any{
 		helloObject(),
-		errorObject(2, "DOCTOR_FAILED", "doctor", true, []string{"retry", "open-log"}),
-		terminalResultObject(3, false, "DOCTOR_FAILED", "doctor", "failed", true, []string{"retry", "open-log"}),
+		errorObject(
+			2,
+			string(protocol.CodeUpdateStateAmbiguous),
+			string(protocol.StageDoctor),
+			false,
+			remediation,
+		),
+		terminalResultObject(
+			3,
+			false,
+			string(protocol.CodeUpdateStateAmbiguous),
+			string(protocol.StageDoctor),
+			"failed",
+			false,
+			remediation,
+		),
 	}
 }
 
 func cancelledObjects() []map[string]any {
 	return []map[string]any{
 		helloObject(),
-		errorObject(2, "OPERATION_CANCELLED", "doctor", false, []string{"retry"}),
-		terminalResultObject(3, false, "OPERATION_CANCELLED", "doctor", "cancelled", false, []string{"retry"}),
+		errorObject(
+			2,
+			string(protocol.CodeOperationCancelled),
+			string(protocol.StageDoctor),
+			true,
+			[]string{string(protocol.RemediationRetry)},
+		),
+		terminalResultObject(
+			3,
+			false,
+			string(protocol.CodeOperationCancelled),
+			string(protocol.StageDoctor),
+			"cancelled",
+			true,
+			[]string{string(protocol.RemediationRetry)},
+		),
 	}
 }
 
@@ -904,7 +939,11 @@ func warningObjects(count int) []map[string]any {
 }
 
 func helloObject() map[string]any {
-	return eventObject("hello", 1)
+	event := eventObject(string(protocol.TypeHello), 1)
+	event["runtimeVersion"] = "v1.0.0"
+	event["command"] = testCommand
+	event["capabilities"] = []string{string(protocol.CapabilityStdinCancel)}
+	return event
 }
 
 func resultObject(sequence int) map[string]any {
@@ -957,11 +996,11 @@ func warningObject(sequence int, index int) map[string]any {
 
 func warningSummaryObject(index int) map[string]any {
 	return map[string]any{
-		"code":        fmt.Sprintf("WARN_%03d", index),
-		"stage":       "doctor",
+		"code":        string(protocol.CodeInvalidControlCommand),
+		"stage":       string(protocol.StageDoctor),
 		"message":     fmt.Sprintf("warning %d", index),
-		"retryable":   index%2 == 0,
-		"remediation": []string{fmt.Sprintf("action-%d", index)},
+		"retryable":   false,
+		"remediation": []string{string(protocol.RemediationUpdateDesktop)},
 		"details": map[string]any{
 			"index":  index,
 			"nested": []any{fmt.Sprintf("value-%d", index), index%3 == 0},

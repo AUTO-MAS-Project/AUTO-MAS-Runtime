@@ -11,15 +11,15 @@ import (
 )
 
 var (
-	// ErrResultAlreadyEmitted reports an attempt to emit a second terminal result.
+	// ErrResultAlreadyEmitted 表示调用方试图发射第二个终态 result。
 	ErrResultAlreadyEmitted = errors.New("protocol result already emitted")
-	// ErrEventAfterResult reports an attempt to emit a non-result event after the terminal result.
+	// ErrEventAfterResult 表示调用方试图在终态 result 后继续发射非 result 事件。
 	ErrEventAfterResult = errors.New("protocol event emitted after result")
 )
 
-// ProcessOutput owns the process-wide event renderer, sequence, serialization
-// lock, and single-emitter reservation.
+// ProcessOutput 独占进程级事件 renderer、sequence、串行化锁与单 Emitter 预约。
 type ProcessOutput struct {
+	// mu 线性化 renderer 写入、sequence 分配、终态、写错误、Emitter 预约和 warning 账本。
 	mu             sync.Mutex
 	renderer       EventRenderer
 	nextSequence   uint64
@@ -30,7 +30,7 @@ type ProcessOutput struct {
 	warningCount   uint64
 }
 
-// Emitter writes typed protocol events through a ProcessOutput.
+// Emitter 通过 ProcessOutput 写出类型化协议事件。
 type Emitter struct {
 	output      *ProcessOutput
 	operationID string
@@ -42,10 +42,10 @@ type emitterOptions struct {
 	clock       func() time.Time
 }
 
-// Option customizes an Emitter.
+// Option 配置 Emitter。
 type Option func(*emitterOptions) error
 
-// WithOperationID supplies an existing canonical ULID.
+// WithOperationID 注入已有的规范 ULID。
 func WithOperationID(operationID string) Option {
 	return func(options *emitterOptions) error {
 		if !validOperationID(operationID) {
@@ -56,7 +56,7 @@ func WithOperationID(operationID string) Option {
 	}
 }
 
-// WithClock supplies the event clock. It is primarily intended for tests.
+// WithClock 注入事件时钟，主要供测试使用。
 func WithClock(clock func() time.Time) Option {
 	return func(options *emitterOptions) error {
 		if clock == nil {
@@ -67,7 +67,7 @@ func WithClock(clock func() time.Time) Option {
 	}
 }
 
-// NewProcessOutput creates the process-wide owner of the NDJSON destination.
+// NewProcessOutput 创建进程内唯一的 NDJSON 输出所有者。
 func NewProcessOutput(output io.Writer) (*ProcessOutput, error) {
 	renderer, err := NewNDJSONRenderer(output)
 	if err != nil {
@@ -76,8 +76,7 @@ func NewProcessOutput(output io.Writer) (*ProcessOutput, error) {
 	return NewProcessOutputWithRenderer(renderer)
 }
 
-// NewProcessOutputWithRenderer creates a ProcessOutput whose events are
-// projected by renderer instead of written to an NDJSON destination.
+// NewProcessOutputWithRenderer 创建由 renderer 投影事件而非直接写 NDJSON 的 ProcessOutput。
 func NewProcessOutputWithRenderer(renderer EventRenderer) (*ProcessOutput, error) {
 	if interfaceIsNil(renderer) {
 		return nil, errors.New("protocol renderer must not be nil")
@@ -85,15 +84,16 @@ func NewProcessOutputWithRenderer(renderer EventRenderer) (*ProcessOutput, error
 	return &ProcessOutput{renderer: renderer, nextSequence: 1}, nil
 }
 
-// NewEmitter reserves this process output for one operation and immediately
-// writes the required first hello event. A ProcessOutput cannot create a
-// second emitter.
+// NewEmitter 为单次操作预约此 ProcessOutput，并立即写出必须位于首位的 hello 事件。
+// 同一个 ProcessOutput 不能创建第二个 Emitter。
 func (o *ProcessOutput) NewEmitter(
 	runtimeVersion string,
 	command string,
 	capabilities []string,
 	options ...Option,
 ) (*Emitter, error) {
+	// 入口立即复制，避免调用方在校验后通过共享底层数组改变 hello。
+	capabilitySnapshot := append([]string(nil), capabilities...)
 	settings := emitterOptions{clock: time.Now}
 	for _, option := range options {
 		if option == nil {
@@ -104,8 +104,15 @@ func (o *ProcessOutput) NewEmitter(
 		}
 	}
 
+	// hello 是 capabilities 的唯一构造点，冻结全集在这里收口。
+	for _, advertised := range capabilitySnapshot {
+		if !IsKnownCapability(Capability(advertised)) {
+			return nil, fmt.Errorf("unknown protocol capability %q", advertised)
+		}
+	}
+
 	if settings.operationID == "" {
-		operationID, err := newOperationID(settings.clock(), operationRandom)
+		operationID, err := newRandomOperationID(settings.clock())
 		if err != nil {
 			return nil, err
 		}
@@ -126,40 +133,37 @@ func (o *ProcessOutput) NewEmitter(
 		clock:       settings.clock,
 	}
 
-	if capabilities == nil {
-		capabilities = []string{}
-	}
 	if err := emitter.emit(TypeHello, &HelloEvent{
 		RuntimeVersion: runtimeVersion,
 		Command:        command,
-		Capabilities:   capabilities,
+		Capabilities:   capabilitySnapshot,
 	}); err != nil {
 		return nil, err
 	}
 	return emitter, nil
 }
 
-// OperationID returns the ULID shared by every event from this emitter.
+// OperationID 返回此 Emitter 所有事件共享的 ULID。
 func (e *Emitter) OperationID() string {
 	return e.operationID
 }
 
-// EmitProgress emits a progress event.
+// EmitProgress 发射 progress 事件。
 func (e *Emitter) EmitProgress(event ProgressEvent) error {
 	return e.emit(TypeProgress, &event)
 }
 
-// EmitState emits a lifecycle state event.
+// EmitState 发射生命周期 state 事件。
 func (e *Emitter) EmitState(event StateEvent) error {
 	return e.emit(TypeState, &event)
 }
 
-// EmitLog emits a managed-process log line.
+// EmitLog 发射一行受管进程日志。
 func (e *Emitter) EmitLog(event LogEvent) error {
 	return e.emit(TypeLog, &event)
 }
 
-// EmitWarning emits a non-terminal warning.
+// EmitWarning 发射非终态 warning。
 func (e *Emitter) EmitWarning(event WarningEvent) error {
 	e.output.mu.Lock()
 	defer e.output.mu.Unlock()
@@ -167,6 +171,9 @@ func (e *Emitter) EmitWarning(event WarningEvent) error {
 	if err := e.output.rejectLocked(TypeWarning); err != nil {
 		return err
 	}
+	// 必须先归一化再快照：否则账本里留 nil、发出的事件却是空容器，
+	// result.details.warnings[i] 会与原 warning 事件不再逐字段相等。
+	event.normalize()
 	canonical, ledger, err := snapshotWarning(event)
 	if err != nil {
 		return err
@@ -181,12 +188,12 @@ func (e *Emitter) EmitWarning(event WarningEvent) error {
 	return nil
 }
 
-// EmitError emits an operation error.
+// EmitError 发射操作 error。
 func (e *Emitter) EmitError(event ErrorEvent) error {
 	return e.emit(TypeError, &event)
 }
 
-// EmitResult emits an operation result.
+// EmitResult 发射操作 result。
 func (e *Emitter) EmitResult(event ResultEvent) error {
 	e.output.mu.Lock()
 	defer e.output.mu.Unlock()
@@ -198,7 +205,7 @@ func (e *Emitter) EmitResult(event ResultEvent) error {
 	return e.emitPreparedLocked(TypeResult, &event)
 }
 
-func (e *Emitter) emit(eventType EventType, event eventWithCommon) error {
+func (e *Emitter) emit(eventType EventType, event protocolEvent) error {
 	e.output.mu.Lock()
 	defer e.output.mu.Unlock()
 
@@ -221,7 +228,8 @@ func (o *ProcessOutput) rejectLocked(eventType EventType) error {
 	return nil
 }
 
-func (e *Emitter) emitPreparedLocked(eventType EventType, event eventWithCommon) error {
+func (e *Emitter) emitPreparedLocked(eventType EventType, event protocolEvent) error {
+	event.normalize()
 	event.setCommon(Common{
 		Protocol:    Version,
 		Type:        eventType,
@@ -229,7 +237,16 @@ func (e *Emitter) emitPreparedLocked(eventType EventType, event eventWithCommon)
 		Sequence:    e.output.nextSequence,
 		Timestamp:   e.clock().Format(time.RFC3339Nano),
 	})
+	terminalReserved := eventType == TypeResult
+	if terminalReserved {
+		// 在可能阻塞的 renderer 前预约终态，使唯一 result 与解锁顺序成为显式不变量。
+		// renderer 失败时仍在同一锁域回滚，保留非粘性编码错误的重试语义。
+		e.output.terminal = true
+	}
 	if err := renderEvent(e.output.renderer, event); err != nil {
+		if terminalReserved {
+			e.output.terminal = false
+		}
 		var nonSticky *nonStickyRenderError
 		if errors.As(err, &nonSticky) {
 			return nonSticky.err
@@ -238,9 +255,6 @@ func (e *Emitter) emitPreparedLocked(eventType EventType, event eventWithCommon)
 	}
 
 	e.output.nextSequence++
-	if eventType == TypeResult {
-		e.output.terminal = true
-	}
 	return nil
 }
 
@@ -286,10 +300,9 @@ func decodeWarningSummary(encoded []byte) (WarningSummary, error) {
 	return summary, nil
 }
 
+// resultDetails 构造 result 的 details。它总是返回新的顶层 map，
+// 既不修改调用方的 map，也不会让 details 变成 null。
 func (o *ProcessOutput) resultDetails(details map[string]any) map[string]any {
-	if details == nil && o.warningCount == 0 {
-		return nil
-	}
 	copied := make(map[string]any, len(details)+3)
 	for key, value := range details {
 		copied[key] = value
@@ -350,8 +363,12 @@ func (o *ProcessOutput) rememberWriteError(err error) error {
 	return o.writeErr
 }
 
-type eventWithCommon interface {
+// protocolEvent 是可发射的协议事件：既能被写入公共字段，也能把空容器字段
+// 归一化。归一化做成接口方法而不是各 Emit 方法里的散装判断，是为了让新增
+// 事件类型在编译期就必须表态，同时覆盖不经公开 Emit 方法的 hello 路径。
+type protocolEvent interface {
 	setCommon(Common)
+	normalize()
 }
 
 func (e *HelloEvent) setCommon(common Common) {
@@ -380,4 +397,46 @@ func (e *ErrorEvent) setCommon(common Common) {
 
 func (e *ResultEvent) setCommon(common Common) {
 	e.Common = common
+}
+
+func (e *HelloEvent) normalize() {
+	if e.Capabilities == nil {
+		e.Capabilities = []string{}
+	}
+}
+
+// normalize 对 progress 是空操作：该事件没有容器字段。
+func (e *ProgressEvent) normalize() {}
+
+func (e *StateEvent) normalize() {
+	if e.Details == nil {
+		e.Details = map[string]any{}
+	}
+}
+
+// normalize 对 log 是空操作：该事件没有容器字段。
+func (e *LogEvent) normalize() {}
+
+func (e *WarningEvent) normalize() {
+	e.Remediation, e.Details = normalizeContainers(e.Remediation, e.Details)
+}
+
+func (e *ErrorEvent) normalize() {
+	e.Remediation, e.Details = normalizeContainers(e.Remediation, e.Details)
+}
+
+func (e *ResultEvent) normalize() {
+	e.Remediation, e.Details = normalizeContainers(e.Remediation, e.Details)
+}
+
+// normalizeContainers 把 nil 的 remediation 与 details 换成空容器，
+// 保证 wire 上这两个字段永远是数组和对象，不出现 null。
+func normalizeContainers(remediation []string, details map[string]any) ([]string, map[string]any) {
+	if remediation == nil {
+		remediation = []string{}
+	}
+	if details == nil {
+		details = map[string]any{}
+	}
+	return remediation, details
 }

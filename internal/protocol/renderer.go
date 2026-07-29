@@ -5,10 +5,9 @@ import (
 	"reflect"
 )
 
-// EventRenderer projects protocol events after their Common fields have been
-// populated. A renderer must not modify business semantics or call back into
-// the current Emitter or ProcessOutput, because rendering occurs under its
-// serialization lock.
+// EventRenderer 在 Common 字段填充后投影协议事件。
+// 渲染发生在 ProcessOutput 的串行化锁内，因此实现不得改变业务语义，
+// 也不得回调当前 Emitter 或 ProcessOutput。
 type EventRenderer interface {
 	RenderHello(HelloEvent) error
 	RenderProgress(ProgressEvent) error
@@ -19,6 +18,7 @@ type EventRenderer interface {
 	RenderResult(ResultEvent) error
 }
 
+// nonStickyRenderError 表示目标输出尚未受损，不能把该错误固化为后续写入错误。
 type nonStickyRenderError struct {
 	err error
 }
@@ -27,7 +27,7 @@ func (e *nonStickyRenderError) Error() string { return e.err.Error() }
 
 func (e *nonStickyRenderError) Unwrap() error { return e.err }
 
-func renderEvent(renderer EventRenderer, event eventWithCommon) error {
+func renderEvent(renderer EventRenderer, event protocolEvent) error {
 	switch value := event.(type) {
 	case *HelloEvent:
 		return renderer.RenderHello(*value)
@@ -48,6 +48,7 @@ func renderEvent(renderer EventRenderer, event eventWithCommon) error {
 	}
 }
 
+// interfaceIsNil 同时识别 interface 本身为 nil 和其中包裹的 typed nil。
 func interfaceIsNil(value any) bool {
 	if value == nil {
 		return true

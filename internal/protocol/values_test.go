@@ -2,11 +2,8 @@ package protocol_test
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -63,6 +60,9 @@ func TestProtocolValuesMatchArchitectureDocument(t *testing.T) {
 	if got := protocol.AllStateStatuses(); !reflect.DeepEqual(got, stateStatuses) {
 		t.Fatalf("AllStateStatuses() = %#v, documented = %#v", got, stateStatuses)
 	}
+	if got, want := protocol.AllCapabilities(), documentedCapabilities(t); !reflect.DeepEqual(got, want) {
+		t.Fatalf("AllCapabilities() = %#v, documented = %#v", got, want)
+	}
 }
 
 func TestProtocolValueQueriesReturnDefensiveCopies(t *testing.T) {
@@ -84,6 +84,12 @@ func TestProtocolValueQueriesReturnDefensiveCopies(t *testing.T) {
 	stateStatuses[0] = protocol.StateStatus("changed")
 	if got := protocol.AllStateStatuses()[0]; got != protocol.StateUninitialized {
 		t.Fatalf("AllStateStatuses() exposed shared storage: %q", got)
+	}
+
+	capabilities := protocol.AllCapabilities()
+	capabilities[0] = protocol.Capability("changed")
+	if got := protocol.AllCapabilities()[0]; got != protocol.CapabilityStdinCancel {
+		t.Fatalf("AllCapabilities() exposed shared storage: %q", got)
 	}
 }
 
@@ -115,6 +121,15 @@ func TestProtocolValueKnownQueries(t *testing.T) {
 	}
 	if protocol.IsKnownStateStatus(protocol.StateStatus("future")) {
 		t.Error("IsKnownStateStatus(future) = true, want false")
+	}
+
+	for _, capability := range protocol.AllCapabilities() {
+		if !protocol.IsKnownCapability(capability) {
+			t.Errorf("IsKnownCapability(%q) = false, want true", capability)
+		}
+	}
+	if protocol.IsKnownCapability(protocol.Capability("future.capability")) {
+		t.Error("IsKnownCapability(future.capability) = true, want false")
 	}
 }
 
@@ -178,24 +193,16 @@ func TestUnknownStageDecodesWithoutProtocolRejection(t *testing.T) {
 func documentedProtocolValues(t *testing.T) ([]protocol.Stage, []protocol.ProgressStatus, []protocol.StateStatus) {
 	t.Helper()
 
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller() could not resolve test source")
-	}
-	architecturePath := filepath.Join(filepath.Dir(source), "..", "..", "doc", "架构设计.md")
-	content, err := os.ReadFile(architecturePath)
-	if err != nil {
-		t.Fatalf("read architecture document: %v", err)
-	}
+	content := readDoc(t, "架构设计.md")
 
-	stageSection := architectureSection(t, string(content), "协议版本 1 的 `stage` 标识固定如下", "新增 stage 可以追加")
+	stageSection := docSection(t, content, "协议版本 1 的 `stage` 标识固定如下", "新增 stage 可以追加")
 	stageMatches := regexp.MustCompile("`([a-z]+(?:\\.[a-z]+)?)`").FindAllStringSubmatch(stageSection, -1)
 	stages := make([]protocol.Stage, 0, len(stageMatches))
 	for _, match := range stageMatches {
 		stages = append(stages, protocol.Stage(match[1]))
 	}
 
-	progressSection := architectureSection(t, string(content), "`progress.status` 在协议版本 1 中只能是", "协议版本 1 的 `stage` 标识固定如下")
+	progressSection := docSection(t, content, "`progress.status` 在协议版本 1 中只能是", "协议版本 1 的 `stage` 标识固定如下")
 	progressSentence, _, found := strings.Cut(progressSection, "。")
 	if !found {
 		t.Fatal("progress.status sentence is not terminated")
@@ -206,7 +213,7 @@ func documentedProtocolValues(t *testing.T) ([]protocol.Stage, []protocol.Progre
 		progressStatuses = append(progressStatuses, protocol.ProgressStatus(match[1]))
 	}
 
-	stateSection := architectureSection(t, string(content), "协议版本 1 的 `state.status` 取值固定如下", "主准备路径固定为")
+	stateSection := docSection(t, content, "协议版本 1 的 `state.status` 取值固定如下", "主准备路径固定为")
 	stateMatches := regexp.MustCompile("(?m)^\\| `([a-z_]+)` \\|").FindAllStringSubmatch(stateSection, -1)
 	stateStatuses := make([]protocol.StateStatus, 0, len(stateMatches))
 	for _, match := range stateMatches {
@@ -219,16 +226,22 @@ func documentedProtocolValues(t *testing.T) ([]protocol.Stage, []protocol.Progre
 	return stages, progressStatuses, stateStatuses
 }
 
-func architectureSection(t *testing.T, content, start, end string) string {
+func documentedCapabilities(t *testing.T) []protocol.Capability {
 	t.Helper()
-	startIndex := strings.Index(content, start)
-	if startIndex < 0 {
-		t.Fatalf("architecture document missing start marker %q", start)
+
+	section := docSection(
+		t,
+		readDoc(t, "架构设计.md"),
+		"协议版本 1 的能力标识固定如下",
+		"新增能力标识可以追加",
+	)
+	matches := regexp.MustCompile("(?m)^\\| `([a-z0-9.]+)` \\|").FindAllStringSubmatch(section, -1)
+	capabilities := make([]protocol.Capability, 0, len(matches))
+	for _, match := range matches {
+		capabilities = append(capabilities, protocol.Capability(match[1]))
 	}
-	section := content[startIndex+len(start):]
-	endIndex := strings.Index(section, end)
-	if endIndex < 0 {
-		t.Fatalf("architecture document missing end marker %q", end)
+	if len(capabilities) != 3 {
+		t.Fatalf("documented capability count = %d, want 3", len(capabilities))
 	}
-	return section[:endIndex]
+	return capabilities
 }

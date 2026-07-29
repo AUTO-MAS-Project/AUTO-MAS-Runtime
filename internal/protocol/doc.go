@@ -1,10 +1,7 @@
-// Package protocol defines the public event, error, lifecycle, rendering, and
-// stdin control contracts for one Runtime operation.
+// Package protocol 定义单次 Runtime 操作的事件、错误、生命周期、渲染和 stdin 控制契约。
 //
-// ProcessOutput serializes every event through one renderer, emits exactly one
-// terminal result, and rejects all later events. Successfully emitted warnings
-// are snapshotted into a bounded, authoritative result summary.
+// ProcessOutput 通过同一个 renderer 串行化所有事件，只允许一个终态 result，
+// 并拒绝其后的任何事件。成功发射的 warning 会以有界快照形式汇总到权威 result 中。
 //
-// The contracttest subpackage validates raw NDJSON framing, envelopes, terminal
-// semantics, and warning summaries for command integration tests.
+// contracttest 子包为命令集成测试校验原始 NDJSON 分帧、公共结构、终态语义与 warning 汇总。
 package protocol

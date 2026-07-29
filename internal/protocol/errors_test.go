@@ -1,11 +1,8 @@
 package protocol_test
 
 import (
-	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -115,6 +112,50 @@ func TestRemediationConstantsAreComplete(t *testing.T) {
 
 	if !reflect.DeepEqual(implemented, want) {
 		t.Fatalf("AllRemediations() = %#v, want %#v", implemented, want)
+	}
+}
+
+func TestStableErrorValueQueries(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		code protocol.Code
+		want bool
+	}{
+		{name: "success", code: protocol.CodeOK, want: true},
+		{name: "defined error", code: protocol.CodeOperationCancelled, want: true},
+		{name: "unknown", code: protocol.Code("FUTURE_UNKNOWN_CODE"), want: false},
+	} {
+		test := test
+		t.Run("code "+test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := protocol.IsKnownCode(test.code); got != test.want {
+				t.Errorf("IsKnownCode(%q) = %t, want %t", test.code, got, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name        string
+		remediation protocol.Remediation
+		want        bool
+	}{
+		{name: "defined", remediation: protocol.RemediationRetry, want: true},
+		{name: "unknown", remediation: protocol.Remediation("future-action"), want: false},
+	} {
+		test := test
+		t.Run("remediation "+test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := protocol.IsKnownRemediation(test.remediation); got != test.want {
+				t.Errorf(
+					"IsKnownRemediation(%q) = %t, want %t",
+					test.remediation,
+					got,
+					test.want,
+				)
+			}
+		})
 	}
 }
 
@@ -244,36 +285,38 @@ func TestEventConstructorsRejectUnknownCode(t *testing.T) {
 	}
 }
 
+func TestNewErrorEventRejectsWarningOnlyCodes(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []protocol.Code{
+		protocol.CodeInvalidControlCommand,
+		protocol.CodeBackendForceTerminated,
+	} {
+		code := code
+		t.Run(string(code), func(t *testing.T) {
+			t.Parallel()
+			if _, err := protocol.NewErrorEvent(code, protocol.StageDoctor, "warning-only", nil); err == nil {
+				t.Errorf("NewErrorEvent(%q) error = nil, want warning-only-code error", code)
+			}
+		})
+	}
+}
+
 func documentedErrorDefinitions(t *testing.T) []protocol.ErrorDefinition {
 	t.Helper()
 
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller() could not resolve test source")
-	}
-	architecturePath := filepath.Join(filepath.Dir(source), "..", "..", "doc", "架构设计.md")
-	content, err := os.ReadFile(architecturePath)
-	if err != nil {
-		t.Fatalf("read architecture document: %v", err)
-	}
+	content := docSection(
+		t,
+		readDoc(t, "架构设计.md"),
+		"### 错误码全集",
+		"### 已确认决策",
+	)
 
 	rowPattern := regexp.MustCompile("^\\| `([A-Z][A-Z0-9_]*)` \\| ([0-9]+) \\| (是|否) \\| (.*) \\|$")
 	remediationPattern := regexp.MustCompile("`([^`]+)`")
-	inErrorSection := false
 	var definitions []protocol.ErrorDefinition
-	for _, line := range strings.Split(string(content), "\n") {
+	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSuffix(line, "\r")
-		switch line {
-		case "### 错误码全集":
-			inErrorSection = true
-			continue
-		case "### 已确认决策":
-			inErrorSection = false
-		}
-		if !inErrorSection {
-			continue
-		}
-
 		match := rowPattern.FindStringSubmatch(line)
 		if match == nil {
 			continue

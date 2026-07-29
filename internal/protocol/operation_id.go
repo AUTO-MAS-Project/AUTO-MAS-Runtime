@@ -13,7 +13,7 @@ const (
 	ulidAlphabet      = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 )
 
-// newOperationID returns a canonical ULID containing the supplied timestamp.
+// newOperationID 返回包含给定时间戳的规范 ULID。
 func newOperationID(now time.Time, random io.Reader) (string, error) {
 	var data [16]byte
 
@@ -40,6 +40,10 @@ func newOperationID(now time.Time, random io.Reader) (string, error) {
 	return string(encoded[:]), nil
 }
 
+func newRandomOperationID(now time.Time) (string, error) {
+	return newOperationID(now, rand.Reader)
+}
+
 func validOperationID(value string) bool {
 	if len(value) != operationIDLength || value[0] > '7' {
 		return false
@@ -60,5 +64,3 @@ func isULIDCharacter(value byte) bool {
 	}
 	return false
 }
-
-var operationRandom = rand.Reader

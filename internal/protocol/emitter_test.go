@@ -82,6 +82,69 @@ func TestNewEmitterEmitsHelloFirst(t *testing.T) {
 	}
 }
 
+func TestNewEmitterRejectsUnknownCapabilityWithoutOutput(t *testing.T) {
+	t.Parallel()
+
+	var output flushingBuffer
+	processOutput, err := protocol.NewProcessOutput(&output)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	if _, err := processOutput.NewEmitter(
+		"v1.0.0",
+		"doctor",
+		[]string{"future.capability"},
+		protocol.WithOperationID(testOperationID),
+	); err == nil || !strings.Contains(err.Error(), `unknown protocol capability "future.capability"`) {
+		t.Fatalf("NewEmitter() error = %v, want unknown capability error", err)
+	}
+	if got := output.String(); got != "" {
+		t.Fatalf("output after rejected capability = %q, want empty", got)
+	}
+	if output.flushes != 0 {
+		t.Fatalf("flush count after rejected capability = %d, want 0", output.flushes)
+	}
+}
+
+func TestNewEmitterCopiesCapabilitiesAtEntry(t *testing.T) {
+	t.Parallel()
+
+	var output flushingBuffer
+	processOutput, err := protocol.NewProcessOutput(&output)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	now := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
+	capabilities := []string{string(protocol.CapabilityStdinCancel)}
+	if _, err := processOutput.NewEmitter(
+		"v1.0.0",
+		"doctor",
+		capabilities,
+		protocol.WithOperationID(testOperationID),
+		protocol.WithClock(func() time.Time {
+			capabilities[0] = "future.capability"
+			return now
+		}),
+	); err != nil {
+		t.Fatalf("NewEmitter() error = %v", err)
+	}
+	if got := capabilities[0]; got != "future.capability" {
+		t.Fatalf("injected clock did not mutate caller slice: got %q", got)
+	}
+
+	lines := ndjsonLines(t, output.String())
+	if len(lines) != 1 {
+		t.Fatalf("line count = %d, want 1", len(lines))
+	}
+	var hello protocol.HelloEvent
+	if err := json.Unmarshal([]byte(lines[0]), &hello); err != nil {
+		t.Fatalf("hello is not valid JSON: %v", err)
+	}
+	if got, want := hello.Capabilities, []string{string(protocol.CapabilityStdinCancel)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("hello.capabilities = %#v, want entry snapshot %#v", got, want)
+	}
+}
+
 func TestNewProcessOutputStillUsesNDJSON(t *testing.T) {
 	var output bytes.Buffer
 	now := time.Date(2026, 7, 28, 15, 30, 0, 0, time.UTC)
@@ -899,6 +962,176 @@ func TestProcessOutputRejectsSecondEmitter(t *testing.T) {
 		protocol.WithOperationID("01ARZ3NDEKTSV4RRFFQ69G5FAW"),
 	); err == nil {
 		t.Fatal("second ProcessOutput.NewEmitter() error = nil, want process-output ownership error")
+	}
+}
+
+func TestEmitter_ContainerFieldsAreNeverNull(t *testing.T) {
+	t.Parallel()
+
+	var output flushingBuffer
+	emitter := newTestEmitter(t, &output)
+
+	if err := emitter.EmitProgress(protocol.ProgressEvent{
+		Stage:   protocol.StageDoctor,
+		Status:  protocol.ProgressRunning,
+		Message: "正在检查",
+	}); err != nil {
+		t.Fatalf("EmitProgress() error = %v", err)
+	}
+	if err := emitter.EmitState(protocol.StateEvent{
+		Stage:   protocol.StageDoctor,
+		Status:  protocol.StateReadyToStart,
+		Message: "已就绪",
+	}); err != nil {
+		t.Fatalf("EmitState() error = %v", err)
+	}
+	if err := emitter.EmitLog(protocol.LogEvent{
+		Source:  "backend",
+		Stream:  "stdout",
+		Message: "started",
+	}); err != nil {
+		t.Fatalf("EmitLog() error = %v", err)
+	}
+	if err := emitter.EmitError(protocol.ErrorEvent{
+		Code:    string(protocol.CodeStateWriteFailed),
+		Stage:   protocol.StageDoctor,
+		Message: "状态写入失败",
+	}); err != nil {
+		t.Fatalf("EmitError() error = %v", err)
+	}
+	if err := emitter.EmitResult(protocol.ResultEvent{
+		Code:    string(protocol.CodeStateWriteFailed),
+		Stage:   protocol.StageDoctor,
+		Status:  "failed",
+		Message: "状态写入失败",
+	}); err != nil {
+		t.Fatalf("EmitResult() error = %v", err)
+	}
+
+	events := decodeEvents(t, output.String())
+	if len(events) != 6 {
+		t.Fatalf("event count = %d, want 6", len(events))
+	}
+	for _, test := range []struct {
+		index   int
+		typ     string
+		arrays  []string
+		objects []string
+	}{
+		{index: 0, typ: "hello", arrays: []string{"capabilities"}},
+		{index: 1, typ: "progress"},
+		{index: 2, typ: "state", objects: []string{"details"}},
+		{index: 3, typ: "log"},
+		{index: 4, typ: "error", arrays: []string{"remediation"}, objects: []string{"details"}},
+		{index: 5, typ: "result", arrays: []string{"remediation"}, objects: []string{"details"}},
+	} {
+		event := events[test.index]
+		if got := event["type"]; got != test.typ {
+			t.Fatalf("event[%d].type = %v, want %q", test.index, got, test.typ)
+		}
+		for _, key := range test.arrays {
+			assertEmptyArray(t, test.typ, key, event)
+		}
+		for _, key := range test.objects {
+			assertEmptyObject(t, test.typ, key, event)
+		}
+	}
+}
+
+func TestEmitter_WarningSummaryNormalizesContainers(t *testing.T) {
+	t.Parallel()
+
+	var output flushingBuffer
+	emitter := newTestEmitter(t, &output)
+
+	if err := emitter.EmitWarning(protocol.WarningEvent{
+		Code:    string(protocol.CodeInvalidControlCommand),
+		Stage:   protocol.StageDoctor,
+		Message: "已忽略无效的 stdin 控制命令",
+	}); err != nil {
+		t.Fatalf("EmitWarning() error = %v", err)
+	}
+	if err := emitter.EmitResult(protocol.ResultEvent{
+		Success: true,
+		Code:    string(protocol.CodeOK),
+		Stage:   protocol.StageDoctor,
+		Status:  "succeeded",
+		Message: "完成",
+	}); err != nil {
+		t.Fatalf("EmitResult() error = %v", err)
+	}
+
+	events := decodeEvents(t, output.String())
+	if len(events) != 3 {
+		t.Fatalf("event count = %d, want 3", len(events))
+	}
+	warning := events[1]
+	assertEmptyArray(t, "warning", "remediation", warning)
+	assertEmptyObject(t, "warning", "details", warning)
+
+	details, ok := events[2]["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("result.details = %#v, want an object", events[2]["details"])
+	}
+	summaries, ok := details["warnings"].([]any)
+	if !ok || len(summaries) != 1 {
+		t.Fatalf("result.details.warnings = %#v, want exactly one summary", details["warnings"])
+	}
+	summary, ok := summaries[0].(map[string]any)
+	if !ok {
+		t.Fatalf("result.details.warnings[0] = %#v, want an object", summaries[0])
+	}
+	assertEmptyArray(t, "result warning summary", "remediation", summary)
+	assertEmptyObject(t, "result warning summary", "details", summary)
+
+	// 归一化必须发生在快照之前，否则汇总与原 warning 事件会漂移。
+	for _, field := range []string{"code", "stage", "message", "retryable", "remediation", "details"} {
+		if !reflect.DeepEqual(summary[field], warning[field]) {
+			t.Errorf("summary[%q] = %#v, warning[%q] = %#v", field, summary[field], field, warning[field])
+		}
+	}
+}
+
+func decodeEvents(t *testing.T, transcript string) []map[string]any {
+	t.Helper()
+
+	lines := ndjsonLines(t, transcript)
+	events := make([]map[string]any, 0, len(lines))
+	for index, line := range lines {
+		decoder := json.NewDecoder(strings.NewReader(line))
+		decoder.UseNumber()
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatalf("line %d is not a JSON object: %v", index+1, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func assertEmptyArray(t *testing.T, label, key string, event map[string]any) {
+	t.Helper()
+
+	value, exists := event[key]
+	if !exists {
+		t.Errorf("%s.%s is missing, want an empty array", label, key)
+		return
+	}
+	if got, ok := value.([]any); !ok || len(got) != 0 {
+		t.Errorf("%s.%s = %#v, want an empty array", label, key, value)
+	}
+}
+
+func assertEmptyObject(t *testing.T, label, key string, event map[string]any) {
+	t.Helper()
+
+	value, exists := event[key]
+	if !exists {
+		t.Errorf("%s.%s is missing, want an empty object", label, key)
+		return
+	}
+	if got, ok := value.(map[string]any); !ok || len(got) != 0 {
+		t.Errorf("%s.%s = %#v, want an empty object", label, key, value)
 	}
 }
 

@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// LifecycleTransition is a valid lifecycle state transition.
+// LifecycleTransition 表示一条合法的生命周期状态迁移。
 type LifecycleTransition struct {
 	From StateStatus
 	To   StateStatus
@@ -39,12 +39,12 @@ var lifecycleTransitions = []LifecycleTransition{
 	{From: StateStoppingBackend, To: StateBackendFailed},
 }
 
-// AllLifecycleTransitions returns the lifecycle transition table in protocol order.
+// AllLifecycleTransitions 按协议顺序返回生命周期迁移表的防御性副本。
 func AllLifecycleTransitions() []LifecycleTransition {
 	return append([]LifecycleTransition(nil), lifecycleTransitions...)
 }
 
-// IsKnownLifecycleTransition reports whether from-to is in the static transition table.
+// IsKnownLifecycleTransition 报告 from 到 to 是否位于静态迁移表中。
 func IsKnownLifecycleTransition(from, to StateStatus) bool {
 	for _, transition := range lifecycleTransitions {
 		if transition.From == from && transition.To == to {
@@ -54,15 +54,16 @@ func IsKnownLifecycleTransition(from, to StateStatus) bool {
 	return false
 }
 
-// LifecycleMachine validates and applies in-process lifecycle transitions.
+// LifecycleMachine 校验并应用进程内生命周期迁移。
 type LifecycleMachine struct {
+	// mu 保护 initial、current 与 restartUsed，使读取和迁移处于同一线性化域。
 	mu          sync.RWMutex
 	initial     StateStatus
 	current     StateStatus
 	restartUsed bool
 }
 
-// NewLifecycleMachine creates a machine from a persisted stable lifecycle state.
+// NewLifecycleMachine 从已持久化的稳定生命周期状态创建状态机。
 func NewLifecycleMachine(initial StateStatus) (*LifecycleMachine, error) {
 	switch initial {
 	case StateUninitialized, StateEnvironmentBroken, StateReadyToStart:
@@ -75,28 +76,28 @@ func NewLifecycleMachine(initial StateStatus) (*LifecycleMachine, error) {
 	}
 }
 
-// Current returns the current lifecycle state.
+// Current 返回当前生命周期状态。
 func (m *LifecycleMachine) Current() StateStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.current
 }
 
-// Initial returns the stable state used to construct the machine.
+// Initial 返回构造状态机时使用的稳定状态。
 func (m *LifecycleMachine) Initial() StateStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.initial
 }
 
-// RestartUsed reports whether the automatic backend restart has been used.
+// RestartUsed 报告自动后端重启机会是否已经使用。
 func (m *LifecycleMachine) RestartUsed() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.restartUsed
 }
 
-// RollbackPreparation restores the stable initial state before managed state changes.
+// RollbackPreparation 在发生受管状态变更前恢复稳定初始状态。
 func (m *LifecycleMachine) RollbackPreparation() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -110,7 +111,8 @@ func (m *LifecycleMachine) RollbackPreparation() error {
 	}
 }
 
-// Transition moves the machine to next when the static transition table allows it.
+// Transition 在静态迁移表和当前实例的状态化守卫都允许时把状态机移动到 next。
+// 状态化守卫拒绝终态迁移、自循环，以及绕过或重复使用单次自动重启。
 func (m *LifecycleMachine) Transition(next StateStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

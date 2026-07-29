@@ -38,69 +38,82 @@ func demoRunner(t *testing.T, terminal contracttest.Terminal) contracttest.Trans
 
 	switch terminal {
 	case contracttest.TerminalSuccess:
-		mustEmitWarning(t, emitter, protocol.WarningEvent{
-			Code:        "OPTIONAL_CHECK_SKIPPED",
-			Stage:       protocol.StageDoctor,
-			Message:     "optional check skipped",
-			Retryable:   false,
-			Remediation: []string{"review-log"},
-			Details:     map[string]any{"check": "optional"},
-		})
-		mustEmitResult(t, emitter, protocol.ResultEvent{
-			Success:     true,
-			Code:        "OK",
-			Stage:       protocol.StageDoctor,
-			Status:      "succeeded",
-			Message:     "doctor passed",
-			Retryable:   false,
-			Remediation: []string{},
-			Details:     map[string]any{},
-		})
+		warning := mustNewWarningEvent(
+			t,
+			protocol.CodeInvalidControlCommand,
+			"invalid control command ignored",
+			map[string]any{"command": "unsupported"},
+		)
+		mustEmitWarning(t, emitter, warning)
+		mustEmitResult(
+			t,
+			emitter,
+			protocol.NewSuccessResult(
+				protocol.StageDoctor,
+				"succeeded",
+				"doctor passed",
+				map[string]any{},
+			),
+		)
 	case contracttest.TerminalFailure:
-		failure := protocol.ErrorEvent{
-			Code:        "DOCTOR_FAILED",
-			Stage:       protocol.StageDoctor,
-			Message:     "doctor failed",
-			Retryable:   true,
-			Remediation: []string{"retry"},
-			Details:     map[string]any{"check": "runtime"},
-		}
+		failure := mustNewErrorEvent(
+			t,
+			protocol.CodeUpdateStateAmbiguous,
+			"doctor failed",
+			map[string]any{"check": "runtime"},
+		)
 		mustEmitError(t, emitter, failure)
-		mustEmitResult(t, emitter, protocol.ResultEvent{
-			Success:     false,
-			Code:        failure.Code,
-			Stage:       failure.Stage,
-			Status:      "failed",
-			Message:     failure.Message,
-			Retryable:   failure.Retryable,
-			Remediation: failure.Remediation,
-			Details:     map[string]any{},
-		})
+		mustEmitResult(
+			t,
+			emitter,
+			protocol.NewFailureResult(failure, "failed", failure.Message, map[string]any{}),
+		)
 	case contracttest.TerminalCancelled:
-		cancelled := protocol.ErrorEvent{
-			Code:        string(protocol.CodeOperationCancelled),
-			Stage:       protocol.StageDoctor,
-			Message:     "doctor cancelled",
-			Retryable:   false,
-			Remediation: []string{"retry"},
-			Details:     map[string]any{},
-		}
+		cancelled := mustNewErrorEvent(
+			t,
+			protocol.CodeOperationCancelled,
+			"doctor cancelled",
+			map[string]any{},
+		)
 		mustEmitError(t, emitter, cancelled)
-		mustEmitResult(t, emitter, protocol.ResultEvent{
-			Success:     false,
-			Code:        cancelled.Code,
-			Stage:       cancelled.Stage,
-			Status:      "cancelled",
-			Message:     cancelled.Message,
-			Retryable:   cancelled.Retryable,
-			Remediation: cancelled.Remediation,
-			Details:     map[string]any{},
-		})
+		mustEmitResult(
+			t,
+			emitter,
+			protocol.NewFailureResult(cancelled, "cancelled", cancelled.Message, map[string]any{}),
+		)
 	default:
 		t.Fatalf("unexpected terminal %q", terminal)
 	}
 
 	return contracttest.Transcript{Stdout: stdout.Bytes()}
+}
+
+func mustNewWarningEvent(
+	t *testing.T,
+	code protocol.Code,
+	message string,
+	details map[string]any,
+) protocol.WarningEvent {
+	t.Helper()
+	event, err := protocol.NewWarningEvent(code, protocol.StageDoctor, message, details)
+	if err != nil {
+		t.Fatalf("NewWarningEvent() error = %v", err)
+	}
+	return event
+}
+
+func mustNewErrorEvent(
+	t *testing.T,
+	code protocol.Code,
+	message string,
+	details map[string]any,
+) protocol.ErrorEvent {
+	t.Helper()
+	event, err := protocol.NewErrorEvent(code, protocol.StageDoctor, message, details)
+	if err != nil {
+		t.Fatalf("NewErrorEvent() error = %v", err)
+	}
+	return event
 }
 
 func mustEmitWarning(t *testing.T, emitter *protocol.Emitter, event protocol.WarningEvent) {

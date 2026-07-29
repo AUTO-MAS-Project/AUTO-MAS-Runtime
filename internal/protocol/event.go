@@ -1,9 +1,9 @@
 package protocol
 
-// Version is the current Runtime NDJSON protocol version.
+// Version 是当前 Runtime NDJSON 协议版本。
 const Version = 1
 
-// EventType identifies an NDJSON event.
+// EventType 标识一种 NDJSON 事件。
 type EventType string
 
 const (
@@ -16,7 +16,7 @@ const (
 	TypeResult   EventType = "result"
 )
 
-// Common contains the fields shared by every protocol event.
+// Common 包含所有协议事件共享的字段。
 type Common struct {
 	Protocol    int       `json:"protocol"`
 	Type        EventType `json:"type"`
@@ -25,7 +25,7 @@ type Common struct {
 	Timestamp   string    `json:"timestamp"`
 }
 
-// HelloEvent describes the Runtime and the operation being started.
+// HelloEvent 描述 Runtime 及即将开始的操作。
 type HelloEvent struct {
 	Common
 	RuntimeVersion string   `json:"runtimeVersion"`
@@ -33,7 +33,7 @@ type HelloEvent struct {
 	Capabilities   []string `json:"capabilities"`
 }
 
-// ProgressEvent reports progress for a stable stage.
+// ProgressEvent 报告稳定 stage 的执行进度。
 type ProgressEvent struct {
 	Common
 	Stage   Stage          `json:"stage"`
@@ -44,7 +44,7 @@ type ProgressEvent struct {
 	Message string         `json:"message"`
 }
 
-// StateEvent reports a lifecycle transition or a read-only status snapshot.
+// StateEvent 报告生命周期迁移或只读状态快照。
 type StateEvent struct {
 	Common
 	Stage   Stage          `json:"stage"`
@@ -53,7 +53,7 @@ type StateEvent struct {
 	Details map[string]any `json:"details"`
 }
 
-// LogEvent carries one displayable line from a managed process.
+// LogEvent 携带受管进程的一行可显示日志。
 type LogEvent struct {
 	Common
 	Source  string `json:"source"`
@@ -61,7 +61,7 @@ type LogEvent struct {
 	Message string `json:"message"`
 }
 
-// WarningEvent reports a condition that does not stop the operation.
+// WarningEvent 报告不会终止操作的异常情况。
 type WarningEvent struct {
 	Common
 	Code        string         `json:"code"`
@@ -72,12 +72,11 @@ type WarningEvent struct {
 	Details     map[string]any `json:"details"`
 }
 
-// MaxResultWarningSummaries is the maximum number of warning snapshots kept
-// in a terminal result. warningCount still reports every emitted warning.
+// MaxResultWarningSummaries 是终态 result 最多保留的 warning 快照数。
+// warningCount 仍会统计全部已发射的 warning。
 const MaxResultWarningSummaries = 256
 
-// WarningSummary is the immutable business-field snapshot of an emitted
-// warning that is included in the terminal result.
+// WarningSummary 是已发射 warning 与调用方可变输入隔离的业务字段快照，会随终态 result 返回。
 type WarningSummary struct {
 	Code        string         `json:"code"`
 	Stage       Stage          `json:"stage"`
@@ -87,7 +86,7 @@ type WarningSummary struct {
 	Details     map[string]any `json:"details"`
 }
 
-// ErrorEvent reports the primary failure of an operation.
+// ErrorEvent 报告操作的主错误。
 type ErrorEvent struct {
 	Common
 	Code        string         `json:"code"`
@@ -98,7 +97,7 @@ type ErrorEvent struct {
 	Details     map[string]any `json:"details"`
 }
 
-// ResultEvent is the final outcome of a top-level operation.
+// ResultEvent 表示顶层操作的最终结果。
 type ResultEvent struct {
 	Common
 	Success     bool           `json:"success"`

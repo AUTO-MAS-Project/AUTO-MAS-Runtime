@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	maxTypeLabelBytes          = 64
+	maxDiagnosticValueBytes    = 64
 	maxTypeSummaryBytes        = 256
 	diagnosticTruncationMarker = "...(truncated)"
 )
@@ -43,6 +43,7 @@ func (i contractIssue) Error() string {
 	)
 }
 
+// inspect 先保留物理行证据，再叠加跨事件校验，使所有问题共享同一份有界诊断摘要。
 func inspect(command string, terminal Terminal, stdout []byte) ([]parsedEvent, []contractIssue) {
 	events, issues := parsePhysicalLines(command, terminal, stdout)
 	issues = append(issues, validateEnvelope(command, terminal, events)...)
@@ -54,6 +55,7 @@ func inspect(command string, terminal Terminal, stdout []byte) ([]parsedEvent, [
 	return events, issues
 }
 
+// parsePhysicalLines 严格按 LF 分帧，并要求每个物理行恰好包含一个 UTF-8 JSON object。
 func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]parsedEvent, []contractIssue) {
 	if len(stdout) == 0 {
 		return nil, []contractIssue{newIssue(command, terminal, 0, nil, "transcript is empty")}
@@ -98,7 +100,7 @@ func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]par
 				terminal,
 				lineNumber,
 				line,
-				fmt.Sprintf("duplicate JSON object name %q", truncateUTF8String(name, maxTypeLabelBytes)),
+				fmt.Sprintf("duplicate JSON object name %q", truncateUTF8String(name, maxDiagnosticValueBytes)),
 			))
 			continue
 		}
@@ -136,6 +138,7 @@ func parsePhysicalLines(command string, terminal Terminal, stdout []byte) ([]par
 	return events, issues
 }
 
+// duplicateJSONObjectName 在标准解码覆盖同名字段之前递归扫描原始 token。
 func duplicateJSONObjectName(line []byte) (string, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(line))
 	decoder.UseNumber()
@@ -146,6 +149,7 @@ func duplicateJSONObjectName(line []byte) (string, bool) {
 	return name, duplicate
 }
 
+// scanJSONValue 遍历任意嵌套 object/array，并返回遇到的第一处重复 object name。
 func scanJSONValue(decoder *json.Decoder) (string, bool, error) {
 	token, err := decoder.Token()
 	if err != nil {
@@ -255,7 +259,7 @@ func summarizeEventType(event parsedEvent) string {
 }
 
 func boundedTypeName(value string) string {
-	return truncateUTF8String(value, maxTypeLabelBytes)
+	return truncateUTF8String(value, maxDiagnosticValueBytes)
 }
 
 func truncateUTF8String(value string, maxBytes int) string {

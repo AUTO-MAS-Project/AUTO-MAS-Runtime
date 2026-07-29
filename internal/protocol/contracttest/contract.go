@@ -1,9 +1,9 @@
-// Package contracttest validates raw protocol NDJSON emitted by Runtime commands.
+// Package contracttest 校验 Runtime 命令发射的原始协议 NDJSON。
 package contracttest
 
 import "testing"
 
-// Terminal identifies the expected operation outcome for a transcript.
+// Terminal 标识 transcript 预期的操作终态。
 type Terminal string
 
 const (
@@ -12,15 +12,15 @@ const (
 	TerminalCancelled Terminal = "cancelled"
 )
 
-// Transcript contains the raw stdout bytes emitted by a command scenario.
+// Transcript 保存命令场景写出的原始 stdout 字节。
 type Transcript struct {
 	Stdout []byte
 }
 
-// Runner executes one command scenario and returns its raw transcript.
+// Runner 执行一个命令场景并返回原始 transcript。
 type Runner func(t *testing.T, terminal Terminal) Transcript
 
-// Register runs the common contract for every terminal scenario.
+// Register 对每一种终态场景运行公共契约。
 func Register(t *testing.T, command string, run Runner) {
 	t.Helper()
 	for _, terminal := range []Terminal{
@@ -36,7 +36,7 @@ func Register(t *testing.T, command string, run Runner) {
 	}
 }
 
-// Assert reports every contract violation in stdout.
+// Assert 报告 stdout 中的每一项契约违规。
 func Assert(t *testing.T, command string, terminal Terminal, stdout []byte) {
 	t.Helper()
 	_, issues := inspect(command, terminal, stdout)

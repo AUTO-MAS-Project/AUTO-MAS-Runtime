@@ -23,32 +23,7 @@ var knownEventTypes = map[string]struct{}{
 	string(protocol.TypeResult):   {},
 }
 
-type schemaRule struct {
-	field       string
-	description string
-	valid       func(any) bool
-}
-
-var resultSchema = []schemaRule{
-	{field: "success", description: "a boolean", valid: isBoolean},
-	{field: "code", description: "a string", valid: isString},
-	{field: "stage", description: "a string", valid: isString},
-	{field: "status", description: "a string", valid: isString},
-	{field: "message", description: "a string", valid: isString},
-	{field: "retryable", description: "a boolean", valid: isBoolean},
-	{field: "remediation", description: "an array of strings or null", valid: validRemediation},
-	{field: "details", description: "an object or null", valid: validDetails},
-}
-
-var diagnosticSchema = []schemaRule{
-	{field: "code", description: "a string", valid: isString},
-	{field: "stage", description: "a string", valid: isString},
-	{field: "message", description: "a string", valid: isString},
-	{field: "retryable", description: "a boolean", valid: isBoolean},
-	{field: "remediation", description: "an array of strings or null", valid: validRemediation},
-	{field: "details", description: "an object or null", valid: validDetails},
-}
-
+// validateEnvelope 校验跨事件公共不变量，并在结构足够完整时继续检查终态和 warning 账本。
 func validateEnvelope(command string, terminal Terminal, events []parsedEvent) []contractIssue {
 	var issues []contractIssue
 	helloCount := 0
@@ -122,89 +97,6 @@ func validateEnvelope(command string, terminal Terminal, events []parsedEvent) [
 	return issues
 }
 
-func validateBusinessSchemas(command string, terminal Terminal, events []parsedEvent) []contractIssue {
-	var issues []contractIssue
-	for _, event := range events {
-		eventType, _ := event.object["type"].(string)
-		switch eventType {
-		case string(protocol.TypeResult):
-			issues = append(issues, validateObjectSchema(command, terminal, event, "result", event.object, resultSchema)...)
-			issues = append(issues, validateResultSummarySchemas(command, terminal, event)...)
-		case string(protocol.TypeError):
-			issues = append(issues, validateObjectSchema(command, terminal, event, "error", event.object, diagnosticSchema)...)
-		case string(protocol.TypeWarning):
-			issues = append(issues, validateObjectSchema(command, terminal, event, "warning", event.object, diagnosticSchema)...)
-		}
-	}
-	return issues
-}
-
-func validateObjectSchema(
-	command string,
-	terminal Terminal,
-	event parsedEvent,
-	label string,
-	object map[string]any,
-	rules []schemaRule,
-) []contractIssue {
-	var issues []contractIssue
-	for _, rule := range rules {
-		value, exists := object[rule.field]
-		if !exists || !rule.valid(value) {
-			issues = append(issues, issueForEvent(
-				command,
-				terminal,
-				event,
-				fmt.Sprintf("%s field %q must be %s", label, rule.field, rule.description),
-			))
-		}
-	}
-	return issues
-}
-
-func validateResultSummarySchemas(
-	command string,
-	terminal Terminal,
-	result parsedEvent,
-) []contractIssue {
-	details, ok := result.object["details"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	value, exists := details["warnings"]
-	if !exists {
-		return nil
-	}
-	summaries, ok := value.([]any)
-	if !ok {
-		return nil
-	}
-
-	var issues []contractIssue
-	for index, value := range summaries {
-		summary, ok := value.(map[string]any)
-		if !ok {
-			issues = append(issues, issueForEvent(
-				command,
-				terminal,
-				result,
-				fmt.Sprintf("result warning summary %d must be an object", index+1),
-			))
-			continue
-		}
-		label := fmt.Sprintf("result warning summary %d", index+1)
-		issues = append(issues, validateObjectSchema(
-			command,
-			terminal,
-			result,
-			label,
-			summary,
-			diagnosticSchema,
-		)...)
-	}
-	return issues
-}
-
 func validateTerminal(
 	command string,
 	terminal Terminal,
@@ -271,6 +163,7 @@ func validateTerminal(
 	return issues
 }
 
+// validateWarningSummary 证明 result 中的汇总与此前 warning 的有界权威快照完全一致。
 func validateWarningSummary(
 	command string,
 	terminal Terminal,
@@ -385,40 +278,6 @@ func tupleMatches(left map[string]any, right map[string]any) bool {
 		leftStage == rightStage &&
 		leftRetryable == rightRetryable &&
 		reflect.DeepEqual(leftRemediation, rightRemediation)
-}
-
-func validRemediation(value any) bool {
-	if value == nil {
-		return true
-	}
-	remediation, ok := value.([]any)
-	if !ok {
-		return false
-	}
-	for _, item := range remediation {
-		if _, ok := item.(string); !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func validDetails(value any) bool {
-	if value == nil {
-		return true
-	}
-	_, ok := value.(map[string]any)
-	return ok
-}
-
-func isString(value any) bool {
-	_, ok := value.(string)
-	return ok
-}
-
-func isBoolean(value any) bool {
-	_, ok := value.(bool)
-	return ok
 }
 
 func expectedWarningSummaries(warnings []parsedEvent) []any {

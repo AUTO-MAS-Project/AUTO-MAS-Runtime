@@ -8,14 +8,13 @@ import (
 	"io"
 )
 
-// NDJSONRenderer renders protocol events as one newline-delimited JSON object
-// per event.
+// NDJSONRenderer 把每个协议事件渲染为一个以换行符结束的 JSON object。
 type NDJSONRenderer struct {
 	writer      *bufio.Writer
 	destination io.Writer
 }
 
-// NewNDJSONRenderer creates an NDJSON renderer for output.
+// NewNDJSONRenderer 为 output 创建 NDJSON renderer。
 func NewNDJSONRenderer(output io.Writer) (*NDJSONRenderer, error) {
 	if interfaceIsNil(output) {
 		return nil, errors.New("protocol output must not be nil")
@@ -26,37 +25,37 @@ func NewNDJSONRenderer(output io.Writer) (*NDJSONRenderer, error) {
 	}, nil
 }
 
-// RenderHello renders a hello event.
+// RenderHello 渲染 hello 事件。
 func (r *NDJSONRenderer) RenderHello(event HelloEvent) error {
 	return r.render(TypeHello, event)
 }
 
-// RenderProgress renders a progress event.
+// RenderProgress 渲染 progress 事件。
 func (r *NDJSONRenderer) RenderProgress(event ProgressEvent) error {
 	return r.render(TypeProgress, event)
 }
 
-// RenderState renders a state event.
+// RenderState 渲染 state 事件。
 func (r *NDJSONRenderer) RenderState(event StateEvent) error {
 	return r.render(TypeState, event)
 }
 
-// RenderLog renders a log event.
+// RenderLog 渲染 log 事件。
 func (r *NDJSONRenderer) RenderLog(event LogEvent) error {
 	return r.render(TypeLog, event)
 }
 
-// RenderWarning renders a warning event.
+// RenderWarning 渲染 warning 事件。
 func (r *NDJSONRenderer) RenderWarning(event WarningEvent) error {
 	return r.render(TypeWarning, event)
 }
 
-// RenderError renders an error event.
+// RenderError 渲染 error 事件。
 func (r *NDJSONRenderer) RenderError(event ErrorEvent) error {
 	return r.render(TypeError, event)
 }
 
-// RenderResult renders a result event.
+// RenderResult 渲染 result 事件。
 func (r *NDJSONRenderer) RenderResult(event ResultEvent) error {
 	return r.render(TypeResult, event)
 }

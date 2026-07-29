@@ -2,7 +2,7 @@ package protocol
 
 import "slices"
 
-// Stage identifies a stable Runtime operation stage.
+// Stage 标识稳定的 Runtime 操作阶段。
 type Stage string
 
 const (
@@ -59,17 +59,17 @@ var stages = []Stage{
 	StageBackendCleanup,
 }
 
-// AllStages returns every stable stage in document order.
+// AllStages 按文档顺序返回全部稳定 stage 的防御性副本。
 func AllStages() []Stage {
 	return append([]Stage(nil), stages...)
 }
 
-// IsKnownStage reports whether value is a stable Runtime stage.
+// IsKnownStage 报告 value 是否为稳定的 Runtime stage。
 func IsKnownStage(value Stage) bool {
 	return slices.Contains(stages, value)
 }
 
-// ProgressStatus identifies the state of progress for a stage.
+// ProgressStatus 标识一个 stage 的进度状态。
 type ProgressStatus string
 
 const (
@@ -90,17 +90,17 @@ var progressStatuses = []ProgressStatus{
 	ProgressCancelled,
 }
 
-// AllProgressStatuses returns every stable progress status in document order.
+// AllProgressStatuses 按文档顺序返回全部稳定进度状态的防御性副本。
 func AllProgressStatuses() []ProgressStatus {
 	return append([]ProgressStatus(nil), progressStatuses...)
 }
 
-// IsKnownProgressStatus reports whether value is a stable progress status.
+// IsKnownProgressStatus 报告 value 是否为稳定进度状态。
 func IsKnownProgressStatus(value ProgressStatus) bool {
 	return slices.Contains(progressStatuses, value)
 }
 
-// StateStatus identifies a Runtime lifecycle state.
+// StateStatus 标识 Runtime 生命周期状态。
 type StateStatus string
 
 const (
@@ -135,12 +135,38 @@ var stateStatuses = []StateStatus{
 	StateStopped,
 }
 
-// AllStateStatuses returns every stable lifecycle state in document order.
+// AllStateStatuses 按文档顺序返回全部稳定生命周期状态的防御性副本。
 func AllStateStatuses() []StateStatus {
 	return append([]StateStatus(nil), stateStatuses...)
 }
 
-// IsKnownStateStatus reports whether value is a stable lifecycle state.
+// IsKnownStateStatus 报告 value 是否为稳定生命周期状态。
 func IsKnownStateStatus(value StateStatus) bool {
 	return slices.Contains(stateStatuses, value)
+}
+
+// Capability 是 hello 事件公告的稳定能力标识。
+type Capability string
+
+// 协议 v1 的能力标识全集，逐项含义见 doc/架构设计.md「能力标识全集」。
+const (
+	CapabilityStdinCancel Capability = "stdin.cancel"
+	CapabilityStateV1     Capability = "state.v1"
+	CapabilityLogStream   Capability = "log.stream"
+)
+
+var knownCapabilities = []Capability{
+	CapabilityStdinCancel,
+	CapabilityStateV1,
+	CapabilityLogStream,
+}
+
+// AllCapabilities 按文档顺序返回全部稳定能力标识的防御性副本。
+func AllCapabilities() []Capability {
+	return append([]Capability(nil), knownCapabilities...)
+}
+
+// IsKnownCapability 报告 value 是否为稳定能力标识。
+func IsKnownCapability(value Capability) bool {
+	return slices.Contains(knownCapabilities, value)
 }
