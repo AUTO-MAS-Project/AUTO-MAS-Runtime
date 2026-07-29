@@ -28,7 +28,8 @@
 4. **推送需授权。** `git push`、创建远端仓库/Release、任何把仓库内容发往外部服务的操作，
    都必须先得到用户明确许可。
 5. **语言约定。** 与用户对话、`doc/` 文档、**Go 注释（含 doc comment）**一律中文；
-   标识符、Go error 字符串、提交信息用英文。详见 [AGENTS.md](AGENTS.md) 8.1。
+   标识符、Go error 字符串用英文，提交信息使用英文 type + 中文描述。详见
+   [AGENTS.md](AGENTS.md) 7、8.1。
 6. **命令用 PowerShell 7。** 每条原生命令后检查 `$LASTEXITCODE`；不要假设失败会自动中断脚本。
 
 ## 可用技能

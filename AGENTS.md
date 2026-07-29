@@ -27,12 +27,12 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-07-28）
+## 2. 当前状态（截至 2026-07-29）
 
 | 里程碑 | 状态 |
 | --- | --- |
-| M0 工程基础与最小 CI | T0.1/T0.2 完成；**T0.3/T0.4 受阻**（等待用户明确授权推送、远端 CI 全绿证据待补） |
-| M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** ✅ `7235163` |
+| M0 工程基础与最小 CI | T0.1~T0.3 完成；**T0.4 受阻**（远端 CI 全绿证据待补） |
+| M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** ✅ `7afd192` |
 | M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | 未开始 ← **下一步** |
 | M3~M7、M9 | 未开始 |
 
@@ -195,7 +195,7 @@ if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
 在 `doc/任务拆分.md` 中：`- [ ]` 改 `- [x]`，标题行尾追加 `✅ YYYY-MM-DD <commit 短哈希>`；
 进行中用 `🚧`，受阻用 `⛔ <一句话原因>` 并登记第 7 章「变更记录」；
 里程碑复选框只有在其下**全部任务**勾选后才能勾。
-进度提交独立于代码提交，形如 `docs: record M1 protocol completion`。
+进度提交独立于代码提交，形如 `docs: 记录 M1 协议层完成情况`。
 
 ### 6.5 发现文档与实现矛盾时
 
@@ -216,13 +216,13 @@ if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
 
 ## 7. 提交规范
 
-- Conventional Commits，**英文小写祈使句**，标题结尾带任务号：
+- Conventional Commits，**type 使用英文小写，描述使用中文**，标题结尾带任务号：
 
   ```text
-  feat: enforce terminal protocol result (T1.6)
-  fix: bound duplicate-key diagnostics (T1.6)
-  test: cover protocol terminal contracts (T1.6)
-  docs: record M1 protocol completion
+  feat: 强制协议终态 result (T1.6)
+  fix: 限制重复键诊断信息规模 (T1.6)
+  test: 覆盖协议终态契约 (T1.6)
+  docs: 记录 M1 协议层完成情况
   ```
 
 - 常用类型：`feat` / `fix` / `test` / `docs` / `refactor` / `chore` / `ci`；
@@ -241,7 +241,7 @@ if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
 | **注释（含包注释、导出声明的 doc comment、实现内注释）** | **中文** |
 | Go error 字符串（`errors.New` / `fmt.Errorf`） | 英文、小写开头、无结尾标点 |
 | 协议中用户可见的 `message` 字段 | 中文（如「正在安装 Python 依赖」） |
-| 提交信息 | 英文 |
+| 提交信息 | 英文 type + 中文描述 |
 | `doc/` 下的设计与任务文档 | 中文，中英文之间留空格 |
 
 **中文注释仍遵循 Go 官方 doc comment 格式**（[Go Doc Comments](https://go.dev/doc/comment)）：
