@@ -1,9 +1,13 @@
 package config_test
 
 import (
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
@@ -101,6 +105,53 @@ func TestLayout_AllFixedPathsStayWithinAppRoot(t *testing.T) {
 				t.Fatalf("got path outside app root: %q", test.path)
 			}
 		})
+	}
+}
+
+func TestLayout_ConstructionAndGettersDoNotTouchFilesystem(t *testing.T) {
+	base := t.TempDir()
+	appRoot := filepath.Join(base, "does-not-exist")
+	if _, err := os.Stat(appRoot); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(%q) error = %v, want errors.Is(_, fs.ErrNotExist)", appRoot, err)
+	}
+
+	layout, err := config.NewLayout(appRoot, base)
+	if err != nil {
+		t.Fatalf("NewLayout(%q, %q) error = %v", appRoot, base, err)
+	}
+	_ = layout.AppRoot()
+	_ = layout.IdentityKey()
+	_ = layout.ProtectedRootDirs()
+	for _, fixed := range fixedPaths(layout) {
+		_ = fixed.path
+	}
+
+	dynamicCalls := []struct {
+		name string
+		call func() error
+	}{
+		{name: "RepoUpdateDir", call: func() error { _, err := layout.RepoUpdateDir("operation"); return err }},
+		{name: "RepoPreviousDir", call: func() error { _, err := layout.RepoPreviousDir("operation"); return err }},
+		{name: "UVVersionDir", call: func() error { _, err := layout.UVVersionDir("0.8.0"); return err }},
+		{name: "UVExecutable", call: func() error { _, err := layout.UVExecutable("0.8.0"); return err }},
+		{name: "DownloadFile", call: func() error { _, err := layout.DownloadFile("uv.zip"); return err }},
+		{name: "DownloadPartFile", call: func() error { _, err := layout.DownloadPartFile("uv.zip"); return err }},
+		{name: "UVStagingDir", call: func() error { _, err := layout.UVStagingDir("0.8.0", "operation"); return err }},
+		{name: "RuntimeLogFile", call: func() error {
+			_, err := layout.RuntimeLogFile("diagnose", time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC))
+			return err
+		}},
+	}
+	for _, dynamic := range dynamicCalls {
+		t.Run(dynamic.name, func(t *testing.T) {
+			if err := dynamic.call(); err != nil {
+				t.Fatalf("%s() error = %v", dynamic.name, err)
+			}
+		})
+	}
+
+	if _, err := os.Stat(appRoot); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(%q) after getters error = %v, want errors.Is(_, fs.ErrNotExist)", appRoot, err)
 	}
 }
 
