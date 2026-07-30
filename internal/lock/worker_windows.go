@@ -370,17 +370,22 @@ func runWorker(
 
 	for {
 		request := <-requests
-		if request.operation != requestClose {
+		switch request.operation {
+		case requestAcquire:
+			request.response <- state.acquire(request)
+		case requestRelease:
+			request.response <- state.release(request)
+		case requestClose:
+			finishWorker(state, request.response)
+			return
+		default:
 			request.response <- workerResponse{
 				err: fmt.Errorf(
 					"unsupported worker request %d",
 					request.operation,
 				),
 			}
-			continue
 		}
-		finishWorker(state, request.response)
-		return
 	}
 }
 
@@ -497,10 +502,28 @@ func closeWorkerHandles(state *workerState) error {
 	)
 }
 
-func finishWorker(state *workerState, response chan workerResponse) {
+func finishWorker(
+	state *workerState,
+	response chan workerResponse,
+) {
+	backendRelease := state.releaseSlotForClose(&state.backend)
+	mutationRelease := state.releaseSlotForClose(&state.mutation)
 	closeErr := closeWorkerHandles(state)
-	runtime.UnlockOSThread()
-	response <- workerResponse{
-		exit: workerExit{waitForThread: false, err: closeErr},
+	allErr := errors.Join(
+		state.poison,
+		backendRelease,
+		mutationRelease,
+		closeErr,
+	)
+	if !state.backend.maybeOwned && !state.mutation.maybeOwned {
+		runtime.UnlockOSThread()
+		response <- workerResponse{
+			exit: workerExit{waitForThread: false, err: allErr},
+		}
+		return
 	}
+	response <- workerResponse{
+		exit: workerExit{waitForThread: true, err: allErr},
+	}
+	// 所有权不确定时退出 goroutine，让 Go 终止仍锁定的 OS thread。
 }

@@ -86,6 +86,7 @@ func TestMutexName_RejectsUnknownKindBeforeWin32(t *testing.T) {
 func TestOperationError_UsesMutexOperationFailed(t *testing.T) {
 	testRootOperationErrors(t)
 	testWorkerOperationErrors(t)
+	testAcquireOperationErrors(t)
 }
 
 func testRootOperationErrors(t *testing.T) {
