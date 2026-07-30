@@ -23,6 +23,9 @@ type apiCall struct {
 	Index          int
 	ThreadID       uint32
 	Handle         windows.Handle
+	SourceProcess  windows.Handle
+	SourceHandle   windows.Handle
+	TargetProcess  windows.Handle
 	Timeout        uint32
 	Access         uint32
 	Share          uint32
@@ -214,9 +217,9 @@ func (a *testWindowsAPI) duplicateHandle(
 ) error {
 	call := a.record(apiCall{
 		Operation:     "duplicate-thread",
-		Handle:        source,
-		Access:        uint32(sourceProcess),
-		Share:         uint32(targetProcess),
+		SourceProcess: sourceProcess,
+		SourceHandle:  source,
+		TargetProcess: targetProcess,
 		DesiredAccess: desiredAccess,
 		InheritHandle: inheritHandle,
 		Options:       options,
