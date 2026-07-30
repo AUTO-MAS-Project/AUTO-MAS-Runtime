@@ -11,6 +11,9 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 const cstrEqual int32 = 2
@@ -1028,4 +1031,423 @@ func setFileInformationWindows(
 		return callErr
 	}
 	return nil
+}
+
+func openPinnedChain(
+	ctx context.Context,
+	rootParent CanonicalPath,
+	target CanonicalPath,
+	leafSpec openSpec,
+) (*pinnedChain, error) {
+	return openPinnedChainWith(ctx, rootParent, target, leafSpec, newProductionPathAPI())
+}
+
+func openPinnedChainWith(
+	ctx context.Context,
+	rootParent CanonicalPath,
+	target CanonicalPath,
+	leafSpec openSpec,
+	api pathAPI,
+) (*pinnedChain, error) {
+	if ctx == nil || !api.valid() ||
+		rootParent == (CanonicalPath{}) || target == (CanonicalPath{}) {
+		return nil, fmt.Errorf("%w: invalid pinned-chain input", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !rootParent.Contains(target) {
+		return nil, outsidePathError("pin", target.String(), ErrIdentityChanged)
+	}
+	if err := ensureLocalVolumeWith(rootParent, api); err != nil {
+		return nil, err
+	}
+
+	chain := &pinnedChain{
+		api:     api,
+		objects: make([]pinnedObject, 0, len(canonicalComponents(target.comparisonKey))+1),
+	}
+	fail := func(operationErr error) (*pinnedChain, error) {
+		return nil, errors.Join(operationErr, chain.close())
+	}
+
+	rootSpec := directoryPinSpec()
+	rootHandle, err := api.openPath(rootParent.Native(), rootSpec)
+	if err != nil {
+		return fail(&FileError{
+			Operation: "open-root-parent",
+			Path:      rootParent.String(),
+			Err:       err,
+		})
+	}
+	rootIdentity, err := api.identity(rootHandle)
+	if err != nil {
+		closeErr := api.closeHandle(rootHandle)
+		return fail(joinOperationCleanup(
+			&FileError{
+				Operation: "identify-root-parent",
+				Path:      rootParent.String(),
+				Err:       err,
+			},
+			wrapFileError("close", rootParent.String(), closeErr),
+		))
+	}
+	root := pinnedObject{path: rootParent, handle: rootHandle, identity: rootIdentity}
+	chain.objects = append(chain.objects, root)
+	if err := ensureCaseInsensitiveChain(ctx, chain); err != nil {
+		return fail(err)
+	}
+
+	parentComponents := canonicalComponents(rootParent.comparisonKey)
+	targetComponents := canonicalComponents(target.comparisonKey)
+	displayComponents := canonicalComponents(target.display)
+	if len(targetComponents) != len(displayComponents) ||
+		len(targetComponents) <= len(parentComponents) {
+		return fail(outsidePathError("pin", target.String(), ErrIdentityChanged))
+	}
+	for i := len(parentComponents); i < len(targetComponents); i++ {
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		spec := directoryPinSpec()
+		if i == len(targetComponents)-1 {
+			spec = leafSpec
+		}
+		child, err := openRelativeCheckedWith(
+			ctx,
+			chain.objects[len(chain.objects)-1],
+			displayComponents[i],
+			spec,
+			api,
+		)
+		if err != nil {
+			return fail(err)
+		}
+		chain.objects = append(chain.objects, child)
+	}
+	if !chain.objects[len(chain.objects)-1].path.Equal(target) {
+		return fail(outsidePathError("pin", target.String(), ErrIdentityChanged))
+	}
+	return chain, nil
+}
+
+func openRelativeCheckedWith(
+	ctx context.Context,
+	parent pinnedObject,
+	name string,
+	spec openSpec,
+	api pathAPI,
+) (pinnedObject, error) {
+	if ctx == nil || name == "" || !api.valid() {
+		return pinnedObject{}, fmt.Errorf("%w: invalid relative-open input", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return pinnedObject{}, err
+	}
+	handle, err := api.openRelative(parent.handle, name, spec)
+	if err != nil {
+		return pinnedObject{}, &FileError{
+			Operation: "open-relative",
+			Path:      filepath.Join(parent.path.String(), name),
+			Err:       err,
+		}
+	}
+	closeOnFailure := func(operationErr error) (pinnedObject, error) {
+		closeErr := api.closeHandle(handle)
+		return pinnedObject{}, joinOperationCleanup(
+			operationErr,
+			wrapFileError("close", filepath.Join(parent.path.String(), name), closeErr),
+		)
+	}
+
+	identity, err := api.identity(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{
+			Operation: "identify",
+			Path:      filepath.Join(parent.path.String(), name),
+			Err:       err,
+		})
+	}
+	if identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return closeOnFailure(unsafeReparseError(filepath.Join(parent.path.String(), name)))
+	}
+	isDirectory := identity.attributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if isDirectory != spec.directory {
+		return closeOnFailure(&FileError{
+			Operation: "type",
+			Path:      filepath.Join(parent.path.String(), name),
+			Err:       ErrIdentityChanged,
+		})
+	}
+	finalPath, err := api.finalPath(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{
+			Operation: "final-path",
+			Path:      filepath.Join(parent.path.String(), name),
+			Err:       err,
+		})
+	}
+	canonical, err := canonicalizeContextWith(ctx, finalPath, api)
+	if err != nil {
+		return closeOnFailure(err)
+	}
+	child := pinnedObject{path: canonical, handle: handle, identity: identity}
+	if err := validateParentIdentityWith(ctx, parent, child, api); err != nil {
+		return closeOnFailure(err)
+	}
+	if isDirectory {
+		if err := validatePinnedDirectory(ctx, child, api); err != nil {
+			return closeOnFailure(err)
+		}
+	}
+	return child, nil
+}
+
+func validateParentIdentityWith(
+	ctx context.Context,
+	parent pinnedObject,
+	child pinnedObject,
+	api pathAPI,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	finalPath, err := api.finalPath(child.handle)
+	if err != nil {
+		return &FileError{Operation: "final-path", Path: child.path.String(), Err: err}
+	}
+	display, err := displayWindowsPath(finalPath)
+	if err != nil {
+		return err
+	}
+	parentPath := filepath.Dir(display)
+	handle, err := api.openPath(nativeWindowsPath(parentPath), parentIdentitySpec())
+	if err != nil {
+		return &FileError{Operation: "open-parent-identity", Path: parentPath, Err: err}
+	}
+	identity, identityErr := api.identity(handle)
+	closeErr := api.closeHandle(handle)
+	if identityErr != nil || closeErr != nil {
+		return errors.Join(
+			wrapFileError("identify-parent", parentPath, identityErr),
+			wrapFileError("close", parentPath, closeErr),
+		)
+	}
+	if identity.volumeSerial != parent.identity.volumeSerial ||
+		identity.fileID != parent.identity.fileID {
+		return &FileError{
+			Operation: "validate-parent",
+			Path:      child.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	return nil
+}
+
+func validatePinnedDirectory(
+	ctx context.Context,
+	object pinnedObject,
+	api pathAPI,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if object.identity.attributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return &FileError{Operation: "type", Path: object.path.String(), Err: ErrIdentityChanged}
+	}
+	if object.identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return unsafeReparseError(object.path.String())
+	}
+	caseSensitive, err := api.caseSensitive(object.handle)
+	if err != nil {
+		return &FileError{
+			Operation: "case-sensitivity",
+			Path:      object.path.String(),
+			Err:       errors.Join(ErrUnsupportedCaseSensitivity, err),
+		}
+	}
+	if caseSensitive {
+		return &FileError{
+			Operation: "case-sensitivity",
+			Path:      object.path.String(),
+			Err:       ErrUnsupportedCaseSensitivity,
+		}
+	}
+	return nil
+}
+
+func ensureCaseInsensitiveChain(ctx context.Context, chain *pinnedChain) error {
+	if ctx == nil || chain == nil || !chain.api.valid() {
+		return fmt.Errorf("%w: invalid case-insensitive chain", ErrInvalidArgument)
+	}
+	for _, object := range chain.objects {
+		if err := validatePinnedDirectory(ctx, object, chain.api); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureLocalVolumeWith(path CanonicalPath, api pathAPI) error {
+	if strings.HasPrefix(path.volumeKey, `\\`) {
+		return outsidePathError("volume", path.String(), ErrIdentityChanged)
+	}
+	driveType, err := api.driveType(path.volumeKey + `\`)
+	if err != nil {
+		return &FileError{Operation: "drive-type", Path: path.String(), Err: err}
+	}
+	if driveType != windows.DRIVE_FIXED && driveType != windows.DRIVE_REMOVABLE {
+		return outsidePathError("volume", path.String(), ErrIdentityChanged)
+	}
+	return nil
+}
+
+func directoryPinSpec() openSpec {
+	return openSpec{
+		access:    windows.FILE_LIST_DIRECTORY | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: true,
+	}
+}
+
+func parentIdentitySpec() openSpec {
+	return openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: true,
+	}
+}
+
+func deleteByHandleWith(handle windows.Handle, api pathAPI) error {
+	if err := api.setDisposition(handle); err != nil {
+		return fmt.Errorf("delete by handle: %w", err)
+	}
+	return nil
+}
+
+func renameByHandleWith(
+	source windows.Handle,
+	targetParent windows.Handle,
+	name string,
+	replace bool,
+	api pathAPI,
+) error {
+	if err := api.rename(source, targetParent, name, replace); err != nil {
+		return fmt.Errorf("rename by handle: %w", err)
+	}
+	return nil
+}
+
+func (c *pinnedChain) close() error {
+	if c == nil {
+		return nil
+	}
+	closeErrors := make([]error, 0, len(c.objects))
+	for i := len(c.objects) - 1; i >= 0; i-- {
+		handle := &c.objects[i].handle
+		if *handle == 0 || *handle == windows.InvalidHandle {
+			continue
+		}
+		if err := c.api.closeHandle(*handle); err != nil {
+			closeErrors = append(closeErrors, &FileError{
+				Operation: "close",
+				Path:      c.objects[i].path.String(),
+				Err:       err,
+			})
+			continue
+		}
+		*handle = windows.InvalidHandle
+	}
+	return errors.Join(closeErrors...)
+}
+
+func outsidePathError(operation, path string, cause error) error {
+	return &Error{
+		code:      protocol.CodePathOutsideManagedRoot,
+		Operation: operation,
+		Path:      path,
+		Err:       cause,
+	}
+}
+
+func unsafeReparseError(path string) error {
+	return &Error{
+		code:      protocol.CodeUnsafeReparsePoint,
+		Operation: "reparse",
+		Path:      path,
+		Err:       errors.New("filesystem path contains a reparse point"),
+	}
+}
+
+func validateDangerousRoot(
+	ctx context.Context,
+	layout *config.Layout,
+	targets []string,
+) ([]*pinnedChain, error) {
+	return validateDangerousRootWith(ctx, layout, targets, newProductionPathAPI())
+}
+
+func validateDangerousRootWith(
+	ctx context.Context,
+	layout *config.Layout,
+	targets []string,
+	api pathAPI,
+) ([]*pinnedChain, error) {
+	if ctx == nil || layout == nil || len(targets) == 0 || !api.valid() {
+		return nil, fmt.Errorf("%w: invalid root-validation input", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	appRoot, err := canonicalizeContextWith(ctx, layout.AppRoot(), api)
+	if err != nil {
+		return nil, err
+	}
+	rootParent, err := canonicalizeContextWith(ctx, filepath.Dir(layout.AppRoot()), api)
+	if err != nil {
+		return nil, err
+	}
+	if !rootParent.Contains(appRoot) {
+		return nil, outsidePathError("validate-root", appRoot.String(), ErrIdentityChanged)
+	}
+
+	chains := make([]*pinnedChain, 0, len(targets))
+	closeAll := func(operationErr error) ([]*pinnedChain, error) {
+		closeErrors := make([]error, 0, len(chains))
+		for i := len(chains) - 1; i >= 0; i-- {
+			closeErrors = append(closeErrors, chains[i].close())
+		}
+		return nil, errors.Join(operationErr, errors.Join(closeErrors...))
+	}
+	for _, rawTarget := range targets {
+		if err := ctx.Err(); err != nil {
+			return closeAll(err)
+		}
+		target, err := canonicalizeContextWith(ctx, rawTarget, api)
+		if err != nil {
+			return closeAll(err)
+		}
+		if !appRoot.Equal(target) && !appRoot.Contains(target) {
+			return closeAll(outsidePathError("validate-root", target.String(), ErrIdentityChanged))
+		}
+		chain, err := openPinnedChainWith(
+			ctx,
+			rootParent,
+			target,
+			directoryPinSpec(),
+			api,
+		)
+		if err != nil {
+			return closeAll(err)
+		}
+		chains = append(chains, chain)
+	}
+	return chains, nil
 }

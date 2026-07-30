@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -515,4 +516,350 @@ func shortPathForTest(t *testing.T, path string) (string, bool) {
 		return "", false
 	}
 	return short, true
+}
+
+func TestPinnedChain_RejectsReparsePointAtEveryLevel(t *testing.T) {
+	parent := t.TempDir()
+	external := t.TempDir()
+	link := filepath.Join(parent, "linked")
+	if err := os.Symlink(external, link); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	rootParent := mustCanonicalize(t, parent)
+	target := mustCanonicalize(t, link)
+	chain, err := openPinnedChainWith(
+		t.Context(),
+		rootParent,
+		target,
+		directoryPinSpec(),
+		newProductionPathAPI(),
+	)
+	if chain != nil {
+		_ = chain.close()
+		t.Fatal("openPinnedChainWith() returned a chain through a reparse point")
+	}
+	assertFilesystemCode(t, err, protocol.CodeUnsafeReparsePoint)
+}
+
+func TestPinnedChain_RejectsIdentityOrParentMismatch(t *testing.T) {
+	chain := openPinnedTestChain(t)
+	defer func() {
+		if err := chain.close(); err != nil {
+			t.Errorf("chain.close() error = %v", err)
+		}
+	}()
+	parent := chain.objects[len(chain.objects)-2]
+	child := chain.objects[len(chain.objects)-1]
+	parent.identity.fileID[0] ^= 0xff
+	err := validateParentIdentityWith(t.Context(), parent, child, chain.api)
+	if !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("validateParentIdentityWith() error = %v, want ErrIdentityChanged", err)
+	}
+}
+
+func TestPinnedChain_HoldsEveryAncestorUntilClose(t *testing.T) {
+	chain := openPinnedTestChain(t)
+	target := chain.objects[len(chain.objects)-1].path.String()
+	replacement := target + "-renamed"
+	if err := os.Rename(target, replacement); err == nil {
+		_ = os.Rename(replacement, target)
+		_ = chain.close()
+		t.Fatal("os.Rename() succeeded while the target was pinned")
+	}
+	if err := chain.close(); err != nil {
+		t.Fatalf("chain.close() error = %v", err)
+	}
+	if err := os.Rename(target, replacement); err != nil {
+		t.Fatalf("os.Rename() after close error = %v", err)
+	}
+}
+
+func TestDangerousRootValidation_RejectsUNCAndRemoteRoots(t *testing.T) {
+	api := newProductionPathAPI()
+	api.driveType = func(string) (uint32, error) {
+		return windows.DRIVE_REMOTE, nil
+	}
+	path := mustCanonicalize(t, t.TempDir())
+	err := ensureLocalVolumeWith(path, api)
+	if err == nil {
+		t.Fatal("ensureLocalVolumeWith() error = nil, want remote-volume rejection")
+	}
+
+	unc := canonicalPathForTest(`\\server\share\AUTO-MAS`)
+	if err := ensureLocalVolumeWith(unc, api); err == nil {
+		t.Fatal("ensureLocalVolumeWith(UNC) error = nil, want rejection")
+	}
+}
+
+func TestDangerousRootValidation_RejectsCaseSensitiveAncestor(t *testing.T) {
+	api := newProductionPathAPI()
+	api.caseSensitive = func(windows.Handle) (bool, error) { return true, nil }
+	parent := t.TempDir()
+	target := filepath.Join(parent, "app")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	chain, err := openPinnedChainWith(
+		t.Context(),
+		mustCanonicalize(t, parent),
+		mustCanonicalize(t, target),
+		directoryPinSpec(),
+		api,
+	)
+	if chain != nil {
+		_ = chain.close()
+		t.Fatal("openPinnedChainWith() returned a case-sensitive chain")
+	}
+	if !errors.Is(err, ErrUnsupportedCaseSensitivity) {
+		t.Fatalf("error = %v, want ErrUnsupportedCaseSensitivity", err)
+	}
+}
+
+func TestDangerousRootValidation_RejectsIndeterminateCaseSensitivity(t *testing.T) {
+	injected := errors.New("case query failed")
+	api := newProductionPathAPI()
+	api.caseSensitive = func(windows.Handle) (bool, error) {
+		return false, injected
+	}
+	parent := t.TempDir()
+	target := filepath.Join(parent, "app")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	chain, err := openPinnedChainWith(
+		t.Context(),
+		mustCanonicalize(t, parent),
+		mustCanonicalize(t, target),
+		directoryPinSpec(),
+		api,
+	)
+	if chain != nil {
+		_ = chain.close()
+		t.Fatal("openPinnedChainWith() returned an indeterminate chain")
+	}
+	if !errors.Is(err, injected) ||
+		!errors.Is(err, ErrUnsupportedCaseSensitivity) {
+		t.Fatalf("error = %v, want injected and unsupported-case errors", err)
+	}
+}
+
+func TestDangerousRootValidation_RejectsNilContextAndLayout(t *testing.T) {
+	layout := newPathTestLayout(t)
+	api := newProductionPathAPI()
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		layout *config.Layout
+	}{
+		{name: "nil context", layout: layout},
+		{name: "nil layout", ctx: t.Context()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			chains, err := validateDangerousRootWith(
+				test.ctx,
+				test.layout,
+				[]string{layout.AppRoot()},
+				api,
+			)
+			if chains != nil {
+				t.Fatalf("chains = %#v, want nil", chains)
+			}
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("error = %v, want ErrInvalidArgument", err)
+			}
+		})
+	}
+}
+
+func TestOpenSpec_DirectoryPinMatchesMatrix(t *testing.T) {
+	got := directoryPinSpec()
+	want := openSpec{
+		access:    windows.FILE_LIST_DIRECTORY | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: true,
+	}
+	if got != want {
+		t.Fatalf("directoryPinSpec() = %#v, want %#v", got, want)
+	}
+}
+
+func TestOpenSpec_ParentIdentityMatchesMatrix(t *testing.T) {
+	got := parentIdentitySpec()
+	want := openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: true,
+	}
+	if got != want {
+		t.Fatalf("parentIdentitySpec() = %#v, want %#v", got, want)
+	}
+}
+
+func TestOpenRelativeChecked_ValidatesParentIdentity(t *testing.T) {
+	chain := openPinnedTestChain(t)
+	parent := chain.objects[len(chain.objects)-2]
+	child := chain.objects[len(chain.objects)-1]
+	if err := validateParentIdentityWith(t.Context(), parent, child, chain.api); err != nil {
+		_ = chain.close()
+		t.Fatalf("validateParentIdentityWith() error = %v", err)
+	}
+	if err := chain.close(); err != nil {
+		t.Fatalf("chain.close() error = %v", err)
+	}
+}
+
+func TestWindows_ReparsePointsNeverEscapeManagedRoot(t *testing.T) {
+	parent := t.TempDir()
+	external := t.TempDir()
+	sentinel := filepath.Join(external, "sentinel.txt")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	link := filepath.Join(parent, "escape")
+	if err := os.Symlink(external, link); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	chain, err := openPinnedChainWith(
+		t.Context(),
+		mustCanonicalize(t, parent),
+		mustCanonicalize(t, link),
+		directoryPinSpec(),
+		newProductionPathAPI(),
+	)
+	if chain != nil {
+		_ = chain.close()
+		t.Fatal("openPinnedChainWith() followed a reparse point")
+	}
+	assertFilesystemCode(t, err, protocol.CodeUnsafeReparsePoint)
+	got, readErr := os.ReadFile(sentinel)
+	if readErr != nil || string(got) != "unchanged" {
+		t.Fatalf("external sentinel = %q, error = %v", got, readErr)
+	}
+}
+
+func TestWindows_CaseSensitiveDirectoryFailsClosed(t *testing.T) {
+	target := t.TempDir()
+	api := newProductionPathAPI()
+	handle, err := api.openPath(nativeWindowsPath(target), openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.FILE_WRITE_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: true,
+	})
+	if err != nil {
+		t.Skipf("case-sensitivity probe open unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		information := fileCaseSensitiveInfo{}
+		_ = setFileInformationWindows(
+			handle,
+			fileCaseSensitiveClass,
+			unsafe.Pointer(&information),
+			unsafe.Sizeof(information),
+		)
+		_ = api.closeHandle(handle)
+	})
+	information := fileCaseSensitiveInfo{flags: fileCaseSensitiveDir}
+	if err := setFileInformationWindows(
+		handle,
+		fileCaseSensitiveClass,
+		unsafe.Pointer(&information),
+		unsafe.Sizeof(information),
+	); err != nil {
+		t.Skipf("per-directory case sensitivity unavailable: %v", err)
+	}
+	chain, err := openPinnedChainWith(
+		t.Context(),
+		mustCanonicalize(t, filepath.Dir(target)),
+		mustCanonicalize(t, target),
+		directoryPinSpec(),
+		api,
+	)
+	if chain != nil {
+		_ = chain.close()
+		t.Fatal("case-sensitive directory was accepted")
+	}
+	if !errors.Is(err, ErrUnsupportedCaseSensitivity) {
+		t.Fatalf("error = %v, want ErrUnsupportedCaseSensitivity", err)
+	}
+}
+
+func TestWindows_UNCAndRemoteRootsFailClosed(t *testing.T) {
+	api := newProductionPathAPI()
+	api.driveType = func(string) (uint32, error) {
+		return windows.DRIVE_REMOTE, nil
+	}
+	err := ensureLocalVolumeWith(mustCanonicalize(t, t.TempDir()), api)
+	if err == nil {
+		t.Fatal("remote root was accepted")
+	}
+	t.Skip("UNC share fixture unavailable; remote drive classification completed")
+}
+
+func TestWindows_CustomFileInformationStructuresMatchABI(t *testing.T) {
+	if unsafe.Sizeof(ntObjectAttributes{}) != 48 {
+		t.Fatalf("ntObjectAttributes size = %d, want 48", unsafe.Sizeof(ntObjectAttributes{}))
+	}
+	if unsafe.Offsetof(fileIDBothDirectoryInformation{}.fileName) != 104 {
+		t.Fatalf(
+			"directory fileName offset = %d, want 104",
+			unsafe.Offsetof(fileIDBothDirectoryInformation{}.fileName),
+		)
+	}
+	if unsafe.Sizeof(fileDispositionInfoEx{}) != 4 {
+		t.Fatalf("fileDispositionInfoEx size = %d, want 4", unsafe.Sizeof(fileDispositionInfoEx{}))
+	}
+	if unsafe.Offsetof(fileRenameInfoEx{}.fileName) != 20 {
+		t.Fatalf(
+			"fileRenameInfoEx fileName offset = %d, want 20",
+			unsafe.Offsetof(fileRenameInfoEx{}.fileName),
+		)
+	}
+}
+
+func openPinnedTestChain(t *testing.T) *pinnedChain {
+	t.Helper()
+	parent := t.TempDir()
+	target := filepath.Join(parent, "app")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	chain, err := openPinnedChainWith(
+		t.Context(),
+		mustCanonicalize(t, parent),
+		mustCanonicalize(t, target),
+		directoryPinSpec(),
+		newProductionPathAPI(),
+	)
+	if err != nil {
+		t.Fatalf("openPinnedChainWith() error = %v", err)
+	}
+	return chain
+}
+
+func newPathTestLayout(t *testing.T) *config.Layout {
+	t.Helper()
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	return layout
+}
+
+func assertFilesystemCode(t *testing.T, err error, want protocol.Code) {
+	t.Helper()
+	var filesystemErr *Error
+	if !errors.As(err, &filesystemErr) {
+		t.Fatalf("error = %v, want *Error", err)
+	}
+	if got := filesystemErr.Code(); got != want {
+		t.Fatalf("Code() = %q, want %q", got, want)
+	}
 }
