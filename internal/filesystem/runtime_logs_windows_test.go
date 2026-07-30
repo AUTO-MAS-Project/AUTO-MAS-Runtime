@@ -522,7 +522,13 @@ func TestRuntimeLogFiles_RemoveReportsAppliedBeforeCloseError(t *testing.T) {
 	token := createRuntimeLogToken(t, files, "sync")
 	injected := errors.New("close failed")
 	closeHandle := files.api.closeHandle
-	inject := true
+	inject := false
+	setDisposition := files.api.setDisposition
+	files.api.setDisposition = func(handle windows.Handle) error {
+		err := setDisposition(handle)
+		inject = err == nil
+		return err
+	}
 	files.api.closeHandle = func(handle windows.Handle) error {
 		err := closeHandle(handle)
 		if inject {
@@ -646,6 +652,57 @@ func TestRuntimeLogFiles_RemoveCancellationAfterDispositionKeepsApplied(t *testi
 	result, err := files.Remove(ctx, token)
 	if err != nil || !result.MutationApplied {
 		t.Fatalf("Remove() = %#v, %v, want applied/nil", result, err)
+	}
+}
+
+func TestRuntimeLogFiles_RemoveUsesStoredAPIForCanonicalization(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+
+	attributeCalls := 0
+	attributes := files.api.attributes
+	files.api.attributes = func(path string) (uint32, error) {
+		attributeCalls++
+		return attributes(path)
+	}
+
+	result, err := files.Remove(t.Context(), token)
+	if err != nil || !result.MutationApplied {
+		t.Fatalf("Remove() = %#v, %v, want applied/nil", result, err)
+	}
+	if attributeCalls == 0 {
+		t.Fatal("Remove() bypassed the stored path API during canonicalization")
+	}
+}
+
+func TestRuntimeLogFiles_RemoveRejectsParentIdentityMismatch(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+
+	var parentHandle windows.Handle
+	openPath := files.api.openPath
+	files.api.openPath = func(path string, spec openSpec) (windows.Handle, error) {
+		handle, err := openPath(path, spec)
+		if err == nil && spec == parentIdentitySpec() {
+			parentHandle = handle
+		}
+		return handle, err
+	}
+	identity := files.api.identity
+	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		got, err := identity(handle)
+		if err == nil && handle == parentHandle && parentHandle != windows.InvalidHandle {
+			got.fileID[0] ^= 0xff
+		}
+		return got, err
+	}
+
+	result, err := files.Remove(t.Context(), token)
+	if result.MutationApplied || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("Remove() = %#v, %v, want false/ErrIdentityChanged", result, err)
+	}
+	if _, err := os.Stat(token.Path()); err != nil {
+		t.Fatalf("token target changed after parent mismatch: %v", err)
 	}
 }
 

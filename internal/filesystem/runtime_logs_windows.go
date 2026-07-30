@@ -267,7 +267,7 @@ func (f *RuntimeLogFiles) List(ctx context.Context) ([]RuntimeLogFile, error) {
 		if entry.attributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
 			continue
 		}
-		leaf, err := openRuntimeLogLeaf(ctx, f.pins[2], entry.name, spec, f.api)
+		leaf, err := openRelativeCheckedWith(ctx, f.pins[2], entry.name, spec, f.api)
 		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) ||
 			errors.Is(err, windows.ERROR_PATH_NOT_FOUND) ||
 			errors.Is(err, windows.ERROR_DIRECTORY) {
@@ -317,12 +317,11 @@ func (f *RuntimeLogFiles) Remove(
 		return RemoveResult{}, ErrInvalidToken
 	}
 	expectedPath := filepath.Join(f.layout.RuntimeLogDir(), file.name)
-	canonicalAPI := newProductionPathAPI()
-	expected, err := canonicalizeContextWith(ctx, expectedPath, canonicalAPI)
+	expected, err := canonicalizeContextWith(ctx, expectedPath, f.api)
 	if err != nil {
 		return RemoveResult{}, err
 	}
-	tokenPath, err := canonicalizeContextWith(ctx, file.path, canonicalAPI)
+	tokenPath, err := canonicalizeContextWith(ctx, file.path, f.api)
 	if err != nil {
 		return RemoveResult{}, ErrInvalidToken
 	}
@@ -339,7 +338,7 @@ func (f *RuntimeLogFiles) Remove(
 		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		directory: false,
 	}
-	leaf, err := openRuntimeLogLeaf(ctx, f.pins[2], file.name, spec, f.api)
+	leaf, err := openRelativeCheckedWith(ctx, f.pins[2], file.name, spec, f.api)
 	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
 		return RemoveResult{}, nil
 	}
@@ -371,44 +370,6 @@ func (f *RuntimeLogFiles) Remove(
 		return result, &FileError{Operation: "close", Path: file.path, Err: err}
 	}
 	return result, nil
-}
-
-func openRuntimeLogLeaf(
-	ctx context.Context,
-	parent pinnedObject,
-	name string,
-	spec openSpec,
-	api pathAPI,
-) (pinnedObject, error) {
-	if ctx == nil || name == "" || !api.valid() {
-		return pinnedObject{}, fmt.Errorf("%w: invalid runtime-log relative-open input", ErrInvalidArgument)
-	}
-	if err := ctx.Err(); err != nil {
-		return pinnedObject{}, err
-	}
-	path := filepath.Join(parent.path.String(), name)
-	handle, err := api.openRelative(parent.handle, name, spec)
-	if err != nil {
-		return pinnedObject{}, &FileError{Operation: "open-relative", Path: path, Err: err}
-	}
-	closeOnFailure := func(operationErr error) (pinnedObject, error) {
-		return pinnedObject{}, joinOperationCleanup(
-			operationErr,
-			wrapFileError("close", path, api.closeHandle(handle)),
-		)
-	}
-	identity, err := api.identity(handle)
-	if err != nil {
-		return closeOnFailure(&FileError{Operation: "identify", Path: path, Err: err})
-	}
-	if identity.volumeSerial != parent.identity.volumeSerial ||
-		identity.attributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		return closeOnFailure(&FileError{Operation: "type", Path: path, Err: ErrIdentityChanged})
-	}
-	if identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return closeOnFailure(unsafeReparseError(path))
-	}
-	return pinnedObject{path: CanonicalPath{display: path}, handle: handle, identity: identity}, nil
 }
 
 // Write 将内容附加到已验证的单链接日志文件。
