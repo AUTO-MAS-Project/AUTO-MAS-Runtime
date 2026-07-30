@@ -51,3 +51,13 @@ type RuntimeLogFile struct {
 type RemoveResult struct {
 	MutationApplied bool
 }
+
+// Path 返回仅供诊断的日志文件绝对路径。
+func (f RuntimeLogFile) Path() string {
+	return f.path
+}
+
+// Name 返回仅供诊断的日志文件名。
+func (f RuntimeLogFile) Name() string {
+	return f.name
+}

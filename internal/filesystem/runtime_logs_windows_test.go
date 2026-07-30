@@ -413,3 +413,521 @@ func assertRuntimeLogAncestorsRenamable(t *testing.T, layout *config.Layout) {
 		}
 	}
 }
+
+func TestRuntimeLogFiles_ListReturnsOnlyDirectSafeFiles(t *testing.T) {
+	files, layout := newRuntimeLogFixture(t)
+	first := createRuntimeLogToken(t, files, "sync")
+	second := createRuntimeLogToken(t, files, "doctor")
+	subdirectory := filepath.Join(layout.RuntimeLogDir(), "nested")
+	if err := os.Mkdir(subdirectory, 0o700); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(subdirectory, "hidden.log"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	listed, err := files.List(t.Context())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	names := map[string]bool{}
+	for _, file := range listed {
+		names[file.Name()] = true
+	}
+	for _, want := range []string{first.Name(), second.Name()} {
+		if !names[want] {
+			t.Errorf("List() names = %v, missing %q", names, want)
+		}
+	}
+	if names["hidden.log"] {
+		t.Fatal("List() returned a nested file")
+	}
+}
+
+func TestRuntimeLogFiles_ListSkipsDirectoriesReparseAndHardLinks(t *testing.T) {
+	files, layout := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	alias := token.Path() + ".alias"
+	if err := os.Link(token.Path(), alias); err != nil {
+		t.Skipf("hard-link fixture unavailable: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(layout.RuntimeLogDir(), "directory"), 0o700); err != nil {
+		t.Fatalf("os.Mkdir() error = %v", err)
+	}
+	external := filepath.Join(t.TempDir(), "external.log")
+	if err := os.WriteFile(external, []byte("external"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	link := filepath.Join(layout.RuntimeLogDir(), "link.log")
+	if err := os.Symlink(external, link); err != nil {
+		t.Logf("file symlink unavailable: %v", err)
+	}
+	listed, err := files.List(t.Context())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, file := range listed {
+		if file.Path() == token.Path() || file.Path() == alias || file.Path() == link {
+			t.Fatalf("List() returned unsafe file %q", file.Path())
+		}
+	}
+}
+
+func TestRuntimeLogFiles_RemoveRejectsZeroAndForeignTokens(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	if result, err := files.Remove(t.Context(), RuntimeLogFile{}); result.MutationApplied ||
+		!errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("Remove(zero) = %#v, %v, want false/ErrInvalidToken", result, err)
+	}
+	foreignFiles, _ := newRuntimeLogFixture(t)
+	foreign := createRuntimeLogToken(t, foreignFiles, "sync")
+	if result, err := files.Remove(t.Context(), foreign); result.MutationApplied ||
+		!errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("Remove(foreign) = %#v, %v, want false/ErrInvalidToken", result, err)
+	}
+}
+
+func TestRuntimeLogFiles_RemoveRejectsReplacedIdentity(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	if err := os.Remove(token.Path()); err != nil {
+		t.Fatalf("os.Remove() error = %v", err)
+	}
+	if err := os.WriteFile(token.Path(), []byte("replacement"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	result, err := files.Remove(t.Context(), token)
+	if result.MutationApplied || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("Remove() = %#v, %v, want false/ErrIdentityChanged", result, err)
+	}
+	got, err := os.ReadFile(token.Path())
+	if err != nil || string(got) != "replacement" {
+		t.Fatalf("replacement = %q, error = %v", got, err)
+	}
+}
+
+func TestRuntimeLogFiles_RemoveMissingIsIdempotent(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	if err := os.Remove(token.Path()); err != nil {
+		t.Fatalf("os.Remove() error = %v", err)
+	}
+	result, err := files.Remove(t.Context(), token)
+	if err != nil || result.MutationApplied {
+		t.Fatalf("Remove() = %#v, %v, want zero/nil", result, err)
+	}
+}
+
+func TestRuntimeLogFiles_RemoveReportsAppliedBeforeCloseError(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	injected := errors.New("close failed")
+	closeHandle := files.api.closeHandle
+	inject := true
+	files.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		if inject {
+			inject = false
+			return errors.Join(injected, err)
+		}
+		return err
+	}
+	result, err := files.Remove(t.Context(), token)
+	if !result.MutationApplied || !errors.Is(err, injected) {
+		t.Fatalf("Remove() = %#v, %v, want applied/injected", result, err)
+	}
+}
+
+func TestRuntimeLogFiles_RemoveNeverDeletesHardLinkTarget(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	alias := token.Path() + ".alias"
+	if err := os.Link(token.Path(), alias); err != nil {
+		t.Skipf("hard-link fixture unavailable: %v", err)
+	}
+	result, err := files.Remove(t.Context(), token)
+	if result.MutationApplied || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("Remove() = %#v, %v, want false/identity-changed", result, err)
+	}
+	if _, err := os.Stat(alias); err != nil {
+		t.Fatalf("hard-link target changed: %v", err)
+	}
+}
+
+func TestRuntimeLogFiles_ListAndRemoveRejectAfterClose(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	if err := files.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := files.List(t.Context()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("List() error = %v, want ErrClosed", err)
+	}
+	if _, err := files.Remove(t.Context(), token); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Remove() error = %v, want ErrClosed", err)
+	}
+}
+
+func TestRuntimeLogFiles_ListAndRemoveContextsRejectedBeforeIO(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	listCalls := 0
+	removeCalls := 0
+	listDirectory := files.api.listDirectory
+	setDisposition := files.api.setDisposition
+	files.api.listDirectory = func(handle windows.Handle) ([]directoryEntry, error) {
+		listCalls++
+		return listDirectory(handle)
+	}
+	files.api.setDisposition = func(handle windows.Handle) error {
+		removeCalls++
+		return setDisposition(handle)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := files.List(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("List() error = %v, want context.Canceled", err)
+	}
+	if _, err := files.Remove(nil, token); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Remove(nil) error = %v, want ErrInvalidArgument", err)
+	}
+	if listCalls != 0 || removeCalls != 0 {
+		t.Fatalf("I/O calls = list %d/remove %d, want 0/0", listCalls, removeCalls)
+	}
+}
+
+func TestRuntimeLogFiles_ListAndRemoveMatchAccessMatrixAndParentIdentity(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	var specs []openSpec
+	openRelative := files.api.openRelative
+	files.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		specs = append(specs, spec)
+		return openRelative(parent, name, spec)
+	}
+	if _, err := files.List(t.Context()); err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if _, err := files.Remove(t.Context(), token); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	wantList := openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+	wantRemove := openSpec{
+		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+	if !containsOpenSpec(specs, wantList) || !containsOpenSpec(specs, wantRemove) {
+		t.Fatalf("open specs = %#v, want list and remove specs", specs)
+	}
+}
+
+func TestRuntimeLogFiles_RemoveCancellationAfterDispositionKeepsApplied(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	ctx, cancel := context.WithCancel(t.Context())
+	setDisposition := files.api.setDisposition
+	files.api.setDisposition = func(handle windows.Handle) error {
+		err := setDisposition(handle)
+		cancel()
+		return err
+	}
+	result, err := files.Remove(ctx, token)
+	if err != nil || !result.MutationApplied {
+		t.Fatalf("Remove() = %#v, %v, want applied/nil", result, err)
+	}
+}
+
+func TestRuntimeLogFiles_CloseWaitsForStartedOperation(t *testing.T) {
+	for _, operation := range []string{"open", "list", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			assertRuntimeLogCloseWaitsForOperation(t, operation)
+		})
+	}
+}
+
+func assertRuntimeLogCloseWaitsForOperation(t *testing.T, operation string) {
+	t.Helper()
+	files, _ := newRuntimeLogFixture(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var run func() error
+
+	switch operation {
+	case "open":
+		openRelative := files.api.openRelative
+		files.api.openRelative = func(
+			parent windows.Handle,
+			name string,
+			spec openSpec,
+		) (windows.Handle, error) {
+			close(entered)
+			<-release
+			return openRelative(parent, name, spec)
+		}
+		run = func() error {
+			writer, err := files.OpenAppend(t.Context(), "sync", time.Now())
+			if err != nil {
+				return err
+			}
+			return writer.Close()
+		}
+	case "list":
+		listDirectory := files.api.listDirectory
+		files.api.listDirectory = func(handle windows.Handle) ([]directoryEntry, error) {
+			close(entered)
+			<-release
+			return listDirectory(handle)
+		}
+		run = func() error {
+			_, err := files.List(t.Context())
+			return err
+		}
+	case "remove":
+		token := createRuntimeLogToken(t, files, "sync")
+		setDisposition := files.api.setDisposition
+		files.api.setDisposition = func(handle windows.Handle) error {
+			close(entered)
+			<-release
+			return setDisposition(handle)
+		}
+		run = func() error {
+			_, err := files.Remove(t.Context(), token)
+			return err
+		}
+	default:
+		t.Fatalf("unknown operation %q", operation)
+	}
+
+	operationDone := make(chan error, 1)
+	go func() { operationDone <- run() }()
+	<-entered
+	if files.mu.TryLock() {
+		files.mu.Unlock()
+		t.Fatal("operation did not hold the RuntimeLogFiles mutex")
+	}
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- files.Close()
+	}()
+	<-closeStarted
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close() returned before %s: %v", operation, err)
+	default:
+	}
+	close(release)
+	if err := <-operationDone; err != nil {
+		t.Fatalf("%s error = %v", operation, err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if writer, err := files.OpenAppend(
+		t.Context(),
+		"sync",
+		time.Now(),
+	); writer != nil || !errors.Is(err, ErrClosed) {
+		t.Fatalf("OpenAppend() after Close = %#v, %v", writer, err)
+	}
+	if listed, err := files.List(t.Context()); listed != nil || !errors.Is(err, ErrClosed) {
+		t.Fatalf("List() after Close = %#v, %v", listed, err)
+	}
+	if result, err := files.Remove(
+		t.Context(),
+		RuntimeLogFile{},
+	); result.MutationApplied || !errors.Is(err, ErrClosed) {
+		t.Fatalf("Remove() after Close = %#v, %v", result, err)
+	}
+}
+
+func TestWindows_RuntimeLogPinsAndTokensSurviveReplacementRaces(t *testing.T) {
+	files, layout := newRuntimeLogFixture(t)
+	token := createRuntimeLogToken(t, files, "sync")
+	if err := os.Remove(token.Path()); err != nil {
+		t.Fatalf("os.Remove() error = %v", err)
+	}
+	if err := os.WriteFile(token.Path(), []byte("competitor"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	if _, err := files.Remove(t.Context(), token); !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("Remove() error = %v, want ErrIdentityChanged", err)
+	}
+	if err := os.Rename(layout.RuntimeLogDir(), layout.RuntimeLogDir()+"-other"); err == nil {
+		t.Fatal("runtime directory replacement succeeded while capability was alive")
+	}
+}
+
+func TestWindows_RuntimeLogSharedAppendBlocksDeleteUntilLastWriterCloses(t *testing.T) {
+	layout := newRuntimeLogTestLayout(t)
+	filesOne, err := NewRuntimeLogFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("first NewRuntimeLogFiles() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := filesOne.Close(); err != nil {
+			t.Errorf("first RuntimeLogFiles.Close() error = %v", err)
+		}
+	})
+	filesTwo, err := NewRuntimeLogFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("second NewRuntimeLogFiles() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := filesTwo.Close(); err != nil {
+			t.Errorf("second RuntimeLogFiles.Close() error = %v", err)
+		}
+	})
+
+	date := time.Date(2026, 7, 29, 12, 0, 0, 0, time.Local)
+	writerOne, err := filesOne.OpenAppend(t.Context(), "sync", date)
+	if err != nil {
+		t.Fatalf("first OpenAppend() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := writerOne.Close(); err != nil {
+			t.Errorf("first writer.Close() error = %v", err)
+		}
+	})
+	if _, err := writerOne.Write([]byte("first\n")); err != nil {
+		t.Fatalf("first writer.Write() error = %v", err)
+	}
+
+	barrierCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	openSecond := make(chan struct{})
+	type writerResult struct {
+		writer *RuntimeLogWriter
+		err    error
+	}
+	secondOpened := make(chan writerResult, 1)
+	go func() {
+		select {
+		case <-openSecond:
+		case <-barrierCtx.Done():
+			secondOpened <- writerResult{err: barrierCtx.Err()}
+			return
+		}
+		writer, openErr := filesTwo.OpenAppend(barrierCtx, "sync", date)
+		if openErr == nil {
+			if _, writeErr := writer.Write([]byte("second\n")); writeErr != nil {
+				openErr = errors.Join(writeErr, writer.Close())
+				writer = nil
+			}
+		}
+		secondOpened <- writerResult{writer: writer, err: openErr}
+	}()
+	close(openSecond)
+
+	var opened writerResult
+	select {
+	case opened = <-secondOpened:
+	case <-barrierCtx.Done():
+		t.Fatalf("second writer barrier error = %v", barrierCtx.Err())
+	}
+	if opened.err != nil || opened.writer == nil {
+		t.Fatalf("second OpenAppend/write = %#v, %v, want live writer", opened.writer, opened.err)
+	}
+	writerTwo := opened.writer
+	t.Cleanup(func() {
+		if err := writerTwo.Close(); err != nil {
+			t.Errorf("second writer.Close() error = %v", err)
+		}
+	})
+
+	listed, err := filesOne.List(t.Context())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	var token RuntimeLogFile
+	for _, file := range listed {
+		if file.Path() == writerOne.Path() {
+			token = file
+			break
+		}
+	}
+	if token.Path() == "" {
+		t.Fatalf("List() did not return %q", writerOne.Path())
+	}
+
+	result, err := filesOne.Remove(t.Context(), token)
+	if result.MutationApplied || !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("Remove() with two writers = %#v, %v, want false/sharing violation", result, err)
+	}
+	if err := writerOne.Close(); err != nil {
+		t.Fatalf("first writer.Close() error = %v", err)
+	}
+	result, err = filesOne.Remove(t.Context(), token)
+	if result.MutationApplied || !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("Remove() with second writer = %#v, %v, want false/sharing violation", result, err)
+	}
+	if err := writerTwo.Close(); err != nil {
+		t.Fatalf("second writer.Close() error = %v", err)
+	}
+
+	got, err := os.ReadFile(writerOne.Path())
+	if err != nil {
+		t.Fatalf("os.ReadFile() error = %v", err)
+	}
+	if string(got) != "first\nsecond\n" {
+		t.Fatalf("log contents = %q, want both appends", got)
+	}
+	result, err = filesOne.Remove(t.Context(), token)
+	if err != nil || !result.MutationApplied {
+		t.Fatalf("Remove() after final close = %#v, %v, want true/nil", result, err)
+	}
+	if _, err := os.Stat(writerOne.Path()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("os.Stat() after Remove error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func createRuntimeLogToken(
+	t *testing.T,
+	files *RuntimeLogFiles,
+	command string,
+) RuntimeLogFile {
+	t.Helper()
+	writer, err := files.OpenAppend(t.Context(), command, time.Now())
+	if err != nil {
+		t.Fatalf("OpenAppend() error = %v", err)
+	}
+	if _, err := writer.Write([]byte(command)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close() error = %v", err)
+	}
+	listed, err := files.List(t.Context())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, file := range listed {
+		if file.Path() == writer.Path() {
+			return file
+		}
+	}
+	t.Fatalf("List() did not return %q", writer.Path())
+	return RuntimeLogFile{}
+}
+
+func containsOpenSpec(values []openSpec, want openSpec) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

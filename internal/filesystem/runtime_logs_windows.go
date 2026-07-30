@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 // NewRuntimeLogFiles 创建固定并验证 Runtime 日志目录的能力。
@@ -221,6 +222,193 @@ func (f *RuntimeLogFiles) OpenAppend(
 		file: leaf,
 		pins: [3]pinnedObject{writerPins[0], writerPins[1], writerPins[2]},
 	}, nil
+}
+
+// List 返回 Runtime 日志目录中已经按对象身份验证的直接日志文件令牌。
+func (f *RuntimeLogFiles) List(ctx context.Context) ([]RuntimeLogFile, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return nil, ErrClosed
+	}
+	entries, err := f.api.listDirectory(f.pins[2].handle)
+	if err != nil {
+		return nil, &FileError{
+			Operation: "list",
+			Path:      f.layout.RuntimeLogDir(),
+			Err:       err,
+		}
+	}
+	result := make([]RuntimeLogFile, 0, len(entries))
+	spec := openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if filepath.Base(entry.name) != entry.name {
+			return nil, &FileError{
+				Operation: "list",
+				Path:      f.layout.RuntimeLogDir(),
+				Err:       ErrIdentityChanged,
+			}
+		}
+		if entry.attributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+			continue
+		}
+		leaf, err := openRuntimeLogLeaf(ctx, f.pins[2], entry.name, spec, f.api)
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) ||
+			errors.Is(err, windows.ERROR_PATH_NOT_FOUND) ||
+			errors.Is(err, windows.ERROR_DIRECTORY) {
+			continue
+		}
+		if err != nil {
+			var stable *Error
+			if errors.As(err, &stable) && stable.Code() == protocol.CodeUnsafeReparsePoint {
+				continue
+			}
+			return nil, err
+		}
+		path := filepath.Join(f.layout.RuntimeLogDir(), entry.name)
+		if leaf.identity.numberOfLinks == 1 {
+			result = append(result, RuntimeLogFile{
+				owner:        f.owner,
+				path:         path,
+				name:         entry.name,
+				volumeSerial: leaf.identity.volumeSerial,
+				fileID:       leaf.identity.fileID,
+			})
+		}
+		if err := f.api.closeHandle(leaf.handle); err != nil {
+			return nil, &FileError{Operation: "close", Path: path, Err: err}
+		}
+	}
+	return result, nil
+}
+
+// Remove 按令牌中的对象身份条件删除已列出的 Runtime 日志文件。
+func (f *RuntimeLogFiles) Remove(
+	ctx context.Context,
+	file RuntimeLogFile,
+) (RemoveResult, error) {
+	if ctx == nil {
+		return RemoveResult{}, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return RemoveResult{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return RemoveResult{}, ErrClosed
+	}
+	if file.owner == nil || file.owner != f.owner || file.name == "" || file.path == "" {
+		return RemoveResult{}, ErrInvalidToken
+	}
+	expectedPath := filepath.Join(f.layout.RuntimeLogDir(), file.name)
+	canonicalAPI := newProductionPathAPI()
+	expected, err := canonicalizeContextWith(ctx, expectedPath, canonicalAPI)
+	if err != nil {
+		return RemoveResult{}, err
+	}
+	tokenPath, err := canonicalizeContextWith(ctx, file.path, canonicalAPI)
+	if err != nil {
+		return RemoveResult{}, ErrInvalidToken
+	}
+	if !expected.Equal(tokenPath) {
+		return RemoveResult{}, ErrInvalidToken
+	}
+	if err := ctx.Err(); err != nil {
+		return RemoveResult{}, err
+	}
+	spec := openSpec{
+		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+	leaf, err := openRuntimeLogLeaf(ctx, f.pins[2], file.name, spec, f.api)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		return RemoveResult{}, nil
+	}
+	if err != nil {
+		return RemoveResult{}, err
+	}
+	if leaf.identity.volumeSerial != file.volumeSerial ||
+		leaf.identity.fileID != file.fileID ||
+		leaf.identity.numberOfLinks != 1 {
+		closeErr := f.api.closeHandle(leaf.handle)
+		return RemoveResult{}, errors.Join(
+			ErrIdentityChanged,
+			wrapFileError("close", file.path, closeErr),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		closeErr := f.api.closeHandle(leaf.handle)
+		return RemoveResult{}, errors.Join(err, wrapFileError("close", file.path, closeErr))
+	}
+	if err := deleteByHandleWith(leaf.handle, f.api); err != nil {
+		closeErr := f.api.closeHandle(leaf.handle)
+		return RemoveResult{}, errors.Join(
+			&FileError{Operation: "remove", Path: file.path, Err: err},
+			wrapFileError("close", file.path, closeErr),
+		)
+	}
+	result := RemoveResult{MutationApplied: true}
+	if err := f.api.closeHandle(leaf.handle); err != nil {
+		return result, &FileError{Operation: "close", Path: file.path, Err: err}
+	}
+	return result, nil
+}
+
+func openRuntimeLogLeaf(
+	ctx context.Context,
+	parent pinnedObject,
+	name string,
+	spec openSpec,
+	api pathAPI,
+) (pinnedObject, error) {
+	if ctx == nil || name == "" || !api.valid() {
+		return pinnedObject{}, fmt.Errorf("%w: invalid runtime-log relative-open input", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return pinnedObject{}, err
+	}
+	path := filepath.Join(parent.path.String(), name)
+	handle, err := api.openRelative(parent.handle, name, spec)
+	if err != nil {
+		return pinnedObject{}, &FileError{Operation: "open-relative", Path: path, Err: err}
+	}
+	closeOnFailure := func(operationErr error) (pinnedObject, error) {
+		return pinnedObject{}, joinOperationCleanup(
+			operationErr,
+			wrapFileError("close", path, api.closeHandle(handle)),
+		)
+	}
+	identity, err := api.identity(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{Operation: "identify", Path: path, Err: err})
+	}
+	if identity.volumeSerial != parent.identity.volumeSerial ||
+		identity.attributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		return closeOnFailure(&FileError{Operation: "type", Path: path, Err: ErrIdentityChanged})
+	}
+	if identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return closeOnFailure(unsafeReparseError(path))
+	}
+	return pinnedObject{path: CanonicalPath{display: path}, handle: handle, identity: identity}, nil
 }
 
 // Write 将内容附加到已验证的单链接日志文件。
