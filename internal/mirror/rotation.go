@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 const (
@@ -234,4 +236,344 @@ func defaultWait(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// Run 按 Plan 顺序执行有限尝试并保持 Target 不变。
+func (r *Rotator) Run(
+	ctx context.Context,
+	plan Plan,
+	target Target,
+	attempt AttemptFunc,
+) (RotationResult, error) {
+	if err := validateRotationRequest(
+		r,
+		ctx,
+		plan,
+		target,
+		attempt,
+	); err != nil {
+		return RotationResult{}, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return RotationResult{}, newSafeError(
+			safeErrorCancellation,
+			ctxErr,
+		)
+	}
+	if plan.offline {
+		return RotationResult{}, newRotationError(
+			protocol.CodeNetworkUnavailable,
+			nil,
+			nil,
+		)
+	}
+
+	reports := make(
+		[]AttemptReport,
+		0,
+		len(plan.sources)*r.maxSourceAttempts,
+	)
+	causes := make(
+		[]error,
+		0,
+		len(plan.sources)*r.maxSourceAttempts,
+	)
+	blacklisted := make(map[string]struct{}, len(plan.sources))
+	hadIntegrityFailure := false
+	globalTry := 0
+
+	for _, source := range plan.sources {
+		if _, blocked := blacklisted[source.key]; blocked {
+			continue
+		}
+		for sourceTry := 1; sourceTry <= r.maxSourceAttempts; sourceTry++ {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return failedRotationResult(reports), newSafeError(
+					safeErrorCancellation,
+					ctxErr,
+				)
+			}
+			if validateTarget(target) != nil ||
+				target.Fingerprint() == "" {
+				targetErr := fmt.Errorf(
+					"%w: target changed during rotation",
+					ErrInvalidRotationRequest,
+				)
+				return failedRotationResult(reports), newSafeError(
+					safeErrorTarget,
+					targetErr,
+				)
+			}
+
+			globalTry++
+			currentAttempt := Attempt{
+				Source:    source,
+				Target:    target,
+				SourceTry: sourceTry,
+				GlobalTry: globalTry,
+			}
+			startedAt := r.clock()
+			outcome := attempt(ctx, currentAttempt)
+			finishedAt := r.clock()
+			outcomeErr := validateAttemptOutcome(plan.kind, outcome)
+			callbackErr := wrapSafeError(
+				safeErrorAttempt,
+				outcome.Err,
+			)
+			legalSuccess := outcomeErr == nil &&
+				outcome.Kind == OutcomeSucceeded
+
+			reportOutcome := outcome
+			if outcomeErr != nil {
+				reportOutcome = AttemptOutcome{Err: outcome.Err}
+			}
+			var ctxErrBeforeReport error
+			if !legalSuccess {
+				ctxErrBeforeReport = ctx.Err()
+				if ctxErrBeforeReport != nil {
+					reportOutcome = AttemptOutcome{
+						Kind: OutcomeCancelled,
+						Err:  ctxErrBeforeReport,
+					}
+				}
+			}
+			report := buildAttemptReport(
+				currentAttempt,
+				startedAt,
+				finishedAt,
+				reportOutcome,
+			)
+			reports = append(reports, report)
+			reporterErr := r.reportAttempt(ctx, report)
+
+			if legalSuccess {
+				result := RotationResult{
+					Source:       source,
+					ActualCommit: outcome.ActualCommit,
+					Reports:      cloneAttemptReports(reports),
+				}
+				if reporterErr != nil {
+					return result, reporterErr
+				}
+				return result, nil
+			}
+			if ctxErrBeforeReport != nil {
+				return failedRotationResult(reports), newSafeError(
+					safeErrorCancellation,
+					errors.Join(
+						ctxErrBeforeReport,
+						outcomeErr,
+						callbackErr,
+						reporterErr,
+					),
+				)
+			}
+			if outcomeErr != nil {
+				return failedRotationResult(reports), newSafeError(
+					safeErrorAttemptContract,
+					errors.Join(
+						outcomeErr,
+						callbackErr,
+						reporterErr,
+					),
+				)
+			}
+			if reporterErr != nil {
+				return failedRotationResult(reports), newSafeError(
+					safeErrorReporter,
+					errors.Join(
+						errors.Join(causes...),
+						callbackErr,
+						reporterErr,
+					),
+				)
+			}
+
+			causes = append(causes, callbackErr)
+			switch outcome.Kind {
+			case OutcomeRetrySameSource:
+				if sourceTry == r.maxSourceAttempts {
+					break
+				}
+				waitErr := r.wait(ctx, r.retryDelay)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return failedRotationResult(reports), newSafeError(
+						safeErrorCancellation,
+						errors.Join(
+							ctxErr,
+							errors.Join(causes...),
+							wrapSafeError(safeErrorWait, waitErr),
+						),
+					)
+				}
+				if waitErr != nil {
+					return failedRotationResult(reports), newSafeError(
+						safeErrorWait,
+						errors.Join(
+							errors.Join(causes...),
+							wrapSafeError(safeErrorWait, waitErr),
+						),
+					)
+				}
+				continue
+			case OutcomeSwitchSource:
+				sourceTry = r.maxSourceAttempts
+			case OutcomeIntegrityFailure:
+				hadIntegrityFailure = true
+				blacklisted[source.key] = struct{}{}
+				sourceTry = r.maxSourceAttempts
+			case OutcomeTargetFailure:
+				return failedRotationResult(reports), newSafeError(
+					safeErrorTarget,
+					callbackErr,
+				)
+			}
+		}
+	}
+
+	result := failedRotationResult(reports)
+	if hadIntegrityFailure {
+		return result, newIntegrityExhaustedError(reports, causes)
+	}
+	return result, newRotationError(
+		protocol.CodeMirrorExhausted,
+		reports,
+		causes,
+	)
+}
+
+func validateRotationRequest(
+	rotator *Rotator,
+	ctx context.Context,
+	plan Plan,
+	target Target,
+	attempt AttemptFunc,
+) error {
+	if !validRotator(rotator) ||
+		ctx == nil ||
+		attempt == nil ||
+		!validPlan(plan) ||
+		target.ValidateForKind(plan.kind) != nil {
+		return fmt.Errorf(
+			"%w: request invariant",
+			ErrInvalidRotationRequest,
+		)
+	}
+	return nil
+}
+
+func validRotator(rotator *Rotator) bool {
+	return rotator != nil &&
+		rotator.clock != nil &&
+		rotator.wait != nil &&
+		rotator.reportContext != nil &&
+		(rotator.reporter == nil || !nilReporter(rotator.reporter)) &&
+		rotator.maxSourceAttempts >= 1 &&
+		rotator.maxSourceAttempts <= maxSourceAttemptsLimit &&
+		rotator.retryDelay > 0
+}
+
+func validateAttemptOutcome(kind Kind, outcome AttemptOutcome) error {
+	if !outcome.Kind.Valid() || outcome.Kind == OutcomeCancelled {
+		return fmt.Errorf(
+			"%w: outcome kind",
+			ErrInvalidRotationRequest,
+		)
+	}
+	if outcome.Kind == OutcomeSucceeded {
+		if outcome.Err != nil ||
+			outcome.FailureKind != "" ||
+			(kind == KindGit && !validGitCommit(outcome.ActualCommit)) ||
+			(kind != KindGit && outcome.ActualCommit != "") {
+			return fmt.Errorf(
+				"%w: success outcome",
+				ErrInvalidRotationRequest,
+			)
+		}
+		return nil
+	}
+	if outcome.Err == nil ||
+		outcome.ActualCommit != "" {
+		return fmt.Errorf(
+			"%w: failure outcome",
+			ErrInvalidRotationRequest,
+		)
+	}
+	if !outcome.FailureKind.Valid() {
+		return fmt.Errorf(
+			"%w: failure diagnostic",
+			ErrInvalidRotationRequest,
+		)
+	}
+	return nil
+}
+
+func validGitCommit(commit string) bool {
+	if len(commit) != 40 {
+		return false
+	}
+	for i := 0; i < len(commit); i++ {
+		character := commit[i]
+		if (character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func buildAttemptReport(
+	attempt Attempt,
+	startedAt time.Time,
+	finishedAt time.Time,
+	outcome AttemptOutcome,
+) AttemptReport {
+	duration := finishedAt.Sub(startedAt)
+	if duration < 0 {
+		duration = 0
+	}
+	return AttemptReport{
+		Kind:         attempt.Source.kind,
+		SourceKey:    attempt.Source.key,
+		SourceTry:    attempt.SourceTry,
+		GlobalTry:    attempt.GlobalTry,
+		Target:       attempt.Target,
+		TargetHash:   attempt.Target.Fingerprint(),
+		StartedAt:    startedAt,
+		Duration:     duration,
+		Outcome:      outcome.Kind,
+		FailureKind:  outcome.FailureKind,
+		Error:        attemptErrorText(outcome),
+		ActualCommit: outcome.ActualCommit,
+	}
+}
+
+func failedRotationResult(reports []AttemptReport) RotationResult {
+	return RotationResult{Reports: cloneAttemptReports(reports)}
+}
+
+// reportAttempt 使用独立收口 context 同步报告一次实际 Attempt。
+func (r *Rotator) reportAttempt(
+	operationCtx context.Context,
+	report AttemptReport,
+) error {
+	if r.reporter == nil {
+		return nil
+	}
+	reportCtx, cancel := r.reportContext(operationCtx)
+	if reportCtx == nil || cancel == nil {
+		if cancel != nil {
+			cancel()
+		}
+		return newSafeError(
+			safeErrorAttemptContract,
+			ErrInvalidRotationRequest,
+		)
+	}
+	defer cancel()
+	if err := r.reporter.ReportAttempt(reportCtx, report); err != nil {
+		return newSafeError(safeErrorReporter, err)
+	}
+	return nil
 }
