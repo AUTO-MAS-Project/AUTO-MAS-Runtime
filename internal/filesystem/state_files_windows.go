@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	stateIntentVersion        = 1
-	maxStateIntentBytes int64 = 64 * 1024
-	stateGateRetryDelay       = 10 * time.Millisecond
+	stateIntentVersion           = 1
+	maxStateIntentBytes    int64 = 64 * 1024
+	stateGateRetryDelay          = 10 * time.Millisecond
+	stateIntentNonceLength       = 32
 
 	ntFileSupersede        = uint32(0x00000000)
 	ntFileSynchronousAlert = uint32(0x00000010)
@@ -491,6 +492,10 @@ func stateIntentLeaf(kind StateFileKind) string {
 	return fmt.Sprintf(".%s.intent", kind)
 }
 
+func stateTransactionLeaf(kind StateFileKind, role string, nonce string) string {
+	return fmt.Sprintf(".%s.%s.%s", kind, role, nonce)
+}
+
 func statePayloadReadSpec() openSpec {
 	return openSpec{
 		access:    windows.FILE_READ_DATA | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
@@ -557,6 +562,7 @@ func (f *StateFiles) acquireStateGuard(
 		return pinnedObject{}, err
 	}
 	leaf := stateGuardLeaf(kind)
+	path := filepath.Join(f.pins[1].path.String(), leaf)
 	createSpec, err := stateGuardNTSpec(mode, ntFileCreate)
 	if err != nil {
 		return pinnedObject{}, err
@@ -565,15 +571,17 @@ func (f *StateFiles) acquireStateGuard(
 	if err == nil {
 		return f.validateStateGuardHandle(ctx, kind, handle)
 	}
+	pendingOperation := "guard-create"
+	pendingErr := err
 	if !isStateGuardCollision(err) {
 		if errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 			if err := f.waitGate(ctx, stateGateRetryDelay); err != nil {
-				return pinnedObject{}, err
+				return pinnedObject{}, stateGuardWaitError(pendingOperation, path, pendingErr, err)
 			}
 		} else {
 			return pinnedObject{}, &FileError{
-				Operation: "guard-create",
-				Path:      filepath.Join(f.pins[1].path.String(), leaf),
+				Operation: pendingOperation,
+				Path:      path,
 				Err:       err,
 			}
 		}
@@ -584,7 +592,7 @@ func (f *StateFiles) acquireStateGuard(
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return pinnedObject{}, err
+			return pinnedObject{}, stateGuardWaitError(pendingOperation, path, pendingErr, err)
 		}
 		handle, err = f.api.ntCreateRelative(f.pins[1].handle, leaf, openSpec)
 		if err == nil {
@@ -593,14 +601,23 @@ func (f *StateFiles) acquireStateGuard(
 		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 			return pinnedObject{}, &FileError{
 				Operation: "guard-open",
-				Path:      filepath.Join(f.pins[1].path.String(), leaf),
+				Path:      path,
 				Err:       err,
 			}
 		}
+		pendingOperation = "guard-open"
+		pendingErr = err
 		if err := f.waitGate(ctx, stateGateRetryDelay); err != nil {
-			return pinnedObject{}, err
+			return pinnedObject{}, stateGuardWaitError(pendingOperation, path, pendingErr, err)
 		}
 	}
+}
+
+func stateGuardWaitError(operation, path string, cause, waitErr error) error {
+	return errors.Join(
+		&FileError{Operation: operation, Path: path, Err: cause},
+		waitErr,
+	)
 }
 
 func isStateGuardCollision(err error) bool {
@@ -687,7 +704,7 @@ func (f *StateFiles) openStateLeaf(
 		return pinnedObject{}, false, err
 	}
 	object, err := openRelativeCheckedWith(ctx, f.pins[1], leaf, spec, f.api)
-	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+	if isInitialStateLeafMissing(err) {
 		return pinnedObject{}, true, nil
 	}
 	if err != nil {
@@ -714,6 +731,13 @@ func (f *StateFiles) openStateLeaf(
 		)
 	}
 	return object, false, nil
+}
+
+func isInitialStateLeafMissing(err error) bool {
+	var fileErr *FileError
+	return errors.As(err, &fileErr) &&
+		fileErr.Operation == "open-relative" &&
+		errors.Is(fileErr.Err, windows.ERROR_FILE_NOT_FOUND)
 }
 
 func validateStateLeafName(leaf string) error {
@@ -898,8 +922,7 @@ func decodeStateIntent(payload []byte) (stateIntent, error) {
 func validateStateIntentValue(intent stateIntent) error {
 	if intent.Version != stateIntentVersion ||
 		!intent.Kind.Valid() ||
-		intent.Nonce == "" ||
-		len(intent.Nonce) > 128 ||
+		!validStateIntentNonce(intent.Nonce) ||
 		intent.Root.VolumeSerial == 0 ||
 		intent.Root.FileID == ([16]byte{}) ||
 		intent.IntentObject.VolumeSerial == 0 ||
@@ -911,14 +934,29 @@ func validateStateIntentValue(intent stateIntent) error {
 	for _, leaf := range []string{
 		intent.DestinationLeaf,
 		intent.IntentLeaf,
-		intent.TempLeaf,
-		intent.BackupLeaf,
 	} {
 		if err := validateStateLeafName(leaf); err != nil {
 			return err
 		}
 	}
+	if intent.IntentLeaf != stateIntentLeaf(intent.Kind) ||
+		intent.TempLeaf != stateTransactionLeaf(intent.Kind, "temp", intent.Nonce) ||
+		intent.BackupLeaf != stateTransactionLeaf(intent.Kind, "backup", intent.Nonce) {
+		return errors.New("state intent leaves are invalid")
+	}
 	return nil
+}
+
+func validStateIntentNonce(nonce string) bool {
+	if len(nonce) != stateIntentNonceLength {
+		return false
+	}
+	for i := 0; i < len(nonce); i++ {
+		if (nonce[i] < '0' || nonce[i] > '9') && (nonce[i] < 'a' || nonce[i] > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validStateObjectProof(proof stateObjectProof) bool {

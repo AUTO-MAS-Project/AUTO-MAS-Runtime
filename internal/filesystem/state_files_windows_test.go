@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -202,6 +203,87 @@ func TestStateFiles_ReadRejectsReparseAndHardLink(t *testing.T) {
 	}
 }
 
+func TestStateFiles_ReadFailsClosedOnInjectedUnsafeCandidates(t *testing.T) {
+	tests := []struct {
+		name   string
+		inject func(t *testing.T, files *StateFiles, fixture *sealedStateFixture)
+	}{
+		{
+			name: "reparse",
+			inject: func(t *testing.T, files *StateFiles, fixture *sealedStateFixture) {
+				t.Helper()
+				openRelative := files.api.openRelative
+				identity := files.api.identity
+				var destination windows.Handle
+				files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+					handle, err := openRelative(parent, name, spec)
+					if err == nil && name == filepath.Base(fixture.destinationPath) {
+						destination = handle
+					}
+					return handle, err
+				}
+				files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+					got, err := identity(handle)
+					if err == nil && handle == destination && destination != windows.InvalidHandle {
+						got.attributes |= windows.FILE_ATTRIBUTE_REPARSE_POINT
+					}
+					return got, err
+				}
+			},
+		},
+		{
+			name: "opaque",
+			inject: func(t *testing.T, files *StateFiles, fixture *sealedStateFixture) {
+				t.Helper()
+				openRelative := files.api.openRelative
+				files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+					if name == filepath.Base(fixture.destinationPath) {
+						return windows.InvalidHandle, windows.ERROR_ACCESS_DENIED
+					}
+					return openRelative(parent, name, spec)
+				}
+			},
+		},
+		{
+			name: "digest unknown",
+			inject: func(t *testing.T, files *StateFiles, fixture *sealedStateFixture) {
+				t.Helper()
+				openRelative := files.api.openRelative
+				readFile := files.api.readFile
+				var destination windows.Handle
+				files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+					handle, err := openRelative(parent, name, spec)
+					if err == nil && name == filepath.Base(fixture.destinationPath) {
+						destination = handle
+					}
+					return handle, err
+				}
+				files.api.readFile = func(handle windows.Handle, buffer []byte) (int, error) {
+					if handle == destination && destination != windows.InvalidHandle {
+						return 0, errors.New("injected digest failure")
+					}
+					return readFile(handle, buffer)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			files, layout := newStateFilesFixture(t)
+			fixture := newSealedStateFixture(t, files, layout, StateBackend, []byte("old"), []byte("new"))
+			fixture.installForeignAtDestination(t)
+			fixture.installOldAtBackup(t)
+			fixture.installNewAtTemp(t)
+			fixture.publishIntent(t)
+			test.inject(t, files, fixture)
+			if _, err := files.Read(t.Context(), StateBackend, MaxStateFileBytes); err == nil ||
+				errors.Is(err, ErrStateFileNotFound) {
+				t.Fatalf("Read() error = %v, want closed non-missing failure", err)
+			}
+		})
+	}
+}
+
 func TestStateFileSnapshot_BytesReturnsDefensiveCopy(t *testing.T) {
 	files, layout := newStateFilesFixture(t)
 	payload := []byte("immutable")
@@ -291,7 +373,7 @@ func TestStateFiles_ReadIntentABADoesNotReturnNotFound(t *testing.T) {
 				snapshot, readErr := reader.Read(t.Context(), StateBackend, MaxStateFileBytes)
 				done <- readResult{snapshot: snapshot, err: readErr}
 			}()
-			<-waitEntered
+			waitStateTestSignal(t, waitEntered, "reader guard wait")
 			select {
 			case result := <-done:
 				t.Fatalf("Read() returned in raw gap: %#v, %v", result.snapshot, result.err)
@@ -305,7 +387,7 @@ func TestStateFiles_ReadIntentABADoesNotReturnNotFound(t *testing.T) {
 				cancelDone <- readErr
 			}()
 			cancel()
-			if err := <-cancelDone; !errors.Is(err, context.Canceled) ||
+			if err := waitStateTestResult(t, cancelDone, "canceled reader completion"); !errors.Is(err, context.Canceled) ||
 				errors.Is(err, ErrStateFileNotFound) {
 				t.Fatalf("canceled Read() error = %v, want context.Canceled only", err)
 			}
@@ -330,7 +412,7 @@ func TestStateFiles_ReadIntentABADoesNotReturnNotFound(t *testing.T) {
 				t.Fatalf("close exclusive guard error = %v", err)
 			}
 			close(releaseWait)
-			result := <-done
+			result := waitStateTestResult(t, done, "reader completion")
 			if result.err != nil {
 				t.Fatalf("Read() error = %v", result.err)
 			}
@@ -481,7 +563,7 @@ func TestStateFiles_RecoveryMatrix(t *testing.T) {
 				fixture.installNewAtTemp(t)
 				intent := fixture.intentValue(t)
 				intent.Kind = StateMutation
-				fixture.publishIntentValue(t, intent)
+				fixture.publishUncheckedIntentValue(t, intent)
 			},
 			wantError: true,
 		},
@@ -492,7 +574,7 @@ func TestStateFiles_RecoveryMatrix(t *testing.T) {
 				fixture.installNewAtTemp(t)
 				intent := fixture.intentValue(t)
 				intent.IntentLeaf = stateIntentLeaf(StateMutation)
-				fixture.publishIntentValue(t, intent)
+				fixture.publishUncheckedIntentValue(t, intent)
 			},
 			wantError: true,
 		},
@@ -503,7 +585,7 @@ func TestStateFiles_RecoveryMatrix(t *testing.T) {
 				fixture.installNewAtTemp(t)
 				intent := fixture.intentValue(t)
 				intent.DestinationLeaf = "mutation.json"
-				fixture.publishIntentValue(t, intent)
+				fixture.publishUncheckedIntentValue(t, intent)
 			},
 			wantError: true,
 		},
@@ -610,6 +692,132 @@ func TestStateFiles_RecoveryMatrix(t *testing.T) {
 		}
 	})
 
+	t.Run("post-open not found never aliases stable missing", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			inject func(files *StateFiles)
+		}{
+			{
+				name: "identity",
+				inject: func(files *StateFiles) {
+					identity := files.api.identity
+					var destination windows.Handle
+					openRelative := files.api.openRelative
+					files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+						handle, err := openRelative(parent, name, spec)
+						if err == nil && name == "backend.json" {
+							destination = handle
+						}
+						return handle, err
+					}
+					files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+						if handle == destination && destination != windows.InvalidHandle {
+							return objectIdentity{}, windows.ERROR_FILE_NOT_FOUND
+						}
+						return identity(handle)
+					}
+				},
+			},
+			{
+				name: "final path",
+				inject: func(files *StateFiles) {
+					finalPath := files.api.finalPath
+					var destination windows.Handle
+					openRelative := files.api.openRelative
+					files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+						handle, err := openRelative(parent, name, spec)
+						if err == nil && name == "backend.json" {
+							destination = handle
+						}
+						return handle, err
+					}
+					files.api.finalPath = func(handle windows.Handle) (string, error) {
+						if handle == destination && destination != windows.InvalidHandle {
+							return "", windows.ERROR_FILE_NOT_FOUND
+						}
+						return finalPath(handle)
+					}
+				},
+			},
+			{
+				name: "canonicalize",
+				inject: func(files *StateFiles) {
+					finalPath := files.api.finalPath
+					var destination windows.Handle
+					openRelative := files.api.openRelative
+					files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+						handle, err := openRelative(parent, name, spec)
+						if err == nil && name == "backend.json" {
+							destination = handle
+						}
+						return handle, err
+					}
+					files.api.finalPath = func(handle windows.Handle) (string, error) {
+						if handle == destination && destination != windows.InvalidHandle {
+							return `Z:\missing\backend.json`, nil
+						}
+						return finalPath(handle)
+					}
+				},
+			},
+			{
+				name: "parent",
+				inject: func(files *StateFiles) {
+					openPath := files.api.openPath
+					files.api.openPath = func(path string, spec openSpec) (windows.Handle, error) {
+						if spec == parentIdentitySpec() {
+							return windows.InvalidHandle, windows.ERROR_FILE_NOT_FOUND
+						}
+						return openPath(path, spec)
+					}
+				},
+			},
+			{
+				name: "cleanup",
+				inject: func(files *StateFiles) {
+					identity := files.api.identity
+					closeHandle := files.api.closeHandle
+					var destination windows.Handle
+					openRelative := files.api.openRelative
+					files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+						handle, err := openRelative(parent, name, spec)
+						if err == nil && name == "backend.json" {
+							destination = handle
+						}
+						return handle, err
+					}
+					files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+						if handle == destination && destination != windows.InvalidHandle {
+							return objectIdentity{}, errors.New("force cleanup")
+						}
+						return identity(handle)
+					}
+					files.api.closeHandle = func(handle windows.Handle) error {
+						if handle == destination && destination != windows.InvalidHandle {
+							_ = closeHandle(handle)
+							return windows.ERROR_FILE_NOT_FOUND
+						}
+						return closeHandle(handle)
+					}
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				files, layout := newStateFilesFixture(t)
+				if err := os.WriteFile(layout.BackendStateFile(), []byte("payload"), 0o600); err != nil {
+					t.Fatalf("os.WriteFile() error = %v", err)
+				}
+				test.inject(files)
+				_, err := files.Read(t.Context(), StateBackend, MaxStateFileBytes)
+				if (!errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(err, windows.ERROR_PATH_NOT_FOUND)) ||
+					errors.Is(err, ErrStateFileNotFound) {
+					t.Fatalf("Read() error = %v, want raw post-open not-found", err)
+				}
+			})
+		}
+	})
+
 	t.Run("stable missing close failure loses missing classification", func(t *testing.T) {
 		files, _ := newStateFilesFixture(t)
 		injected := errors.New("guard close failed")
@@ -690,6 +898,69 @@ func TestStateFiles_RecoveryMatrix(t *testing.T) {
 			t.Fatalf("Read() error = %v, want non-missing recovery failure", err)
 		}
 	})
+}
+
+func TestStateFiles_GuardWaitCancellationPreservesFailureContext(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	injected := windows.ERROR_SHARING_VIOLATION
+	files.api.ntCreateRelative = func(windows.Handle, string, ntCreateSpec) (windows.Handle, error) {
+		return windows.InvalidHandle, injected
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	files.waitGate = func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+	_, err := files.acquireStateGuard(ctx, StateBackend, stateGuardShared)
+	var fileErr *FileError
+	if !errors.As(err, &fileErr) || !errors.Is(err, injected) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("acquireStateGuard() error = %v, want FileError + sharing violation + context.Canceled", err)
+	}
+}
+
+func TestValidateStateIntentValue_RejectsUnboundTransactionLeaves(t *testing.T) {
+	valid := stateIntent{
+		Version:         stateIntentVersion,
+		Kind:            StateBackend,
+		DestinationLeaf: "backend.json",
+		IntentLeaf:      stateIntentLeaf(StateBackend),
+		TempLeaf:        ".backend.temp.0123456789abcdef0123456789abcdef",
+		BackupLeaf:      ".backend.backup.0123456789abcdef0123456789abcdef",
+		Nonce:           "0123456789abcdef0123456789abcdef",
+		Root:            stateIdentityProof{VolumeSerial: 1, FileID: [16]byte{1}},
+		IntentObject:    stateIdentityProof{VolumeSerial: 1, FileID: [16]byte{2}},
+		Old: stateObjectProof{
+			stateIdentityProof: stateIdentityProof{VolumeSerial: 1, FileID: [16]byte{3}},
+			Digest:             [32]byte{1},
+		},
+		New: stateObjectProof{
+			stateIdentityProof: stateIdentityProof{VolumeSerial: 1, FileID: [16]byte{4}},
+			Digest:             [32]byte{2},
+		},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*stateIntent)
+	}{
+		{name: "guard", mutate: func(intent *stateIntent) { intent.TempLeaf = stateGuardLeaf(StateBackend) }},
+		{name: "fixed destination", mutate: func(intent *stateIntent) { intent.TempLeaf = intent.DestinationLeaf }},
+		{name: "fixed intent", mutate: func(intent *stateIntent) { intent.BackupLeaf = intent.IntentLeaf }},
+		{name: "cross kind", mutate: func(intent *stateIntent) { intent.TempLeaf = ".mutation.temp.0123456789abcdef0123456789abcdef" }},
+		{name: "swapped role", mutate: func(intent *stateIntent) { intent.TempLeaf = ".backend.backup.0123456789abcdef0123456789abcdef" }},
+		{name: "wrong nonce", mutate: func(intent *stateIntent) { intent.BackupLeaf = ".backend.backup.fedcba9876543210fedcba9876543210" }},
+		{name: "short nonce", mutate: func(intent *stateIntent) { intent.Nonce = "0123456789abcdef" }},
+		{name: "non-hex nonce", mutate: func(intent *stateIntent) { intent.Nonce = "0123456789abcdef0123456789abcdeg" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			intent := valid
+			test.mutate(&intent)
+			if err := validateStateIntentValue(intent); err == nil {
+				t.Fatal("validateStateIntentValue() accepted an unbound transaction leaf")
+			}
+		})
+	}
 }
 
 func TestStateFiles_OrphanSidecarsAreIgnoredAndNotDeleted(t *testing.T) {
@@ -893,7 +1164,11 @@ func TestStateFiles_GuardSerializesNamespaceDecisions(t *testing.T) {
 				if createCalls.Add(1) == 2 {
 					close(createBarrier)
 				}
-				<-createBarrier
+				select {
+				case <-createBarrier:
+				case <-t.Context().Done():
+					return windows.InvalidHandle, t.Context().Err()
+				}
 			}
 			handle, createErr := original(parent, name, spec)
 			if createErr == nil {
@@ -925,27 +1200,52 @@ func TestStateFiles_GuardSerializesNamespaceDecisions(t *testing.T) {
 			results <- guardResult{files: files, guard: guard, err: acquireErr}
 		}(files)
 	}
+	sharedGuards := make([]guardResult, 0, 2)
 	for range 2 {
-		result := <-results
+		result := waitStateTestResult(t, results, "shared guard acquire")
 		if result.err != nil {
 			t.Fatalf("concurrent shared acquire error = %v", result.err)
 		}
+		sharedGuards = append(sharedGuards, result)
+	}
+	for _, result := range sharedGuards {
+		if _, err := result.files.api.identity(result.guard.handle); err != nil {
+			t.Fatalf("shared guard handle did not remain live: %v", err)
+		}
+	}
+	for _, result := range sharedGuards {
 		if err := result.files.api.closeHandle(result.guard.handle); err != nil {
 			t.Fatalf("concurrent shared close error = %v", err)
 		}
 	}
-	if got := createSuccess.Load(); got != 1 {
-		t.Fatalf("successful guard creates = %d, want 1", got)
+	exclusive, err := first.acquireStateGuard(t.Context(), StateMutation, stateGuardExclusive)
+	if err != nil {
+		t.Fatalf("exclusive create acquire error = %v", err)
 	}
-	if got := openSuccess.Load(); got != 1 {
-		t.Fatalf("successful guard opens = %d, want 1", got)
+	if err := first.api.closeHandle(exclusive.handle); err != nil {
+		t.Fatalf("exclusive create close error = %v", err)
+	}
+	exclusive, err = second.acquireStateGuard(t.Context(), StateMutation, stateGuardExclusive)
+	if err != nil {
+		t.Fatalf("exclusive open acquire error = %v", err)
+	}
+	if err := second.api.closeHandle(exclusive.handle); err != nil {
+		t.Fatalf("exclusive open close error = %v", err)
+	}
+	if got := createSuccess.Load(); got != 2 {
+		t.Fatalf("successful guard creates = %d, want 2", got)
+	}
+	if got := openSuccess.Load(); got != 2 {
+		t.Fatalf("successful guard opens = %d, want 2", got)
 	}
 	specMu.Lock()
+	observedCounts := make(map[string]int, 4)
 	for _, got := range observedSpecs {
 		mode := stateGuardExclusive
 		if got.shareAccess == windows.FILE_SHARE_READ {
 			mode = stateGuardShared
 		}
+		observedCounts[fmt.Sprintf("%d/%d", mode, got.createDisposition)]++
 		if err := validateStateGuardNTSpec(
 			mode,
 			got.createDisposition,
@@ -953,6 +1253,13 @@ func TestStateFiles_GuardSerializesNamespaceDecisions(t *testing.T) {
 		); err != nil {
 			specMu.Unlock()
 			t.Fatalf("observed native guard spec = %#v: %v", got, err)
+		}
+	}
+	for _, test := range specTests {
+		key := fmt.Sprintf("%d/%d", test.mode, test.disposition)
+		if observedCounts[key] == 0 {
+			specMu.Unlock()
+			t.Fatalf("production guard did not use native parameters for %s", test.name)
 		}
 	}
 	specMu.Unlock()
@@ -1348,6 +1655,7 @@ const (
 type sealedStateFixture struct {
 	files            *StateFiles
 	kind             StateFileKind
+	nonce            string
 	oldPayload       []byte
 	newPayload       []byte
 	foreignPayload   []byte
@@ -1397,14 +1705,15 @@ func newSealedStateFixture(
 	return &sealedStateFixture{
 		files:            files,
 		kind:             kind,
+		nonce:            "0123456789abcdef0123456789abcdef",
 		oldPayload:       append([]byte(nil), oldPayload...),
 		newPayload:       append([]byte(nil), newPayload...),
 		foreignPayload:   []byte("foreign"),
 		destinationPath:  stateDestinationPath(layout, kind),
 		guardPath:        filepath.Join(layout.StateDir(), stateGuardLeaf(kind)),
 		intentPath:       filepath.Join(layout.StateDir(), stateIntentLeaf(kind)),
-		backupPath:       filepath.Join(layout.StateDir(), fmt.Sprintf(".%s.backup-test", kind)),
-		tempPath:         filepath.Join(layout.StateDir(), fmt.Sprintf(".%s.temp-test", kind)),
+		backupPath:       filepath.Join(layout.StateDir(), stateTransactionLeaf(kind, "backup", "0123456789abcdef0123456789abcdef")),
+		tempPath:         filepath.Join(layout.StateDir(), stateTransactionLeaf(kind, "temp", "0123456789abcdef0123456789abcdef")),
 		orphanTempPath:   filepath.Join(layout.StateDir(), fmt.Sprintf(".%s.temp-orphan", kind)),
 		orphanIntentPath: filepath.Join(layout.StateDir(), fmt.Sprintf(".%s.intent-orphan", kind)),
 	}
@@ -1490,7 +1799,7 @@ func (f *sealedStateFixture) intentValue(t *testing.T) stateIntent {
 		IntentLeaf:      filepath.Base(f.intentPath),
 		TempLeaf:        filepath.Base(f.tempPath),
 		BackupLeaf:      filepath.Base(f.backupPath),
-		Nonce:           "test-nonce",
+		Nonce:           f.nonce,
 		Root:            proofIdentity(f.files.pins[1].identity),
 		IntentObject:    proofIdentity(intentObject),
 		Old:             f.oldProof,
@@ -1506,6 +1815,24 @@ func (f *sealedStateFixture) publishIntentValue(t *testing.T, intent stateIntent
 	}
 	if err := os.WriteFile(f.intentPath, envelope, 0o600); err != nil {
 		t.Fatalf("write intent error = %v", err)
+	}
+}
+
+func (f *sealedStateFixture) publishUncheckedIntentValue(t *testing.T, intent stateIntent) {
+	t.Helper()
+	body, err := json.Marshal(intent)
+	if err != nil {
+		t.Fatalf("marshal unchecked state intent error = %v", err)
+	}
+	envelope, err := json.Marshal(stateIntentEnvelope{
+		Intent: intent,
+		Seal:   sha256.Sum256(body),
+	})
+	if err != nil {
+		t.Fatalf("marshal unchecked state intent envelope error = %v", err)
+	}
+	if err := os.WriteFile(f.intentPath, envelope, 0o600); err != nil {
+		t.Fatalf("write unchecked intent error = %v", err)
 	}
 }
 
@@ -1657,7 +1984,7 @@ func assertGuardBlocksMode(
 		}
 		done <- acquireErr
 	}()
-	<-entered
+	waitStateTestSignal(t, entered, "incompatible guard wait")
 	select {
 	case err := <-done:
 		t.Fatalf("waiter acquired incompatible guard early: %v", err)
@@ -1667,7 +1994,7 @@ func assertGuardBlocksMode(
 		t.Fatalf("holder close error = %v", err)
 	}
 	close(release)
-	if err := <-done; err != nil {
+	if err := waitStateTestResult(t, done, "guard acquire after release"); err != nil {
 		t.Fatalf("waiter acquire after release error = %v", err)
 	}
 }
@@ -1718,7 +2045,11 @@ func assertStateFilesCloseWaitsAt(t *testing.T, point string) {
 		files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
 			if name == filepath.Base(layout.BackendStateFile()) {
 				close(entered)
-				<-release
+				select {
+				case <-release:
+				case <-t.Context().Done():
+					return windows.InvalidHandle, t.Context().Err()
+				}
 			}
 			return openRelative(parent, name, spec)
 		}
@@ -1728,7 +2059,10 @@ func assertStateFilesCloseWaitsAt(t *testing.T, point string) {
 		files.api.readFile = func(handle windows.Handle, buffer []byte) (int, error) {
 			once.Do(func() {
 				close(entered)
-				<-release
+				select {
+				case <-release:
+				case <-t.Context().Done():
+				}
 			})
 			return readFile(handle, buffer)
 		}
@@ -1746,7 +2080,10 @@ func assertStateFilesCloseWaitsAt(t *testing.T, point string) {
 		files.api.closeHandle = func(handle windows.Handle) error {
 			if handle == payloadHandle && payloadHandle != windows.InvalidHandle {
 				close(entered)
-				<-release
+				select {
+				case <-release:
+				case <-t.Context().Done():
+				}
 				payloadHandle = windows.InvalidHandle
 			}
 			return closeHandle(handle)
@@ -1761,7 +2098,7 @@ func assertStateFilesCloseWaitsAt(t *testing.T, point string) {
 		_, readErr := files.Read(t.Context(), StateBackend, MaxStateFileBytes)
 		readDone <- readErr
 	}()
-	<-entered
+	waitStateTestSignal(t, entered, "read entered "+point)
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- files.Close() }()
 	select {
@@ -1775,10 +2112,10 @@ func assertStateFilesCloseWaitsAt(t *testing.T, point string) {
 		}
 	}
 	close(release)
-	if err := <-readDone; err != nil {
+	if err := waitStateTestResult(t, readDone, "Read completion at "+point); err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
-	if err := <-closeDone; err != nil {
+	if err := waitStateTestResult(t, closeDone, "Close completion at "+point); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
 	if blocker != nil {
@@ -1792,6 +2129,37 @@ func assertStateFilesCloseWaitsAt(t *testing.T, point string) {
 }
 
 type tContextWithoutFailure struct{}
+
+func waitStateTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", description)
+	case <-t.Context().Done():
+		t.Fatalf("context ended while waiting for %s: %v", description, t.Context().Err())
+	}
+}
+
+func waitStateTestResult[T any](t *testing.T, result <-chan T, description string) T {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case value := <-result:
+		return value
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", description)
+		var zero T
+		return zero
+	case <-t.Context().Done():
+		t.Fatalf("context ended while waiting for %s: %v", description, t.Context().Err())
+		var zero T
+		return zero
+	}
+}
 
 func (tContextWithoutFailure) Deadline() (time.Time, bool) { return time.Time{}, false }
 func (tContextWithoutFailure) Done() <-chan struct{}       { return nil }
