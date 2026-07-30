@@ -373,6 +373,8 @@ func runWorker(
 		switch request.operation {
 		case requestAcquire:
 			request.response <- state.acquire(request)
+		case requestProbe:
+			request.response <- state.probe(request)
 		case requestRelease:
 			request.response <- state.release(request)
 		case requestClose:

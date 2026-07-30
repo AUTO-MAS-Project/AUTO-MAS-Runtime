@@ -87,6 +87,7 @@ func TestOperationError_UsesMutexOperationFailed(t *testing.T) {
 	testRootOperationErrors(t)
 	testWorkerOperationErrors(t)
 	testAcquireOperationErrors(t)
+	testProbeOperationErrors(t)
 }
 
 func testRootOperationErrors(t *testing.T) {
