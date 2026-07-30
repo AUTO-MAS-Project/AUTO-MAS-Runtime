@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2354,4 +2355,797 @@ func mustRotator(t *testing.T, options ...RotationOption) *Rotator {
 		t.Fatalf("NewRotator() error = %v", err)
 	}
 	return rotator
+}
+
+func TestRotator_ReportsEveryAttemptWithIndependentContext(t *testing.T) {
+	type contextKey struct{}
+	type reportContextIDKey struct{}
+	operationCtx := context.WithValue(
+		context.Background(),
+		contextKey{},
+		"operation-value",
+	)
+	operationCtx, cancelOperation := context.WithCancel(operationCtx)
+	factoryCalls := 0
+	cancelCalls := make([]int, 0, 2)
+	reporterCalls := 0
+	var reportContexts []context.Context
+	var reported []AttemptReport
+	factory := func(
+		ctx context.Context,
+	) (context.Context, context.CancelFunc) {
+		id := factoryCalls
+		factoryCalls++
+		baseCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		reportCtx := context.WithValue(baseCtx, reportContextIDKey{}, id)
+		cancelCalls = append(cancelCalls, 0)
+		return reportCtx, func() {
+			cancelCalls[id]++
+			cancel()
+		}
+	}
+	reporter := reporterFunc(
+		func(ctx context.Context, report AttemptReport) error {
+			if ctx.Err() != nil {
+				t.Errorf("report context error = %v, want nil", ctx.Err())
+			}
+			if got := ctx.Value(contextKey{}); got != "operation-value" {
+				t.Errorf("report context value = %#v, want operation-value", got)
+			}
+			if got := ctx.Value(reportContextIDKey{}); got != reporterCalls {
+				t.Errorf(
+					"report context id = %#v, want %d",
+					got,
+					reporterCalls,
+				)
+			}
+			reporterCalls++
+			reportContexts = append(reportContexts, ctx)
+			reported = append(reported, report)
+			return nil
+		},
+	)
+	rotator, err := newRotatorWithDependencies(
+		factory,
+		WithMaxSourceAttempts(1),
+		WithAttemptReporter(reporter),
+	)
+	if err != nil {
+		t.Fatalf("newRotatorWithDependencies() error = %v", err)
+	}
+	result, err := rotator.Run(
+		operationCtx,
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			if reporterCalls == 1 {
+				cancelOperation()
+			}
+			return AttemptOutcome{
+				Kind:        OutcomeSwitchSource,
+				FailureKind: FailureKind("source_unavailable"),
+				Err:         errors.New("operation interrupted"),
+			}
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	if reporterCalls != 2 {
+		t.Fatalf("reporter calls = %d, want 2", reporterCalls)
+	}
+	if factoryCalls != 2 ||
+		!reflect.DeepEqual(cancelCalls, []int{1, 1}) {
+		t.Fatalf(
+			"report context lifecycle = factory %d/cancels %#v, want 2/[1 1]",
+			factoryCalls,
+			cancelCalls,
+		)
+	}
+	if len(reportContexts) != 2 ||
+		reportContexts[0] == reportContexts[1] {
+		t.Fatalf("report contexts are not two distinct instances: %#v", reportContexts)
+	}
+	for index, reportCtx := range reportContexts {
+		if !errors.Is(reportCtx.Err(), context.Canceled) {
+			t.Errorf(
+				"report context %d error after cancel = %v",
+				index,
+				reportCtx.Err(),
+			)
+		}
+	}
+	if len(result.Reports) != 2 ||
+		!reflect.DeepEqual(reported, result.Reports) ||
+		reported[0].Outcome != OutcomeSwitchSource ||
+		reported[1].Outcome != OutcomeCancelled {
+		t.Fatalf(
+			"reported/result reports = %#v/%#v",
+			reported,
+			result.Reports,
+		)
+	}
+}
+
+func TestRotator_PostReportCancellationPrecedesTargetFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	targetErr := errors.New(
+		"GET https://user:password@example.invalid/release?token=secret",
+	)
+	attemptCalls := 0
+	reporterCalls := 0
+	result, err := mustRotator(
+		t,
+		WithAttemptReporter(
+			reporterFunc(
+				func(context.Context, AttemptReport) error {
+					reporterCalls++
+					cancel()
+					return nil
+				},
+			),
+		),
+	).Run(
+		ctx,
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			attemptCalls++
+			return AttemptOutcome{
+				Kind:        OutcomeTargetFailure,
+				FailureKind: FailureKind("target"),
+				Err:         targetErr,
+			}
+		},
+	)
+	if !errors.Is(err, context.Canceled) ||
+		!errors.Is(err, targetErr) ||
+		err.Error() != "mirror operation cancelled" {
+		t.Fatalf(
+			"Run() error = %v, want safe cancellation to precede target failure",
+			err,
+		)
+	}
+	if attemptCalls != 1 ||
+		reporterCalls != 1 ||
+		len(result.Reports) != 1 {
+		t.Fatalf(
+			"calls/reports = attempt %d/reporter %d/reports %d",
+			attemptCalls,
+			reporterCalls,
+			len(result.Reports),
+		)
+	}
+	for _, forbidden := range []string{
+		"user:password",
+		"example.invalid",
+		"token=secret",
+	} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("Run() Error() = %q, contains %q", err, forbidden)
+		}
+	}
+}
+
+func TestRotator_ReporterFailureStopsFurtherAttempts(t *testing.T) {
+	reporterErr := errors.New(
+		"POST https://user:password@example.invalid/report?token=secret",
+	)
+	attemptCalls := 0
+	reporterCalls := 0
+	result, err := mustRotator(
+		t,
+		WithAttemptReporter(
+			reporterFunc(
+				func(context.Context, AttemptReport) error {
+					reporterCalls++
+					return reporterErr
+				},
+			),
+		),
+	).Run(
+		context.Background(),
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			attemptCalls++
+			return AttemptOutcome{
+				Kind:        OutcomeSwitchSource,
+				FailureKind: FailureKind("source_unavailable"),
+				Err:         errors.New("source unavailable"),
+			}
+		},
+	)
+	var rotationErr *RotationError
+	if !errors.Is(err, reporterErr) ||
+		errors.As(err, &rotationErr) ||
+		err.Error() != "mirror attempt reporting failed" {
+		t.Fatalf("Run() error = %v, want safe reporter error", err)
+	}
+	if attemptCalls != 1 || reporterCalls != 1 || len(result.Reports) != 1 {
+		t.Fatalf(
+			"calls/reports = attempt %d/reporter %d/reports %d",
+			attemptCalls,
+			reporterCalls,
+			len(result.Reports),
+		)
+	}
+}
+
+func TestRotator_SuccessReporterFailureReturnsPopulatedResult(t *testing.T) {
+	reporterErr := errors.New(
+		"POST https://user:password@example.invalid/report?token=secret",
+	)
+	actualCommit := strings.Repeat("1", 40)
+	var reporterCopy AttemptReport
+	result, err := mustRotator(
+		t,
+		WithAttemptReporter(
+			reporterFunc(
+				func(_ context.Context, report AttemptReport) error {
+					reporterCopy = report
+					report.SourceKey = "mutated-by-reporter"
+					return reporterErr
+				},
+			),
+		),
+	).Run(
+		context.Background(),
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			return AttemptOutcome{
+				Kind:         OutcomeSucceeded,
+				ActualCommit: actualCommit,
+			}
+		},
+	)
+	if !errors.Is(err, reporterErr) ||
+		err.Error() != "mirror attempt reporting failed" {
+		t.Fatalf("Run() error = %v, want safe reporter error", err)
+	}
+	if result.Source.Key() != "cnb" ||
+		result.ActualCommit != actualCommit ||
+		len(result.Reports) != 1 ||
+		result.Reports[0].SourceKey != "cnb" ||
+		reporterCopy.SourceKey != "cnb" {
+		t.Fatalf(
+			"success with reporter failure result = %#v/reporter %#v",
+			result,
+			reporterCopy,
+		)
+	}
+}
+
+func TestRotator_CancellationAndReporterErrorAreBothPreserved(t *testing.T) {
+	reporterErr := errors.New(
+		"POST https://user:password@example.invalid/report?token=secret#fragment",
+	)
+	tests := []struct {
+		name          string
+		cancelAttempt bool
+		cancelReport  bool
+	}{
+		{name: "cancelled before reporter", cancelAttempt: true},
+		{name: "cancelled by reporter", cancelReport: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			reporterCalls := 0
+			attemptCalls := 0
+			result, err := mustRotator(
+				t,
+				WithAttemptReporter(
+					reporterFunc(
+						func(
+							reportCtx context.Context,
+							report AttemptReport,
+						) error {
+							reporterCalls++
+							if reportCtx.Err() != nil {
+								t.Errorf(
+									"report context error = %v",
+									reportCtx.Err(),
+								)
+							}
+							if test.cancelReport {
+								cancel()
+							}
+							if report.GlobalTry != 1 {
+								t.Errorf(
+									"report GlobalTry = %d, want 1",
+									report.GlobalTry,
+								)
+							}
+							return reporterErr
+						},
+					),
+				),
+			).Run(
+				ctx,
+				mustOnlinePlan(t, KindGit),
+				mustRotationTarget(t),
+				func(context.Context, Attempt) AttemptOutcome {
+					attemptCalls++
+					if test.cancelAttempt {
+						cancel()
+					}
+					return AttemptOutcome{
+						Kind:        OutcomeSwitchSource,
+						FailureKind: FailureKind("source_unavailable"),
+						Err:         errors.New("attempt failed"),
+					}
+				},
+			)
+			if !errors.Is(err, context.Canceled) ||
+				!errors.Is(err, reporterErr) ||
+				err.Error() != "mirror operation cancelled" {
+				t.Fatalf(
+					"Run() error = %v, want safe cancellation and reporter error",
+					err,
+				)
+			}
+			for _, forbidden := range []string{
+				"user:password",
+				"example.invalid",
+				"token=secret",
+				"fragment",
+			} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf(
+						"Run() Error() = %q, contains %q",
+						err,
+						forbidden,
+					)
+				}
+			}
+			if attemptCalls != 1 ||
+				reporterCalls != 1 ||
+				len(result.Reports) != 1 {
+				t.Fatalf(
+					"calls/reports = %d/%d/%d",
+					attemptCalls,
+					reporterCalls,
+					len(result.Reports),
+				)
+			}
+			if test.cancelAttempt &&
+				result.Reports[0].Outcome != OutcomeCancelled {
+				t.Fatalf(
+					"pre-report cancellation outcome = %q",
+					result.Reports[0].Outcome,
+				)
+			}
+		})
+	}
+}
+
+func TestRotator_LegalSuccessWinsReporterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	actualCommit := strings.Repeat("2", 40)
+	result, err := mustRotator(
+		t,
+		WithAttemptReporter(
+			reporterFunc(
+				func(context.Context, AttemptReport) error {
+					cancel()
+					return nil
+				},
+			),
+		),
+	).Run(
+		ctx,
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			return AttemptOutcome{
+				Kind:         OutcomeSucceeded,
+				ActualCommit: actualCommit,
+			}
+		},
+	)
+	if err != nil || !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("Run() error = %v/context error = %v", err, ctx.Err())
+	}
+	if result.Source.Key() != "cnb" ||
+		result.ActualCommit != actualCommit ||
+		result.Reports[0].Outcome != OutcomeSucceeded {
+		t.Fatalf("success result = %#v", result)
+	}
+}
+
+func TestRotator_IntegrityHistoryDoesNotOverrideLaterTerminal(t *testing.T) {
+	integrityErr := errors.New("first source checksum mismatch")
+
+	t.Run("later target failure", func(t *testing.T) {
+		targetErr := errors.New("target cannot be satisfied")
+		attemptCalls := 0
+		_, err := mustRotator(
+			t,
+			WithMaxSourceAttempts(1),
+		).Run(
+			context.Background(),
+			mustOnlinePlan(t, KindGit),
+			mustRotationTarget(t),
+			func(context.Context, Attempt) AttemptOutcome {
+				attemptCalls++
+				if attemptCalls == 1 {
+					return AttemptOutcome{
+						Kind:        OutcomeIntegrityFailure,
+						FailureKind: FailureKind("integrity"),
+						Err:         integrityErr,
+					}
+				}
+				return AttemptOutcome{
+					Kind:        OutcomeTargetFailure,
+					FailureKind: FailureKind("target"),
+					Err:         targetErr,
+				}
+			},
+		)
+		var exhaustedErr *IntegrityExhaustedError
+		if !errors.Is(err, targetErr) ||
+			errors.As(err, &exhaustedErr) ||
+			attemptCalls != 2 {
+			t.Fatalf(
+				"Run() error = %v/calls %d, want target terminal",
+				err,
+				attemptCalls,
+			)
+		}
+	})
+
+	t.Run("later reporter failure", func(t *testing.T) {
+		reporterErr := errors.New("reporter unavailable")
+		attemptCalls := 0
+		reporterCalls := 0
+		_, err := mustRotator(
+			t,
+			WithMaxSourceAttempts(1),
+			WithAttemptReporter(
+				reporterFunc(
+					func(context.Context, AttemptReport) error {
+						reporterCalls++
+						if reporterCalls == 2 {
+							return reporterErr
+						}
+						return nil
+					},
+				),
+			),
+		).Run(
+			context.Background(),
+			mustOnlinePlan(t, KindGit),
+			mustRotationTarget(t),
+			func(context.Context, Attempt) AttemptOutcome {
+				attemptCalls++
+				if attemptCalls == 1 {
+					return AttemptOutcome{
+						Kind:        OutcomeIntegrityFailure,
+						FailureKind: FailureKind("integrity"),
+						Err:         integrityErr,
+					}
+				}
+				return AttemptOutcome{
+					Kind:        OutcomeSwitchSource,
+					FailureKind: FailureKind("source_unavailable"),
+					Err:         errors.New("second source failed"),
+				}
+			},
+		)
+		var exhaustedErr *IntegrityExhaustedError
+		if !errors.Is(err, reporterErr) ||
+			errors.As(err, &exhaustedErr) ||
+			attemptCalls != 2 {
+			t.Fatalf(
+				"Run() error = %v/calls %d, want reporter terminal",
+				err,
+				attemptCalls,
+			)
+		}
+	})
+
+	t.Run("later cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		attemptCalls := 0
+		result, err := mustRotator(
+			t,
+			WithMaxSourceAttempts(1),
+		).Run(
+			ctx,
+			mustOnlinePlan(t, KindGit),
+			mustRotationTarget(t),
+			func(context.Context, Attempt) AttemptOutcome {
+				attemptCalls++
+				if attemptCalls == 1 {
+					return AttemptOutcome{
+						Kind:        OutcomeIntegrityFailure,
+						FailureKind: FailureKind("integrity"),
+						Err:         integrityErr,
+					}
+				}
+				cancel()
+				return AttemptOutcome{
+					Kind:        OutcomeSwitchSource,
+					FailureKind: FailureKind("source_unavailable"),
+					Err:         errors.New("cancelled transport"),
+				}
+			},
+		)
+		var exhaustedErr *IntegrityExhaustedError
+		if !errors.Is(err, context.Canceled) ||
+			errors.As(err, &exhaustedErr) ||
+			attemptCalls != 2 {
+			t.Fatalf(
+				"Run() error = %v/calls %d, want cancellation",
+				err,
+				attemptCalls,
+			)
+		}
+		if len(result.Reports) != 2 ||
+			result.Reports[1].Outcome != OutcomeCancelled {
+			t.Fatalf("cancellation reports = %#v", result.Reports)
+		}
+	})
+}
+
+func TestRotator_ReportSequenceUsesInjectedClock(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	times := []time.Time{
+		base,
+		base.Add(5 * time.Millisecond),
+		base.Add(10 * time.Millisecond),
+		base.Add(17 * time.Millisecond),
+	}
+	clockIndex := 0
+	var reported []AttemptReport
+	rotator := mustRotator(
+		t,
+		WithMaxSourceAttempts(1),
+		WithRotatorClock(func() time.Time {
+			current := times[clockIndex]
+			clockIndex++
+			return current
+		}),
+		WithAttemptReporter(
+			reporterFunc(
+				func(_ context.Context, report AttemptReport) error {
+					reported = append(reported, report)
+					return nil
+				},
+			),
+		),
+	)
+	attemptCalls := 0
+	result, err := rotator.Run(
+		context.Background(),
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			attemptCalls++
+			if attemptCalls == 1 {
+				return AttemptOutcome{
+					Kind:        OutcomeSwitchSource,
+					FailureKind: FailureKind("source_unavailable"),
+					Err:         errors.New("first source unavailable"),
+				}
+			}
+			return AttemptOutcome{
+				Kind:         OutcomeSucceeded,
+				ActualCommit: strings.Repeat("3", 40),
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !reflect.DeepEqual(reported, result.Reports) {
+		t.Fatalf(
+			"reported/result reports = %#v/%#v",
+			reported,
+			result.Reports,
+		)
+	}
+	wantDurations := []time.Duration{5 * time.Millisecond, 7 * time.Millisecond}
+	wantKeys := []string{"cnb", "github"}
+	for index, report := range result.Reports {
+		if report.StartedAt != times[index*2] ||
+			report.Duration != wantDurations[index] ||
+			report.SourceKey != wantKeys[index] ||
+			report.SourceTry != 1 ||
+			report.GlobalTry != index+1 {
+			t.Fatalf("report[%d] = %#v", index, report)
+		}
+	}
+}
+
+func TestRotator_ConcurrentRunsIsolateCountersAndBlacklist(t *testing.T) {
+	rotator := mustRotator(t, WithMaxSourceAttempts(1))
+	plan := mustOnlinePlan(t, KindGit)
+	target := mustRotationTarget(t)
+	runABlockedOnNextSource := make(chan struct{})
+	releaseRunA := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseA := func() {
+		releaseOnce.Do(func() { close(releaseRunA) })
+	}
+	t.Cleanup(releaseA)
+
+	type runResult struct {
+		result   RotationResult
+		err      error
+		attempts []Attempt
+	}
+	runAResult := make(chan runResult, 1)
+	go func() {
+		attempts := make([]Attempt, 0, 2)
+		result, err := rotator.Run(
+			context.Background(),
+			plan,
+			target,
+			func(_ context.Context, attempt Attempt) AttemptOutcome {
+				attempts = append(attempts, attempt)
+				if len(attempts) == 1 {
+					return AttemptOutcome{
+						Kind:        OutcomeIntegrityFailure,
+						FailureKind: FailureKind("integrity"),
+						Err:         errors.New("run A integrity failure"),
+					}
+				}
+				close(runABlockedOnNextSource)
+				<-releaseRunA
+				return AttemptOutcome{
+					Kind:         OutcomeSucceeded,
+					ActualCommit: strings.Repeat("4", 40),
+				}
+			},
+		)
+		runAResult <- runResult{
+			result:   result,
+			err:      err,
+			attempts: attempts,
+		}
+	}()
+
+	select {
+	case <-runABlockedOnNextSource:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run A did not blacklist CNB and reach the next source")
+	}
+
+	var runBAttempts []Attempt
+	runB, runBErr := rotator.Run(
+		context.Background(),
+		plan,
+		target,
+		func(_ context.Context, attempt Attempt) AttemptOutcome {
+			runBAttempts = append(runBAttempts, attempt)
+			return AttemptOutcome{
+				Kind:         OutcomeSucceeded,
+				ActualCommit: strings.Repeat("5", 40),
+			}
+		},
+	)
+	if runBErr != nil {
+		t.Fatalf("Run B error = %v", runBErr)
+	}
+	if len(runBAttempts) != 1 ||
+		runBAttempts[0].Source.Key() != "cnb" ||
+		runBAttempts[0].SourceTry != 1 ||
+		runBAttempts[0].GlobalTry != 1 ||
+		runB.Source.Key() != "cnb" {
+		t.Fatalf(
+			"Run B observed Run A blacklist or counters: attempts %#v/result %#v",
+			runBAttempts,
+			runB,
+		)
+	}
+
+	releaseA()
+	var runA runResult
+	select {
+	case runA = <-runAResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run A did not return after release")
+	}
+	if runA.err != nil ||
+		runA.result.Source.Key() != "github" ||
+		len(runA.attempts) != 2 ||
+		runA.attempts[0].Source.Key() != "cnb" ||
+		runA.attempts[1].Source.Key() != "github" ||
+		runA.attempts[1].GlobalTry != 2 ||
+		runA.attempts[1].SourceTry != 1 {
+		t.Fatalf(
+			"Run A state = result %#v/error %v/attempts %#v",
+			runA.result,
+			runA.err,
+			runA.attempts,
+		)
+	}
+}
+
+// 上述 barrier 先证明 Run A 已把 CNB 写入自己的 blacklist 并进入 github callback，
+// 才启动 Run B。若把 blacklist 移到共享 Rotator（即使用 mutex 消除 race），
+// Run B 会跳过 CNB，精确触发 “observed Run A blacklist” 失败。
+
+func TestRotator_AttemptReportRedactsSecretBearingErrors(t *testing.T) {
+	secretErr := errors.New(
+		"GET https://user:password@example.invalid/file?token=top-secret",
+	)
+	result, err := mustRotator(
+		t,
+		WithMaxSourceAttempts(1),
+	).Run(
+		context.Background(),
+		mustOnlinePlan(t, KindGit),
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			return AttemptOutcome{
+				Kind:        OutcomeSwitchSource,
+				FailureKind: FailureKind("source_unavailable"),
+				Err:         secretErr,
+			}
+		},
+	)
+	var rotationErr *RotationError
+	if !errors.As(err, &rotationErr) ||
+		!errors.Is(err, secretErr) {
+		t.Fatalf("Run() error = %v, want preserved RotationError cause", err)
+	}
+	for _, report := range result.Reports {
+		for _, forbidden := range []string{
+			"user:password",
+			"example.invalid",
+			"token=top-secret",
+			"https://",
+		} {
+			if strings.Contains(report.Error, forbidden) {
+				t.Fatalf(
+					"AttemptReport.Error = %q, contains %q",
+					report.Error,
+					forbidden,
+				)
+			}
+		}
+	}
+	for _, forbidden := range []string{
+		"user:password",
+		"example.invalid",
+		"token=top-secret",
+	} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("Run() Error() = %q, contains %q", err, forbidden)
+		}
+	}
+}
+
+func TestRotator_InvalidRequestDoesNotInvokeReporter(t *testing.T) {
+	reporterCalls := 0
+	rotator := mustRotator(
+		t,
+		WithAttemptReporter(
+			reporterFunc(
+				func(context.Context, AttemptReport) error {
+					reporterCalls++
+					return nil
+				},
+			),
+		),
+	)
+	_, err := rotator.Run(
+		context.Background(),
+		Plan{},
+		mustRotationTarget(t),
+		func(context.Context, Attempt) AttemptOutcome {
+			t.Fatal("AttemptFunc called for invalid request")
+			return AttemptOutcome{}
+		},
+	)
+	if !errors.Is(err, ErrInvalidRotationRequest) {
+		t.Fatalf("Run() error = %v, want ErrInvalidRotationRequest", err)
+	}
+	if reporterCalls != 0 {
+		t.Fatalf("reporter calls = %d, want 0", reporterCalls)
+	}
 }

@@ -357,11 +357,11 @@ func (r *Rotator) Run(
 				}
 				return result, nil
 			}
-			if ctxErrBeforeReport != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
 				return failedRotationResult(reports), newSafeError(
 					safeErrorCancellation,
 					errors.Join(
-						ctxErrBeforeReport,
+						ctxErr,
 						outcomeErr,
 						callbackErr,
 						reporterErr,
