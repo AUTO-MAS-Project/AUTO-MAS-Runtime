@@ -1,6 +1,11 @@
 package filesystem
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+)
 
 // MaxStateFileBytes 是受管状态文件默认允许的最大字节数。
 const MaxStateFileBytes int64 = 256 * 1024
@@ -56,11 +61,44 @@ func (p StateWritePhase) Valid() bool {
 	}
 }
 
+type stateFileOwner struct {
+	marker byte
+}
+
 // StateFiles 表示受管状态目录能力。
-type StateFiles struct{}
+type StateFiles struct {
+	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed 与操作/关闭的句柄生命周期。
+
+	layout      *config.Layout
+	api         pathAPI
+	waitGate    WaitFunc
+	owner       *stateFileOwner
+	pins        [2]pinnedObject
+	probePassed map[StateFileKind]bool
+	closed      bool
+	closeErr    error
+}
 
 // StateFileSnapshot 绑定读取内容与其物理文件身份。
-type StateFileSnapshot struct{}
+type StateFileSnapshot struct {
+	owner        *stateFileOwner
+	kind         StateFileKind
+	volumeSerial uint64
+	fileID       [16]byte
+	size         int64
+	digest       [32]byte
+	bytes        []byte
+}
+
+// Kind 返回 snapshot 对应的封闭状态文件类别。
+func (s StateFileSnapshot) Kind() StateFileKind {
+	return s.kind
+}
+
+// Bytes 返回 snapshot payload 的防御性副本。
+func (s StateFileSnapshot) Bytes() []byte {
+	return append([]byte(nil), s.bytes...)
+}
 
 // WriteAtomicResult 报告原子写入的副作用与恢复事实。
 type WriteAtomicResult struct {
