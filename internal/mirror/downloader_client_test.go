@@ -509,11 +509,15 @@ func mustURL(t *testing.T, raw string) *url.URL {
 
 type manualTimer struct {
 	channel chan time.Time
+	reset   chan struct{}
 	stopped atomic.Bool
 }
 
 func newManualTimer() *manualTimer {
-	return &manualTimer{channel: make(chan time.Time, 1)}
+	return &manualTimer{
+		channel: make(chan time.Time, 1),
+		reset:   make(chan struct{}, 1),
+	}
 }
 
 func (t *manualTimer) C() <-chan time.Time {
@@ -526,11 +530,19 @@ func (t *manualTimer) Stop() bool {
 
 func (t *manualTimer) Reset(time.Duration) bool {
 	t.stopped.Store(false)
+	select {
+	case t.reset <- struct{}{}:
+	default:
+	}
 	return false
 }
 
-func (t *manualTimer) Fire() {
+func (t *manualTimer) Fire() bool {
+	if t.stopped.Load() {
+		return false
+	}
 	t.channel <- time.Unix(2, 0)
+	return true
 }
 
 func waitSignal(t *testing.T, signal <-chan struct{}) {

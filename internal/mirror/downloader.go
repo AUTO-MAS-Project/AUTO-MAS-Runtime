@@ -3,9 +3,11 @@ package mirror
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -414,4 +416,252 @@ func validateHTTPSURL(rawURL string) (*url.URL, error) {
 		return nil, errors.New("download URL violates HTTPS policy")
 	}
 	return parsed, nil
+}
+
+type progressReporter struct {
+	callback ProgressFunc
+	total    int64
+	interval time.Duration
+	clock    func() time.Time
+	started  bool
+	lastAt   time.Time
+	last     int64
+}
+
+func newProgressReporter(
+	callback ProgressFunc,
+	total int64,
+	interval time.Duration,
+	clock func() time.Time,
+) *progressReporter {
+	return &progressReporter{
+		callback: callback,
+		total:    total,
+		interval: interval,
+		clock:    clock,
+	}
+}
+
+func (r *progressReporter) report(received int64, force bool) error {
+	if r.callback == nil {
+		return nil
+	}
+	now := r.clock()
+	if r.started && received < r.last {
+		return safeExternalError(
+			"progress callback failed",
+			errors.New("download progress decreased"),
+		)
+	}
+	if r.started && !force && now.Sub(r.lastAt) < r.interval {
+		return nil
+	}
+	percent := float64(received) / float64(r.total) * 100
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	if err := r.callback(DownloadProgress{
+		Received: received,
+		Total:    r.total,
+		Percent:  percent,
+	}); err != nil {
+		return safeExternalError("progress callback failed", err)
+	}
+	r.started = true
+	r.lastAt = now
+	r.last = received
+	return nil
+}
+
+type bodyChunk struct {
+	data []byte
+	err  error
+}
+
+func pumpBody(
+	ctx context.Context,
+	body io.Reader,
+	chunks chan<- bodyChunk,
+	done chan<- struct{},
+) {
+	defer close(done)
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buffer)
+		if n == 0 && err == nil {
+			continue
+		}
+		chunk := bodyChunk{err: err}
+		if n > 0 {
+			chunk.data = append([]byte(nil), buffer[:n]...)
+		}
+		select {
+		case chunks <- chunk:
+		case <-ctx.Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (d *Downloader) readResponse(
+	operationCtx context.Context,
+	requestCtx context.Context,
+	cancel context.CancelFunc,
+	response *http.Response,
+	session downloadSession,
+	request validatedRequest,
+	reporter *progressReporter,
+) (int64, [32]byte, *DownloadFailure) {
+	hasher := sha256.New()
+	writer := io.MultiWriter(session, hasher)
+	chunks := make(chan bodyChunk)
+	pumpDone := make(chan struct{})
+	go pumpBody(requestCtx, response.Body, chunks, pumpDone)
+	readTimer := d.timers(d.readTimeout)
+
+	var (
+		received int64
+		failure  *DownloadFailure
+	)
+	for failure == nil {
+		select {
+		case chunk := <-chunks:
+			stopAndDrainTimer(readTimer)
+			if operationCtx.Err() != nil {
+				failure = newDownloadFailure(
+					FailureCancelled,
+					0,
+					errors.Join(errRequestCancelled, operationCtx.Err()),
+				)
+				break
+			}
+			if len(chunk.data) > 0 {
+				written, writeErr := writer.Write(chunk.data)
+				if writeErr == nil && written != len(chunk.data) {
+					writeErr = io.ErrShortWrite
+				}
+				if writeErr != nil {
+					failure = newDownloadFailure(FailureFilesystem, 0, writeErr)
+				} else {
+					next, sizeErr := advanceReceived(
+						received,
+						written,
+						request.expectedSize,
+					)
+					if sizeErr != nil {
+						failure = newDownloadFailure(FailureSizeMismatch, 0, sizeErr)
+					} else {
+						received = next
+					}
+					if failure == nil {
+						if err := reporter.report(
+							received,
+							received == request.expectedSize,
+						); err != nil {
+							failure = newDownloadFailure(FailureProgress, 0, err)
+						}
+					}
+				}
+			}
+			if failure == nil && operationCtx.Err() != nil {
+				failure = newDownloadFailure(
+					FailureCancelled,
+					0,
+					errors.Join(errRequestCancelled, operationCtx.Err()),
+				)
+			}
+			if failure != nil {
+				break
+			}
+			if chunk.err != nil {
+				if errors.Is(chunk.err, io.EOF) {
+					goto settled
+				}
+				failure = newDownloadFailure(
+					FailureNetwork,
+					0,
+					safeExternalError("http response read failed", chunk.err),
+				)
+				break
+			}
+			readTimer.Reset(d.readTimeout)
+		case <-readTimer.C():
+			if operationCtx.Err() != nil {
+				failure = newDownloadFailure(
+					FailureCancelled,
+					0,
+					errors.Join(errRequestCancelled, operationCtx.Err()),
+				)
+			} else {
+				failure = newDownloadFailure(
+					FailureReadTimeout,
+					0,
+					errors.New("download response read timed out"),
+				)
+			}
+		case <-operationCtx.Done():
+			stopAndDrainTimer(readTimer)
+			failure = newDownloadFailure(
+				FailureCancelled,
+				0,
+				errors.Join(errRequestCancelled, operationCtx.Err()),
+			)
+		}
+	}
+
+settled:
+	stopAndDrainTimer(readTimer)
+	var digest [32]byte
+	copy(digest[:], hasher.Sum(nil))
+	if failure == nil && received != request.expectedSize {
+		failure = newDownloadFailure(
+			FailureSizeMismatch,
+			0,
+			errors.New("download size does not match expected size"),
+		)
+	}
+	if failure == nil &&
+		subtle.ConstantTimeCompare(
+			digest[:],
+			request.expectedDigest[:],
+		) != 1 {
+		failure = newDownloadFailure(
+			FailureChecksumMismatch,
+			0,
+			errors.New("download checksum does not match expected checksum"),
+		)
+	}
+	cancel()
+	closeErr := response.Body.Close()
+	<-pumpDone
+	if closeErr != nil {
+		safeCloseErr := safeExternalError("http response close failed", closeErr)
+		if failure == nil {
+			failure = newDownloadFailure(FailureNetwork, 0, safeCloseErr)
+		} else {
+			failure.Err = errors.Join(failure.Err, safeCloseErr)
+		}
+	}
+	return received, digest, failure
+}
+
+func advanceReceived(
+	received int64,
+	written int,
+	expected int64,
+) (int64, error) {
+	if received < 0 || received > expected || written < 0 {
+		return received, errors.New("download size accounting is invalid")
+	}
+	written64 := int64(written)
+	if written64 > expected-received {
+		return received, errors.New("download exceeds expected size")
+	}
+	return received + written64, nil
 }

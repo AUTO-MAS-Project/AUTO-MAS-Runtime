@@ -2,16 +2,20 @@ package mirror
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -445,3 +449,553 @@ func (e *testTypedError) Unwrap() error {
 }
 
 var _ io.Writer = (*fakeDownloadSession)(nil)
+
+type bodyRead struct {
+	data []byte
+	err  error
+}
+
+type scriptedBody struct {
+	ctx        context.Context
+	reads      chan bodyRead
+	secondRead chan struct{}
+	readCount  atomic.Int32
+	closeCount atomic.Int32
+}
+
+func newScriptedBody(ctx context.Context, reads ...bodyRead) *scriptedBody {
+	channel := make(chan bodyRead, len(reads))
+	for _, read := range reads {
+		channel <- read
+	}
+	return &scriptedBody{
+		ctx:        ctx,
+		reads:      channel,
+		secondRead: make(chan struct{}),
+	}
+}
+
+func (b *scriptedBody) Read(p []byte) (int, error) {
+	select {
+	case read := <-b.reads:
+		count := b.readCount.Add(1)
+		if count == 2 {
+			close(b.secondRead)
+		}
+		n := copy(p, read.data)
+		return n, read.err
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	}
+}
+
+func (b *scriptedBody) Close() error {
+	b.closeCount.Add(1)
+	return nil
+}
+
+type progressClock struct {
+	mu    sync.Mutex
+	times []time.Time
+}
+
+func (c *progressClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.times) == 0 {
+		return time.Unix(100, 0)
+	}
+	value := c.times[0]
+	c.times = c.times[1:]
+	return value
+}
+
+func TestDownloader_ReadPumpOwnsChunkBackingArray(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := newScriptedBody(
+		ctx,
+		bodyRead{data: []byte("abc")},
+		bodyRead{data: []byte("xyz")},
+		bodyRead{err: io.EOF},
+	)
+	firstWrite := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	writes := make([]string, 0, 2)
+	session := &fakeDownloadSession{write: func(p []byte) (int, error) {
+		if len(writes) == 0 {
+			close(firstWrite)
+			waitSignal(t, body.secondRead)
+			if got := string(p); got != "abc" {
+				t.Fatalf("first chunk changed to %q, want abc", got)
+			}
+			close(releaseWrite)
+		}
+		writes = append(writes, string(p))
+		return len(p), nil
+	}}
+	downloader := downloaderForTransferTest(
+		t,
+		func(time.Duration) timer { return newManualTimer() },
+		func() time.Time { return time.Unix(1, 0) },
+	)
+	request := validatedForBytes(t, []byte("abcxyz"), nil)
+	response := &http.Response{Body: body, ContentLength: 6}
+	received, digest, failure := downloader.readResponse(
+		t.Context(),
+		ctx,
+		cancel,
+		response,
+		session,
+		request,
+		newProgressReporter(nil, request.expectedSize, time.Second, downloader.clock),
+	)
+	waitSignal(t, firstWrite)
+	waitSignal(t, releaseWrite)
+	if failure != nil {
+		t.Fatalf("readResponse() failure = %v, want nil", failure)
+	}
+	if received != 6 || strings.Join(writes, "") != "abcxyz" {
+		t.Fatalf("received/writes = %d/%q, want 6/abcxyz", received, strings.Join(writes, ""))
+	}
+	if digest != sha256.Sum256([]byte("abcxyz")) {
+		t.Fatalf("digest = %x, want %x", digest, sha256.Sum256([]byte("abcxyz")))
+	}
+}
+
+func TestDownloader_ReadIdleTimerExcludesBlockingWrite(t *testing.T) {
+	runReadIdleLocalWorkTest(t, "write")
+}
+
+func TestDownloader_ReadIdleTimerExcludesBlockingProgress(t *testing.T) {
+	runReadIdleLocalWorkTest(t, "progress")
+}
+
+func runReadIdleLocalWorkTest(t *testing.T, phase string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := newScriptedBody(ctx, bodyRead{data: []byte("abc")})
+	readTimer := newManualTimer()
+	localStarted := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	session := &fakeDownloadSession{}
+	var progress ProgressFunc
+	if phase == "write" {
+		session.write = func(p []byte) (int, error) {
+			if !readTimer.stopped.Load() {
+				t.Fatal("read timer is running during local Write")
+			}
+			close(localStarted)
+			<-releaseLocal
+			return len(p), nil
+		}
+	} else {
+		progress = func(value DownloadProgress) error {
+			if value.Received == 0 {
+				return nil
+			}
+			if !readTimer.stopped.Load() {
+				t.Fatal("read timer is running during local Progress")
+			}
+			close(localStarted)
+			<-releaseLocal
+			return nil
+		}
+	}
+	downloader := downloaderForTransferTest(
+		t,
+		func(time.Duration) timer { return readTimer },
+		func() time.Time { return time.Unix(1, 0) },
+	)
+	request := validatedForBytes(t, []byte("abc"), progress)
+	result := make(chan *DownloadFailure, 1)
+	go func() {
+		_, _, failure := downloader.readResponse(
+			ctx,
+			ctx,
+			cancel,
+			&http.Response{Body: body, ContentLength: 3},
+			session,
+			request,
+			newProgressReporter(
+				progress,
+				3,
+				time.Nanosecond,
+				downloader.clock,
+			),
+		)
+		result <- failure
+	}()
+
+	waitSignal(t, localStarted)
+	if readTimer.Fire() {
+		t.Fatal("read timer fired while local work exceeded its timeout")
+	}
+	select {
+	case failure := <-result:
+		t.Fatalf("readResponse() returned during local work: %v", failure)
+	default:
+	}
+	select {
+	case <-readTimer.reset:
+		t.Fatal("read timer reset before local work was released")
+	default:
+	}
+
+	close(releaseLocal)
+	waitSignal(t, readTimer.reset)
+	if !readTimer.Fire() {
+		t.Fatal("read timer did not fire during the next network wait")
+	}
+	failure := waitValue(t, result)
+	if failure == nil || failure.Kind != FailureReadTimeout {
+		t.Fatalf("failure = %#v, want FailureReadTimeout after next wait", failure)
+	}
+	if body.closeCount.Load() != 1 {
+		t.Fatalf("Body.Close count = %d, want 1", body.closeCount.Load())
+	}
+}
+
+func TestDownloader_ReadTimeoutAndCancellationJoinPump(t *testing.T) {
+	cases := []struct {
+		name    string
+		trigger func(context.CancelFunc, *manualTimer)
+		kind    FailureKind
+	}{
+		{
+			name: "read timeout",
+			trigger: func(_ context.CancelFunc, timer *manualTimer) {
+				timer.Fire()
+			},
+			kind: FailureReadTimeout,
+		},
+		{
+			name: "cancel",
+			trigger: func(cancel context.CancelFunc, _ *manualTimer) {
+				cancel()
+			},
+			kind: FailureCancelled,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			body := newScriptedBody(ctx)
+			readTimer := newManualTimer()
+			downloader := downloaderForTransferTest(
+				t,
+				func(time.Duration) timer { return readTimer },
+				func() time.Time { return time.Unix(1, 0) },
+			)
+			request := validatedForBytes(t, []byte("abc"), nil)
+			result := make(chan *DownloadFailure, 1)
+			go func() {
+				_, _, failure := downloader.readResponse(
+					ctx,
+					ctx,
+					cancel,
+					&http.Response{Body: body, ContentLength: -1},
+					&fakeDownloadSession{},
+					request,
+					newProgressReporter(nil, 3, time.Second, downloader.clock),
+				)
+				result <- failure
+			}()
+			testCase.trigger(cancel, readTimer)
+			failure := waitValue(t, result)
+			if failure == nil || failure.Kind != testCase.kind {
+				t.Fatalf("failure = %#v, want %q", failure, testCase.kind)
+			}
+			if body.closeCount.Load() != 1 {
+				t.Fatalf("Body.Close count = %d, want 1", body.closeCount.Load())
+			}
+		})
+	}
+}
+
+func TestDownloader_CancellationDuringLocalWorkWinsOverTerminalChunk(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase string
+	}{
+		{name: "write", phase: "write"},
+		{name: "progress", phase: "progress"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			body := newScriptedBody(
+				ctx,
+				bodyRead{data: []byte("abc"), err: io.EOF},
+			)
+			localStarted := make(chan struct{})
+			releaseLocal := make(chan struct{})
+			session := &fakeDownloadSession{}
+			var progress ProgressFunc
+			if testCase.phase == "write" {
+				session.write = func(p []byte) (int, error) {
+					close(localStarted)
+					<-releaseLocal
+					return len(p), nil
+				}
+			} else {
+				progress = func(value DownloadProgress) error {
+					if value.Received == 0 {
+						return nil
+					}
+					close(localStarted)
+					<-releaseLocal
+					return nil
+				}
+			}
+			downloader := downloaderForTransferTest(
+				t,
+				func(time.Duration) timer { return newManualTimer() },
+				func() time.Time { return time.Unix(1, 0) },
+			)
+			request := validatedForBytes(t, []byte("abc"), progress)
+			result := make(chan *DownloadFailure, 1)
+			go func() {
+				_, _, failure := downloader.readResponse(
+					ctx,
+					ctx,
+					cancel,
+					&http.Response{Body: body, ContentLength: 3},
+					session,
+					request,
+					newProgressReporter(
+						progress,
+						3,
+						time.Nanosecond,
+						downloader.clock,
+					),
+				)
+				result <- failure
+			}()
+
+			waitSignal(t, localStarted)
+			cancel()
+			close(releaseLocal)
+			failure := waitValue(t, result)
+			if failure == nil || failure.Kind != FailureCancelled {
+				t.Fatalf("failure = %#v, want FailureCancelled", failure)
+			}
+			if !errors.Is(failure, context.Canceled) {
+				t.Fatal("failure does not preserve context.Canceled")
+			}
+			if body.closeCount.Load() != 1 {
+				t.Fatalf("Body.Close count = %d, want 1", body.closeCount.Load())
+			}
+		})
+	}
+}
+
+func TestDownloader_ProcessesBytesBeforeTerminalReadError(t *testing.T) {
+	terminalErr := errors.New("terminal read error")
+	cases := []struct {
+		name     string
+		readErr  error
+		wantKind FailureKind
+	}{
+		{name: "bytes and EOF", readErr: io.EOF},
+		{name: "bytes and error", readErr: terminalErr, wantKind: FailureNetwork},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			body := newScriptedBody(ctx, bodyRead{data: []byte("abc"), err: testCase.readErr})
+			written := make([]byte, 0, 3)
+			session := &fakeDownloadSession{write: func(p []byte) (int, error) {
+				written = append(written, p...)
+				return len(p), nil
+			}}
+			downloader := downloaderForTransferTest(
+				t,
+				func(time.Duration) timer { return newManualTimer() },
+				func() time.Time { return time.Unix(1, 0) },
+			)
+			request := validatedForBytes(t, []byte("abc"), nil)
+			received, digest, failure := downloader.readResponse(
+				t.Context(),
+				ctx,
+				cancel,
+				&http.Response{Body: body, ContentLength: 3},
+				session,
+				request,
+				newProgressReporter(nil, 3, time.Second, downloader.clock),
+			)
+			if received != 3 || string(written) != "abc" {
+				t.Fatalf("received/written = %d/%q, want 3/abc", received, written)
+			}
+			if digest != sha256.Sum256([]byte("abc")) {
+				t.Fatalf("digest = %x, want abc digest", digest)
+			}
+			if testCase.wantKind == "" {
+				if failure != nil {
+					t.Fatalf("failure = %v, want nil", failure)
+				}
+				return
+			}
+			if failure == nil || failure.Kind != testCase.wantKind {
+				t.Fatalf("failure = %#v, want %q", failure, testCase.wantKind)
+			}
+			if !errors.Is(failure, terminalErr) {
+				t.Fatal("terminal read cause was not preserved")
+			}
+		})
+	}
+}
+
+func TestDownloader_ShortWriteIsNotRetriedOrCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	body := newScriptedBody(ctx, bodyRead{data: []byte("abc")}, bodyRead{err: io.EOF})
+	var writeCalls atomic.Int32
+	session := &fakeDownloadSession{write: func([]byte) (int, error) {
+		writeCalls.Add(1)
+		return 1, nil
+	}}
+	downloader := downloaderForTransferTest(
+		t,
+		func(time.Duration) timer { return newManualTimer() },
+		func() time.Time { return time.Unix(1, 0) },
+	)
+	request := validatedForBytes(t, []byte("abc"), nil)
+	received, _, failure := downloader.readResponse(
+		t.Context(),
+		ctx,
+		cancel,
+		&http.Response{Body: body, ContentLength: 3},
+		session,
+		request,
+		newProgressReporter(nil, 3, time.Second, downloader.clock),
+	)
+	if failure == nil || failure.Kind != FailureFilesystem {
+		t.Fatalf("failure = %#v, want FailureFilesystem", failure)
+	}
+	if !errors.Is(failure, io.ErrShortWrite) {
+		t.Fatal("failure does not preserve io.ErrShortWrite")
+	}
+	if writeCalls.Load() != 1 || received != 0 {
+		t.Fatalf("write calls/received = %d/%d, want 1/0", writeCalls.Load(), received)
+	}
+}
+
+func TestDownloader_SizeAccountingDoesNotOverflow(t *testing.T) {
+	cases := []struct {
+		name     string
+		received int64
+		written  int
+		expected int64
+		want     int64
+		wantErr  bool
+	}{
+		{name: "exact MaxInt64", received: math.MaxInt64 - 3, written: 3, expected: math.MaxInt64, want: math.MaxInt64},
+		{name: "overflow target", received: math.MaxInt64 - 2, written: 3, expected: math.MaxInt64, want: math.MaxInt64 - 2, wantErr: true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := advanceReceived(testCase.received, testCase.written, testCase.expected)
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("advanceReceived() error = %v, wantErr %t", err, testCase.wantErr)
+			}
+			if got != testCase.want {
+				t.Fatalf("advanceReceived() = %d, want %d", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestDownloader_ProgressInitialMonotonicFinalAndCallbackSafety(t *testing.T) {
+	clock := &progressClock{times: []time.Time{
+		time.Unix(1, 0),
+		time.Unix(1, 100),
+		time.Unix(2, 0),
+	}}
+	var values []DownloadProgress
+	reporter := newProgressReporter(
+		func(progress DownloadProgress) error {
+			values = append(values, progress)
+			return nil
+		},
+		3,
+		time.Second,
+		clock.Now,
+	)
+	for _, step := range []struct {
+		received int64
+		force    bool
+	}{
+		{received: 0, force: true},
+		{received: 1},
+		{received: 3, force: true},
+	} {
+		if err := reporter.report(step.received, step.force); err != nil {
+			t.Fatalf("report() error = %v, want nil", err)
+		}
+	}
+	if len(values) != 2 {
+		t.Fatalf("progress count = %d, want 2", len(values))
+	}
+	if values[0].Received != 0 || values[1].Received != 3 ||
+		values[1].Total != 3 || values[1].Percent != 100 {
+		t.Fatalf("progress values = %#v, want initial 0 and final 3/100", values)
+	}
+
+	reporter = newProgressReporter(
+		func(DownloadProgress) error { return errTestSecret },
+		3,
+		time.Second,
+		clock.Now,
+	)
+	err := reporter.report(0, true)
+	if err == nil || strings.Contains(err.Error(), "callback-secret") {
+		t.Fatalf("progress error = %v, want sanitized non-nil", err)
+	}
+	if !errors.Is(err, errTestSecret) {
+		t.Fatal("progress error does not preserve callback cause")
+	}
+}
+
+func downloaderForTransferTest(
+	t *testing.T,
+	timers timerFactory,
+	clock func() time.Time,
+) *Downloader {
+	t.Helper()
+	options, err := resolveDownloaderOptions(nil)
+	if err != nil {
+		t.Fatalf("resolveDownloaderOptions() error = %v, want nil", err)
+	}
+	dependencies := testDependencies(&fakeSessionFactory{}, &fakeHTTPClient{})
+	dependencies.timers = timers
+	dependencies.clock = clock
+	downloader, err := newDownloaderWithDependencies(
+		testLayout(t),
+		options,
+		dependencies,
+	)
+	if err != nil {
+		t.Fatalf("newDownloaderWithDependencies() error = %v, want nil", err)
+	}
+	return downloader
+}
+
+func validatedForBytes(
+	t *testing.T,
+	content []byte,
+	progress ProgressFunc,
+) validatedRequest {
+	t.Helper()
+	digest := sha256.Sum256(content)
+	return validatedRequest{
+		expectedSize:   int64(len(content)),
+		expectedSHA256: hex.EncodeToString(digest[:]),
+		expectedDigest: digest,
+		progress:       progress,
+	}
+}
