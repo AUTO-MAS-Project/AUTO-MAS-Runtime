@@ -2,11 +2,14 @@ package filesystem
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
@@ -307,7 +310,12 @@ func (o *Operator) pinDeleteTarget(
 		}
 	}
 	pinnedTarget := target
-	if !exists {
+	if exists {
+		pinnedTarget, err = canonicalizeContextWith(ctx, filepath.Dir(target.String()), o.api)
+		if err != nil {
+			return nil, false, err
+		}
+	} else {
 		existing := filepath.Dir(target.String())
 		for {
 			_, err := o.api.attributes(nativeWindowsPath(existing))
@@ -353,7 +361,34 @@ func (o *Operator) pinDeleteTarget(
 	if err != nil {
 		return nil, false, err
 	}
+	if exists {
+		parent := chain.objects[len(chain.objects)-1]
+		root, err := openRelativeCheckedWith(
+			ctx,
+			parent,
+			filepath.Base(target.String()),
+			authorizedDeleteRootSpec(),
+			o.api,
+		)
+		if err != nil {
+			return nil, false, errors.Join(err, chain.close())
+		}
+		chain.objects = append(chain.objects, root)
+	}
 	return chain, exists, nil
+}
+
+func authorizedDeleteRootSpec() openSpec {
+	return openSpec{
+		access: windows.DELETE |
+			windows.FILE_READ_ATTRIBUTES |
+			windows.FILE_LIST_DIRECTORY |
+			windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: true,
+	}
 }
 
 func (o *Operator) recordDeleteStarted(
@@ -376,4 +411,155 @@ func (o *Operator) recordDeleteStarted(
 		}
 	}
 	return nil
+}
+
+// RemoveTree 以固定句柄递归删除已授权的受管目录，并完成双阶段审计。
+func (o *Operator) RemoveTree(
+	ctx context.Context,
+	request DeleteRequest,
+) (DeleteResult, error) {
+	authorized, err := o.authorizeDeleteRequest(ctx, request)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+	if err := o.recordDeleteStarted(ctx, authorized); err != nil {
+		return DeleteResult{}, errors.Join(err, authorized.chain.close())
+	}
+
+	state := removalState{}
+	var operationErr error
+	resultName := "not_found"
+	if authorized.exists {
+		operationErr = o.removePinnedTree(ctx, authorized.root, &state)
+		if operationErr == nil {
+			resultName = "succeeded"
+		} else if errors.Is(operationErr, context.Canceled) ||
+			errors.Is(operationErr, context.DeadlineExceeded) {
+			resultName = "cancelled"
+		} else {
+			resultName = "failed"
+		}
+	}
+	if operationErr != nil && state.removed {
+		state.partial = true
+	}
+	result := DeleteResult{
+		Removed: state.removed,
+		Partial: state.partial,
+	}
+
+	finishedCtx, cancel := o.finishedContext(ctx)
+	if finishedCtx == nil || cancel == nil {
+		operationErr = errors.Join(
+			operationErr,
+			&AuditError{
+				Phase:           DeleteAuditFinished,
+				MutationApplied: result.Removed || result.Partial,
+				Cause:           ErrInvalidArgument,
+			},
+		)
+	} else {
+		finishedErr := o.auditor.RecordDeletion(finishedCtx, DeleteAuditRecord{
+			Phase:       DeleteAuditFinished,
+			OperationID: request.OperationID,
+			Kind:        request.Kind,
+			Target:      authorized.target.String(),
+			Reason:      request.Reason,
+			Removed:     result.Removed,
+			Partial:     result.Partial,
+			Result:      resultName,
+		})
+		cancel()
+		if finishedErr != nil {
+			operationErr = errors.Join(
+				operationErr,
+				&AuditError{
+					Phase:           DeleteAuditFinished,
+					MutationApplied: result.Removed || result.Partial,
+					Cause:           finishedErr,
+				},
+			)
+		} else {
+			result.AuditCompleted = true
+		}
+	}
+	closeErr := authorized.chain.close()
+	return result, errors.Join(operationErr, closeErr)
+}
+
+type removalState struct {
+	removed bool
+	partial bool
+}
+
+func (o *Operator) removePinnedTree(
+	ctx context.Context,
+	root *pinnedObject,
+	state *removalState,
+) error {
+	if ctx == nil || root == nil || state == nil {
+		return ErrInvalidArgument
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := o.api.listDirectory(root.handle)
+	if err != nil {
+		return &FileError{Operation: "list", Path: root.path.String(), Err: err}
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return unsafeReparseError(filepath.Join(root.path.String(), entry.name))
+		}
+		directory := entry.attributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+		spec := recursiveDeleteSpec(directory)
+		child, err := openRelativeCheckedWith(ctx, *root, entry.name, spec, o.api)
+		if err != nil {
+			return err
+		}
+		childErr := error(nil)
+		if directory {
+			childErr = o.removePinnedTree(ctx, &child, state)
+		} else {
+			if err := ctx.Err(); err != nil {
+				childErr = err
+			} else if err := deleteByHandleWith(child.handle, o.api); err != nil {
+				childErr = &FileError{
+					Operation: "remove",
+					Path:      child.path.String(),
+					Err:       err,
+				}
+			} else {
+				state.removed = true
+			}
+		}
+		closeErr := closePinnedObject(o.api, &child)
+		if childErr != nil || closeErr != nil {
+			return errors.Join(childErr, closeErr)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := deleteByHandleWith(root.handle, o.api); err != nil {
+		return &FileError{Operation: "remove", Path: root.path.String(), Err: err}
+	}
+	state.removed = true
+	return nil
+}
+
+func recursiveDeleteSpec(directory bool) openSpec {
+	if directory {
+		return authorizedDeleteRootSpec()
+	}
+	return openSpec{
+		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
 }
