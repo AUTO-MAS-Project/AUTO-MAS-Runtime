@@ -396,6 +396,122 @@ func (d *Downloader) validateRequest(
 	}, nil
 }
 
+// Download 执行一次已确定资源的 HTTPS 传输、校验和 no-replace 发布。
+func (d *Downloader) Download(
+	ctx context.Context,
+	request DownloadRequest,
+) (DownloadResult, error) {
+	validated, failure := d.validateRequest(ctx, request)
+	if failure != nil {
+		return DownloadResult{}, failure
+	}
+	session, err := d.sessions.Begin(ctx, validated.fileName)
+	if err != nil {
+		return DownloadResult{}, newDownloadFailure(FailureFilesystem, 0, err)
+	}
+	result := DownloadResult{
+		Path:   session.Path(),
+		Size:   validated.expectedSize,
+		SHA256: validated.expectedSHA256,
+	}
+	reporter := newProgressReporter(
+		validated.progress,
+		validated.expectedSize,
+		d.progressInterval,
+		d.clock,
+	)
+	if err := reporter.report(0, true); err != nil {
+		return DownloadResult{}, d.abortFailure(
+			ctx,
+			session,
+			newDownloadFailure(FailureProgress, 0, err),
+		)
+	}
+
+	handle, failure := d.doRequest(ctx, validated.url)
+	if failure != nil {
+		return DownloadResult{}, d.abortFailure(ctx, session, failure)
+	}
+	response := handle.response
+	if response.StatusCode != http.StatusOK {
+		failure = newDownloadFailure(
+			FailureHTTPStatus,
+			response.StatusCode,
+			errors.New("http response status is not 200"),
+		)
+		failure.Err = errors.Join(failure.Err, closeResponseAndCancel(handle))
+		return DownloadResult{}, d.abortFailure(ctx, session, failure)
+	}
+	if response.ContentLength >= 0 &&
+		response.ContentLength != validated.expectedSize {
+		failure = newDownloadFailure(
+			FailureSizeMismatch,
+			0,
+			errors.New("http content length does not match expected size"),
+		)
+		failure.Err = errors.Join(failure.Err, closeResponseAndCancel(handle))
+		return DownloadResult{}, d.abortFailure(ctx, session, failure)
+	}
+
+	_, _, failure = d.readResponse(
+		ctx,
+		response.Request.Context(),
+		handle.cancel,
+		response,
+		session,
+		validated,
+		reporter,
+	)
+	if failure != nil {
+		return DownloadResult{}, d.abortFailure(ctx, session, failure)
+	}
+	publishResult, publishErr := session.PublishNoReplace(ctx)
+	if publishErr == nil && publishResult.Published {
+		return result, nil
+	}
+	publishKind := FailureFilesystem
+	if errors.Is(publishErr, filesystem.ErrDestinationExists) {
+		publishKind = FailureDestinationOccupied
+	}
+	if publishErr == nil {
+		publishErr = errors.New("download session did not publish")
+	}
+	failure = newDownloadFailure(publishKind, 0, publishErr)
+	failure.Published = publishResult.Published
+	if publishResult.Published {
+		return result, failure
+	}
+	return DownloadResult{}, d.abortFailure(ctx, session, failure)
+}
+
+func closeResponseAndCancel(handle *responseHandle) error {
+	handle.cancel()
+	return closeResponse(handle.response)
+}
+
+func (d *Downloader) abortFailure(
+	operationCtx context.Context,
+	session downloadSession,
+	failure *DownloadFailure,
+) *DownloadFailure {
+	if failure.Published {
+		return failure
+	}
+	cleanupCtx, cancel := d.cleanup(operationCtx)
+	abortResult, abortErr := session.Abort(cleanupCtx)
+	cancel()
+	if abortErr == nil && !abortResult.Removed {
+		abortErr = errors.New("download part was not removed")
+	}
+	if abortErr != nil {
+		failure.CleanupErr = safeExternalError(
+			"download cleanup failed",
+			abortErr,
+		)
+	}
+	return failure
+}
+
 func newDownloadFailure(
 	kind FailureKind,
 	statusCode int,

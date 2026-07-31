@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -184,6 +185,40 @@ func TestDownloaderClient_UsesTrustedTLSAndIdentityEncoding(t *testing.T) {
 	handle.cancel()
 	if err := handle.response.Body.Close(); err != nil {
 		t.Fatalf("Body.Close() error = %v, want nil", err)
+	}
+}
+
+func TestDownloader_TLSComponentDownloadsVerifiedArtifact(t *testing.T) {
+	content := []byte("tls-verified-artifact")
+	server := httptest.NewTLSServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Header.Get("Accept-Encoding") != "identity" {
+			t.Errorf("Accept-Encoding = %q, want identity", request.Header.Get("Accept-Encoding"))
+		}
+		if request.Header.Get("Range") != "" {
+			t.Errorf("Range = %q, want empty", request.Header.Get("Range"))
+		}
+		writer.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		_, _ = writer.Write(content)
+	}))
+	defer server.Close()
+	session := successfulRecordingSession()
+	downloader := downloaderForTransactionTest(
+		t,
+		session,
+		trustedClientForServers(t, server),
+		nil,
+	)
+	request := requestForBytes(content)
+	request.URL = server.URL + "/asset?signature=tls-secret"
+	result, err := downloader.Download(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Download() error = %v, want nil", err)
+	}
+	if result.Size != int64(len(content)) {
+		t.Fatalf("result.Size = %d, want %d", result.Size, len(content))
 	}
 }
 

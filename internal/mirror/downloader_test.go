@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -998,4 +1000,1263 @@ func validatedForBytes(
 		expectedDigest: digest,
 		progress:       progress,
 	}
+}
+
+type recordingSession struct {
+	fakeDownloadSession
+	mu            sync.Mutex
+	content       []byte
+	events        []string
+	writeResult   int
+	writeErr      error
+	writeFault    bool
+	publishResult filesystem.PublishResult
+	publishErr    error
+	abortResult   filesystem.AbortResult
+	abortErr      error
+	publish       func(context.Context) (filesystem.PublishResult, error)
+	abort         func(context.Context) (filesystem.AbortResult, error)
+	writeHook     func()
+}
+
+func (s *recordingSession) Write(p []byte) (int, error) {
+	if s.writeHook != nil {
+		s.writeHook()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, "write")
+	if s.writeFault {
+		return s.writeResult, s.writeErr
+	}
+	s.content = append(s.content, p...)
+	return len(p), nil
+}
+
+func (s *recordingSession) PublishNoReplace(
+	ctx context.Context,
+) (filesystem.PublishResult, error) {
+	s.mu.Lock()
+	s.events = append(s.events, "publish")
+	publish := s.publish
+	result := s.publishResult
+	err := s.publishErr
+	s.mu.Unlock()
+	if publish != nil {
+		return publish(ctx)
+	}
+	return result, err
+}
+
+func (s *recordingSession) Abort(
+	ctx context.Context,
+) (filesystem.AbortResult, error) {
+	s.mu.Lock()
+	s.abortCalls++
+	s.events = append(s.events, "abort")
+	abortErr := s.abortErr
+	abortResult := s.abortResult
+	abort := s.abort
+	s.mu.Unlock()
+	if abort != nil {
+		return abort(ctx)
+	}
+	if abortErr != nil {
+		return abortResult, abortErr
+	}
+	select {
+	case <-ctx.Done():
+		return abortResult, ctx.Err()
+	default:
+		return abortResult, nil
+	}
+}
+
+func (s *recordingSession) snapshot() ([]byte, []string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.content...),
+		append([]string(nil), s.events...),
+		s.abortCalls
+}
+
+func TestDownloader_DownloadPublishesVerifiedResult(t *testing.T) {
+	content := []byte("verified-content")
+	session := &recordingSession{
+		fakeDownloadSession: fakeDownloadSession{
+			path:     `C:\app\runtime\cache\downloads\uv.zip`,
+			partPath: `C:\app\runtime\cache\downloads\uv.zip.part`,
+		},
+		publishResult: filesystem.PublishResult{Published: true},
+		abortResult:   filesystem.AbortResult{Removed: true},
+	}
+	client := responseClient(t, content, int64(len(content)), http.StatusOK)
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	request := requestForBytes(content)
+	var progress []DownloadProgress
+	request.Progress = func(value DownloadProgress) error {
+		progress = append(progress, value)
+		return nil
+	}
+	result, err := downloader.Download(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Download() error = %v, want nil", err)
+	}
+	digest := sha256.Sum256(content)
+	if result.Path != session.path ||
+		result.Size != int64(len(content)) ||
+		result.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("Download() result = %#v, want verified path/size/digest", result)
+	}
+	written, events, abortCalls := session.snapshot()
+	if !bytes.Equal(written, content) {
+		t.Fatalf("written bytes = %q, want %q", written, content)
+	}
+	if got := strings.Join(events, ","); got != "write,publish" {
+		t.Fatalf("events = %q, want write,publish", got)
+	}
+	if abortCalls != 0 {
+		t.Fatalf("Abort calls = %d, want 0", abortCalls)
+	}
+	if len(progress) < 2 ||
+		progress[0].Received != 0 ||
+		progress[len(progress)-1].Received != int64(len(content)) {
+		t.Fatalf("progress = %#v, want initial and final", progress)
+	}
+}
+
+func TestDownloader_DownloadValidatesBeforeBeginOrNetwork(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*DownloadRequest)
+	}{
+		{name: "URL", mutate: func(request *DownloadRequest) { request.URL = "http://127.0.0.1/asset" }},
+		{name: "file", mutate: func(request *DownloadRequest) { request.FileName = `nested\asset` }},
+		{name: "size", mutate: func(request *DownloadRequest) { request.ExpectedSize = 0 }},
+		{name: "checksum", mutate: func(request *DownloadRequest) { request.ExpectedSHA256 = "invalid" }},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			sessions := &fakeSessionFactory{}
+			client := &fakeHTTPClient{}
+			options, err := resolveDownloaderOptions(nil)
+			if err != nil {
+				t.Fatalf("resolveDownloaderOptions() error = %v", err)
+			}
+			downloader, err := newDownloaderWithDependencies(
+				testLayout(t),
+				options,
+				testDependencies(sessions, client),
+			)
+			if err != nil {
+				t.Fatalf("newDownloaderWithDependencies() error = %v", err)
+			}
+			request := requestForBytes([]byte("abc"))
+			testCase.mutate(&request)
+			_, err = downloader.Download(t.Context(), request)
+			var failure *DownloadFailure
+			if !errors.As(err, &failure) {
+				t.Fatalf("Download() error = %v, want *DownloadFailure", err)
+			}
+			if sessions.Calls() != 0 || client.Calls() != 0 {
+				t.Fatalf("side effects = Begin:%d Do:%d, want 0/0", sessions.Calls(), client.Calls())
+			}
+		})
+	}
+}
+
+func TestDownloader_DownloadAcceptsMissingContentLength(t *testing.T) {
+	content := []byte("abc")
+	session := successfulRecordingSession()
+	client := responseClient(t, content, -1, http.StatusOK)
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	result, err := downloader.Download(t.Context(), requestForBytes(content))
+	if err != nil {
+		t.Fatalf("Download() error = %v, want nil", err)
+	}
+	if result.Size != 3 {
+		t.Fatalf("result.Size = %d, want 3", result.Size)
+	}
+}
+
+func TestDownloader_UnpublishedFailuresAbortAndPreserveMainKind(t *testing.T) {
+	content := []byte("abc")
+	progressErr := errors.New("progress-private-message")
+	readErr := errors.New("read-private-message")
+	cases := []struct {
+		name       string
+		request    DownloadRequest
+		client     httpClient
+		session    *recordingSession
+		wantKind   FailureKind
+		wantStatus int
+		wantCause  error
+	}{
+		{
+			name:       "HTTP status",
+			request:    requestForBytes(content),
+			client:     responseClient(t, []byte("private body"), 12, http.StatusNotFound),
+			session:    successfulRecordingSession(),
+			wantKind:   FailureHTTPStatus,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "HTTP 429",
+			request:    requestForBytes(content),
+			client:     responseClient(t, []byte("private body"), 12, http.StatusTooManyRequests),
+			session:    successfulRecordingSession(),
+			wantKind:   FailureHTTPStatus,
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "HTTP 500",
+			request:    requestForBytes(content),
+			client:     responseClient(t, []byte("private body"), 12, http.StatusInternalServerError),
+			session:    successfulRecordingSession(),
+			wantKind:   FailureHTTPStatus,
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:     "Content-Length mismatch",
+			request:  requestForBytes(content),
+			client:   responseClient(t, content, 4, http.StatusOK),
+			session:  successfulRecordingSession(),
+			wantKind: FailureSizeMismatch,
+		},
+		{
+			name: "short body",
+			request: DownloadRequest{
+				URL:            validRequest().URL,
+				FileName:       "uv.zip",
+				ExpectedSize:   4,
+				ExpectedSHA256: strings.Repeat("a", 64),
+			},
+			client:   responseClient(t, content, -1, http.StatusOK),
+			session:  successfulRecordingSession(),
+			wantKind: FailureSizeMismatch,
+		},
+		{
+			name:     "long body",
+			request:  requestForBytes(content),
+			client:   responseClient(t, []byte("abcd"), -1, http.StatusOK),
+			session:  successfulRecordingSession(),
+			wantKind: FailureSizeMismatch,
+		},
+		{
+			name:     "checksum mismatch",
+			request:  validRequest(),
+			client:   responseClient(t, content, 3, http.StatusOK),
+			session:  successfulRecordingSession(),
+			wantKind: FailureChecksumMismatch,
+		},
+		{
+			name: "progress",
+			request: func() DownloadRequest {
+				request := requestForBytes(content)
+				request.Progress = func(DownloadProgress) error { return progressErr }
+				return request
+			}(),
+			client:    responseClient(t, content, 3, http.StatusOK),
+			session:   successfulRecordingSession(),
+			wantKind:  FailureProgress,
+			wantCause: progressErr,
+		},
+		{
+			name:    "body read",
+			request: requestForBytes(content),
+			client: responseWithBodyClient(t, &terminalBody{
+				content: content,
+				err:     readErr,
+			}, 3, http.StatusOK),
+			session:   successfulRecordingSession(),
+			wantKind:  FailureNetwork,
+			wantCause: readErr,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			downloader := downloaderForTransactionTest(
+				t,
+				testCase.session,
+				testCase.client,
+				nil,
+			)
+			result, err := downloader.Download(t.Context(), testCase.request)
+			var failure *DownloadFailure
+			if !errors.As(err, &failure) {
+				t.Fatalf("Download() error = %v, want *DownloadFailure", err)
+			}
+			if failure.Kind != testCase.wantKind ||
+				failure.StatusCode != testCase.wantStatus ||
+				failure.Published {
+				t.Fatalf("failure = %#v, want kind/status unpublished", failure)
+			}
+			if result != (DownloadResult{}) {
+				t.Fatalf("result = %#v, want zero", result)
+			}
+			_, _, abortCalls := testCase.session.snapshot()
+			if abortCalls != 1 {
+				t.Fatalf("Abort calls = %d, want 1", abortCalls)
+			}
+			if testCase.wantCause != nil && !errors.Is(failure, testCase.wantCause) {
+				t.Fatalf("failure does not preserve cause %v", testCase.wantCause)
+			}
+			if strings.Contains(
+				failure.Error()+" "+errorText(failure.Err),
+				"private",
+			) {
+				t.Fatalf("public failure text leaked external text: %v", failure)
+			}
+		})
+	}
+}
+
+func TestDownloader_DownloadFaultMatrix(t *testing.T) {
+	content := []byte("abc")
+	beginCause := errors.New("begin-secret")
+	beginTyped := &testTypedError{cause: beginCause}
+	beginSessions := &fakeSessionFactory{err: beginTyped}
+	beginClient := &fakeHTTPClient{}
+	options, err := resolveDownloaderOptions(nil)
+	if err != nil {
+		t.Fatalf("resolveDownloaderOptions() error = %v", err)
+	}
+	beginDownloader, err := newDownloaderWithDependencies(
+		testLayout(t),
+		options,
+		testDependencies(beginSessions, beginClient),
+	)
+	if err != nil {
+		t.Fatalf("newDownloaderWithDependencies() error = %v", err)
+	}
+	beginResult, beginErr := beginDownloader.Download(
+		t.Context(),
+		requestForBytes(content),
+	)
+	var beginFailure *DownloadFailure
+	var beginGotTyped *testTypedError
+	if beginResult != (DownloadResult{}) ||
+		!errors.As(beginErr, &beginFailure) ||
+		beginFailure.Kind != FailureFilesystem ||
+		beginFailure.Published ||
+		!errors.Is(beginErr, beginCause) ||
+		!errors.As(beginErr, &beginGotTyped) ||
+		beginGotTyped != beginTyped ||
+		beginClient.Calls() != 0 {
+		t.Fatalf(
+			"Begin fault result/error/client calls = %#v/%v/%d",
+			beginResult,
+			beginErr,
+			beginClient.Calls(),
+		)
+	}
+	if strings.Contains(
+		beginFailure.Error()+" "+errorText(beginFailure.Err),
+		"secret",
+	) {
+		t.Fatalf("Begin public failure leaked cause: %v", beginFailure)
+	}
+
+	mainCause := errors.New("main-secret")
+	mainTyped := &testTypedError{cause: mainCause}
+	cleanupCause := errors.New("cleanup-secret")
+	cleanupTyped := &testTypedError{cause: cleanupCause}
+	cases := []struct {
+		name        string
+		configure   func(*recordingSession, *closeCountingBody)
+		bodyReader  func() io.Reader
+		wantKind    FailureKind
+		wantMain    error
+		wantCleanup error
+	}{
+		{
+			name: "write",
+			configure: func(session *recordingSession, _ *closeCountingBody) {
+				session.writeFault = true
+				session.writeErr = mainTyped
+			},
+			wantKind: FailureFilesystem,
+			wantMain: mainCause,
+		},
+		{
+			name: "short write",
+			configure: func(session *recordingSession, _ *closeCountingBody) {
+				session.writeFault = true
+				session.writeResult = 1
+			},
+			wantKind: FailureFilesystem,
+			wantMain: io.ErrShortWrite,
+		},
+		{
+			name: "Flush in publish phase",
+			configure: func(session *recordingSession, _ *closeCountingBody) {
+				session.publishResult = filesystem.PublishResult{}
+				session.publishErr = mainTyped
+			},
+			wantKind: FailureFilesystem,
+			wantMain: mainCause,
+		},
+		{
+			name: "Body Close",
+			configure: func(_ *recordingSession, body *closeCountingBody) {
+				body.err = mainTyped
+			},
+			wantKind: FailureNetwork,
+			wantMain: mainCause,
+		},
+		{
+			name: "Publish",
+			configure: func(session *recordingSession, _ *closeCountingBody) {
+				session.publishResult = filesystem.PublishResult{}
+				session.publishErr = filesystem.ErrDestinationExists
+			},
+			wantKind: FailureDestinationOccupied,
+			wantMain: filesystem.ErrDestinationExists,
+		},
+		{
+			name: "Abort",
+			configure: func(session *recordingSession, _ *closeCountingBody) {
+				session.abortErr = cleanupTyped
+			},
+			bodyReader: func() io.Reader {
+				return &terminalBody{content: content, err: mainTyped}
+			},
+			wantKind:    FailureNetwork,
+			wantMain:    mainCause,
+			wantCleanup: cleanupCause,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			session := successfulRecordingSession()
+			reader := io.Reader(bytes.NewReader(content))
+			if testCase.bodyReader != nil {
+				reader = testCase.bodyReader()
+			}
+			body := &closeCountingBody{reader: reader}
+			testCase.configure(session, body)
+			downloader := downloaderForTransactionTest(
+				t,
+				session,
+				responseWithBodyClient(
+					t,
+					body,
+					int64(len(content)),
+					http.StatusOK,
+				),
+				nil,
+			)
+			result, err := downloader.Download(
+				t.Context(),
+				requestForBytes(content),
+			)
+			var failure *DownloadFailure
+			if result != (DownloadResult{}) ||
+				!errors.As(err, &failure) ||
+				failure.Kind != testCase.wantKind ||
+				failure.Published ||
+				!errors.Is(err, testCase.wantMain) {
+				t.Fatalf(
+					"Download() result/error = %#v/%v, want %q unpublished with main cause",
+					result,
+					err,
+					testCase.wantKind,
+				)
+			}
+			if testCase.wantMain == mainCause {
+				var gotTyped *testTypedError
+				if !errors.As(err, &gotTyped) || gotTyped != mainTyped {
+					t.Fatalf("main errors.As() = %#v, want original", gotTyped)
+				}
+			}
+			if testCase.wantCleanup != nil {
+				if failure.CleanupErr == nil || !errors.Is(err, testCase.wantCleanup) {
+					t.Fatalf("cleanup chain = %#v, want cleanup cause", failure)
+				}
+			} else if failure.CleanupErr != nil {
+				t.Fatalf("CleanupErr = %v, want nil", failure.CleanupErr)
+			}
+			_, _, abortCalls := session.snapshot()
+			if abortCalls != 1 || body.count.Load() != 1 {
+				t.Fatalf(
+					"Abort/Body.Close calls = %d/%d, want 1/1",
+					abortCalls,
+					body.count.Load(),
+				)
+			}
+			public := failure.Error() + " " +
+				errorText(failure.Err) + " " +
+				errorText(failure.CleanupErr)
+			if strings.Contains(public, "secret") {
+				t.Fatalf("public failure text leaked cause: %q", public)
+			}
+		})
+	}
+}
+
+func TestDownloader_PublishResultControlsAbortAndNormalizesResult(t *testing.T) {
+	publishErr := errors.New("publish failed")
+	cases := []struct {
+		name       string
+		result     filesystem.PublishResult
+		publishErr error
+		wantKind   FailureKind
+		wantResult bool
+		wantAbort  int
+	}{
+		{
+			name:       "destination occupied",
+			publishErr: filesystem.ErrDestinationExists,
+			wantKind:   FailureDestinationOccupied,
+			wantAbort:  1,
+		},
+		{
+			name:       "rename did not publish",
+			publishErr: publishErr,
+			wantKind:   FailureFilesystem,
+			wantAbort:  1,
+		},
+		{
+			name:       "rename published then close failed",
+			result:     filesystem.PublishResult{Published: true},
+			publishErr: publishErr,
+			wantKind:   FailureFilesystem,
+			wantResult: true,
+			wantAbort:  0,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			session := successfulRecordingSession()
+			session.publishResult = testCase.result
+			session.publishErr = testCase.publishErr
+			content := []byte("abc")
+			downloader := downloaderForTransactionTest(
+				t,
+				session,
+				responseClient(t, content, 3, http.StatusOK),
+				nil,
+			)
+			request := requestForBytes(content)
+			if testCase.result.Published {
+				request.ExpectedSHA256 = strings.ToUpper(
+					request.ExpectedSHA256,
+				)
+			}
+			result, err := downloader.Download(t.Context(), request)
+			var failure *DownloadFailure
+			if !errors.As(err, &failure) {
+				t.Fatalf("Download() error = %v, want *DownloadFailure", err)
+			}
+			if failure.Kind != testCase.wantKind ||
+				failure.Published != testCase.result.Published {
+				t.Fatalf("failure = %#v, want kind %q published %t", failure, testCase.wantKind, testCase.result.Published)
+			}
+			if (result != (DownloadResult{})) != testCase.wantResult {
+				t.Fatalf("result = %#v, wantResult %t", result, testCase.wantResult)
+			}
+			if failure.Published {
+				digest := sha256.Sum256(content)
+				want := DownloadResult{
+					Path:   session.path,
+					Size:   int64(len(content)),
+					SHA256: hex.EncodeToString(digest[:]),
+				}
+				if result != want {
+					t.Fatalf(
+						"published failure result = %#v, want %#v",
+						result,
+						want,
+					)
+				}
+				if failure.CleanupErr != nil {
+					t.Fatalf(
+						"published failure CleanupErr = %v, want nil",
+						failure.CleanupErr,
+					)
+				}
+			}
+			_, _, abortCalls := session.snapshot()
+			if abortCalls != testCase.wantAbort {
+				t.Fatalf("Abort calls = %d, want %d", abortCalls, testCase.wantAbort)
+			}
+		})
+	}
+}
+
+type closeCountingBody struct {
+	reader io.Reader
+	count  atomic.Int32
+	err    error
+}
+
+func (b *closeCountingBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *closeCountingBody) Close() error {
+	b.count.Add(1)
+	return b.err
+}
+
+func TestDownloader_BodyClosedExactlyOnceAcrossResponsePaths(t *testing.T) {
+	content := []byte("abc")
+	cases := []struct {
+		name          string
+		status        int
+		contentLength int64
+		request       DownloadRequest
+	}{
+		{name: "success", status: http.StatusOK, contentLength: 3, request: requestForBytes(content)},
+		{name: "HTTP error", status: http.StatusNotFound, contentLength: 3, request: requestForBytes(content)},
+		{name: "length mismatch", status: http.StatusOK, contentLength: 4, request: requestForBytes(content)},
+		{name: "checksum mismatch", status: http.StatusOK, contentLength: 3, request: validRequest()},
+		{
+			name:          "progress error",
+			status:        http.StatusOK,
+			contentLength: 3,
+			request: func() DownloadRequest {
+				request := requestForBytes(content)
+				request.Progress = func(progress DownloadProgress) error {
+					if progress.Received == progress.Total {
+						return errTestSecret
+					}
+					return nil
+				}
+				return request
+			}(),
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := &closeCountingBody{reader: bytes.NewReader(content)}
+			client := responseWithBodyClient(
+				t,
+				body,
+				testCase.contentLength,
+				testCase.status,
+			)
+			downloader := downloaderForTransactionTest(
+				t,
+				successfulRecordingSession(),
+				client,
+				nil,
+			)
+			_, _ = downloader.Download(t.Context(), testCase.request)
+			if body.count.Load() != 1 {
+				t.Fatalf("Body.Close count = %d, want 1", body.count.Load())
+			}
+		})
+	}
+}
+
+func TestDownloader_BodyCloseFailureMatrix(t *testing.T) {
+	content := []byte("abc")
+	closeCause := errors.New("close-cause-secret")
+	typedClose := &testTypedError{cause: closeCause}
+	cases := []struct {
+		name          string
+		status        int
+		contentLength int64
+		request       DownloadRequest
+		wantKind      FailureKind
+	}{
+		{
+			name:          "normal EOF",
+			status:        http.StatusOK,
+			contentLength: 3,
+			request:       requestForBytes(content),
+			wantKind:      FailureNetwork,
+		},
+		{
+			name:          "non-200",
+			status:        http.StatusNotFound,
+			contentLength: 3,
+			request:       requestForBytes(content),
+			wantKind:      FailureHTTPStatus,
+		},
+		{
+			name:          "Content-Length precheck",
+			status:        http.StatusOK,
+			contentLength: 4,
+			request:       requestForBytes(content),
+			wantKind:      FailureSizeMismatch,
+		},
+		{
+			name:          "checksum primary precedes close",
+			status:        http.StatusOK,
+			contentLength: 3,
+			request:       validRequest(),
+			wantKind:      FailureChecksumMismatch,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := &closeCountingBody{
+				reader: bytes.NewReader(content),
+				err:    typedClose,
+			}
+			session := successfulRecordingSession()
+			downloader := downloaderForTransactionTest(
+				t,
+				session,
+				responseWithBodyClient(
+					t,
+					body,
+					testCase.contentLength,
+					testCase.status,
+				),
+				nil,
+			)
+			result, err := downloader.Download(t.Context(), testCase.request)
+			var failure *DownloadFailure
+			var gotTyped *testTypedError
+			if !errors.As(err, &failure) ||
+				failure.Kind != testCase.wantKind ||
+				failure.Published ||
+				!errors.Is(err, closeCause) ||
+				!errors.As(err, &gotTyped) ||
+				gotTyped != typedClose {
+				t.Fatalf(
+					"Download() result/error = %#v/%v, want %q unpublished with typed close cause",
+					result,
+					err,
+					testCase.wantKind,
+				)
+			}
+			if result != (DownloadResult{}) {
+				t.Fatalf("Download() result = %#v, want zero", result)
+			}
+			_, _, abortCalls := session.snapshot()
+			if body.count.Load() != 1 || abortCalls != 1 {
+				t.Fatalf(
+					"Close/Abort calls = %d/%d, want 1/1",
+					body.count.Load(),
+					abortCalls,
+				)
+			}
+			public := failure.Error() + " " +
+				errorText(failure.Err) + " " +
+				errorText(failure.CleanupErr)
+			if strings.Contains(public, "secret") {
+				t.Fatalf("public failure text leaked cause: %q", public)
+			}
+		})
+	}
+}
+
+func TestDownloader_PublishesOnlyAfterBodyCloseAndNeverCallsBackAfter(t *testing.T) {
+	content := []byte("abc")
+	body := &orderedBody{
+		reader: strings.NewReader(string(content)),
+		events: make(chan string, 4),
+	}
+	session := successfulRecordingSession()
+	var published atomic.Bool
+	callbackCalls := atomic.Int32{}
+	finalCallback := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	session.publish = func(context.Context) (filesystem.PublishResult, error) {
+		if got := waitValue(t, body.events); got != "close" {
+			t.Fatalf("event before publish = %q, want close", got)
+		}
+		published.Store(true)
+		return filesystem.PublishResult{Published: true}, nil
+	}
+	request := requestForBytes(content)
+	request.Progress = func(progress DownloadProgress) error {
+		if published.Load() {
+			return errors.New("progress called after publish")
+		}
+		callbackCalls.Add(1)
+		if progress.Received == progress.Total {
+			close(finalCallback)
+			<-releaseCallback
+		}
+		return nil
+	}
+	downloader := downloaderForTransactionTest(
+		t,
+		session,
+		responseWithBodyClient(t, body, 3, http.StatusOK),
+		nil,
+	)
+	result := make(chan error, 1)
+	go func() {
+		_, err := downloader.Download(t.Context(), request)
+		result <- err
+	}()
+	waitSignal(t, finalCallback)
+	if published.Load() {
+		t.Fatal("Publish occurred before the final progress callback returned")
+	}
+	close(releaseCallback)
+	err := waitValue(t, result)
+	if err != nil {
+		t.Fatalf("Download() error = %v, want nil", err)
+	}
+	if !published.Load() {
+		t.Fatal("Publish was not observed")
+	}
+	if callbackCalls.Load() != 2 {
+		t.Fatalf("callback count = %d, want initial and final only", callbackCalls.Load())
+	}
+}
+
+type cleanupValueKey struct{}
+
+type sessionFactoryFunc func(
+	ctx context.Context,
+	name string,
+) (downloadSession, error)
+
+func (f sessionFactoryFunc) Begin(
+	ctx context.Context,
+	name string,
+) (downloadSession, error) {
+	return f(ctx, name)
+}
+
+type httpClientFunc func(*http.Request) (*http.Response, error)
+
+func (f httpClientFunc) Do(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestDownloader_ConcurrentDownloadsHaveIndependentState(t *testing.T) {
+	contents := map[string][]byte{
+		"/one": []byte("first"),
+		"/two": []byte("second"),
+	}
+	writesArrived := make(chan struct{}, len(contents))
+	releaseWrites := make(chan struct{})
+	var created sync.Map
+	sessions := sessionFactoryFunc(func(
+		_ context.Context,
+		name string,
+	) (downloadSession, error) {
+		session := successfulRecordingSession()
+		session.path = `C:\downloads\` + name
+		session.partPath = session.path + ".part"
+		session.writeHook = func() {
+			writesArrived <- struct{}{}
+			<-releaseWrites
+		}
+		created.Store(name, session)
+		return session, nil
+	})
+	client := httpClientFunc(func(request *http.Request) (*http.Response, error) {
+		content := contents[request.URL.Path]
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: int64(len(content)),
+			Body:          io.NopCloser(bytes.NewReader(content)),
+			Request:       request,
+		}, nil
+	})
+	options, err := resolveDownloaderOptions(nil)
+	if err != nil {
+		t.Fatalf("resolveDownloaderOptions() error = %v", err)
+	}
+	dependencies := testDependencies(sessions, client)
+	downloader, err := newDownloaderWithDependencies(
+		testLayout(t),
+		options,
+		dependencies,
+	)
+	if err != nil {
+		t.Fatalf("newDownloaderWithDependencies() error = %v", err)
+	}
+	start := make(chan struct{})
+	type concurrentResult struct {
+		name    string
+		content []byte
+		result  DownloadResult
+		err     error
+	}
+	results := make(chan concurrentResult, len(contents))
+	for path, content := range contents {
+		path := path
+		content := append([]byte(nil), content...)
+		go func() {
+			<-start
+			request := requestForBytes(content)
+			request.URL = "https://example.invalid" + path
+			name := strings.TrimPrefix(path, "/") + ".zip"
+			request.FileName = name
+			result, err := downloader.Download(t.Context(), request)
+			results <- concurrentResult{
+				name:    name,
+				content: content,
+				result:  result,
+				err:     err,
+			}
+		}()
+	}
+	close(start)
+	for range contents {
+		waitSignal(t, writesArrived)
+	}
+	close(releaseWrites)
+	for range contents {
+		got := waitValue(t, results)
+		if got.err != nil {
+			t.Fatalf("concurrent Download(%q) error = %v, want nil", got.name, got.err)
+		}
+		digest := sha256.Sum256(got.content)
+		wantResult := DownloadResult{
+			Path:   `C:\downloads\` + got.name,
+			Size:   int64(len(got.content)),
+			SHA256: hex.EncodeToString(digest[:]),
+		}
+		if got.result != wantResult {
+			t.Fatalf("concurrent Download(%q) result = %#v, want %#v", got.name, got.result, wantResult)
+		}
+		value, ok := created.Load(got.name)
+		if !ok {
+			t.Fatalf("session %q was not recorded", got.name)
+		}
+		session := value.(*recordingSession)
+		written, events, abortCalls := session.snapshot()
+		if !bytes.Equal(written, got.content) ||
+			strings.Join(events, ",") != "write,publish" ||
+			abortCalls != 0 {
+			t.Fatalf(
+				"session %q content/events/abort = %q/%q/%d, want %q/write,publish/0",
+				got.name,
+				written,
+				strings.Join(events, ","),
+				abortCalls,
+				got.content,
+			)
+		}
+	}
+}
+
+func TestDownloader_CleanupIgnoresOperationCancelAndPreservesValues(t *testing.T) {
+	content := []byte("abc")
+	session := successfulRecordingSession()
+	value := "cleanup-value"
+	abortObserved := make(chan struct{})
+	session.abort = func(ctx context.Context) (filesystem.AbortResult, error) {
+		if got := ctx.Value(cleanupValueKey{}); got != value {
+			t.Errorf("cleanup context value = %v, want %q", got, value)
+		}
+		if ctx.Err() != nil {
+			t.Errorf("cleanup context error = %v, want nil on entry", ctx.Err())
+		}
+		close(abortObserved)
+		return filesystem.AbortResult{Removed: true}, nil
+	}
+	doStarted := make(chan struct{})
+	client := &fakeHTTPClient{do: func(request *http.Request) (*http.Response, error) {
+		close(doStarted)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	}}
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	operationCtx, cancel := context.WithCancel(
+		context.WithValue(t.Context(), cleanupValueKey{}, value),
+	)
+	result := make(chan error, 1)
+	go func() {
+		_, err := downloader.Download(operationCtx, requestForBytes(content))
+		result <- err
+	}()
+	waitSignal(t, doStarted)
+	cancel()
+	err := waitValue(t, result)
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) || failure.Kind != FailureCancelled {
+		t.Fatalf("Download() error = %v, want FailureCancelled", err)
+	}
+	waitSignal(t, abortObserved)
+}
+
+func TestDownloader_CleanupErrorDoesNotReplaceMainFailure(t *testing.T) {
+	mainErr := errors.New("network-main-secret")
+	cleanupErr := errors.New("cleanup-secondary-secret")
+	session := successfulRecordingSession()
+	session.abortResult = filesystem.AbortResult{Removed: false}
+	session.abortErr = cleanupErr
+	client := &fakeHTTPClient{do: func(*http.Request) (*http.Response, error) {
+		return nil, mainErr
+	}}
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	_, err := downloader.Download(t.Context(), requestForBytes([]byte("abc")))
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) || failure.Kind != FailureNetwork {
+		t.Fatalf("Download() error = %v, want FailureNetwork", err)
+	}
+	if failure.CleanupErr == nil ||
+		!errors.Is(failure, mainErr) ||
+		!errors.Is(failure, cleanupErr) {
+		t.Fatalf("failure chains = %#v, want main and cleanup", failure)
+	}
+	text := failure.Error() + " " + errorText(failure.Err) + " " + errorText(failure.CleanupErr)
+	if strings.Contains(text, "secret") {
+		t.Fatalf("public error text leaked external message: %q", text)
+	}
+}
+
+func TestDownloader_RotatorAttemptReportRedactsDownloadFailure(
+	t *testing.T,
+) {
+	typedCause := &testTypedError{cause: errTestSecret}
+	client := &fakeHTTPClient{do: func(*http.Request) (*http.Response, error) {
+		return nil, &url.Error{
+			Op: "Get",
+			URL: "https://user:password@example.invalid/" +
+				"asset?token=url-secret#fragment",
+			Err: typedCause,
+		}
+	}}
+	downloader := downloaderForTransactionTest(
+		t,
+		successfulRecordingSession(),
+		client,
+		nil,
+	)
+	_, downloadErr := downloader.Download(
+		t.Context(),
+		requestForBytes([]byte("abc")),
+	)
+	var downloadFailure *DownloadFailure
+	var leakedURL *url.Error
+	if !errors.As(downloadErr, &downloadFailure) ||
+		downloadFailure.Kind != FailureNetwork ||
+		!errors.Is(downloadErr, errTestSecret) ||
+		errors.As(downloadErr, &leakedURL) {
+		t.Fatalf(
+			"Downloader error = %v, want sanitized network failure preserving typed cause",
+			downloadErr,
+		)
+	}
+
+	rotator, err := NewRotator(WithMaxSourceAttempts(1))
+	if err != nil {
+		t.Fatalf("NewRotator() error = %v", err)
+	}
+	catalog, err := DefaultCatalog()
+	if err != nil {
+		t.Fatalf("DefaultCatalog() error = %v", err)
+	}
+	policy, err := NewPolicy(PolicySpec{})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	plan, err := BuildPlan(catalog, policy, KindUV)
+	if err != nil {
+		t.Fatalf("BuildPlan() error = %v", err)
+	}
+	target, err := NewTarget(TargetSpec{
+		ProductVersion: "v5.3.0",
+		ReleaseBranch:  "release/v5.3.0",
+		UVVersion:      "0.8.12",
+		PythonVersion:  "3.12.10",
+		LockDigest:     strings.Repeat("a1", 32),
+	})
+	if err != nil {
+		t.Fatalf("NewTarget() error = %v", err)
+	}
+	result, err := rotator.Run(
+		t.Context(),
+		plan,
+		target,
+		func(context.Context, Attempt) AttemptOutcome {
+			return AttemptOutcome{
+				Kind:        OutcomeSwitchSource,
+				FailureKind: downloadFailure.Kind,
+				Err:         downloadFailure,
+			}
+		},
+	)
+	var rotationFailure *RotationError
+	var gotDownloadFailure *DownloadFailure
+	var gotTyped *testTypedError
+	if !errors.As(err, &rotationFailure) ||
+		!errors.As(err, &gotDownloadFailure) ||
+		gotDownloadFailure != downloadFailure ||
+		!errors.As(err, &gotTyped) ||
+		gotTyped != typedCause ||
+		!errors.Is(err, errTestSecret) {
+		t.Fatalf(
+			"Rotator error = %v, want RotationError and original typed downloader chain",
+			err,
+		)
+	}
+	publicTexts := []string{err.Error()}
+	for _, report := range result.Reports {
+		if report.FailureKind != FailureNetwork ||
+			report.Error != "attempt failed: network" {
+			t.Fatalf("AttemptReport = %#v, want stable network report", report)
+		}
+		publicTexts = append(publicTexts, report.Error)
+	}
+	for _, cause := range rotationFailure.Unwrap() {
+		publicTexts = append(publicTexts, cause.Error())
+	}
+	for _, text := range publicTexts {
+		for _, secret := range []string{
+			"user:password",
+			"url-secret",
+			"callback-secret",
+			"fragment",
+			"example.invalid",
+			"https://",
+		} {
+			if strings.Contains(text, secret) {
+				t.Fatalf("public Rotator text %q contains %q", text, secret)
+			}
+		}
+	}
+}
+
+func TestDownloader_CleanupDeadlinePreservesMainAndDeadline(t *testing.T) {
+	mainErr := errors.New("network failure")
+	session := successfulRecordingSession()
+	session.abort = func(ctx context.Context) (filesystem.AbortResult, error) {
+		<-ctx.Done()
+		return filesystem.AbortResult{Removed: false}, ctx.Err()
+	}
+	client := &fakeHTTPClient{do: func(*http.Request) (*http.Response, error) {
+		return nil, mainErr
+	}}
+	cleanup := func(operationCtx context.Context) (context.Context, context.CancelFunc) {
+		return context.WithDeadline(
+			context.WithoutCancel(operationCtx),
+			time.Unix(1, 0),
+		)
+	}
+	downloader := downloaderForTransactionTest(t, session, client, cleanup)
+	_, err := downloader.Download(t.Context(), requestForBytes([]byte("abc")))
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) || failure.Kind != FailureNetwork {
+		t.Fatalf("Download() error = %v, want FailureNetwork", err)
+	}
+	if !errors.Is(failure, mainErr) ||
+		!errors.Is(failure, context.DeadlineExceeded) {
+		t.Fatalf("failure = %#v, want main and cleanup deadline chains", failure)
+	}
+}
+
+type terminalBody struct {
+	content []byte
+	err     error
+	done    bool
+}
+
+func (b *terminalBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, io.EOF
+	}
+	b.done = true
+	return copy(p, b.content), b.err
+}
+
+func (b *terminalBody) Close() error {
+	return nil
+}
+
+type orderedBody struct {
+	reader *strings.Reader
+	events chan string
+}
+
+func (b *orderedBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *orderedBody) Close() error {
+	b.events <- "close"
+	return nil
+}
+
+func responseClient(
+	t *testing.T,
+	content []byte,
+	contentLength int64,
+	status int,
+) httpClient {
+	t.Helper()
+	return responseWithBodyClient(
+		t,
+		io.NopCloser(bytes.NewReader(content)),
+		contentLength,
+		status,
+	)
+}
+
+func responseWithBodyClient(
+	t *testing.T,
+	body io.ReadCloser,
+	contentLength int64,
+	status int,
+) httpClient {
+	t.Helper()
+	return &fakeHTTPClient{do: func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    status,
+			ContentLength: contentLength,
+			Body:          body,
+			Request:       request,
+		}, nil
+	}}
+}
+
+func successfulRecordingSession() *recordingSession {
+	return &recordingSession{
+		fakeDownloadSession: fakeDownloadSession{
+			path:     `C:\app\runtime\cache\downloads\uv.zip`,
+			partPath: `C:\app\runtime\cache\downloads\uv.zip.part`,
+		},
+		publishResult: filesystem.PublishResult{Published: true},
+		abortResult:   filesystem.AbortResult{Removed: true},
+	}
+}
+
+func downloaderForTransactionTest(
+	t *testing.T,
+	session downloadSession,
+	client httpClient,
+	cleanup cleanupContextFactory,
+) *Downloader {
+	t.Helper()
+	options, err := resolveDownloaderOptions(nil)
+	if err != nil {
+		t.Fatalf("resolveDownloaderOptions() error = %v, want nil", err)
+	}
+	dependencies := testDependencies(
+		&fakeSessionFactory{session: session},
+		client,
+	)
+	if cleanup != nil {
+		dependencies.cleanup = cleanup
+	}
+	downloader, err := newDownloaderWithDependencies(
+		testLayout(t),
+		options,
+		dependencies,
+	)
+	if err != nil {
+		t.Fatalf("newDownloaderWithDependencies() error = %v, want nil", err)
+	}
+	return downloader
+}
+
+func requestForBytes(content []byte) DownloadRequest {
+	digest := sha256.Sum256(content)
+	return DownloadRequest{
+		URL:            "https://downloads.example.invalid/uv.zip?signature=request-secret",
+		FileName:       "uv.zip",
+		ExpectedSize:   int64(len(content)),
+		ExpectedSHA256: hex.EncodeToString(digest[:]),
+	}
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
