@@ -271,6 +271,46 @@ type Downloader struct {
 	progressInterval time.Duration
 }
 
+// NewDownloader 创建构造后只读、可并发调用的 Downloader。
+func NewDownloader(
+	layout *config.Layout,
+	options ...DownloaderOption,
+) (*Downloader, error) {
+	if layout == nil {
+		return nil, fmt.Errorf("configure downloader layout: %w", ErrInvalidDownloaderOption)
+	}
+	resolved, err := resolveDownloaderOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	files, err := filesystem.NewDownloadFiles(layout)
+	if err != nil {
+		return nil, safeExternalError("create download files failed", err)
+	}
+	return newDownloaderWithDependencies(
+		layout,
+		resolved,
+		downloaderDependencies{
+			sessions: filesystemSessions{files: files},
+			client:   newDefaultHTTPClient(),
+			clock:    time.Now,
+			timers: func(delay time.Duration) timer {
+				return &runtimeTimer{timer: time.NewTimer(delay)}
+			},
+			cleanup: productionCleanupContext,
+		},
+	)
+}
+
+func productionCleanupContext(
+	operationCtx context.Context,
+) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(
+		context.WithoutCancel(operationCtx),
+		cleanupTimeout,
+	)
+}
+
 func newDownloaderWithDependencies(
 	layout *config.Layout,
 	options downloaderOptions,
