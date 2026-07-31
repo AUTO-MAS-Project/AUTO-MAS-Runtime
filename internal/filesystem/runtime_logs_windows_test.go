@@ -205,6 +205,256 @@ func TestRuntimeLogFiles_OpenAppendMatchesAccessMatrixAndParentIdentity(t *testi
 	}
 }
 
+func TestRuntimeLogFiles_OpenAppendClassifiesLeafReparseAfterTypeConstrainedOpenFailure(
+	t *testing.T,
+) {
+	files, _ := newRuntimeLogFixture(t)
+	files.api.openRelative = func(
+		windows.Handle,
+		string,
+		openSpec,
+	) (windows.Handle, error) {
+		return windows.InvalidHandle, windows.ERROR_ACCESS_DENIED
+	}
+
+	const probeHandle = windows.Handle(0x4242)
+	var got ntCreateSpec
+	probeCalls := 0
+	files.api.ntCreateRelative = func(
+		parent windows.Handle,
+		name string,
+		spec ntCreateSpec,
+	) (windows.Handle, error) {
+		probeCalls++
+		if parent != files.pins[2].handle {
+			t.Fatalf("classification parent = %#x, want pinned runtime-log parent %#x", parent, files.pins[2].handle)
+		}
+		if name == "" || filepath.Base(name) != name {
+			t.Fatalf("classification leaf = %q, want one relative name", name)
+		}
+		got = spec
+		return probeHandle, nil
+	}
+	identity := files.api.identity
+	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		if handle == probeHandle {
+			return objectIdentity{
+				attributes: windows.FILE_ATTRIBUTE_DIRECTORY |
+					windows.FILE_ATTRIBUTE_REPARSE_POINT,
+			}, nil
+		}
+		return identity(handle)
+	}
+	closeHandle := files.api.closeHandle
+	probeClosed := false
+	files.api.closeHandle = func(handle windows.Handle) error {
+		if handle == probeHandle {
+			probeClosed = true
+			return nil
+		}
+		return closeHandle(handle)
+	}
+
+	writer, err := files.OpenAppend(t.Context(), "sync", time.Now())
+	if writer != nil {
+		_ = writer.Close()
+		t.Fatal("OpenAppend() returned a writer through a reparse point")
+	}
+	assertFilesystemCode(t, err, protocol.CodeUnsafeReparsePoint)
+	if probeCalls != 1 {
+		t.Fatalf("classification probe calls = %d, want 1", probeCalls)
+	}
+	want := ntCreateSpec{
+		desiredAccess: windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		shareAccess: windows.FILE_SHARE_READ |
+			windows.FILE_SHARE_WRITE |
+			windows.FILE_SHARE_DELETE,
+		createDisposition: ntFileOpen,
+		createOptions: ntFileOpenReparsePoint |
+			ntFileSynchronousNonalert,
+	}
+	if got != want {
+		t.Fatalf("classification ntCreateSpec = %#v, want %#v", got, want)
+	}
+	if got.createOptions&(ntFileDirectoryFile|ntFileNonDirectoryFile) != 0 {
+		t.Fatalf("classification create options = %#x, want no type constraint", got.createOptions)
+	}
+	if !probeClosed {
+		t.Fatal("classification probe handle was not closed")
+	}
+}
+
+func TestRuntimeLogFiles_OpenAppendClassificationFailureMatrix(t *testing.T) {
+	originalErr := windows.ERROR_ACCESS_DENIED
+	probeOpenErr := errors.New("probe open failed")
+	identityErr := errors.New("probe identity failed")
+	closeErr := errors.New("probe close failed")
+	tests := []struct {
+		name              string
+		probeOpenErr      error
+		identity          objectIdentity
+		identityErr       error
+		closeErr          error
+		wantProbeOpenErr  bool
+		wantIdentityErr   bool
+		wantCloseErr      bool
+		wantUnsafeReparse bool
+		wantClosed        bool
+	}{
+		{
+			name:             "probe open failure",
+			probeOpenErr:     probeOpenErr,
+			wantProbeOpenErr: true,
+		},
+		{
+			name:            "probe identity failure",
+			identityErr:     identityErr,
+			wantIdentityErr: true,
+			wantClosed:      true,
+		},
+		{
+			name:       "ordinary object preserves original",
+			wantClosed: true,
+		},
+		{
+			name:         "ordinary object close failure",
+			closeErr:     closeErr,
+			wantCloseErr: true,
+			wantClosed:   true,
+		},
+		{
+			name: "reparse object close failure",
+			identity: objectIdentity{
+				attributes: windows.FILE_ATTRIBUTE_REPARSE_POINT,
+			},
+			closeErr:          closeErr,
+			wantCloseErr:      true,
+			wantUnsafeReparse: true,
+			wantClosed:        true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			files, _ := newRuntimeLogFixture(t)
+			files.api.openRelative = func(
+				windows.Handle,
+				string,
+				openSpec,
+			) (windows.Handle, error) {
+				return windows.InvalidHandle, originalErr
+			}
+
+			const probeHandle = windows.Handle(0x4343)
+			files.api.ntCreateRelative = func(
+				windows.Handle,
+				string,
+				ntCreateSpec,
+			) (windows.Handle, error) {
+				if test.probeOpenErr != nil {
+					return windows.InvalidHandle, test.probeOpenErr
+				}
+				return probeHandle, nil
+			}
+			identity := files.api.identity
+			files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+				if handle == probeHandle {
+					return test.identity, test.identityErr
+				}
+				return identity(handle)
+			}
+			closeHandle := files.api.closeHandle
+			closed := false
+			files.api.closeHandle = func(handle windows.Handle) error {
+				if handle == probeHandle {
+					closed = true
+					return test.closeErr
+				}
+				return closeHandle(handle)
+			}
+
+			writer, err := files.OpenAppend(t.Context(), "sync", time.Now())
+			if writer != nil {
+				_ = writer.Close()
+				t.Fatal("OpenAppend() returned a writer after append-open failure")
+			}
+			if !errors.Is(err, originalErr) {
+				t.Fatalf("OpenAppend() error = %v, want original append-open error", err)
+			}
+			if got := errors.Is(err, probeOpenErr); got != test.wantProbeOpenErr {
+				t.Fatalf("errors.Is(probeOpenErr) = %t, want %t", got, test.wantProbeOpenErr)
+			}
+			if got := errors.Is(err, identityErr); got != test.wantIdentityErr {
+				t.Fatalf("errors.Is(identityErr) = %t, want %t", got, test.wantIdentityErr)
+			}
+			if got := errors.Is(err, closeErr); got != test.wantCloseErr {
+				t.Fatalf("errors.Is(closeErr) = %t, want %t", got, test.wantCloseErr)
+			}
+			var stable *Error
+			gotUnsafeReparse := errors.As(err, &stable) &&
+				stable.Code() == protocol.CodeUnsafeReparsePoint
+			if gotUnsafeReparse != test.wantUnsafeReparse {
+				t.Fatalf(
+					"unsafe reparse classification = %t, want %t; error = %v",
+					gotUnsafeReparse,
+					test.wantUnsafeReparse,
+					err,
+				)
+			}
+			if closed != test.wantClosed {
+				t.Fatalf("classification probe closed = %t, want %t", closed, test.wantClosed)
+			}
+		})
+	}
+}
+
+func TestRuntimeLogFiles_OpenAppendDoesNotClassifyPostOpenValidationFailure(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	const leafHandle = windows.Handle(0x4444)
+	files.api.openRelative = func(
+		windows.Handle,
+		string,
+		openSpec,
+	) (windows.Handle, error) {
+		return leafHandle, nil
+	}
+	identityErr := errors.New("leaf identity failed")
+	identity := files.api.identity
+	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		if handle == leafHandle {
+			return objectIdentity{}, identityErr
+		}
+		return identity(handle)
+	}
+	closeHandle := files.api.closeHandle
+	files.api.closeHandle = func(handle windows.Handle) error {
+		if handle == leafHandle {
+			return nil
+		}
+		return closeHandle(handle)
+	}
+	probeCalls := 0
+	files.api.ntCreateRelative = func(
+		windows.Handle,
+		string,
+		ntCreateSpec,
+	) (windows.Handle, error) {
+		probeCalls++
+		return windows.InvalidHandle, errors.New("unexpected classification probe")
+	}
+
+	writer, err := files.OpenAppend(t.Context(), "sync", time.Now())
+	if writer != nil {
+		_ = writer.Close()
+		t.Fatal("OpenAppend() returned a writer after identity failure")
+	}
+	if !errors.Is(err, identityErr) {
+		t.Fatalf("OpenAppend() error = %v, want identity failure", err)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("classification probe calls = %d, want 0 after post-open failure", probeCalls)
+	}
+}
+
 func TestRuntimeLogWriter_WriteAndCloseUseStoredAPI(t *testing.T) {
 	files, _ := newRuntimeLogFixture(t)
 	writeCalls := 0

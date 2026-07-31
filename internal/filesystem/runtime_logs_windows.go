@@ -194,7 +194,16 @@ func (f *RuntimeLogFiles) OpenAppend(
 	}
 	leaf, err := openRelativeCheckedWith(context.WithoutCancel(ctx), f.pins[2], filepath.Base(path), spec, f.api)
 	if err != nil {
-		return nil, err
+		var fileErr *FileError
+		if !errors.As(err, &fileErr) || fileErr.Operation != "open-relative" {
+			return nil, err
+		}
+		return nil, classifyRuntimeLogOpenFailure(
+			f.pins[2],
+			filepath.Base(path),
+			err,
+			f.api,
+		)
 	}
 	if leaf.identity.numberOfLinks != 1 {
 		closeErr := f.api.closeHandle(leaf.handle)
@@ -222,6 +231,52 @@ func (f *RuntimeLogFiles) OpenAppend(
 		file: leaf,
 		pins: [3]pinnedObject{writerPins[0], writerPins[1], writerPins[2]},
 	}, nil
+}
+
+// classifyRuntimeLogOpenFailure 只在类型约束阻止取得 append handle 后识别叶节点 Reparse Point。
+func classifyRuntimeLogOpenFailure(
+	parent pinnedObject,
+	name string,
+	openErr error,
+	api pathAPI,
+) error {
+	path := filepath.Join(parent.path.String(), name)
+	spec := ntCreateSpec{
+		desiredAccess: windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		shareAccess: windows.FILE_SHARE_READ |
+			windows.FILE_SHARE_WRITE |
+			windows.FILE_SHARE_DELETE,
+		createDisposition: ntFileOpen,
+		createOptions: ntFileOpenReparsePoint |
+			ntFileSynchronousNonalert,
+	}
+	handle, err := api.ntCreateRelative(parent.handle, name, spec)
+	if err != nil {
+		return errors.Join(
+			openErr,
+			&FileError{Operation: "classify-reparse-open", Path: path, Err: err},
+		)
+	}
+	identity, identityErr := api.identity(handle)
+	closeErr := api.closeHandle(handle)
+	if identityErr != nil {
+		return errors.Join(
+			openErr,
+			&FileError{Operation: "classify-reparse-identify", Path: path, Err: identityErr},
+			wrapFileError("classify-reparse-close", path, closeErr),
+		)
+	}
+	if identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errors.Join(
+			unsafeReparseError(path),
+			openErr,
+			wrapFileError("classify-reparse-close", path, closeErr),
+		)
+	}
+	return errors.Join(
+		openErr,
+		wrapFileError("classify-reparse-close", path, closeErr),
+	)
 }
 
 // List 返回 Runtime 日志目录中已经按对象身份验证的直接日志文件令牌。
