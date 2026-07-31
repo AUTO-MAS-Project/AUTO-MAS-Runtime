@@ -72,6 +72,7 @@ type StateFiles struct {
 	layout      *config.Layout
 	api         pathAPI
 	waitGate    WaitFunc
+	fillNonce   func([]byte) error
 	owner       *stateFileOwner
 	pins        [2]pinnedObject
 	probePassed map[StateFileKind]bool

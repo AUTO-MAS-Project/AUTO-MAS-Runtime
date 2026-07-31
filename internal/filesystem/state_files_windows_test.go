@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -339,6 +341,7 @@ func TestStateFiles_ReadIntentABADoesNotReturnNotFound(t *testing.T) {
 							return ctx.Err()
 						}
 					},
+					fillNonce: fillCryptoNonce,
 				},
 			)
 			if err != nil {
@@ -896,6 +899,29 @@ func TestStateFiles_RecoveryMatrix(t *testing.T) {
 			MaxStateFileBytes,
 		); err == nil || errors.Is(err, ErrStateFileNotFound) {
 			t.Fatalf("Read() error = %v, want non-missing recovery failure", err)
+		}
+	})
+
+	t.Run("WriteAtomic recovers pre-commit gap before next write", func(t *testing.T) {
+		files, layout := newStateFilesFixture(t)
+		fixture := newSealedStateFixture(t, files, layout, StateBackend, []byte("old"), []byte("new"))
+		fixture.installOldAtBackup(t)
+		fixture.installNewAtTemp(t)
+		fixture.publishIntent(t)
+
+		result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("next"))
+		if err != nil {
+			t.Fatalf("WriteAtomic() error = %v", err)
+		}
+		if result != (WriteAtomicResult{MutationApplied: true}) {
+			t.Fatalf("WriteAtomic() result = %#v, want applied without recovery", result)
+		}
+		snapshot, err := files.Read(t.Context(), StateBackend, MaxStateFileBytes)
+		if err != nil {
+			t.Fatalf("Read() after recovery error = %v", err)
+		}
+		if got := snapshot.Bytes(); !bytes.Equal(got, []byte("next")) {
+			t.Fatalf("Read() after recovery = %q, want next", got)
 		}
 	})
 }
@@ -1536,7 +1562,7 @@ func TestNewStateFiles_VerificationFailureDoesNotRemoveCreatedDirectory(t *testi
 			files, err := newStateFilesWithDependencies(
 				t.Context(),
 				layout,
-				stateFileDependencies{api: api, waitGate: defaultStateGateWait},
+				stateFileDependencies{api: api, waitGate: defaultStateGateWait, fillNonce: fillCryptoNonce},
 			)
 			if files != nil || err == nil {
 				t.Fatalf("constructor = %#v, %v, want nil/error", files, err)
@@ -1595,7 +1621,7 @@ func TestStateFiles_ReadContextsRejectedBeforeIO(t *testing.T) {
 	if files, err := newStateFilesWithDependencies(
 		nil,
 		layout,
-		stateFileDependencies{api: api, waitGate: defaultStateGateWait},
+		stateFileDependencies{api: api, waitGate: defaultStateGateWait, fillNonce: fillCryptoNonce},
 	); files != nil || !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("nil-context constructor = %#v, %v, want nil/ErrInvalidArgument", files, err)
 	}
@@ -1604,7 +1630,7 @@ func TestStateFiles_ReadContextsRejectedBeforeIO(t *testing.T) {
 	if files, err := newStateFilesWithDependencies(
 		ctx,
 		layout,
-		stateFileDependencies{api: api, waitGate: defaultStateGateWait},
+		stateFileDependencies{api: api, waitGate: defaultStateGateWait, fillNonce: fillCryptoNonce},
 	); files != nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-cancel constructor = %#v, %v, want nil/context.Canceled", files, err)
 	}
@@ -1642,6 +1668,1305 @@ func TestStateFiles_ReadContextsRejectedBeforeIO(t *testing.T) {
 	}
 }
 
+func TestStateFiles_WriteAtomicRejectsEmptyAndOversizeBeforeIO(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	var calls atomic.Int32
+	files.api.ntCreateRelative = func(windows.Handle, string, ntCreateSpec) (windows.Handle, error) {
+		calls.Add(1)
+		return windows.InvalidHandle, errors.New("unexpected gate I/O")
+	}
+	files.api.openRelative = func(windows.Handle, string, openSpec) (windows.Handle, error) {
+		calls.Add(1)
+		return windows.InvalidHandle, errors.New("unexpected leaf I/O")
+	}
+	files.api.writeFile = func(windows.Handle, []byte) (int, error) {
+		calls.Add(1)
+		return 0, errors.New("unexpected write I/O")
+	}
+	files.api.setStateDisposition = func(windows.Handle, stateDispositionSpec) error {
+		calls.Add(1)
+		return errors.New("unexpected disposition I/O")
+	}
+	files.api.renameState = func(windows.Handle, windows.Handle, string, uint32) error {
+		calls.Add(1)
+		return errors.New("unexpected rename I/O")
+	}
+
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		kind    StateFileKind
+		payload []byte
+		want    error
+	}{
+		{name: "nil context", kind: StateBackend, payload: []byte("value"), want: ErrInvalidArgument},
+		{name: "nil payload", ctx: t.Context(), kind: StateBackend, want: ErrInvalidArgument},
+		{name: "empty payload", ctx: t.Context(), kind: StateBackend, payload: []byte{}, want: ErrInvalidArgument},
+		{name: "oversize", ctx: t.Context(), kind: StateBackend, payload: make([]byte, MaxStateFileBytes+1), want: ErrInvalidArgument},
+		{name: "invalid kind", ctx: t.Context(), kind: StateFileKind("foreign"), payload: []byte("value"), want: ErrInvalidArgument},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := files.WriteAtomic(test.ctx, test.kind, test.payload)
+			if result != (WriteAtomicResult{}) || !errors.Is(err, test.want) {
+				t.Fatalf("WriteAtomic() = %#v, %v, want zero/%v", result, err, test.want)
+			}
+		})
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("I/O calls = %d, want 0", got)
+	}
+}
+
+func TestStateFiles_WriteAtomicCopiesCallerPayload(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	payload := []byte("caller-owned")
+	result, err := files.WriteAtomic(t.Context(), StateBackend, payload)
+	if err != nil {
+		t.Fatalf("WriteAtomic() error = %v", err)
+	}
+	if result != (WriteAtomicResult{MutationApplied: true}) {
+		t.Fatalf("WriteAtomic() result = %#v, want applied without recovery", result)
+	}
+	payload[0] ^= 0xff
+	snapshot, err := files.Read(t.Context(), StateBackend, MaxStateFileBytes)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := snapshot.Bytes(); !bytes.Equal(got, []byte("caller-owned")) {
+		t.Fatalf("Read() = %q, want caller-owned", got)
+	}
+}
+
+func TestStateFiles_WriteAtomicReturnsTypedStateWriteErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		phase StateWritePhase
+		setup func(t *testing.T, files *StateFiles, layout *config.Layout)
+	}{
+		{
+			name:  "recover",
+			phase: StateWritePhaseRecover,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				files.api.ntCreateRelative = func(windows.Handle, string, ntCreateSpec) (windows.Handle, error) {
+					return windows.InvalidHandle, errors.New("injected recover failure")
+				}
+			},
+		},
+		{
+			name:  "create",
+			phase: StateWritePhaseCreate,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("prime")); err != nil {
+					t.Fatalf("prime WriteAtomic() error = %v", err)
+				}
+				openRelative := files.api.openRelative
+				files.api.openRelative = func(parent windows.Handle, name string, spec openSpec) (windows.Handle, error) {
+					if spec.creation == windows.CREATE_NEW {
+						return windows.InvalidHandle, errors.New("injected create failure")
+					}
+					return openRelative(parent, name, spec)
+				}
+			},
+		},
+		{
+			name:  "write",
+			phase: StateWritePhaseWrite,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("prime")); err != nil {
+					t.Fatalf("prime WriteAtomic() error = %v", err)
+				}
+				files.api.writeFile = func(windows.Handle, []byte) (int, error) {
+					return 0, errors.New("injected write failure")
+				}
+			},
+		},
+		{
+			name:  "sync",
+			phase: StateWritePhaseSync,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("prime")); err != nil {
+					t.Fatalf("prime WriteAtomic() error = %v", err)
+				}
+				files.api.flushFile = func(windows.Handle) error {
+					return errors.New("injected sync failure")
+				}
+			},
+		},
+		{
+			name:  "rename",
+			phase: StateWritePhaseRename,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("prime")); err != nil {
+					t.Fatalf("prime WriteAtomic() error = %v", err)
+				}
+				files.api.renameState = func(windows.Handle, windows.Handle, string, uint32) error {
+					return errors.New("injected rename failure")
+				}
+			},
+		},
+		{
+			name:  "finalize",
+			phase: StateWritePhaseFinalize,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("prime")); err != nil {
+					t.Fatalf("prime WriteAtomic() error = %v", err)
+				}
+				files.api.setStateDisposition = func(windows.Handle, stateDispositionSpec) error {
+					return errors.New("injected finalize failure")
+				}
+			},
+		},
+		{
+			name:  "close",
+			phase: StateWritePhaseClose,
+			setup: func(t *testing.T, files *StateFiles, _ *config.Layout) {
+				t.Helper()
+				ntCreateRelative := files.api.ntCreateRelative
+				var guardHandle windows.Handle
+				files.api.ntCreateRelative = func(
+					parent windows.Handle,
+					name string,
+					spec ntCreateSpec,
+				) (windows.Handle, error) {
+					handle, err := ntCreateRelative(parent, name, spec)
+					if err == nil && name == stateGuardLeaf(StateBackend) {
+						guardHandle = handle
+					}
+					return handle, err
+				}
+				closeHandle := files.api.closeHandle
+				var injected atomic.Bool
+				files.api.closeHandle = func(handle windows.Handle) error {
+					err := closeHandle(handle)
+					if handle == guardHandle &&
+						injected.CompareAndSwap(false, true) {
+						return errors.Join(errors.New("injected close failure"), err)
+					}
+					return err
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			files, layout := newStateFilesFixture(t)
+			test.setup(t, files, layout)
+			result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("next"))
+			var writeErr *StateWriteError
+			if !errors.As(err, &writeErr) {
+				t.Fatalf("WriteAtomic() error = %v, want *StateWriteError", err)
+			}
+			if writeErr.Phase != test.phase {
+				t.Fatalf(
+					"StateWriteError.Phase = %s, want %s; error = %v",
+					writeErr.Phase,
+					test.phase,
+					err,
+				)
+			}
+			if result.MutationApplied != writeErr.MutationApplied ||
+				result.RecoveryRequired != writeErr.RecoveryRequired {
+				t.Fatalf("result/error facts differ: %#v / %#v", result, writeErr)
+			}
+			if writeErr.Cause == nil && writeErr.CleanupError == nil {
+				t.Fatal("StateWriteError lost both error chains")
+			}
+		})
+	}
+}
+
+func TestStateFiles_IntentPublicationIsSealedAndNoReplace(t *testing.T) {
+	t.Run("published intent is canonical and rename flags are zero", func(t *testing.T) {
+		files, layout := newStateFilesFixture(t)
+		if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+			t.Fatalf("initial WriteAtomic() error = %v", err)
+		}
+		renameState := files.api.renameState
+		var sawIntent atomic.Bool
+		files.api.renameState = func(source windows.Handle, parent windows.Handle, name string, flags uint32) error {
+			if flags != 0 {
+				t.Fatalf("rename flags = %#x, want 0", flags)
+			}
+			if name == stateIntentLeaf(StateBackend) {
+				if _, err := windows.SetFilePointer(source, 0, nil, windows.FILE_BEGIN); err != nil {
+					t.Fatalf("rewind sealed staging intent error = %v", err)
+				}
+				payload := make([]byte, maxStateIntentBytes+1)
+				total := 0
+				for total < len(payload) {
+					n, err := files.api.readFile(source, payload[total:])
+					if err != nil {
+						t.Fatalf("read sealed staging intent error = %v", err)
+					}
+					total += n
+					if n == 0 {
+						break
+					}
+				}
+				if _, err := decodeStateIntent(payload[:total]); err != nil {
+					t.Fatalf("decode sealed staging intent error = %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(layout.StateDir(), name)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("fixed intent before publication error = %v, want not-exist", err)
+				}
+				sawIntent.Store(true)
+			}
+			return renameState(source, parent, name, flags)
+		}
+		if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new")); err != nil {
+			t.Fatalf("replacement WriteAtomic() error = %v", err)
+		}
+		if !sawIntent.Load() {
+			t.Fatal("sealed intent publication was not observed")
+		}
+	})
+
+	t.Run("existing fixed intent is never replaced", func(t *testing.T) {
+		files, layout := newStateFilesFixture(t)
+		if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+			t.Fatalf("initial WriteAtomic() error = %v", err)
+		}
+		intentPath := filepath.Join(layout.StateDir(), stateIntentLeaf(StateBackend))
+		competitor := []byte("competitor")
+		if err := os.WriteFile(intentPath, competitor, 0o600); err != nil {
+			t.Fatalf("write competitor intent error = %v", err)
+		}
+		before := identityForPath(t, files, intentPath)
+		result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new"))
+		if err == nil || result.MutationApplied {
+			t.Fatalf("WriteAtomic() = %#v, %v, want pre-commit failure", result, err)
+		}
+		after := identityForPath(t, files, intentPath)
+		got, readErr := os.ReadFile(intentPath)
+		if readErr != nil || !bytes.Equal(got, competitor) || before.fileID != after.fileID {
+			t.Fatalf("competitor intent changed: bytes %q/%v, identity %#v -> %#v", got, readErr, before, after)
+		}
+	})
+}
+
+func TestStateFiles_RecoveryNeverOverwritesForeignObjects(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+		t.Fatalf("initial WriteAtomic() error = %v", err)
+	}
+	alias := filepath.Join(t.TempDir(), "old.alias")
+	if err := os.Link(layout.BackendStateFile(), alias); err != nil {
+		t.Skipf("hard-link fixture unavailable: %v", err)
+	}
+	before := identityForPath(t, files, layout.BackendStateFile())
+	beforeBytes, err := os.ReadFile(layout.BackendStateFile())
+	if err != nil {
+		t.Fatalf("read old destination error = %v", err)
+	}
+	result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new"))
+	if err == nil || result.MutationApplied {
+		t.Fatalf("WriteAtomic() = %#v, %v, want hard-link pre-commit failure", result, err)
+	}
+	after := identityForPath(t, files, layout.BackendStateFile())
+	afterBytes, readErr := os.ReadFile(layout.BackendStateFile())
+	if readErr != nil || before.fileID != after.fileID || !bytes.Equal(beforeBytes, afterBytes) {
+		t.Fatalf("foreign object changed: bytes %q/%v, identity %#v -> %#v", afterBytes, readErr, before, after)
+	}
+}
+
+func TestStateFiles_ConcurrentWriterCannotTreatGapAsAbsent(t *testing.T) {
+	layout := newStateFilesTestLayout(t)
+	first, err := NewStateFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("first NewStateFiles() error = %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := NewStateFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("second NewStateFiles() error = %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if _, err := first.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+		t.Fatalf("initial WriteAtomic() error = %v", err)
+	}
+	renameState := first.api.renameState
+	gapEntered := make(chan struct{})
+	releaseGap := make(chan struct{})
+	first.api.renameState = func(source windows.Handle, parent windows.Handle, name string, flags uint32) error {
+		sourcePath, pathErr := first.api.finalPath(source)
+		err := renameState(source, parent, name, flags)
+		if err == nil && pathErr == nil &&
+			filepath.Base(sourcePath) == filepath.Base(layout.BackendStateFile()) &&
+			strings.Contains(name, ".backup.") {
+			close(gapEntered)
+			select {
+			case <-releaseGap:
+			case <-t.Context().Done():
+				return t.Context().Err()
+			}
+		}
+		return err
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, writeErr := first.WriteAtomic(t.Context(), StateBackend, []byte("first"))
+		firstDone <- writeErr
+	}()
+	waitStateTestSignal(t, gapEntered, "first writer raw gap")
+	secondDone := make(chan error, 1)
+	go func() {
+		_, writeErr := second.WriteAtomic(t.Context(), StateBackend, []byte("second"))
+		secondDone <- writeErr
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second writer crossed exclusive guard early: %v", err)
+	default:
+	}
+	close(releaseGap)
+	if err := waitStateTestResult(t, firstDone, "first writer completion"); err != nil {
+		t.Fatalf("first WriteAtomic() error = %v", err)
+	}
+	if err := waitStateTestResult(t, secondDone, "second writer completion"); err != nil {
+		t.Fatalf("second WriteAtomic() error = %v", err)
+	}
+	snapshot, err := second.Read(t.Context(), StateBackend, MaxStateFileBytes)
+	if err != nil || !bytes.Equal(snapshot.Bytes(), []byte("second")) {
+		t.Fatalf("final Read() = %q, %v, want second", snapshot.Bytes(), err)
+	}
+}
+
+func TestStateFiles_FinalizeDeletesBackupBeforeIntent(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+
+	probeAnchorSpec := ntCreateSpec{
+		desiredAccess: windows.FILE_READ_DATA |
+			windows.FILE_WRITE_DATA |
+			windows.FILE_READ_ATTRIBUTES |
+			windows.DELETE |
+			windows.SYNCHRONIZE,
+		shareAccess:       windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE,
+		createDisposition: ntFileCreate,
+		createOptions: ntFileOpenReparsePoint |
+			ntFileNonDirectoryFile |
+			ntFileSynchronousNonalert |
+			ntFileDeleteOnClose,
+	}
+	existingAnchorSpec := openSpec{
+		access: windows.FILE_READ_DATA |
+			windows.FILE_READ_ATTRIBUTES |
+			windows.DELETE |
+			windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+	createAnchorSpec := existingAnchorSpec
+	createAnchorSpec.access |= windows.FILE_WRITE_DATA
+	createAnchorSpec.creation = windows.CREATE_NEW
+	unlinkSpec := openSpec{
+		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+
+	type unlinkHandle struct {
+		leaf   string
+		anchor windows.Handle
+	}
+	var mu sync.Mutex
+	events := make([]string, 0, 15)
+	anchorsByID := make(map[[16]byte]windows.Handle)
+	anchorLeaf := make(map[windows.Handle]string)
+	unlinkHandles := make(map[windows.Handle]unlinkHandle)
+	unlinkClosed := make(map[string]bool)
+	absentProved := make(map[string]bool)
+	seenProbeAnchor := false
+	seenExistingAnchor := false
+	seenCreateAnchor := false
+
+	recordAnchor := func(t *testing.T, handle windows.Handle) {
+		t.Helper()
+		identity, err := files.api.identity(handle)
+		if err != nil {
+			t.Fatalf("anchor identity error = %v", err)
+		}
+		mu.Lock()
+		anchorsByID[identity.fileID] = handle
+		mu.Unlock()
+	}
+
+	ntCreateRelative := files.api.ntCreateRelative
+	files.api.ntCreateRelative = func(
+		parent windows.Handle,
+		name string,
+		spec ntCreateSpec,
+	) (windows.Handle, error) {
+		handle, err := ntCreateRelative(parent, name, spec)
+		if err == nil && strings.Contains(name, ".probe.") {
+			if spec != probeAnchorSpec {
+				t.Fatalf("probe anchor spec = %#v, want %#v", spec, probeAnchorSpec)
+			}
+			mu.Lock()
+			seenProbeAnchor = true
+			mu.Unlock()
+			recordAnchor(t, handle)
+		}
+		return handle, err
+	}
+
+	openRelative := files.api.openRelative
+	files.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		handle, err := openRelative(parent, name, spec)
+		switch {
+		case spec.access&windows.DELETE != 0 &&
+			spec.access&windows.FILE_READ_DATA != 0 &&
+			spec.creation == windows.OPEN_EXISTING:
+			if spec != existingAnchorSpec {
+				t.Fatalf("existing identity anchor spec for %q = %#v, want %#v", name, spec, existingAnchorSpec)
+			}
+			if err == nil {
+				mu.Lock()
+				seenExistingAnchor = true
+				mu.Unlock()
+				recordAnchor(t, handle)
+			}
+		case spec.access&windows.DELETE != 0 &&
+			spec.access&windows.FILE_WRITE_DATA != 0 &&
+			spec.creation == windows.CREATE_NEW:
+			if spec != createAnchorSpec {
+				t.Fatalf("created identity anchor spec for %q = %#v, want %#v", name, spec, createAnchorSpec)
+			}
+			if err == nil {
+				mu.Lock()
+				seenCreateAnchor = true
+				mu.Unlock()
+				recordAnchor(t, handle)
+			}
+		case spec == unlinkSpec:
+			if err == nil {
+				identity, identityErr := files.api.identity(handle)
+				if identityErr != nil {
+					t.Fatalf("unlink handle identity for %q error = %v", name, identityErr)
+				}
+				mu.Lock()
+				anchor, ok := anchorsByID[identity.fileID]
+				if !ok {
+					mu.Unlock()
+					t.Fatalf("unlink handle %q file ID %x has no matching identity anchor", name, identity.fileID)
+				}
+				anchorLeaf[anchor] = name
+				unlinkHandles[handle] = unlinkHandle{leaf: name, anchor: anchor}
+				mu.Unlock()
+			}
+		case spec == stateAbsenceProbeSpec() && err != nil && isWindowsNotFound(err):
+			mu.Lock()
+			if unlinkClosed[name] {
+				events = append(events, "absent:"+stateUnlinkTestRole(name))
+				absentProved[name] = true
+			}
+			mu.Unlock()
+		}
+		return handle, err
+	}
+
+	setDisposition := files.api.setStateDisposition
+	files.api.setStateDisposition = func(handle windows.Handle, spec stateDispositionSpec) error {
+		if spec != statePOSIXDispositionSpec() {
+			t.Fatalf("state disposition spec = %#v, want %#v", spec, statePOSIXDispositionSpec())
+		}
+		mu.Lock()
+		unlink, ok := unlinkHandles[handle]
+		if !ok {
+			mu.Unlock()
+			t.Fatalf("disposition handle %#x is not an independently opened U", handle)
+		}
+		events = append(events, "disposition:"+stateUnlinkTestRole(unlink.leaf))
+		mu.Unlock()
+		return setDisposition(handle, spec)
+	}
+
+	closeHandle := files.api.closeHandle
+	files.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		mu.Lock()
+		if unlink, ok := unlinkHandles[handle]; ok && err == nil {
+			events = append(events, "u-close:"+stateUnlinkTestRole(unlink.leaf))
+			unlinkClosed[unlink.leaf] = true
+			delete(unlinkHandles, handle)
+		}
+		mu.Unlock()
+		return err
+	}
+
+	identity := files.api.identity
+	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		got, err := identity(handle)
+		mu.Lock()
+		if leaf, ok := anchorLeaf[handle]; ok && absentProved[leaf] {
+			events = append(events, "anchor-identity:"+stateUnlinkTestRole(leaf))
+		}
+		mu.Unlock()
+		return got, err
+	}
+
+	readFile := files.api.readFile
+	files.api.readFile = func(handle windows.Handle, buffer []byte) (int, error) {
+		n, err := readFile(handle, buffer)
+		mu.Lock()
+		if leaf, ok := anchorLeaf[handle]; ok && absentProved[leaf] {
+			events = append(events, "anchor-read:"+stateUnlinkTestRole(leaf))
+		}
+		mu.Unlock()
+		return n, err
+	}
+
+	if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+		t.Fatalf("initial WriteAtomic() error = %v", err)
+	}
+	if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new")); err != nil {
+		t.Fatalf("replacement WriteAtomic() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !seenProbeAnchor || !seenExistingAnchor || !seenCreateAnchor {
+		t.Fatalf(
+			"identity anchor coverage = probe:%t existing:%t create:%t, want all true",
+			seenProbeAnchor,
+			seenExistingAnchor,
+			seenCreateAnchor,
+		)
+	}
+	for _, role := range []string{"probe", "backup", "intent"} {
+		want := []string{
+			"disposition:" + role,
+			"u-close:" + role,
+			"absent:" + role,
+			"anchor-identity:" + role,
+			"anchor-read:" + role,
+		}
+		position := -1
+		for _, event := range want {
+			next := slicesIndexAfter(events, event, position+1)
+			if next < 0 {
+				t.Fatalf("unlink events = %v, missing ordered event %q for %s", events, event, role)
+			}
+			position = next
+		}
+	}
+	backupAbsent := slicesIndexAfter(events, "absent:backup", 0)
+	intentDisposition := slicesIndexAfter(events, "disposition:intent", 0)
+	if backupAbsent < 0 || intentDisposition < 0 || backupAbsent >= intentDisposition {
+		t.Fatalf("unlink events = %v, want backup absent before intent disposition", events)
+	}
+}
+
+func stateUnlinkTestRole(leaf string) string {
+	switch {
+	case strings.Contains(leaf, ".probe."):
+		return "probe"
+	case strings.Contains(leaf, ".backup."):
+		return "backup"
+	case leaf == stateIntentLeaf(StateBackend):
+		return "intent"
+	default:
+		return leaf
+	}
+}
+
+func slicesIndexAfter(values []string, want string, start int) int {
+	for index := start; index < len(values); index++ {
+		if values[index] == want {
+			return index
+		}
+	}
+	return -1
+}
+
+func TestStateFiles_PostCommitFailureReportsAppliedAndRecovery(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+		t.Fatalf("initial WriteAtomic() error = %v", err)
+	}
+	injected := errors.New("injected post-commit disposition failure")
+	setDisposition := files.api.setStateDisposition
+	files.api.setStateDisposition = func(handle windows.Handle, spec stateDispositionSpec) error {
+		path, err := files.api.finalPath(handle)
+		if err == nil && strings.Contains(filepath.Base(path), ".backup.") {
+			return injected
+		}
+		return setDisposition(handle, spec)
+	}
+	result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new"))
+	var writeErr *StateWriteError
+	if result != (WriteAtomicResult{MutationApplied: true, RecoveryRequired: true}) ||
+		!errors.As(err, &writeErr) ||
+		writeErr.Phase != StateWritePhaseFinalize ||
+		!errors.Is(err, injected) {
+		t.Fatalf("WriteAtomic() = %#v, %v, want applied/recovery finalize error", result, err)
+	}
+	got, readErr := os.ReadFile(layout.BackendStateFile())
+	if readErr != nil || !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("destination after post-commit failure = %q, %v, want new", got, readErr)
+	}
+}
+
+func TestStateFiles_SourceHardLinkInjectionFailsClosed(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+		t.Fatalf("initial WriteAtomic() error = %v", err)
+	}
+	alias := filepath.Join(t.TempDir(), "backend.alias")
+	if err := os.Link(layout.BackendStateFile(), alias); err != nil {
+		t.Skipf("hard-link fixture unavailable: %v", err)
+	}
+	result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new"))
+	if err == nil || result.MutationApplied || !errors.Is(err, ErrUnsafeHardLink) {
+		t.Fatalf("WriteAtomic() = %#v, %v, want hard-link failure before commit", result, err)
+	}
+	got, readErr := os.ReadFile(layout.BackendStateFile())
+	if readErr != nil || !bytes.Equal(got, []byte("old")) {
+		t.Fatalf("destination after hard-link rejection = %q, %v, want old", got, readErr)
+	}
+}
+
+func TestStateFiles_WriteCancellationAfterRenameKeepsApplied(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("old")); err != nil {
+		t.Fatalf("initial WriteAtomic() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	renameState := files.api.renameState
+	files.api.renameState = func(source windows.Handle, parent windows.Handle, name string, flags uint32) error {
+		sourcePath, pathErr := files.api.finalPath(source)
+		err := renameState(source, parent, name, flags)
+		if err == nil && pathErr == nil &&
+			strings.Contains(filepath.Base(sourcePath), ".temp.") &&
+			name == filepath.Base(layout.BackendStateFile()) {
+			cancel()
+		}
+		return err
+	}
+	result, err := files.WriteAtomic(ctx, StateBackend, []byte("new"))
+	if err != nil || result != (WriteAtomicResult{MutationApplied: true}) {
+		t.Fatalf("WriteAtomic() = %#v, %v, want applied clean success", result, err)
+	}
+	got, readErr := os.ReadFile(layout.BackendStateFile())
+	if readErr != nil || !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("destination after commit cancellation = %q, %v, want new", got, readErr)
+	}
+}
+
+func TestStateFiles_POSIXUnlinkCapabilityAndExactFlags(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+	openRelative := files.api.openRelative
+	setDisposition := files.api.setStateDisposition
+	closeHandle := files.api.closeHandle
+	identity := files.api.identity
+	readFile := files.api.readFile
+	var unlinkOpens []openSpec
+	var dispositions []stateDispositionSpec
+	var events []string
+	var anchorHandle windows.Handle
+	var unlinkHandle windows.Handle
+	var anchorID [16]byte
+	var unlinkClosed bool
+	files.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		handle, err := openRelative(parent, name, spec)
+		if name != filepath.Base(layout.BackendStateFile()) {
+			return handle, err
+		}
+		switch {
+		case err == nil && spec == stateMutationOpenSpec():
+			anchorHandle = handle
+			value, identityErr := identity(handle)
+			if identityErr != nil {
+				t.Fatalf("anchor identity error = %v", identityErr)
+			}
+			anchorID = value.fileID
+		case err == nil && spec == stateUnlinkOpenSpec():
+			unlinkHandle = handle
+			unlinkOpens = append(unlinkOpens, spec)
+			value, identityErr := identity(handle)
+			if identityErr != nil {
+				t.Fatalf("unlink identity error = %v", identityErr)
+			}
+			if value.fileID != anchorID {
+				t.Fatalf("unlink file ID = %x, want anchor %x", value.fileID, anchorID)
+			}
+		case spec == stateAbsenceProbeSpec():
+			if !unlinkClosed {
+				t.Fatal("relative absence check happened before U close")
+			}
+			if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+				t.Fatalf("relative absence error = %v, want file not found", err)
+			}
+			events = append(events, "absent")
+		}
+		return handle, err
+	}
+	files.api.setStateDisposition = func(
+		handle windows.Handle,
+		spec stateDispositionSpec,
+	) error {
+		dispositions = append(dispositions, spec)
+		if handle == unlinkHandle {
+			events = append(events, "disposition")
+		}
+		return setDisposition(handle, spec)
+	}
+	files.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		if handle == unlinkHandle && err == nil {
+			unlinkClosed = true
+			events = append(events, "u-close")
+		}
+		return err
+	}
+	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		value, err := identity(handle)
+		if err == nil && handle == anchorHandle && unlinkClosed {
+			if value.fileID != anchorID {
+				t.Fatalf("anchor file ID after unlink = %x, want %x", value.fileID, anchorID)
+			}
+			events = append(events, "anchor-identity")
+		}
+		return value, err
+	}
+	files.api.readFile = func(handle windows.Handle, buffer []byte) (int, error) {
+		n, err := readFile(handle, buffer)
+		if handle == anchorHandle && unlinkClosed {
+			events = append(events, "anchor-read")
+		}
+		return n, err
+	}
+
+	result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+	if err != nil || result != (StateRemoveResult{MutationApplied: true}) {
+		t.Fatalf("RemoveTransactionIfUnchanged() = %#v, %v, want applied success", result, err)
+	}
+	if len(unlinkOpens) != 1 {
+		t.Fatalf("actual unlink opens = %d, want 1", len(unlinkOpens))
+	}
+	wantOpen := stateUnlinkOpenSpec()
+	if unlinkOpens[0] != wantOpen {
+		t.Fatalf("actual unlink open = %#v, want %#v", unlinkOpens[0], wantOpen)
+	}
+	if len(dispositions) != 1 || dispositions[0] != statePOSIXDispositionSpec() {
+		t.Fatalf("actual dispositions = %#v, want exact POSIX disposition", dispositions)
+	}
+	requiredOrder := []string{
+		"disposition",
+		"u-close",
+		"absent",
+		"anchor-identity",
+		"anchor-read",
+	}
+	previous := -1
+	for _, event := range requiredOrder {
+		index := slicesIndexAfter(events, event, previous+1)
+		if index < 0 {
+			t.Fatalf("events = %v, missing %q after index %d", events, event, previous)
+		}
+		previous = index
+	}
+	if _, err := os.Stat(layout.BackendStateFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination after remove error = %v, want not-exist", err)
+	}
+
+	t.Run("cached probe actual disposition failure is known not applied", func(t *testing.T) {
+		failingFiles, failingLayout := newStateFilesFixture(t)
+		failingSnapshot := writeAndReadStateSnapshot(
+			t,
+			failingFiles,
+			StateBackend,
+			[]byte("payload"),
+		)
+		injected := errors.New("injected disposition failure")
+		failingFiles.api.setStateDisposition = func(
+			windows.Handle,
+			stateDispositionSpec,
+		) error {
+			return injected
+		}
+		result, err := failingFiles.RemoveTransactionIfUnchanged(t.Context(), failingSnapshot)
+		if result != (StateRemoveResult{}) || !errors.Is(err, injected) {
+			t.Fatalf("known-not-applied remove = %#v, %v", result, err)
+		}
+		got, readErr := os.ReadFile(failingLayout.BackendStateFile())
+		if readErr != nil || !bytes.Equal(got, []byte("payload")) {
+			t.Fatalf("destination after failed disposition = %q, %v", got, readErr)
+		}
+	})
+
+	t.Run("unsupported probe leaves destination stable", func(t *testing.T) {
+		unsupportedFiles, unsupportedLayout := newStateFilesFixture(t)
+		unsupportedSnapshot := writeAndReadStateSnapshot(
+			t,
+			unsupportedFiles,
+			StateBackend,
+			[]byte("payload"),
+		)
+		unsupportedFiles.probePassed[StateBackend] = false
+		unsupportedFiles.api.setStateDisposition = func(
+			windows.Handle,
+			stateDispositionSpec,
+		) error {
+			return windows.ERROR_INVALID_PARAMETER
+		}
+		result, err := unsupportedFiles.RemoveTransactionIfUnchanged(
+			t.Context(),
+			unsupportedSnapshot,
+		)
+		if result != (StateRemoveResult{}) ||
+			!errors.Is(err, ErrPOSIXUnlinkUnsupported) {
+			t.Fatalf("unsupported remove = %#v, %v", result, err)
+		}
+		got, readErr := os.ReadFile(unsupportedLayout.BackendStateFile())
+		if readErr != nil || !bytes.Equal(got, []byte("payload")) {
+			t.Fatalf("destination after unsupported probe = %q, %v", got, readErr)
+		}
+	})
+
+	t.Run("U close ambiguity requires recovery", func(t *testing.T) {
+		ambiguousFiles, _ := newStateFilesFixture(t)
+		ambiguousSnapshot := writeAndReadStateSnapshot(
+			t,
+			ambiguousFiles,
+			StateBackend,
+			[]byte("payload"),
+		)
+		openRelative := ambiguousFiles.api.openRelative
+		closeHandle := ambiguousFiles.api.closeHandle
+		var unlinkHandle windows.Handle
+		ambiguousFiles.api.openRelative = func(
+			parent windows.Handle,
+			name string,
+			spec openSpec,
+		) (windows.Handle, error) {
+			handle, err := openRelative(parent, name, spec)
+			if err == nil && spec == stateUnlinkOpenSpec() {
+				unlinkHandle = handle
+			}
+			return handle, err
+		}
+		injected := errors.New("injected U close ambiguity")
+		ambiguousFiles.api.closeHandle = func(handle windows.Handle) error {
+			err := closeHandle(handle)
+			if handle == unlinkHandle {
+				return errors.Join(injected, err)
+			}
+			return err
+		}
+		result, err := ambiguousFiles.RemoveTransactionIfUnchanged(
+			t.Context(),
+			ambiguousSnapshot,
+		)
+		if result != (StateRemoveResult{RecoveryRequired: true}) ||
+			!errors.Is(err, injected) {
+			t.Fatalf("ambiguous U close remove = %#v, %v", result, err)
+		}
+	})
+}
+
+func TestStateFiles_ConditionalRemoveResultMatrix(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		files, _ := newStateFilesFixture(t)
+		snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		if err != nil || result != (StateRemoveResult{MutationApplied: true}) {
+			t.Fatalf("RemoveTransactionIfUnchanged() = %#v, %v, want applied success", result, err)
+		}
+	})
+
+	t.Run("clean mismatch", func(t *testing.T) {
+		files, _ := newStateFilesFixture(t)
+		snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("old"))
+		if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new")); err != nil {
+			t.Fatalf("replacement WriteAtomic() error = %v", err)
+		}
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		var removeErr *StateRemoveError
+		if result != (StateRemoveResult{}) || !errors.Is(err, ErrIdentityChanged) ||
+			errors.As(err, &removeErr) {
+			t.Fatalf("mismatch remove = %#v, %v, want bare identity mismatch", result, err)
+		}
+	})
+
+	t.Run("missing then guard close failure", func(t *testing.T) {
+		files, layout := newStateFilesFixture(t)
+		snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+		if err := os.Remove(layout.BackendStateFile()); err != nil {
+			t.Fatalf("os.Remove(destination) error = %v", err)
+		}
+		injectStateGuardCloseFailure(files, StateBackend, errors.New("injected guard close failure"))
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		if result != (StateRemoveResult{RecoveryRequired: true}) ||
+			err == nil {
+			t.Fatalf("missing remove with close failure = %#v, %v", result, err)
+		}
+	})
+
+	t.Run("mismatch then guard close failure", func(t *testing.T) {
+		files, _ := newStateFilesFixture(t)
+		snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("old"))
+		if _, err := files.WriteAtomic(t.Context(), StateBackend, []byte("new")); err != nil {
+			t.Fatalf("replacement WriteAtomic() error = %v", err)
+		}
+		injected := errors.New("injected guard close failure")
+		injectStateGuardCloseFailure(files, StateBackend, injected)
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		var removeErr *StateRemoveError
+		if result != (StateRemoveResult{RecoveryRequired: true}) ||
+			!errors.Is(err, ErrIdentityChanged) ||
+			!errors.Is(err, injected) ||
+			!errors.As(err, &removeErr) {
+			t.Fatalf("mismatch remove with close failure = %#v, %v", result, err)
+		}
+	})
+
+	t.Run("commit then guard close failure", func(t *testing.T) {
+		files, _ := newStateFilesFixture(t)
+		snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+		injected := errors.New("injected guard close failure")
+		injectStateGuardCloseFailure(files, StateBackend, injected)
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		if result != (StateRemoveResult{
+			MutationApplied:  true,
+			RecoveryRequired: true,
+		}) || !errors.Is(err, injected) {
+			t.Fatalf("committed remove with close failure = %#v, %v", result, err)
+		}
+	})
+}
+
+func TestStateFiles_ConditionalRemoveRecoversOrRefusesIntent(t *testing.T) {
+	t.Run("snapshot from backup is recovered before remove", func(t *testing.T) {
+		files, layout := newStateFilesFixture(t)
+		fixture := newSealedStateFixture(
+			t,
+			files,
+			layout,
+			StateBackend,
+			[]byte("old"),
+			[]byte("new"),
+		)
+		fixture.installOldAtBackup(t)
+		fixture.installNewAtTemp(t)
+		fixture.publishIntent(t)
+		snapshot, err := files.Read(t.Context(), StateBackend, MaxStateFileBytes)
+		if err != nil {
+			t.Fatalf("Read() from backup error = %v", err)
+		}
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		if err != nil || result != (StateRemoveResult{MutationApplied: true}) {
+			t.Fatalf("recovered remove = %#v, %v, want applied success", result, err)
+		}
+	})
+
+	t.Run("unsealed intent is refused", func(t *testing.T) {
+		files, layout := newStateFilesFixture(t)
+		snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("old"))
+		if err := os.WriteFile(
+			filepath.Join(layout.StateDir(), stateIntentLeaf(StateBackend)),
+			[]byte("foreign"),
+			0o600,
+		); err != nil {
+			t.Fatalf("os.WriteFile(foreign intent) error = %v", err)
+		}
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+		if !result.RecoveryRequired || result.MutationApplied || err == nil {
+			t.Fatalf("foreign intent remove = %#v, %v, want recovery failure", result, err)
+		}
+	})
+}
+
+func TestStateFiles_MissingRemoveDoesNotRequirePOSIXUnlink(t *testing.T) {
+	tests := []struct {
+		name    string
+		orphans bool
+	}{
+		{name: "clean missing"},
+		{name: "missing with orphans", orphans: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			files, layout := newStateFilesFixture(t)
+			snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+			if err := os.Remove(layout.BackendStateFile()); err != nil {
+				t.Fatalf("os.Remove(destination) error = %v", err)
+			}
+			var orphanPaths []string
+			if test.orphans {
+				orphanPaths = []string{
+					filepath.Join(layout.StateDir(), ".backend.temp-orphan"),
+					filepath.Join(layout.StateDir(), ".backend.intent-orphan"),
+				}
+				for _, path := range orphanPaths {
+					if err := os.WriteFile(path, []byte(filepath.Base(path)), 0o600); err != nil {
+						t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+					}
+				}
+			}
+			var dispositions atomic.Int32
+			files.api.setStateDisposition = func(windows.Handle, stateDispositionSpec) error {
+				dispositions.Add(1)
+				return ErrPOSIXUnlinkUnsupported
+			}
+			result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+			if err != nil || result != (StateRemoveResult{}) {
+				t.Fatalf("missing remove = %#v, %v, want idempotent success", result, err)
+			}
+			if got := dispositions.Load(); got != 0 {
+				t.Fatalf("disposition calls = %d, want 0", got)
+			}
+			for _, path := range orphanPaths {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("orphan %q changed: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestStateFiles_ConcurrentKindsSerializeProbeCache(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	backend := writeAndReadStateSnapshot(t, files, StateBackend, []byte("backend"))
+	if _, err := files.WriteAtomic(t.Context(), StateMutation, []byte("mutation")); err != nil {
+		t.Fatalf("mutation WriteAtomic() error = %v", err)
+	}
+	setDisposition := files.api.setStateDisposition
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	files.api.setStateDisposition = func(
+		handle windows.Handle,
+		spec stateDispositionSpec,
+	) error {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+		return setDisposition(handle, spec)
+	}
+	removeDone := make(chan error, 1)
+	go func() {
+		_, err := files.RemoveTransactionIfUnchanged(t.Context(), backend)
+		removeDone <- err
+	}()
+	waitStateTestSignal(t, entered, "backend remove disposition")
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := files.WriteAtomic(t.Context(), StateMutation, []byte("mutation-next"))
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		t.Fatalf("different-kind write escaped StateFiles lock: %v", err)
+	default:
+	}
+	close(release)
+	if err := waitStateTestResult(t, removeDone, "serialized remove"); err != nil {
+		t.Fatalf("RemoveTransactionIfUnchanged() error = %v", err)
+	}
+	if err := waitStateTestResult(t, writeDone, "serialized write"); err != nil {
+		t.Fatalf("WriteAtomic() error = %v", err)
+	}
+}
+
+func TestStateFiles_WriteAndRemoveRejectAfterClose(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+	if err := files.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	var ioCalls atomic.Int32
+	files.api.ntCreateRelative = func(windows.Handle, string, ntCreateSpec) (windows.Handle, error) {
+		ioCalls.Add(1)
+		return windows.InvalidHandle, errors.New("unexpected I/O")
+	}
+	writeResult, writeErr := files.WriteAtomic(t.Context(), StateBackend, []byte("next"))
+	removeResult, removeErr := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+	if writeResult != (WriteAtomicResult{}) || !errors.Is(writeErr, ErrClosed) {
+		t.Fatalf("WriteAtomic() after Close = %#v, %v", writeResult, writeErr)
+	}
+	if removeResult != (StateRemoveResult{}) || !errors.Is(removeErr, ErrClosed) {
+		t.Fatalf("RemoveTransactionIfUnchanged() after Close = %#v, %v", removeResult, removeErr)
+	}
+	if got := ioCalls.Load(); got != 0 {
+		t.Fatalf("I/O calls after Close = %d, want 0", got)
+	}
+}
+
+func TestStateFiles_RemoveCancellationAfterDispositionKeepsApplied(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+	ctx, cancel := context.WithCancel(t.Context())
+	setDisposition := files.api.setStateDisposition
+	files.api.setStateDisposition = func(
+		handle windows.Handle,
+		spec stateDispositionSpec,
+	) error {
+		err := setDisposition(handle, spec)
+		if err == nil {
+			cancel()
+		}
+		return err
+	}
+	result, err := files.RemoveTransactionIfUnchanged(ctx, snapshot)
+	if err != nil || result != (StateRemoveResult{MutationApplied: true}) {
+		t.Fatalf("remove after cancellation = %#v, %v, want applied success", result, err)
+	}
+	if _, err := os.Stat(layout.BackendStateFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination after cancellation error = %v, want not-exist", err)
+	}
+}
+
+func TestStateFiles_WriteAndRemoveContextsRejectedBeforeIO(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+	foreignFiles, _ := newStateFilesFixture(t)
+	foreignSnapshot := writeAndReadStateSnapshot(
+		t,
+		foreignFiles,
+		StateBackend,
+		[]byte("foreign"),
+	)
+	environmentSnapshot := writeAndReadStateSnapshot(
+		t,
+		files,
+		StateEnvironment,
+		[]byte("environment"),
+	)
+	var ioCalls atomic.Int32
+	files.api.ntCreateRelative = func(windows.Handle, string, ntCreateSpec) (windows.Handle, error) {
+		ioCalls.Add(1)
+		return windows.InvalidHandle, errors.New("unexpected I/O")
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	writeContexts := []context.Context{nil, canceled}
+	for _, ctx := range writeContexts {
+		if result, err := files.WriteAtomic(ctx, StateBackend, []byte("next")); err == nil ||
+			result != (WriteAtomicResult{}) {
+			t.Fatalf("WriteAtomic(%v) = %#v, %v, want pre-I/O error", ctx, result, err)
+		}
+	}
+	removeContexts := []context.Context{nil, canceled}
+	for _, ctx := range removeContexts {
+		if result, err := files.RemoveTransactionIfUnchanged(ctx, snapshot); err == nil ||
+			result != (StateRemoveResult{}) {
+			t.Fatalf("RemoveTransactionIfUnchanged(%v) = %#v, %v, want pre-I/O error", ctx, result, err)
+		}
+	}
+	tampered := snapshot
+	tampered.bytes = append([]byte(nil), snapshot.bytes...)
+	tampered.bytes[0] ^= 0xff
+	invalidSnapshots := []StateFileSnapshot{
+		{},
+		foreignSnapshot,
+		environmentSnapshot,
+		tampered,
+	}
+	for _, invalid := range invalidSnapshots {
+		result, err := files.RemoveTransactionIfUnchanged(t.Context(), invalid)
+		if result != (StateRemoveResult{}) || !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("RemoveTransactionIfUnchanged(invalid) = %#v, %v", result, err)
+		}
+	}
+	if got := ioCalls.Load(); got != 0 {
+		t.Fatalf("I/O calls = %d, want 0", got)
+	}
+}
+
+func TestWindows_StateGuardReleasedAtEveryCrashCutpoint(t *testing.T) {
+	if point := os.Getenv("AUTO_MAS_STATE_CRASH_POINT"); point != "" {
+		runStateRemoveCrashChild(t, point)
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	tests := []struct {
+		point       string
+		wantMissing bool
+	}{
+		{point: "before-disposition"},
+		{point: "after-disposition", wantMissing: true},
+		{point: "after-anchor-verification", wantMissing: true},
+	}
+	for _, test := range tests {
+		t.Run(test.point, func(t *testing.T) {
+			layout := newStateFilesTestLayout(t)
+			command := exec.Command(
+				executable,
+				"-test.run=^TestWindows_StateGuardReleasedAtEveryCrashCutpoint$",
+			)
+			command.Env = append(
+				os.Environ(),
+				"AUTO_MAS_STATE_CRASH_POINT="+test.point,
+				"AUTO_MAS_STATE_CRASH_ROOT="+layout.AppRoot(),
+			)
+			output, err := command.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != stateCrashExitCode {
+				t.Fatalf("crash child error = %v, output = %s", err, output)
+			}
+			files, err := NewStateFiles(t.Context(), layout)
+			if err != nil {
+				t.Fatalf("NewStateFiles() after crash error = %v", err)
+			}
+			guard, err := files.acquireStateGuard(t.Context(), StateBackend, stateGuardExclusive)
+			if err != nil {
+				closeErr := files.Close()
+				t.Fatalf("exclusive guard after crash error = %v; Close() error = %v", err, closeErr)
+			}
+			if err := files.closeStateObject(&guard); err != nil {
+				closeErr := files.Close()
+				t.Fatalf("guard close after crash error = %v; Close() error = %v", err, closeErr)
+			}
+			_, statErr := os.Stat(layout.BackendStateFile())
+			if test.wantMissing && !errors.Is(statErr, os.ErrNotExist) {
+				closeErr := files.Close()
+				t.Fatalf(
+					"destination after %s error = %v, want missing; Close() error = %v",
+					test.point,
+					statErr,
+					closeErr,
+				)
+			}
+			if !test.wantMissing && statErr != nil {
+				closeErr := files.Close()
+				t.Fatalf(
+					"destination after %s error = %v, want present; Close() error = %v",
+					test.point,
+					statErr,
+					closeErr,
+				)
+			}
+			if err := files.Close(); err != nil {
+				t.Fatalf("Close() after crash error = %v", err)
+			}
+		})
+	}
+}
+
 type stateTestLeaf int
 
 const (
@@ -1670,6 +2995,120 @@ type sealedStateFixture struct {
 	newProof         stateObjectProof
 	foreignIdentity  objectIdentity
 	foreignBytes     []byte
+}
+
+const stateCrashExitCode = 86
+
+func writeAndReadStateSnapshot(
+	t *testing.T,
+	files *StateFiles,
+	kind StateFileKind,
+	payload []byte,
+) StateFileSnapshot {
+	t.Helper()
+	if _, err := files.WriteAtomic(t.Context(), kind, payload); err != nil {
+		t.Fatalf("WriteAtomic(%s) error = %v", kind, err)
+	}
+	snapshot, err := files.Read(t.Context(), kind, MaxStateFileBytes)
+	if err != nil {
+		t.Fatalf("Read(%s) error = %v", kind, err)
+	}
+	return snapshot
+}
+
+func injectStateGuardCloseFailure(files *StateFiles, kind StateFileKind, injectedErr error) {
+	ntCreateRelative := files.api.ntCreateRelative
+	var guardHandle windows.Handle
+	files.api.ntCreateRelative = func(
+		parent windows.Handle,
+		name string,
+		spec ntCreateSpec,
+	) (windows.Handle, error) {
+		handle, err := ntCreateRelative(parent, name, spec)
+		if err == nil && name == stateGuardLeaf(kind) {
+			guardHandle = handle
+		}
+		return handle, err
+	}
+	closeHandle := files.api.closeHandle
+	var injected atomic.Bool
+	files.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		if handle == guardHandle && injected.CompareAndSwap(false, true) {
+			return errors.Join(injectedErr, err)
+		}
+		return err
+	}
+}
+
+func runStateRemoveCrashChild(t *testing.T, point string) {
+	t.Helper()
+	root := os.Getenv("AUTO_MAS_STATE_CRASH_ROOT")
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	files, err := NewStateFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("NewStateFiles() error = %v", err)
+	}
+	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+
+	openRelative := files.api.openRelative
+	closeHandle := files.api.closeHandle
+	setDisposition := files.api.setStateDisposition
+	identity := files.api.identity
+	var anchorHandle windows.Handle
+	var unlinkHandle windows.Handle
+	var unlinkClosed atomic.Bool
+	files.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		handle, openErr := openRelative(parent, name, spec)
+		if openErr == nil && name == filepath.Base(layout.BackendStateFile()) {
+			switch spec {
+			case stateMutationOpenSpec():
+				anchorHandle = handle
+			case stateUnlinkOpenSpec():
+				unlinkHandle = handle
+			}
+		}
+		return handle, openErr
+	}
+	files.api.setStateDisposition = func(
+		handle windows.Handle,
+		spec stateDispositionSpec,
+	) error {
+		if handle == unlinkHandle && point == "before-disposition" {
+			os.Exit(stateCrashExitCode)
+		}
+		err := setDisposition(handle, spec)
+		if err == nil && handle == unlinkHandle && point == "after-disposition" {
+			os.Exit(stateCrashExitCode)
+		}
+		return err
+	}
+	files.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		if handle == unlinkHandle && err == nil {
+			unlinkClosed.Store(true)
+		}
+		return err
+	}
+	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		value, identityErr := identity(handle)
+		if identityErr == nil &&
+			handle == anchorHandle &&
+			unlinkClosed.Load() &&
+			point == "after-anchor-verification" {
+			os.Exit(stateCrashExitCode)
+		}
+		return value, identityErr
+	}
+	_, err = files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+	t.Fatalf("RemoveTransactionIfUnchanged() returned at crash point %q: %v", point, err)
 }
 
 func newStateFilesTestLayout(t *testing.T) *config.Layout {

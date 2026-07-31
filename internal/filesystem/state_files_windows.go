@@ -3,7 +3,9 @@ package filesystem
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,11 +26,13 @@ const (
 
 	ntFileSupersede        = uint32(0x00000000)
 	ntFileSynchronousAlert = uint32(0x00000010)
+	ntFileDeleteOnClose    = uint32(0x00001000)
 )
 
 type stateFileDependencies struct {
-	api      pathAPI
-	waitGate WaitFunc
+	api       pathAPI
+	waitGate  WaitFunc
+	fillNonce func([]byte) error
 }
 
 type stateGuardMode uint8
@@ -76,16 +80,48 @@ type stateCandidate struct {
 	present bool
 }
 
+type stateUnlinkMutationError struct {
+	dispositionErr error
+	closeErr       error
+}
+
+func (e *stateUnlinkMutationError) Error() string {
+	return "state unlink mutation failed"
+}
+
+func (e *stateUnlinkMutationError) Unwrap() []error {
+	causes := make([]error, 0, 2)
+	if e.dispositionErr != nil {
+		causes = append(causes, e.dispositionErr)
+	}
+	if e.closeErr != nil {
+		causes = append(causes, e.closeErr)
+	}
+	return causes
+}
+
 // NewStateFiles 创建固定并验证 Runtime state 目录的能力。
 func NewStateFiles(ctx context.Context, layout *config.Layout) (*StateFiles, error) {
 	return newStateFilesWithDependencies(
 		ctx,
 		layout,
 		stateFileDependencies{
-			api:      newProductionPathAPI(),
-			waitGate: defaultStateGateWait,
+			api:       newProductionPathAPI(),
+			waitGate:  defaultStateGateWait,
+			fillNonce: fillCryptoNonce,
 		},
 	)
+}
+
+func fillCryptoNonce(buffer []byte) error {
+	n, err := rand.Read(buffer)
+	if err != nil {
+		return err
+	}
+	if n != len(buffer) {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }
 
 func newStateFilesWithDependencies(
@@ -93,7 +129,8 @@ func newStateFilesWithDependencies(
 	layout *config.Layout,
 	dependencies stateFileDependencies,
 ) (*StateFiles, error) {
-	if ctx == nil || layout == nil || !dependencies.api.valid() || dependencies.waitGate == nil {
+	if ctx == nil || layout == nil || !dependencies.api.valid() ||
+		dependencies.waitGate == nil || dependencies.fillNonce == nil {
 		return nil, fmt.Errorf("%w: invalid state-file dependencies", ErrInvalidArgument)
 	}
 	if err := ctx.Err(); err != nil {
@@ -162,6 +199,7 @@ func newStateFilesWithDependencies(
 		layout:      layout,
 		api:         api,
 		waitGate:    dependencies.waitGate,
+		fillNonce:   dependencies.fillNonce,
 		owner:       &stateFileOwner{marker: 1},
 		pins:        [2]pinnedObject{duplicates[0], duplicates[1]},
 		probePassed: make(map[StateFileKind]bool, 4),
@@ -277,6 +315,299 @@ func (f *StateFiles) Read(
 		return StateFileSnapshot{}, err
 	}
 	return f.readLocked(ctx, kind, maxBytes)
+}
+
+// WriteAtomic 在持久 exclusive guard 内以 sealed intent 和 no-replace rename 发布状态。
+func (f *StateFiles) WriteAtomic(
+	ctx context.Context,
+	kind StateFileKind,
+	payload []byte,
+) (WriteAtomicResult, error) {
+	if ctx == nil {
+		return WriteAtomicResult{}, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if !kind.Valid() || len(payload) == 0 || int64(len(payload)) > MaxStateFileBytes {
+		return WriteAtomicResult{}, fmt.Errorf("%w: invalid state write", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return WriteAtomicResult{}, err
+	}
+	payload = append([]byte(nil), payload...)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return WriteAtomicResult{}, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return WriteAtomicResult{}, err
+	}
+
+	guard, err := f.acquireStateGuard(ctx, kind, stateGuardExclusive)
+	if err != nil {
+		recoveryRequired := !errors.Is(err, context.Canceled) &&
+			!errors.Is(err, context.DeadlineExceeded)
+		return stateWriteFailure(
+			StateWritePhaseRecover,
+			false,
+			recoveryRequired,
+			err,
+			nil,
+		)
+	}
+	if err := f.ensurePOSIXUnlinkCapability(ctx, kind); err != nil {
+		closeErr := f.closeStateObject(&guard)
+		return stateWriteFailure(
+			StateWritePhaseRecover,
+			false,
+			true,
+			err,
+			closeErr,
+		)
+	}
+	if err := f.recoverStateNamespace(ctx, kind); err != nil {
+		closeErr := f.closeStateObject(&guard)
+		return stateWriteFailure(
+			StateWritePhaseRecover,
+			false,
+			true,
+			err,
+			closeErr,
+		)
+	}
+	return f.writeStateLocked(ctx, kind, payload, guard)
+}
+
+// RemoveTransactionIfUnchanged 仅在 snapshot 仍绑定当前正式对象时删除它。
+func (f *StateFiles) RemoveTransactionIfUnchanged(
+	ctx context.Context,
+	snapshot StateFileSnapshot,
+) (StateRemoveResult, error) {
+	if ctx == nil {
+		return StateRemoveResult{}, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if err := f.validateStateRemoveSnapshot(snapshot); err != nil {
+		return StateRemoveResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return StateRemoveResult{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return StateRemoveResult{}, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return StateRemoveResult{}, err
+	}
+
+	guard, err := f.acquireStateGuard(ctx, snapshot.kind, stateGuardExclusive)
+	if err != nil {
+		recoveryRequired := !errors.Is(err, context.Canceled) &&
+			!errors.Is(err, context.DeadlineExceeded)
+		return stateRemoveFailure(recoveryRequired, err, nil)
+	}
+	return f.removeStateLocked(ctx, snapshot, guard)
+}
+
+func (f *StateFiles) validateStateRemoveSnapshot(snapshot StateFileSnapshot) error {
+	if snapshot.owner == nil ||
+		snapshot.owner != f.owner ||
+		!snapshot.kind.Valid() ||
+		snapshot.kind == StateEnvironment ||
+		snapshot.size <= 0 ||
+		snapshot.size != int64(len(snapshot.bytes)) ||
+		snapshot.digest != sha256.Sum256(snapshot.bytes) {
+		return ErrInvalidToken
+	}
+	return nil
+}
+
+func (f *StateFiles) removeStateLocked(
+	ctx context.Context,
+	snapshot StateFileSnapshot,
+	guard pinnedObject,
+) (StateRemoveResult, error) {
+	intentLeaf := stateIntentLeaf(snapshot.kind)
+	intent, intentMissing, err := f.openStateMutationLeaf(ctx, intentLeaf)
+	if err != nil {
+		closeErr := f.closeStateObject(&guard)
+		return stateRemoveFailure(true, err, closeErr)
+	}
+	if !intentMissing {
+		if closeErr := f.closeStateObject(&intent); closeErr != nil {
+			return stateRemoveFailure(
+				true,
+				f.stateRecoveryError(intent.path.String(), closeErr),
+				f.closeStateObject(&guard),
+			)
+		}
+		if err := f.ensurePOSIXUnlinkCapability(ctx, snapshot.kind); err != nil {
+			return stateRemoveFailure(true, err, f.closeStateObject(&guard))
+		}
+		if err := f.recoverStateNamespace(ctx, snapshot.kind); err != nil {
+			return stateRemoveFailure(true, err, f.closeStateObject(&guard))
+		}
+	}
+
+	destinationPath, err := f.statePath(snapshot.kind)
+	if err != nil {
+		return stateRemoveFailure(true, err, f.closeStateObject(&guard))
+	}
+	destinationLeaf := filepath.Base(destinationPath)
+	destination, err := f.inspectStateMutationCandidate(ctx, destinationLeaf)
+	if err != nil {
+		return stateRemoveFailure(true, err, f.closeStateObject(&guard))
+	}
+	if !destination.present {
+		closeErr := f.closeStateObject(&guard)
+		if closeErr != nil {
+			return stateRemoveFailure(true, nil, closeErr)
+		}
+		return StateRemoveResult{}, nil
+	}
+	if !snapshotMatchesStateCandidate(snapshot, destination) {
+		closeErr := errors.Join(
+			f.closeCandidate(&destination),
+			f.closeStateObject(&guard),
+		)
+		if closeErr != nil {
+			return stateRemoveFailure(true, ErrIdentityChanged, closeErr)
+		}
+		return StateRemoveResult{}, ErrIdentityChanged
+	}
+	if err := ctx.Err(); err != nil {
+		closeErr := errors.Join(
+			f.closeCandidate(&destination),
+			f.closeStateObject(&guard),
+		)
+		if closeErr != nil {
+			return stateRemoveFailure(true, err, closeErr)
+		}
+		return StateRemoveResult{}, err
+	}
+	if err := f.ensurePOSIXUnlinkCapability(ctx, snapshot.kind); err != nil {
+		closeErr := errors.Join(
+			f.closeCandidate(&destination),
+			f.closeStateObject(&guard),
+		)
+		if closeErr != nil {
+			return stateRemoveFailure(true, err, closeErr)
+		}
+		return StateRemoveResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		closeErr := errors.Join(
+			f.closeCandidate(&destination),
+			f.closeStateObject(&guard),
+		)
+		if closeErr != nil {
+			return stateRemoveFailure(true, err, closeErr)
+		}
+		return StateRemoveResult{}, err
+	}
+
+	proof := stateObjectProof{
+		stateIdentityProof: proofIdentityValue(destination.object.identity),
+		Size:               destination.object.identity.size,
+		Digest:             destination.digest,
+	}
+	unlinkErr := f.unlinkStateObject(
+		context.WithoutCancel(ctx),
+		destinationLeaf,
+		&destination.object,
+		&proof,
+	)
+	if unlinkErr != nil {
+		knownNotApplied := false
+		var classificationErr error
+		var mutationErr *stateUnlinkMutationError
+		if errors.As(unlinkErr, &mutationErr) &&
+			mutationErr.dispositionErr != nil &&
+			mutationErr.closeErr == nil {
+			knownNotApplied, classificationErr = f.stateUnlinkKnownNotApplied(
+				context.WithoutCancel(ctx),
+				destinationLeaf,
+				snapshot,
+				&destination.object,
+				&proof,
+			)
+		}
+		closeErr := errors.Join(
+			classificationErr,
+			f.closeCandidate(&destination),
+			f.closeStateObject(&guard),
+		)
+		recoveryRequired := !knownNotApplied || closeErr != nil
+		return stateRemoveFailure(recoveryRequired, unlinkErr, closeErr)
+	}
+	closeErr := errors.Join(
+		f.closeCandidate(&destination),
+		f.closeStateObject(&guard),
+	)
+	if closeErr != nil {
+		return StateRemoveResult{
+				MutationApplied:  true,
+				RecoveryRequired: true,
+			},
+			&StateRemoveError{CleanupError: closeErr}
+	}
+	return StateRemoveResult{MutationApplied: true}, nil
+}
+
+func (f *StateFiles) stateUnlinkKnownNotApplied(
+	ctx context.Context,
+	leaf string,
+	snapshot StateFileSnapshot,
+	anchor *pinnedObject,
+	proof *stateObjectProof,
+) (bool, error) {
+	if err := f.verifyStateAnchorReadable(ctx, anchor, proof); err != nil {
+		return false, err
+	}
+	current, err := f.inspectStateMutationCandidate(ctx, leaf)
+	if err != nil || !current.present {
+		return false, err
+	}
+	matches := current.object.identity.volumeSerial == anchor.identity.volumeSerial &&
+		current.object.identity.fileID == anchor.identity.fileID &&
+		snapshotMatchesStateCandidate(snapshot, current)
+	closeErr := f.closeCandidate(&current)
+	if !matches {
+		return false, errors.Join(ErrIdentityChanged, closeErr)
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return true, nil
+}
+
+func snapshotMatchesStateCandidate(
+	snapshot StateFileSnapshot,
+	candidate stateCandidate,
+) bool {
+	return candidate.present &&
+		snapshot.volumeSerial == candidate.object.identity.volumeSerial &&
+		snapshot.fileID == candidate.object.identity.fileID &&
+		snapshot.size == candidate.object.identity.size &&
+		snapshot.digest == candidate.digest &&
+		bytes.Equal(snapshot.bytes, candidate.payload)
+}
+
+func stateRemoveFailure(
+	recoveryRequired bool,
+	cause error,
+	cleanupErr error,
+) (StateRemoveResult, error) {
+	result := StateRemoveResult{RecoveryRequired: recoveryRequired}
+	if cleanupErr == nil {
+		return result, cause
+	}
+	return result, &StateRemoveError{
+		Cause:        cause,
+		CleanupError: cleanupErr,
+	}
 }
 
 func (f *StateFiles) readLocked(
@@ -1094,6 +1425,1032 @@ func (f *StateFiles) readPinnedBytes(
 	}
 	payload := append([]byte(nil), buffer[:total]...)
 	return payload, sha256.Sum256(payload), nil
+}
+
+func stateWriteFailure(
+	phase StateWritePhase,
+	mutationApplied bool,
+	recoveryRequired bool,
+	cause error,
+	cleanupError error,
+) (WriteAtomicResult, error) {
+	result := WriteAtomicResult{
+		MutationApplied:  mutationApplied,
+		RecoveryRequired: recoveryRequired,
+	}
+	return result, &StateWriteError{
+		Phase:            phase,
+		MutationApplied:  result.MutationApplied,
+		RecoveryRequired: result.RecoveryRequired,
+		Cause:            cause,
+		CleanupError:     cleanupError,
+	}
+}
+
+func stateMutationOpenSpec() openSpec {
+	return openSpec{
+		access: windows.FILE_READ_DATA |
+			windows.FILE_READ_ATTRIBUTES |
+			windows.DELETE |
+			windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+}
+
+func stateMutationCreateSpec() openSpec {
+	spec := stateMutationOpenSpec()
+	spec.access |= windows.FILE_WRITE_DATA
+	spec.creation = windows.CREATE_NEW
+	return spec
+}
+
+func stateAbsenceProbeSpec() openSpec {
+	return openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+}
+
+func stateUnlinkOpenSpec() openSpec {
+	return openSpec{
+		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	}
+}
+
+func (f *StateFiles) newStateNonce() (string, error) {
+	bytesValue := make([]byte, stateIntentNonceLength/2)
+	if err := f.fillNonce(bytesValue); err != nil {
+		return "", fmt.Errorf("fill state nonce: %w", err)
+	}
+	return hex.EncodeToString(bytesValue), nil
+}
+
+func (f *StateFiles) validateOpenedStateObject(
+	ctx context.Context,
+	leaf string,
+	handle windows.Handle,
+) (pinnedObject, error) {
+	path := filepath.Join(f.pins[1].path.String(), leaf)
+	closeOnFailure := func(operationErr error) (pinnedObject, error) {
+		return pinnedObject{}, errors.Join(
+			operationErr,
+			wrapFileError("close", path, f.api.closeHandle(handle)),
+		)
+	}
+	identity, err := f.api.identity(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{Operation: "state-leaf-identify", Path: path, Err: err})
+	}
+	if err := validateOrdinaryStateIdentity(identity, f.pins[1].identity.volumeSerial); err != nil {
+		return closeOnFailure(&FileError{Operation: "state-leaf-identity", Path: path, Err: err})
+	}
+	finalPath, err := f.api.finalPath(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{Operation: "state-leaf-final-path", Path: path, Err: err})
+	}
+	canonical, err := canonicalizeContextWith(ctx, finalPath, f.api)
+	if err != nil {
+		return closeOnFailure(err)
+	}
+	expected, err := canonicalizeContextWith(ctx, path, f.api)
+	if err != nil {
+		return closeOnFailure(err)
+	}
+	if !canonical.Equal(expected) {
+		return closeOnFailure(&FileError{
+			Operation: "state-leaf-path",
+			Path:      path,
+			Err:       ErrIdentityChanged,
+		})
+	}
+	object := pinnedObject{path: canonical, handle: handle, identity: identity}
+	if err := validateParentIdentityWith(ctx, f.pins[1], object, f.api); err != nil {
+		return closeOnFailure(err)
+	}
+	return object, nil
+}
+
+func (f *StateFiles) createStateLeaf(
+	ctx context.Context,
+	leaf string,
+) (pinnedObject, error) {
+	if err := validateStateLeafName(leaf); err != nil {
+		return pinnedObject{}, err
+	}
+	object, err := openRelativeCheckedWith(
+		ctx,
+		f.pins[1],
+		leaf,
+		stateMutationCreateSpec(),
+		f.api,
+	)
+	if err != nil {
+		return pinnedObject{}, err
+	}
+	if err := validateOrdinaryStateIdentity(
+		object.identity,
+		f.pins[1].identity.volumeSerial,
+	); err != nil {
+		return pinnedObject{}, errors.Join(
+			&FileError{Operation: "state-leaf-identity", Path: object.path.String(), Err: err},
+			f.closeStateObject(&object),
+		)
+	}
+	return object, nil
+}
+
+func (f *StateFiles) openStateMutationLeaf(
+	ctx context.Context,
+	leaf string,
+) (pinnedObject, bool, error) {
+	return f.openStateLeaf(ctx, leaf, stateMutationOpenSpec())
+}
+
+func (f *StateFiles) writeAllStateBytes(
+	ctx context.Context,
+	object pinnedObject,
+	payload []byte,
+) error {
+	written := 0
+	for written < len(payload) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := f.api.writeFile(object.handle, payload[written:])
+		if n < 0 || n > len(payload)-written {
+			return &FileError{
+				Operation: "write",
+				Path:      object.path.String(),
+				Err:       errors.New("state write returned an invalid byte count"),
+			}
+		}
+		written += n
+		if err != nil {
+			return &FileError{Operation: "write", Path: object.path.String(), Err: err}
+		}
+		if n == 0 {
+			return &FileError{
+				Operation: "write",
+				Path:      object.path.String(),
+				Err:       io.ErrShortWrite,
+			}
+		}
+	}
+	return nil
+}
+
+func rewindStateHandle(object pinnedObject) error {
+	if _, err := windows.SetFilePointer(object.handle, 0, nil, windows.FILE_BEGIN); err != nil {
+		return &FileError{Operation: "rewind", Path: object.path.String(), Err: err}
+	}
+	return nil
+}
+
+func (f *StateFiles) sealWrittenStateObject(
+	ctx context.Context,
+	object *pinnedObject,
+	payload []byte,
+) (stateObjectProof, error) {
+	if err := f.api.flushFile(object.handle); err != nil {
+		return stateObjectProof{}, &FileError{
+			Operation: "flush",
+			Path:      object.path.String(),
+			Err:       err,
+		}
+	}
+	identity, err := f.api.identity(object.handle)
+	if err != nil {
+		return stateObjectProof{}, &FileError{
+			Operation: "identify-after-write",
+			Path:      object.path.String(),
+			Err:       err,
+		}
+	}
+	if identity.volumeSerial != object.identity.volumeSerial ||
+		identity.fileID != object.identity.fileID {
+		return stateObjectProof{}, &FileError{
+			Operation: "identify-after-write",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	if err := validateOrdinaryStateIdentity(
+		identity,
+		f.pins[1].identity.volumeSerial,
+	); err != nil {
+		return stateObjectProof{}, &FileError{
+			Operation: "identify-after-write",
+			Path:      object.path.String(),
+			Err:       err,
+		}
+	}
+	if identity.size != int64(len(payload)) {
+		return stateObjectProof{}, &FileError{
+			Operation: "identify-after-write",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	object.identity = identity
+	if err := rewindStateHandle(*object); err != nil {
+		return stateObjectProof{}, err
+	}
+	actual, digest, err := f.readPinnedBytes(ctx, *object, int64(len(payload)))
+	if err != nil {
+		return stateObjectProof{}, err
+	}
+	if !bytes.Equal(actual, payload) {
+		return stateObjectProof{}, &FileError{
+			Operation: "verify-write",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	return stateObjectProof{
+		stateIdentityProof: proofIdentityValue(object.identity),
+		Size:               object.identity.size,
+		Digest:             digest,
+	}, nil
+}
+
+func proofIdentityValue(identity objectIdentity) stateIdentityProof {
+	return stateIdentityProof{
+		VolumeSerial: identity.volumeSerial,
+		FileID:       identity.fileID,
+	}
+}
+
+func (f *StateFiles) ensurePOSIXUnlinkCapability(
+	ctx context.Context,
+	kind StateFileKind,
+) error {
+	if f.probePassed[kind] {
+		return nil
+	}
+	nonce, err := f.newStateNonce()
+	if err != nil {
+		return errors.Join(ErrPOSIXUnlinkUnsupported, err)
+	}
+	leaf := stateTransactionLeaf(kind, "probe", nonce)
+	spec := ntCreateSpec{
+		desiredAccess: windows.FILE_READ_DATA |
+			windows.FILE_WRITE_DATA |
+			windows.FILE_READ_ATTRIBUTES |
+			windows.DELETE |
+			windows.SYNCHRONIZE,
+		shareAccess:       windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE,
+		createDisposition: ntFileCreate,
+		createOptions: ntFileOpenReparsePoint |
+			ntFileNonDirectoryFile |
+			ntFileSynchronousNonalert |
+			ntFileDeleteOnClose,
+	}
+	handle, err := f.api.ntCreateRelative(f.pins[1].handle, leaf, spec)
+	if err != nil {
+		return errors.Join(ErrPOSIXUnlinkUnsupported, err)
+	}
+	object, err := f.validateOpenedStateObject(ctx, leaf, handle)
+	if err != nil {
+		return errors.Join(ErrPOSIXUnlinkUnsupported, err)
+	}
+	marker := []byte("auto-mas-state-posix-probe")
+	probeErr := f.writeAllStateBytes(ctx, object, marker)
+	if probeErr == nil {
+		probeErr = f.api.flushFile(object.handle)
+	}
+	if probeErr == nil {
+		identity, identityErr := f.api.identity(object.handle)
+		if identityErr != nil {
+			probeErr = identityErr
+		} else if identity.volumeSerial != object.identity.volumeSerial ||
+			identity.fileID != object.identity.fileID ||
+			identity.size != int64(len(marker)) {
+			probeErr = ErrIdentityChanged
+		} else {
+			object.identity = identity
+		}
+	}
+	if probeErr == nil {
+		proof := stateObjectProof{
+			stateIdentityProof: proofIdentityValue(object.identity),
+			Size:               int64(len(marker)),
+			Digest:             sha256.Sum256(marker),
+		}
+		probeErr = f.unlinkStateObject(ctx, leaf, &object, &proof)
+	}
+	closeErr := f.closeStateObject(&object)
+	absenceErr := f.requireStateLeafAbsent(context.WithoutCancel(ctx), leaf)
+	if absenceErr != nil {
+		absenceErr = fmt.Errorf("verify probe absent after anchor close: %w", absenceErr)
+	}
+	if probeErr != nil || closeErr != nil || absenceErr != nil {
+		return errors.Join(ErrPOSIXUnlinkUnsupported, probeErr, closeErr, absenceErr)
+	}
+	f.probePassed[kind] = true
+	return nil
+}
+
+func statePOSIXDispositionSpec() stateDispositionSpec {
+	return stateDispositionSpec{
+		informationClass: fileDispositionExClass,
+		flags:            fileDispositionDelete | fileDispositionPOSIX,
+	}
+}
+
+func (f *StateFiles) requireStateLeafAbsent(ctx context.Context, leaf string) error {
+	object, missing, err := f.openStateLeaf(ctx, leaf, stateAbsenceProbeSpec())
+	if err != nil {
+		return err
+	}
+	if !missing {
+		return errors.Join(
+			&FileError{Operation: "verify-unlink", Path: object.path.String(), Err: ErrIdentityChanged},
+			f.closeStateObject(&object),
+		)
+	}
+	return nil
+}
+
+func (f *StateFiles) unlinkStateObject(
+	ctx context.Context,
+	leaf string,
+	object *pinnedObject,
+	expected *stateObjectProof,
+) error {
+	if object == nil || object.handle == 0 || object.handle == windows.InvalidHandle {
+		return fmt.Errorf("%w: state unlink object is invalid", ErrInvalidArgument)
+	}
+	current, err := f.api.identity(object.handle)
+	if err != nil {
+		return &FileError{Operation: "identify-before-unlink", Path: object.path.String(), Err: err}
+	}
+	if err := validateOrdinaryStateIdentity(
+		current,
+		f.pins[1].identity.volumeSerial,
+	); err != nil {
+		return &FileError{Operation: "identify-before-unlink", Path: object.path.String(), Err: err}
+	}
+	if current.volumeSerial != object.identity.volumeSerial ||
+		current.fileID != object.identity.fileID {
+		return &FileError{
+			Operation: "identify-before-unlink",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	if expected != nil &&
+		(current.volumeSerial != expected.VolumeSerial ||
+			current.fileID != expected.FileID ||
+			current.size != expected.Size) {
+		return &FileError{
+			Operation: "verify-before-unlink",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	object.identity = current
+	if err := f.verifyStateAnchorReadable(ctx, object, expected); err != nil {
+		return err
+	}
+	unlink, missing, err := f.openStateLeaf(ctx, leaf, stateUnlinkOpenSpec())
+	if err != nil {
+		return err
+	}
+	if missing {
+		return &FileError{
+			Operation: "open-unlink",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	if unlink.identity.volumeSerial != object.identity.volumeSerial ||
+		unlink.identity.fileID != object.identity.fileID {
+		return errors.Join(
+			&FileError{
+				Operation: "identify-unlink",
+				Path:      unlink.path.String(),
+				Err:       ErrIdentityChanged,
+			},
+			f.closeStateObject(&unlink),
+		)
+	}
+	dispositionErr := f.api.setStateDisposition(unlink.handle, statePOSIXDispositionSpec())
+	closeErr := f.closeStateObject(&unlink)
+	if dispositionErr != nil || closeErr != nil {
+		return &stateUnlinkMutationError{
+			dispositionErr: wrapFileError(
+				"posix-unlink",
+				object.path.String(),
+				dispositionErr,
+			),
+			closeErr: closeErr,
+		}
+	}
+	if err := f.requireStateLeafAbsent(ctx, leaf); err != nil {
+		return err
+	}
+	return f.verifyStateAnchorReadable(ctx, object, expected)
+}
+
+func (f *StateFiles) verifyStateAnchorReadable(
+	ctx context.Context,
+	object *pinnedObject,
+	expected *stateObjectProof,
+) error {
+	current, err := f.api.identity(object.handle)
+	if err != nil {
+		return &FileError{
+			Operation: "identify-anchor",
+			Path:      object.path.String(),
+			Err:       err,
+		}
+	}
+	if current.volumeSerial != object.identity.volumeSerial ||
+		current.fileID != object.identity.fileID ||
+		current.attributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+		return &FileError{
+			Operation: "identify-anchor",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	if expected != nil &&
+		(current.volumeSerial != expected.VolumeSerial ||
+			current.fileID != expected.FileID ||
+			current.size != expected.Size) {
+		return &FileError{
+			Operation: "verify-anchor",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	object.identity = current
+	if err := rewindStateHandle(*object); err != nil {
+		return err
+	}
+	_, digest, err := f.readPinnedBytes(ctx, *object, current.size)
+	if err != nil {
+		return err
+	}
+	if expected != nil && digest != expected.Digest {
+		return &FileError{
+			Operation: "verify-anchor",
+			Path:      object.path.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	return nil
+}
+
+func (f *StateFiles) inspectStateMutationCandidate(
+	ctx context.Context,
+	leaf string,
+) (stateCandidate, error) {
+	object, missing, err := f.openStateMutationLeaf(ctx, leaf)
+	if err != nil {
+		return stateCandidate{}, f.stateRecoveryError(
+			filepath.Join(f.pins[1].path.String(), leaf),
+			err,
+		)
+	}
+	if missing {
+		return stateCandidate{leaf: leaf}, nil
+	}
+	payload, digest, err := f.readPinnedBytes(ctx, object, MaxStateFileBytes)
+	if err != nil {
+		return stateCandidate{}, errors.Join(
+			f.stateRecoveryError(object.path.String(), err),
+			f.closeStateObject(&object),
+		)
+	}
+	return stateCandidate{
+		leaf:    leaf,
+		object:  object,
+		payload: payload,
+		digest:  digest,
+		present: true,
+	}, nil
+}
+
+func (f *StateFiles) recoverStateNamespace(
+	ctx context.Context,
+	kind StateFileKind,
+) error {
+	destinationPath, err := f.statePath(kind)
+	if err != nil {
+		return err
+	}
+	destinationLeaf := filepath.Base(destinationPath)
+	intentLeaf := stateIntentLeaf(kind)
+	intentObject, intentMissing, err := f.openStateMutationLeaf(ctx, intentLeaf)
+	if err != nil || intentMissing {
+		return err
+	}
+	intentBytes, _, err := f.readPinnedBytes(ctx, intentObject, maxStateIntentBytes)
+	if err != nil {
+		return errors.Join(
+			f.stateRecoveryError(intentObject.path.String(), err),
+			f.closeStateObject(&intentObject),
+		)
+	}
+	intent, err := decodeStateIntent(intentBytes)
+	if err != nil {
+		return errors.Join(
+			f.stateRecoveryError(intentObject.path.String(), err),
+			f.closeStateObject(&intentObject),
+		)
+	}
+	if err := f.validateIntentBinding(
+		kind,
+		destinationLeaf,
+		intentLeaf,
+		intentObject,
+		intent,
+	); err != nil {
+		return errors.Join(err, f.closeStateObject(&intentObject))
+	}
+	destination, err := f.inspectStateMutationCandidate(ctx, destinationLeaf)
+	if err != nil {
+		return errors.Join(err, f.closeStateObject(&intentObject))
+	}
+	backup, err := f.inspectStateMutationCandidate(ctx, intent.BackupLeaf)
+	if err != nil {
+		return errors.Join(err, f.closeCandidate(&destination), f.closeStateObject(&intentObject))
+	}
+	temp, err := f.inspectStateMutationCandidate(ctx, intent.TempLeaf)
+	if err != nil {
+		return errors.Join(
+			err,
+			f.closeCandidate(&backup),
+			f.closeCandidate(&destination),
+			f.closeStateObject(&intentObject),
+		)
+	}
+
+	cleanupContext := context.WithoutCancel(ctx)
+	var operationErr error
+	switch {
+	case destination.matches(intent.Old) && !backup.present:
+		if temp.present {
+			if !temp.matches(intent.New) {
+				operationErr = errors.Join(ErrStateRecoveryRequired, ErrIdentityChanged)
+				break
+			}
+			operationErr = f.unlinkStateObject(cleanupContext, temp.leaf, &temp.object, &intent.New)
+		}
+		if operationErr == nil {
+			operationErr = f.unlinkStateObject(cleanupContext, intentLeaf, &intentObject, nil)
+		}
+	case !destination.present && backup.matches(intent.Old) && temp.matches(intent.New):
+		if err := f.api.renameState(
+			backup.object.handle,
+			f.pins[1].handle,
+			destinationLeaf,
+			0,
+		); err != nil {
+			operationErr = &FileError{
+				Operation: "recover-rollback",
+				Path:      destinationPath,
+				Err:       err,
+			}
+			break
+		}
+		if err := f.unlinkStateObject(cleanupContext, temp.leaf, &temp.object, &intent.New); err != nil {
+			operationErr = err
+			break
+		}
+		operationErr = f.unlinkStateObject(cleanupContext, intentLeaf, &intentObject, nil)
+	case destination.matches(intent.New) && !temp.present:
+		if backup.present {
+			if !backup.matches(intent.Old) {
+				operationErr = errors.Join(ErrStateRecoveryRequired, ErrIdentityChanged)
+				break
+			}
+			if err := f.unlinkStateObject(
+				cleanupContext,
+				backup.leaf,
+				&backup.object,
+				&intent.Old,
+			); err != nil {
+				operationErr = err
+				break
+			}
+		}
+		operationErr = f.unlinkStateObject(cleanupContext, intentLeaf, &intentObject, nil)
+	default:
+		operationErr = errors.Join(ErrStateRecoveryRequired, ErrIdentityChanged)
+	}
+	closeErr := errors.Join(
+		f.closeCandidate(&temp),
+		f.closeCandidate(&backup),
+		f.closeCandidate(&destination),
+		f.closeStateObject(&intentObject),
+	)
+	if operationErr != nil || closeErr != nil {
+		return f.stateRecoveryError(destinationPath, errors.Join(operationErr, closeErr))
+	}
+	return nil
+}
+
+func (f *StateFiles) writeStateLocked(
+	ctx context.Context,
+	kind StateFileKind,
+	payload []byte,
+	guard pinnedObject,
+) (WriteAtomicResult, error) {
+	nonce, err := f.newStateNonce()
+	if err != nil {
+		closeErr := f.closeStateObject(&guard)
+		return stateWriteFailure(StateWritePhaseCreate, false, closeErr != nil, err, closeErr)
+	}
+	tempLeaf := stateTransactionLeaf(kind, "temp", nonce)
+	backupLeaf := stateTransactionLeaf(kind, "backup", nonce)
+	stagingLeaf := stateTransactionLeaf(kind, "intent", nonce)
+	intentLeaf := stateIntentLeaf(kind)
+	destinationPath, err := f.statePath(kind)
+	if err != nil {
+		closeErr := f.closeStateObject(&guard)
+		return stateWriteFailure(StateWritePhaseRecover, false, true, err, closeErr)
+	}
+	destinationLeaf := filepath.Base(destinationPath)
+
+	temp, err := f.createStateLeaf(ctx, tempLeaf)
+	if err != nil {
+		closeErr := f.closeStateObject(&guard)
+		return stateWriteFailure(StateWritePhaseCreate, false, closeErr != nil, err, closeErr)
+	}
+	if err := f.writeAllStateBytes(ctx, temp, payload); err != nil {
+		cleanupErr := errors.Join(
+			f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, nil),
+			f.closeStateObject(&temp),
+			f.closeStateObject(&guard),
+		)
+		return stateWriteFailure(
+			StateWritePhaseWrite,
+			false,
+			cleanupErr != nil,
+			err,
+			cleanupErr,
+		)
+	}
+	newProof, err := f.sealWrittenStateObject(ctx, &temp, payload)
+	if err != nil {
+		cleanupErr := errors.Join(
+			f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, nil),
+			f.closeStateObject(&temp),
+			f.closeStateObject(&guard),
+		)
+		return stateWriteFailure(
+			StateWritePhaseSync,
+			false,
+			cleanupErr != nil,
+			err,
+			cleanupErr,
+		)
+	}
+	intentProbe, intentMissing, err := f.openStateMutationLeaf(ctx, intentLeaf)
+	if err != nil || !intentMissing {
+		if err == nil {
+			err = f.stateRecoveryError(intentProbe.path.String(), ErrIdentityChanged)
+		}
+		cleanupErr := errors.Join(
+			f.closeStateObject(&intentProbe),
+			f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, &newProof),
+			f.closeStateObject(&temp),
+			f.closeStateObject(&guard),
+		)
+		return stateWriteFailure(StateWritePhaseRecover, false, true, err, cleanupErr)
+	}
+	old, err := f.inspectStateMutationCandidate(ctx, destinationLeaf)
+	if err != nil {
+		cleanupErr := errors.Join(
+			f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, &newProof),
+			f.closeStateObject(&temp),
+			f.closeStateObject(&guard),
+		)
+		return stateWriteFailure(StateWritePhaseRecover, false, true, err, cleanupErr)
+	}
+	if !old.present {
+		if err := ctx.Err(); err != nil {
+			cleanupErr := errors.Join(
+				f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, &newProof),
+				f.closeStateObject(&temp),
+				f.closeStateObject(&guard),
+			)
+			return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+		}
+		if err := f.api.renameState(temp.handle, f.pins[1].handle, destinationLeaf, 0); err != nil {
+			cleanupErr := errors.Join(
+				f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, &newProof),
+				f.closeStateObject(&temp),
+				f.closeStateObject(&guard),
+			)
+			return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+		}
+		closeErr := errors.Join(f.closeStateObject(&temp), f.closeStateObject(&guard))
+		if closeErr != nil {
+			return stateWriteFailure(StateWritePhaseClose, true, true, closeErr, nil)
+		}
+		return WriteAtomicResult{MutationApplied: true}, nil
+	}
+	oldProof := stateObjectProof{
+		stateIdentityProof: proofIdentityValue(old.object.identity),
+		Size:               old.object.identity.size,
+		Digest:             old.digest,
+	}
+	return f.replaceStateLocked(
+		ctx,
+		kind,
+		destinationLeaf,
+		intentLeaf,
+		stagingLeaf,
+		tempLeaf,
+		backupLeaf,
+		nonce,
+		old,
+		oldProof,
+		temp,
+		newProof,
+		guard,
+	)
+}
+
+func (f *StateFiles) replaceStateLocked(
+	ctx context.Context,
+	kind StateFileKind,
+	destinationLeaf string,
+	intentLeaf string,
+	stagingLeaf string,
+	tempLeaf string,
+	backupLeaf string,
+	nonce string,
+	old stateCandidate,
+	oldProof stateObjectProof,
+	temp pinnedObject,
+	newProof stateObjectProof,
+	guard pinnedObject,
+) (WriteAtomicResult, error) {
+	staging, err := f.createStateLeaf(ctx, stagingLeaf)
+	if err != nil {
+		cleanupErr := errors.Join(
+			f.unlinkStateObject(context.WithoutCancel(ctx), tempLeaf, &temp, &newProof),
+			f.closeStateObject(&temp),
+			f.closeCandidate(&old),
+			f.closeStateObject(&guard),
+		)
+		return stateWriteFailure(StateWritePhaseCreate, false, cleanupErr != nil, err, cleanupErr)
+	}
+	intent := stateIntent{
+		Version:         stateIntentVersion,
+		Kind:            kind,
+		DestinationLeaf: destinationLeaf,
+		IntentLeaf:      intentLeaf,
+		TempLeaf:        tempLeaf,
+		BackupLeaf:      backupLeaf,
+		Nonce:           nonce,
+		Root:            proofIdentityValue(f.pins[1].identity),
+		IntentObject:    proofIdentityValue(staging.identity),
+		Old:             oldProof,
+		New:             newProof,
+	}
+	envelope, err := encodeStateIntent(intent)
+	if err != nil {
+		cleanupErr := f.cleanupUnpublishedState(
+			ctx,
+			tempLeaf,
+			&temp,
+			&newProof,
+			stagingLeaf,
+			&staging,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseCreate, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := f.writeAllStateBytes(ctx, staging, envelope); err != nil {
+		cleanupErr := f.cleanupUnpublishedState(
+			ctx,
+			tempLeaf,
+			&temp,
+			&newProof,
+			stagingLeaf,
+			&staging,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseWrite, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if _, err := f.sealWrittenStateObject(ctx, &staging, envelope); err != nil {
+		cleanupErr := f.cleanupUnpublishedState(
+			ctx,
+			tempLeaf,
+			&temp,
+			&newProof,
+			stagingLeaf,
+			&staging,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseSync, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupErr := f.cleanupUnpublishedState(
+			ctx,
+			tempLeaf,
+			&temp,
+			&newProof,
+			stagingLeaf,
+			&staging,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := f.api.renameState(staging.handle, f.pins[1].handle, intentLeaf, 0); err != nil {
+		cleanupErr := f.cleanupUnpublishedState(
+			ctx,
+			tempLeaf,
+			&temp,
+			&newProof,
+			stagingLeaf,
+			&staging,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupErr := f.cleanupPublishedBeforeBackup(
+			ctx,
+			intentLeaf,
+			&staging,
+			tempLeaf,
+			&temp,
+			&newProof,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := f.api.renameState(old.object.handle, f.pins[1].handle, backupLeaf, 0); err != nil {
+		cleanupErr := f.cleanupPublishedBeforeBackup(
+			ctx,
+			intentLeaf,
+			&staging,
+			tempLeaf,
+			&temp,
+			&newProof,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupErr := f.rollbackStateBeforeCommit(
+			ctx,
+			destinationLeaf,
+			intentLeaf,
+			&staging,
+			tempLeaf,
+			&temp,
+			&newProof,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+	}
+	if err := f.api.renameState(temp.handle, f.pins[1].handle, destinationLeaf, 0); err != nil {
+		cleanupErr := f.rollbackStateBeforeCommit(
+			ctx,
+			destinationLeaf,
+			intentLeaf,
+			&staging,
+			tempLeaf,
+			&temp,
+			&newProof,
+			&old,
+			&guard,
+		)
+		return stateWriteFailure(StateWritePhaseRename, false, cleanupErr != nil, err, cleanupErr)
+	}
+
+	finalizeContext := context.WithoutCancel(ctx)
+	finalizeErr := f.unlinkStateObject(finalizeContext, backupLeaf, &old.object, &oldProof)
+	if finalizeErr == nil {
+		finalizeErr = f.unlinkStateObject(finalizeContext, intentLeaf, &staging, nil)
+	}
+	closeErr := errors.Join(
+		f.closeStateObject(&staging),
+		f.closeStateObject(&temp),
+		f.closeCandidate(&old),
+		f.closeStateObject(&guard),
+	)
+	if finalizeErr != nil {
+		return stateWriteFailure(
+			StateWritePhaseFinalize,
+			true,
+			true,
+			finalizeErr,
+			closeErr,
+		)
+	}
+	if closeErr != nil {
+		return stateWriteFailure(StateWritePhaseClose, true, true, closeErr, nil)
+	}
+	return WriteAtomicResult{MutationApplied: true}, nil
+}
+
+func (f *StateFiles) cleanupUnpublishedState(
+	ctx context.Context,
+	tempLeaf string,
+	temp *pinnedObject,
+	newProof *stateObjectProof,
+	stagingLeaf string,
+	staging *pinnedObject,
+	old *stateCandidate,
+	guard *pinnedObject,
+) error {
+	cleanupContext := context.WithoutCancel(ctx)
+	return errors.Join(
+		f.unlinkStateObject(cleanupContext, stagingLeaf, staging, nil),
+		f.unlinkStateObject(cleanupContext, tempLeaf, temp, newProof),
+		f.closeStateObject(staging),
+		f.closeStateObject(temp),
+		f.closeCandidate(old),
+		f.closeStateObject(guard),
+	)
+}
+
+func (f *StateFiles) cleanupPublishedBeforeBackup(
+	ctx context.Context,
+	intentLeaf string,
+	intent *pinnedObject,
+	tempLeaf string,
+	temp *pinnedObject,
+	newProof *stateObjectProof,
+	old *stateCandidate,
+	guard *pinnedObject,
+) error {
+	cleanupContext := context.WithoutCancel(ctx)
+	return errors.Join(
+		f.unlinkStateObject(cleanupContext, tempLeaf, temp, newProof),
+		f.unlinkStateObject(cleanupContext, intentLeaf, intent, nil),
+		f.closeStateObject(intent),
+		f.closeStateObject(temp),
+		f.closeCandidate(old),
+		f.closeStateObject(guard),
+	)
+}
+
+func (f *StateFiles) rollbackStateBeforeCommit(
+	ctx context.Context,
+	destinationLeaf string,
+	intentLeaf string,
+	intent *pinnedObject,
+	tempLeaf string,
+	temp *pinnedObject,
+	newProof *stateObjectProof,
+	old *stateCandidate,
+	guard *pinnedObject,
+) error {
+	cleanupContext := context.WithoutCancel(ctx)
+	rollbackErr := f.api.renameState(
+		old.object.handle,
+		f.pins[1].handle,
+		destinationLeaf,
+		0,
+	)
+	if rollbackErr != nil {
+		return errors.Join(
+			&FileError{
+				Operation: "rollback",
+				Path:      filepath.Join(f.pins[1].path.String(), destinationLeaf),
+				Err:       rollbackErr,
+			},
+			f.closeStateObject(intent),
+			f.closeStateObject(temp),
+			f.closeCandidate(old),
+			f.closeStateObject(guard),
+		)
+	}
+	return errors.Join(
+		f.unlinkStateObject(cleanupContext, tempLeaf, temp, newProof),
+		f.unlinkStateObject(cleanupContext, intentLeaf, intent, nil),
+		f.closeStateObject(intent),
+		f.closeStateObject(temp),
+		f.closeCandidate(old),
+		f.closeStateObject(guard),
+	)
 }
 
 func (f *StateFiles) stateRecoveryError(path string, cause error) error {
