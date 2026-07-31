@@ -536,11 +536,9 @@ const (
 	fileIDInfoClass           = uint32(18)
 	fileDispositionInfoClass  = uint32(4)
 	fileDispositionExClass    = uint32(21)
-	fileRenameInfoExClass     = uint32(22)
 	fileCaseSensitiveClass    = uint32(23)
 	fileDispositionDelete     = uint32(0x00000001)
 	fileDispositionPOSIX      = uint32(0x00000002)
-	fileRenameReplace         = uint32(0x00000001)
 	fileCaseSensitiveDir      = uint32(0x00000001)
 )
 
@@ -961,11 +959,11 @@ func setStateDispositionWindows(
 	return nil
 }
 
-type fileRenameInfoEx struct {
-	flags          uint32
-	rootDirectory  windows.Handle
-	fileNameLength uint32
-	fileName       [1]uint16
+type fileRenameInformation struct {
+	replaceIfExists uint8
+	rootDirectory   windows.Handle
+	fileNameLength  uint32
+	fileName        [1]uint16
 }
 
 func renameWindows(
@@ -974,11 +972,10 @@ func renameWindows(
 	name string,
 	replace bool,
 ) error {
-	flags := uint32(0)
-	if replace {
-		flags = fileRenameReplace
+	if err := renameInformationWindows(source, targetParent, name, replace); err != nil {
+		return fmt.Errorf("rename by handle: %w", err)
 	}
-	return renameStateWindows(source, targetParent, name, flags)
+	return nil
 }
 
 func renameStateWindows(
@@ -987,26 +984,48 @@ func renameStateWindows(
 	name string,
 	flags uint32,
 ) error {
+	if flags != 0 {
+		return fmt.Errorf("state rename flags: %w", ErrInvalidArgument)
+	}
+	if err := renameInformationWindows(source, targetParent, name, false); err != nil {
+		return fmt.Errorf("rename state by handle: %w", err)
+	}
+	return nil
+}
+
+func renameInformationWindows(
+	source windows.Handle,
+	targetParent windows.Handle,
+	name string,
+	replace bool,
+) error {
 	nameUTF16, err := windows.UTF16FromString(name)
 	if err != nil {
-		return fmt.Errorf("encode state rename destination: %w", err)
+		return fmt.Errorf("encode rename destination: %w", err)
 	}
 	nameUTF16 = nameUTF16[:len(nameUTF16)-1]
 	nameBytes := len(nameUTF16) * 2
-	offset := int(unsafe.Offsetof(fileRenameInfoEx{}.fileName))
+	offset := int(unsafe.Offsetof(fileRenameInformation{}.fileName))
 	buffer := make([]byte, offset+nameBytes)
-	information := (*fileRenameInfoEx)(unsafe.Pointer(&buffer[0]))
-	information.flags = flags
+	information := (*fileRenameInformation)(unsafe.Pointer(&buffer[0]))
+	if replace {
+		information.replaceIfExists = 1
+	}
 	information.rootDirectory = targetParent
 	information.fileNameLength = uint32(nameBytes)
 	copy(unsafe.Slice(&information.fileName[0], len(nameUTF16)), nameUTF16)
-	if err := setFileInformationWindows(
+	var status windows.IO_STATUS_BLOCK
+	if err := windows.NtSetInformationFile(
 		source,
-		fileRenameInfoExClass,
-		unsafe.Pointer(information),
-		uintptr(len(buffer)),
+		&status,
+		&buffer[0],
+		uint32(len(buffer)),
+		windows.FileRenameInformation,
 	); err != nil {
-		return fmt.Errorf("rename state by handle: %w", err)
+		if ntStatus, ok := err.(windows.NTStatus); ok {
+			return ntStatus.Errno()
+		}
+		return err
 	}
 	return nil
 }

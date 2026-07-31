@@ -802,6 +802,130 @@ func TestWindows_UNCAndRemoteRootsFailClosed(t *testing.T) {
 	t.Skip("UNC share fixture unavailable; remote drive classification completed")
 }
 
+func TestWindows_RenameInformationUsesPinnedParent(t *testing.T) {
+	parentPath := t.TempDir()
+	sourcePath := filepath.Join(parentPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("source"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	parentUTF16, err := windows.UTF16PtrFromString(parentPath)
+	if err != nil {
+		t.Fatalf("windows.UTF16PtrFromString(parent) error = %v", err)
+	}
+	parent, err := windows.CreateFile(
+		parentUTF16,
+		windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("windows.CreateFile(parent) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := windows.CloseHandle(parent); err != nil {
+			t.Errorf("windows.CloseHandle(parent) error = %v", err)
+		}
+	})
+	openSource := func(name string) (windows.Handle, func()) {
+		t.Helper()
+		handle, err := openRelativeWindows(parent, name, openSpec{
+			access:    windows.FILE_READ_ATTRIBUTES | windows.DELETE | windows.SYNCHRONIZE,
+			share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE,
+			creation:  windows.OPEN_EXISTING,
+			options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+			directory: false,
+		})
+		if err != nil {
+			t.Fatalf("openRelativeWindows(%s) error = %v", name, err)
+		}
+		closed := false
+		t.Cleanup(func() {
+			if !closed {
+				if err := windows.CloseHandle(handle); err != nil {
+					t.Errorf("windows.CloseHandle(%s) error = %v", name, err)
+				}
+			}
+		})
+		return handle, func() {
+			t.Helper()
+			if closed {
+				return
+			}
+			if err := windows.CloseHandle(handle); err != nil {
+				t.Fatalf("windows.CloseHandle(%s) error = %v", name, err)
+			}
+			closed = true
+		}
+	}
+	source, closeSource := openSource("source")
+
+	if err := renameStateWindows(source, parent, "target", 0); err != nil {
+		t.Fatalf("renameStateWindows() error = %v", err)
+	}
+	closeSource()
+	got, err := os.ReadFile(filepath.Join(parentPath, "target"))
+	if err != nil {
+		t.Fatalf("os.ReadFile(target) error = %v", err)
+	}
+	if string(got) != "source" {
+		t.Fatalf("target content = %q, want source", got)
+	}
+
+	collisionSourcePath := filepath.Join(parentPath, "collision-source")
+	if err := os.WriteFile(collisionSourcePath, []byte("collision-source"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(collision source) error = %v", err)
+	}
+	occupiedPath := filepath.Join(parentPath, "occupied")
+	if err := os.WriteFile(occupiedPath, []byte("occupied"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(occupied) error = %v", err)
+	}
+	collisionSource, closeCollisionSource := openSource("collision-source")
+	collisionErr := renameStateWindows(collisionSource, parent, "occupied", 0)
+	closeCollisionSource()
+	if !errors.Is(collisionErr, windows.ERROR_ALREADY_EXISTS) &&
+		!errors.Is(collisionErr, windows.ERROR_FILE_EXISTS) {
+		t.Fatalf("collision error = %v, want already exists", collisionErr)
+	}
+	occupied, err := os.ReadFile(occupiedPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(occupied) error = %v", err)
+	}
+	if string(occupied) != "occupied" {
+		t.Fatalf("occupied content = %q, want occupied", occupied)
+	}
+	collisionSourceBytes, err := os.ReadFile(collisionSourcePath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(collision source) error = %v", err)
+	}
+	if string(collisionSourceBytes) != "collision-source" {
+		t.Fatalf("collision source content = %q, want collision-source", collisionSourceBytes)
+	}
+
+	replaceSourcePath := filepath.Join(parentPath, "replace-source")
+	if err := os.WriteFile(replaceSourcePath, []byte("replacement"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(replace source) error = %v", err)
+	}
+	replaceTargetPath := filepath.Join(parentPath, "replace-target")
+	if err := os.WriteFile(replaceTargetPath, []byte("replaced"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(replace target) error = %v", err)
+	}
+	replaceSource, closeReplaceSource := openSource("replace-source")
+	if err := renameWindows(replaceSource, parent, "replace-target", true); err != nil {
+		t.Fatalf("renameWindows(replace) error = %v", err)
+	}
+	closeReplaceSource()
+	replaced, err := os.ReadFile(replaceTargetPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(replace target) error = %v", err)
+	}
+	if string(replaced) != "replacement" {
+		t.Fatalf("replace target content = %q, want replacement", replaced)
+	}
+}
+
 func TestWindows_CustomFileInformationStructuresMatchABI(t *testing.T) {
 	if unsafe.Sizeof(ntObjectAttributes{}) != 48 {
 		t.Fatalf("ntObjectAttributes size = %d, want 48", unsafe.Sizeof(ntObjectAttributes{}))
@@ -815,10 +939,16 @@ func TestWindows_CustomFileInformationStructuresMatchABI(t *testing.T) {
 	if unsafe.Sizeof(fileDispositionInfoEx{}) != 4 {
 		t.Fatalf("fileDispositionInfoEx size = %d, want 4", unsafe.Sizeof(fileDispositionInfoEx{}))
 	}
-	if unsafe.Offsetof(fileRenameInfoEx{}.fileName) != 20 {
+	if unsafe.Offsetof(fileRenameInformation{}.rootDirectory) != 8 {
 		t.Fatalf(
-			"fileRenameInfoEx fileName offset = %d, want 20",
-			unsafe.Offsetof(fileRenameInfoEx{}.fileName),
+			"fileRenameInformation rootDirectory offset = %d, want 8",
+			unsafe.Offsetof(fileRenameInformation{}.rootDirectory),
+		)
+	}
+	if unsafe.Offsetof(fileRenameInformation{}.fileName) != 20 {
+		t.Fatalf(
+			"fileRenameInformation fileName offset = %d, want 20",
+			unsafe.Offsetof(fileRenameInformation{}.fileName),
 		)
 	}
 }
