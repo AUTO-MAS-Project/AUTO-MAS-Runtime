@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 func TestNewDownloadFiles_RejectsInvalidLayoutAndRoot(t *testing.T) {
@@ -98,6 +99,213 @@ func TestNewDownloadFiles_DoesNotCreateOrRetainDirectories(t *testing.T) {
 	}
 }
 
+func TestNewDownloadFiles_AllowsMissingAppRootWithoutCreating(t *testing.T) {
+	base := t.TempDir()
+	appRoot := filepath.Join(base, "app")
+	layout, err := config.NewLayout(appRoot, base)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	files, err := NewDownloadFiles(layout)
+	if err != nil {
+		t.Fatalf("NewDownloadFiles() error = %v", err)
+	}
+	if files == nil {
+		t.Fatal("NewDownloadFiles() = nil, want capability")
+	}
+	if _, err := os.Stat(appRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("os.Stat(app-root) error = %v, want not-exist", err)
+	}
+}
+
+func TestOpenPinnedDirectoryPath_ValidatesBoundaryAndClosesFailures(t *testing.T) {
+	expected := mustCanonicalize(t, t.TempDir())
+	mismatch := t.TempDir()
+	driveErr := errors.New("drive query failed")
+	openErr := errors.New("open failed")
+	identityErr := errors.New("identity failed")
+	finalPathErr := errors.New("final path failed")
+	caseErr := errors.New("case query failed")
+	closeErr := errors.New("close failed")
+	tests := []struct {
+		name              string
+		prepare           func(*pathAPI)
+		wantErrs          []error
+		wantCode          protocol.Code
+		wantOpened        bool
+		injectHelperClose bool
+	}{
+		{name: "drive query", prepare: func(api *pathAPI) {
+			api.driveType = func(string) (uint32, error) { return 0, driveErr }
+		}, wantErrs: []error{driveErr}},
+		{name: "remote volume", prepare: func(api *pathAPI) {
+			api.driveType = func(string) (uint32, error) { return windows.DRIVE_REMOTE, nil }
+		}, wantErrs: []error{ErrIdentityChanged}},
+		{name: "open", prepare: func(api *pathAPI) {
+			api.openPath = func(string, openSpec) (windows.Handle, error) {
+				return windows.InvalidHandle, openErr
+			}
+		}, wantErrs: []error{openErr}},
+		{name: "identity", prepare: func(api *pathAPI) {
+			api.identity = func(windows.Handle) (objectIdentity, error) {
+				return objectIdentity{}, identityErr
+			}
+		}, wantErrs: []error{identityErr}, wantOpened: true},
+		{name: "final path", prepare: func(api *pathAPI) {
+			api.finalPath = func(windows.Handle) (string, error) { return "", finalPathErr }
+		}, wantErrs: []error{finalPathErr}, wantOpened: true},
+		{name: "path mismatch", prepare: func(api *pathAPI) {
+			api.finalPath = func(windows.Handle) (string, error) { return mismatch, nil }
+		}, wantErrs: []error{ErrIdentityChanged}, wantOpened: true},
+		{name: "not directory", prepare: func(api *pathAPI) {
+			identity := api.identity
+			api.identity = func(handle windows.Handle) (objectIdentity, error) {
+				got, err := identity(handle)
+				got.attributes &^= windows.FILE_ATTRIBUTE_DIRECTORY
+				return got, err
+			}
+		}, wantErrs: []error{ErrIdentityChanged}, wantOpened: true},
+		{name: "reparse", prepare: func(api *pathAPI) {
+			identity := api.identity
+			api.identity = func(handle windows.Handle) (objectIdentity, error) {
+				got, err := identity(handle)
+				got.attributes |= windows.FILE_ATTRIBUTE_REPARSE_POINT
+				return got, err
+			}
+		}, wantCode: protocol.CodeUnsafeReparsePoint, wantOpened: true},
+		{name: "case query and close", prepare: func(api *pathAPI) {
+			api.caseSensitive = func(windows.Handle) (bool, error) { return false, caseErr }
+		}, wantErrs: []error{
+			ErrUnsupportedCaseSensitivity,
+			caseErr,
+			closeErr,
+		}, wantOpened: true, injectHelperClose: true},
+		{name: "case sensitive", prepare: func(api *pathAPI) {
+			api.caseSensitive = func(windows.Handle) (bool, error) { return true, nil }
+		}, wantErrs: []error{ErrUnsupportedCaseSensitivity}, wantOpened: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := newProductionPathAPI()
+			openHandles := 0
+			helperHandles := make(map[windows.Handle]struct{})
+			var gotSpecs []openSpec
+			openPath := api.openPath
+			closeHandle := api.closeHandle
+			api.openPath = func(path string, spec openSpec) (windows.Handle, error) {
+				gotSpecs = append(gotSpecs, spec)
+				handle, err := openPath(path, spec)
+				if err == nil {
+					openHandles++
+					if spec == directoryPinSpec() {
+						helperHandles[handle] = struct{}{}
+					}
+				}
+				return handle, err
+			}
+			api.closeHandle = func(handle windows.Handle) error {
+				err := closeHandle(handle)
+				openHandles--
+				_, isHelper := helperHandles[handle]
+				delete(helperHandles, handle)
+				if tt.injectHelperClose && isHelper {
+					return errors.Join(err, closeErr)
+				}
+				return err
+			}
+			tt.prepare(&api)
+			object, err := openPinnedDirectoryPathWith(t.Context(), expected, api)
+			if object != (pinnedObject{}) {
+				t.Fatalf("openPinnedDirectoryPathWith() object = %#v, want zero", object)
+			}
+			for _, wantErr := range tt.wantErrs {
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("openPinnedDirectoryPathWith() error = %v, want %v", err, wantErr)
+				}
+			}
+			if tt.wantCode != "" {
+				assertFilesystemCode(t, err, tt.wantCode)
+			}
+			if tt.wantOpened && (len(gotSpecs) == 0 || gotSpecs[0] != directoryPinSpec()) {
+				t.Fatalf("first open spec = %#v, want %#v", gotSpecs, directoryPinSpec())
+			}
+			if openHandles != 0 || len(helperHandles) != 0 {
+				t.Fatalf(
+					"open/helper handles = %d/%d, want 0/0",
+					openHandles,
+					len(helperHandles),
+				)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	object, err := openPinnedDirectoryPathWith(ctx, expected, newProductionPathAPI())
+	if object != (pinnedObject{}) || !errors.Is(err, context.Canceled) {
+		t.Fatalf(
+			"openPinnedDirectoryPathWith(canceled) = %#v, %v, want zero/context.Canceled",
+			object,
+			err,
+		)
+	}
+	object, err = openPinnedDirectoryPathWith(t.Context(), expected, newProductionPathAPI())
+	if err != nil {
+		t.Fatalf("openPinnedDirectoryPathWith(success) error = %v", err)
+	}
+	if err := closePinnedObject(newProductionPathAPI(), &object); err != nil {
+		t.Fatalf("closePinnedObject() error = %v", err)
+	}
+}
+
+func TestNewDownloadFiles_MissingAppRootParentCloseFailureReturnsError(t *testing.T) {
+	base := t.TempDir()
+	appRoot := filepath.Join(base, "app")
+	layout, err := config.NewLayout(appRoot, base)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	api := newProductionPathAPI()
+	openHandles := 0
+	helperHandles := make(map[windows.Handle]struct{})
+	openPath := api.openPath
+	closeHandle := api.closeHandle
+	injected := errors.New("close failed")
+	api.openPath = func(path string, spec openSpec) (windows.Handle, error) {
+		handle, err := openPath(path, spec)
+		if err == nil {
+			openHandles++
+			if spec == directoryPinSpec() {
+				helperHandles[handle] = struct{}{}
+			}
+		}
+		return handle, err
+	}
+	api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		openHandles--
+		if _, ok := helperHandles[handle]; ok {
+			delete(helperHandles, handle)
+			return errors.Join(err, injected)
+		}
+		return err
+	}
+	files, err := newDownloadFilesWith(layout, downloadFileDependencies{api: api})
+	if files != nil || !errors.Is(err, injected) {
+		t.Fatalf("newDownloadFilesWith() = %#v, %v, want nil/injected", files, err)
+	}
+	if openHandles != 0 || len(helperHandles) != 0 {
+		t.Fatalf(
+			"open/helper handles = %d/%d, want 0/0",
+			openHandles,
+			len(helperHandles),
+		)
+	}
+	if _, err := os.Stat(appRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("os.Stat(app-root) error = %v, want not-exist", err)
+	}
+}
+
 func TestNewDownloadFiles_ValidationCloseFailureReturnsError(t *testing.T) {
 	layout := newDownloadTestLayout(t)
 	api := newProductionPathAPI()
@@ -148,6 +356,39 @@ func TestDownloadFiles_BeginCreatesAndPinsFourAncestors(t *testing.T) {
 		if err := os.Rename(path, renamed); err == nil {
 			_ = os.Rename(renamed, path)
 			_, _ = session.Abort(t.Context())
+			t.Fatalf("ancestor %q renamed while session was open", path)
+		}
+	}
+	if _, err := session.Abort(t.Context()); err != nil {
+		t.Fatalf("Abort() error = %v", err)
+	}
+}
+
+func TestDownloadFiles_BeginCreatesMissingAppRootAndPinsFourAncestors(t *testing.T) {
+	base := t.TempDir()
+	appRoot := filepath.Join(base, "app")
+	layout, err := config.NewLayout(appRoot, base)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	files, err := NewDownloadFiles(layout)
+	if err != nil {
+		t.Fatalf("NewDownloadFiles() error = %v", err)
+	}
+	session, err := files.Begin(t.Context(), "uv.zip")
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	for _, path := range []string{
+		layout.AppRoot(),
+		layout.RuntimeDir(),
+		layout.RuntimeCacheDir(),
+		layout.DownloadCacheDir(),
+	} {
+		renamed := path + "-renamed"
+		if err := os.Rename(path, renamed); err == nil {
+			_ = os.Rename(renamed, path)
+			_, _ = session.Abort(context.Background())
 			t.Fatalf("ancestor %q renamed while session was open", path)
 		}
 	}

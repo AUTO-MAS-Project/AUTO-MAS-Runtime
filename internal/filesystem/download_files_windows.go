@@ -80,6 +80,13 @@ func validateExistingLayoutPathWith(
 	if err != nil {
 		return err
 	}
+	if rootParent.Equal(existingCanonical) {
+		parent, err := openPinnedDirectoryPathWith(ctx, rootParent, api)
+		if err != nil {
+			return err
+		}
+		return closePinnedObject(api, &parent)
+	}
 	chain, err := openPinnedChainWith(
 		ctx,
 		rootParent,
@@ -91,6 +98,68 @@ func validateExistingLayoutPathWith(
 		return err
 	}
 	return chain.close()
+}
+
+func openPinnedDirectoryPathWith(
+	ctx context.Context,
+	expected CanonicalPath,
+	api pathAPI,
+) (pinnedObject, error) {
+	if ctx == nil || expected == (CanonicalPath{}) || !api.valid() {
+		return pinnedObject{}, fmt.Errorf("%w: invalid pinned-directory input", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return pinnedObject{}, err
+	}
+	if err := ensureLocalVolumeWith(expected, api); err != nil {
+		return pinnedObject{}, err
+	}
+	handle, err := api.openPath(expected.Native(), directoryPinSpec())
+	if err != nil {
+		return pinnedObject{}, &FileError{
+			Operation: "open-directory",
+			Path:      expected.String(),
+			Err:       err,
+		}
+	}
+	closeOnFailure := func(operationErr error) (pinnedObject, error) {
+		return pinnedObject{}, joinOperationCleanup(
+			operationErr,
+			wrapFileError("close", expected.String(), api.closeHandle(handle)),
+		)
+	}
+	identity, err := api.identity(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{
+			Operation: "identify",
+			Path:      expected.String(),
+			Err:       err,
+		})
+	}
+	finalPath, err := api.finalPath(handle)
+	if err != nil {
+		return closeOnFailure(&FileError{
+			Operation: "final-path",
+			Path:      expected.String(),
+			Err:       err,
+		})
+	}
+	canonical, err := canonicalizeContextWith(ctx, finalPath, api)
+	if err != nil {
+		return closeOnFailure(err)
+	}
+	object := pinnedObject{path: canonical, handle: handle, identity: identity}
+	if !canonical.Equal(expected) {
+		return closeOnFailure(outsidePathError(
+			"open-directory",
+			expected.String(),
+			ErrIdentityChanged,
+		))
+	}
+	if err := validatePinnedDirectory(ctx, object, api); err != nil {
+		return closeOnFailure(err)
+	}
+	return object, nil
 }
 
 // Begin 创建并固定一个新的下载临时文件会话。
@@ -231,19 +300,17 @@ func (f *DownloadFiles) pinDownloadRoots(
 	if err != nil {
 		return result, err
 	}
-	appChain, err := openPinnedChainWith(
-		ctx,
-		rootParent,
-		appPath,
-		directoryPinSpec(),
-		f.api,
-	)
+	root, err := openPinnedDirectoryPathWith(ctx, rootParent, f.api)
 	if err != nil {
 		return result, err
 	}
-	app, err := detachLeaf(appChain)
+	app, err := openOrCreatePinnedDirectory(ctx, root, appPath, f.api)
+	rootCloseErr := closePinnedObject(f.api, &root)
 	if err != nil {
-		return result, err
+		return result, errors.Join(err, rootCloseErr)
+	}
+	if rootCloseErr != nil {
+		return result, errors.Join(rootCloseErr, closePinnedObject(f.api, &app))
 	}
 	pins := make([]pinnedObject, 0, 4)
 	pins = append(pins, app)
