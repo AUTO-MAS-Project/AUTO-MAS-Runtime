@@ -261,6 +261,62 @@ func TestDownloaderClient_RejectsRedirectDowngradeBeforeRequest(t *testing.T) {
 	}
 }
 
+type clientRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f clientRoundTripFunc) RoundTrip(
+	request *http.Request,
+) (*http.Response, error) {
+	return f(request)
+}
+
+type clientCloseCountingBody struct {
+	closes atomic.Int32
+}
+
+func (*clientCloseCountingBody) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (b *clientCloseCountingBody) Close() error {
+	b.closes.Add(1)
+	return nil
+}
+
+func TestDownloaderClient_RedirectErrorResponseBodyClosedExactlyOnce(
+	t *testing.T,
+) {
+	body := &clientCloseCountingBody{}
+	var calls atomic.Int32
+	client := &http.Client{
+		Transport: clientRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header: http.Header{
+					"Location": {"http://example.invalid/asset"},
+				},
+				Body:    body,
+				Request: request,
+			}, nil
+		}),
+		CheckRedirect: checkDownloadRedirect,
+	}
+	downloader := downloaderForClientTest(t, client, nil)
+	_, failure := downloader.doRequest(
+		t.Context(),
+		mustHTTPSURL(t, "https://example.invalid/origin"),
+	)
+	if failure == nil || failure.Kind != FailureRedirectDowngrade {
+		t.Fatalf("failure = %#v, want FailureRedirectDowngrade", failure)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("RoundTrip calls = %d, want 1", calls.Load())
+	}
+	if body.closes.Load() != 1 {
+		t.Fatalf("Body.Close count = %d, want 1", body.closes.Load())
+	}
+}
+
 func TestDownloaderClient_AllowsHTTPSRedirectAndLimitsTen(t *testing.T) {
 	var loopHits atomic.Int32
 	target := httptest.NewTLSServer(http.HandlerFunc(func(

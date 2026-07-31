@@ -152,7 +152,10 @@ func (d *Downloader) doRequest(
 	}
 
 	if kind != "" {
-		closeErr := closeResponse(result.response)
+		var closeErr error
+		if result.err == nil {
+			closeErr = closeResponse(result.response)
+		}
 		cancel()
 		return nil, newDownloadFailure(kind, 0, errors.Join(cause, closeErr))
 	}
