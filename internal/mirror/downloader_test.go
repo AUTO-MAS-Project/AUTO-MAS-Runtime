@@ -6,15 +6,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2259,4 +2263,479 @@ func errorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func TestDownloader_ComponentCleanRetryNeverUsesRange(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("DownloadFiles handle semantics require Windows")
+	}
+	content := []byte("clean-retry-content")
+	var attempts atomic.Int32
+	firstStarted := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Header.Get("Range") != "" ||
+			request.Header.Get("If-Range") != "" {
+			t.Errorf(
+				"resume headers = Range:%q If-Range:%q, want empty",
+				request.Header.Get("Range"),
+				request.Header.Get("If-Range"),
+			)
+		}
+		if attempts.Add(1) == 1 {
+			close(firstStarted)
+			<-request.Context().Done()
+			return
+		}
+		writer.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		_, _ = writer.Write(content)
+	}))
+	defer server.Close()
+
+	layout := newComponentLayout(t)
+	if err := os.MkdirAll(layout.DownloadCacheDir(), 0o700); err != nil {
+		t.Fatalf("MkdirAll(download cache) error = %v", err)
+	}
+	stalePart, err := layout.DownloadPartFile("uv.zip")
+	if err != nil {
+		t.Fatalf("DownloadPartFile(stale) error = %v", err)
+	}
+	if err := os.WriteFile(stalePart, []byte("stale-part"), 0o600); err != nil {
+		t.Fatalf("WriteFile(stale part) error = %v", err)
+	}
+	downloader := newFilesystemDownloader(
+		t,
+		layout,
+		trustedClientForServers(t, server),
+	)
+	request := requestForBytes(content)
+	request.URL = server.URL + "/artifact?signature=retry-secret"
+	ctx, cancel := context.WithCancel(t.Context())
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := downloader.Download(ctx, request)
+		firstResult <- err
+	}()
+	waitSignal(t, firstStarted)
+	cancel()
+	firstErr := waitValue(t, firstResult)
+	var failure *DownloadFailure
+	if !errors.As(firstErr, &failure) || failure.Kind != FailureCancelled {
+		t.Fatalf("first Download() error = %v, want FailureCancelled", firstErr)
+	}
+	partPath, err := layout.DownloadPartFile(request.FileName)
+	if err != nil {
+		t.Fatalf("DownloadPartFile() error = %v, want nil", err)
+	}
+	if _, err := os.Stat(partPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cancelled part Stat() error = %v, want not exist", err)
+	}
+
+	result, err := downloader.Download(t.Context(), request)
+	if err != nil {
+		t.Fatalf("retry Download() error = %v, want nil", err)
+	}
+	got, err := os.ReadFile(result.Path)
+	if err != nil {
+		t.Fatalf("ReadFile(result.Path) error = %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("final content = %q, want %q", got, content)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempt count = %d, want 2", attempts.Load())
+	}
+}
+
+func TestDownloader_ComponentFinalRaceIsNoReplaceAndPartIsCleaned(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("DownloadFiles handle semantics require Windows")
+	}
+	content := []byte("verified-content")
+	competitor := []byte("competitor-content")
+	server := tlsArtifactServer(t, content)
+	defer server.Close()
+	layout := newComponentLayout(t)
+	downloader := newFilesystemDownloader(
+		t,
+		layout,
+		trustedClientForServers(t, server),
+	)
+	request := requestForBytes(content)
+	request.URL = server.URL + "/artifact"
+	finalPath, err := layout.DownloadFile(request.FileName)
+	if err != nil {
+		t.Fatalf("DownloadFile() error = %v", err)
+	}
+	var once sync.Once
+	request.Progress = func(progress DownloadProgress) error {
+		if progress.Received == progress.Total {
+			once.Do(func() {
+				if err := os.WriteFile(finalPath, competitor, 0o600); err != nil {
+					t.Fatalf("create final competitor: %v", err)
+				}
+			})
+		}
+		return nil
+	}
+	result, err := downloader.Download(t.Context(), request)
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) ||
+		failure.Kind != FailureDestinationOccupied ||
+		failure.Published {
+		t.Fatalf("Download() result/error = %#v/%v, want unpublished destination occupied", result, err)
+	}
+	got, err := os.ReadFile(finalPath)
+	if err != nil {
+		t.Fatalf("ReadFile(final competitor) error = %v", err)
+	}
+	if !bytes.Equal(got, competitor) {
+		t.Fatalf("final competitor = %q, want %q", got, competitor)
+	}
+	partPath, err := layout.DownloadPartFile(request.FileName)
+	if err != nil {
+		t.Fatalf("DownloadPartFile() error = %v", err)
+	}
+	if _, err := os.Stat(partPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part Stat() error = %v, want not exist", err)
+	}
+}
+
+func TestDownloader_ComponentPartIdentityCannotBeReplaced(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("DownloadFiles handle semantics require Windows")
+	}
+	content := []byte("identity-content")
+	server := tlsArtifactServer(t, content)
+	defer server.Close()
+	layout := newComponentLayout(t)
+	downloader := newFilesystemDownloader(
+		t,
+		layout,
+		trustedClientForServers(t, server),
+	)
+	request := requestForBytes(content)
+	request.URL = server.URL + "/artifact"
+	partPath, err := layout.DownloadPartFile(request.FileName)
+	if err != nil {
+		t.Fatalf("DownloadPartFile() error = %v", err)
+	}
+	replacementPath := partPath + ".replacement"
+	replacementAttempt := make(chan error, 1)
+	var once sync.Once
+	request.Progress = func(progress DownloadProgress) error {
+		if progress.Received == progress.Total {
+			once.Do(func() {
+				replacementAttempt <- os.Rename(partPath, replacementPath)
+			})
+		}
+		return nil
+	}
+	result, err := downloader.Download(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Download() error = %v, want nil", err)
+	}
+	if replaceErr := waitValue(t, replacementAttempt); replaceErr == nil {
+		t.Fatal("os.Rename(part, replacement) error = nil, want sharing rejection")
+	}
+	got, err := os.ReadFile(result.Path)
+	if err != nil {
+		t.Fatalf("ReadFile(result.Path) error = %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("published content = %q, want %q", got, content)
+	}
+	if _, err := os.Stat(replacementPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement Stat() error = %v, want not exist", err)
+	}
+}
+
+func TestDownloader_ComponentJunctionAtEveryAncestorFailsBeforeNetwork(
+	t *testing.T,
+) {
+	if runtime.GOOS != "windows" {
+		t.Fatal("ordinary Junction acceptance must run on Windows")
+	}
+	cases := []struct {
+		name string
+		path func(*config.Layout) string
+	}{
+		{name: "app-root", path: func(layout *config.Layout) string {
+			return layout.AppRoot()
+		}},
+		{name: "runtime", path: func(layout *config.Layout) string {
+			return layout.RuntimeDir()
+		}},
+		{name: "cache", path: func(layout *config.Layout) string {
+			return layout.RuntimeCacheDir()
+		}},
+		{name: "downloads", path: func(layout *config.Layout) string {
+			return layout.DownloadCacheDir()
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			base := t.TempDir()
+			appRoot := filepath.Join(base, "app")
+			layout, err := config.NewLayout(appRoot, base)
+			if err != nil {
+				t.Fatalf("config.NewLayout() error = %v", err)
+			}
+			external := filepath.Join(base, "external")
+			if err := os.MkdirAll(external, 0o700); err != nil {
+				t.Fatalf("MkdirAll(external) error = %v", err)
+			}
+			markerPath := filepath.Join(external, "marker.txt")
+			if err := os.WriteFile(
+				markerPath,
+				[]byte("outside"),
+				0o600,
+			); err != nil {
+				t.Fatalf("WriteFile(marker) error = %v", err)
+			}
+			junctionPath := testCase.path(layout)
+			if err := os.MkdirAll(
+				filepath.Dir(junctionPath),
+				0o700,
+			); err != nil {
+				t.Fatalf("MkdirAll(junction parent) error = %v", err)
+			}
+			createOrdinaryJunction(t, junctionPath, external)
+
+			files, downloadErr := filesystem.NewDownloadFiles(layout)
+			client := &fakeHTTPClient{}
+			if downloadErr == nil {
+				options, err := resolveDownloaderOptions(nil)
+				if err != nil {
+					t.Fatalf("resolveDownloaderOptions() error = %v", err)
+				}
+				dependencies := testDependencies(
+					filesystemSessions{files: files},
+					client,
+				)
+				downloader, err := newDownloaderWithDependencies(
+					layout,
+					options,
+					dependencies,
+				)
+				if err != nil {
+					t.Fatalf(
+						"newDownloaderWithDependencies() error = %v",
+						err,
+					)
+				}
+				_, downloadErr = downloader.Download(
+					t.Context(),
+					requestForBytes([]byte("abc")),
+				)
+			}
+			if downloadErr == nil {
+				t.Fatal("Junction ancestor error = nil, want failure")
+			}
+			if client.Calls() != 0 {
+				t.Fatalf("network calls = %d, want 0", client.Calls())
+			}
+			got, err := os.ReadFile(markerPath)
+			if err != nil || string(got) != "outside" {
+				t.Fatalf(
+					"external marker = %q, error = %v, want outside",
+					got,
+					err,
+				)
+			}
+		})
+	}
+}
+
+func createOrdinaryJunction(t *testing.T, link, target string) {
+	t.Helper()
+	const script = `
+$ErrorActionPreference = "Stop"
+$link = $env:AUTO_MAS_TEST_JUNCTION_LINK
+$target = $env:AUTO_MAS_TEST_JUNCTION_TARGET
+New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+`
+	command := exec.CommandContext(
+		t.Context(),
+		"pwsh",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		script,
+	)
+	command.Env = append(
+		os.Environ(),
+		"AUTO_MAS_TEST_JUNCTION_LINK="+link,
+		"AUTO_MAS_TEST_JUNCTION_TARGET="+target,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf(
+			"create ordinary Junction %q -> %q: %v\n%s",
+			link,
+			target,
+			err,
+			output,
+		)
+	}
+}
+
+func TestDownloader_ComponentRejects206AndCleansPart(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("DownloadFiles handle semantics require Windows")
+	}
+	content := []byte("partial")
+	server := httptest.NewTLSServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write(content)
+	}))
+	defer server.Close()
+	layout := newComponentLayout(t)
+	downloader := newFilesystemDownloader(
+		t,
+		layout,
+		trustedClientForServers(t, server),
+	)
+	request := requestForBytes(content)
+	request.URL = server.URL + "/artifact"
+	_, err := downloader.Download(t.Context(), request)
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) ||
+		failure.Kind != FailureHTTPStatus ||
+		failure.StatusCode != http.StatusPartialContent {
+		t.Fatalf("Download() error = %v, want HTTP 206 failure", err)
+	}
+	partPath, err := layout.DownloadPartFile(request.FileName)
+	if err != nil {
+		t.Fatalf("DownloadPartFile() error = %v", err)
+	}
+	if _, err := os.Stat(partPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part Stat() error = %v, want not exist", err)
+	}
+}
+
+func TestDownloader_ComponentTLSChecksumMismatchCleansRealPart(
+	t *testing.T,
+) {
+	if runtime.GOOS != "windows" {
+		t.Fatal("real DownloadFiles acceptance must run on Windows")
+	}
+	content := []byte("checksum-mismatch-content")
+	server := tlsArtifactServer(t, content)
+	defer server.Close()
+	layout := newComponentLayout(t)
+	downloader := newFilesystemDownloader(
+		t,
+		layout,
+		trustedClientForServers(t, server),
+	)
+	request := requestForBytes(content)
+	request.URL = server.URL + "/artifact?signature=checksum-secret"
+	request.ExpectedSHA256 = strings.Repeat("0", 64)
+
+	result, err := downloader.Download(t.Context(), request)
+	var failure *DownloadFailure
+	if result != (DownloadResult{}) ||
+		!errors.As(err, &failure) ||
+		failure.Kind != FailureChecksumMismatch ||
+		failure.Published {
+		t.Fatalf(
+			"Download() result/error = %#v/%v, want unpublished checksum mismatch",
+			result,
+			err,
+		)
+	}
+	finalPath, finalErr := layout.DownloadFile(request.FileName)
+	if finalErr != nil {
+		t.Fatalf("DownloadFile() error = %v", finalErr)
+	}
+	partPath, partErr := layout.DownloadPartFile(request.FileName)
+	if partErr != nil {
+		t.Fatalf("DownloadPartFile() error = %v", partErr)
+	}
+	if _, statErr := os.Stat(finalPath); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("final Stat() error = %v, want not exist", statErr)
+	}
+	if _, statErr := os.Stat(partPath); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("part Stat() error = %v, want not exist", statErr)
+	}
+	if strings.Contains(
+		failure.Error()+" "+errorText(failure.Err),
+		"checksum-secret",
+	) {
+		t.Fatalf("public failure leaked signed URL: %v", failure)
+	}
+}
+
+func newComponentLayout(t *testing.T) *config.Layout {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "app")
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	return layout
+}
+
+func newFilesystemDownloader(
+	t *testing.T,
+	layout *config.Layout,
+	client httpClient,
+) *Downloader {
+	t.Helper()
+	files, err := filesystem.NewDownloadFiles(layout)
+	if err != nil {
+		t.Fatalf("filesystem.NewDownloadFiles() error = %v", err)
+	}
+	options, err := resolveDownloaderOptions(nil)
+	if err != nil {
+		t.Fatalf("resolveDownloaderOptions() error = %v", err)
+	}
+	downloader, err := newDownloaderWithDependencies(
+		layout,
+		options,
+		downloaderDependencies{
+			sessions: filesystemSessions{files: files},
+			client:   client,
+			clock:    time.Now,
+			timers: func(delay time.Duration) timer {
+				return &runtimeTimer{timer: time.NewTimer(delay)}
+			},
+			cleanup: func(operationCtx context.Context) (context.Context, context.CancelFunc) {
+				return context.WithTimeout(
+					context.WithoutCancel(operationCtx),
+					cleanupTimeout,
+				)
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("newDownloaderWithDependencies() error = %v", err)
+	}
+	return downloader
+}
+
+func tlsArtifactServer(t *testing.T, content []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewTLSServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Header.Get("Range") != "" {
+			t.Errorf("Range = %q, want empty", request.Header.Get("Range"))
+		}
+		writer.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		_, _ = writer.Write(content)
+	}))
 }
