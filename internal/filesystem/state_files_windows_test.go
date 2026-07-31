@@ -2896,7 +2896,12 @@ func TestStateFiles_WriteAndRemoveContextsRejectedBeforeIO(t *testing.T) {
 
 func TestWindows_StateGuardReleasedAtEveryCrashCutpoint(t *testing.T) {
 	if point := os.Getenv("AUTO_MAS_STATE_CRASH_POINT"); point != "" {
-		runStateRemoveCrashChild(t, point)
+		leafKind := os.Getenv("AUTO_MAS_STATE_CRASH_LEAF")
+		if leafKind == "destination" {
+			runStateRemoveCrashChild(t, point)
+		} else {
+			runStateLeafUnlinkCrashChild(t, leafKind, point)
+		}
 		return
 	}
 	executable, err := os.Executable()
@@ -2904,6 +2909,7 @@ func TestWindows_StateGuardReleasedAtEveryCrashCutpoint(t *testing.T) {
 		t.Fatalf("os.Executable() error = %v", err)
 	}
 	tests := []struct {
+		leafKind    string
 		point       string
 		wantMissing bool
 	}{
@@ -2911,60 +2917,86 @@ func TestWindows_StateGuardReleasedAtEveryCrashCutpoint(t *testing.T) {
 		{point: "after-disposition", wantMissing: true},
 		{point: "after-anchor-verification", wantMissing: true},
 	}
-	for _, test := range tests {
-		t.Run(test.point, func(t *testing.T) {
-			layout := newStateFilesTestLayout(t)
-			command := exec.Command(
-				executable,
-				"-test.run=^TestWindows_StateGuardReleasedAtEveryCrashCutpoint$",
-			)
-			command.Env = append(
-				os.Environ(),
-				"AUTO_MAS_STATE_CRASH_POINT="+test.point,
-				"AUTO_MAS_STATE_CRASH_ROOT="+layout.AppRoot(),
-			)
-			output, err := command.CombinedOutput()
-			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) || exitErr.ExitCode() != stateCrashExitCode {
-				t.Fatalf("crash child error = %v, output = %s", err, output)
-			}
-			files, err := NewStateFiles(t.Context(), layout)
-			if err != nil {
-				t.Fatalf("NewStateFiles() after crash error = %v", err)
-			}
-			guard, err := files.acquireStateGuard(t.Context(), StateBackend, stateGuardExclusive)
-			if err != nil {
-				closeErr := files.Close()
-				t.Fatalf("exclusive guard after crash error = %v; Close() error = %v", err, closeErr)
-			}
-			if err := files.closeStateObject(&guard); err != nil {
-				closeErr := files.Close()
-				t.Fatalf("guard close after crash error = %v; Close() error = %v", err, closeErr)
-			}
-			_, statErr := os.Stat(layout.BackendStateFile())
-			if test.wantMissing && !errors.Is(statErr, os.ErrNotExist) {
-				closeErr := files.Close()
-				t.Fatalf(
-					"destination after %s error = %v, want missing; Close() error = %v",
-					test.point,
-					statErr,
-					closeErr,
+	leafKinds := []string{"backup", "intent", "temp", "staging", "destination"}
+	for _, leafKind := range leafKinds {
+		for _, test := range tests {
+			test.leafKind = leafKind
+			t.Run(leafKind+"/"+test.point, func(t *testing.T) {
+				layout := newStateFilesTestLayout(t)
+				command := exec.Command(
+					executable,
+					"-test.run=^TestWindows_StateGuardReleasedAtEveryCrashCutpoint$",
 				)
-			}
-			if !test.wantMissing && statErr != nil {
-				closeErr := files.Close()
-				t.Fatalf(
-					"destination after %s error = %v, want present; Close() error = %v",
-					test.point,
-					statErr,
-					closeErr,
+				command.Env = append(
+					os.Environ(),
+					"AUTO_MAS_STATE_CRASH_POINT="+test.point,
+					"AUTO_MAS_STATE_CRASH_LEAF="+test.leafKind,
+					"AUTO_MAS_STATE_CRASH_ROOT="+layout.AppRoot(),
 				)
-			}
-			if err := files.Close(); err != nil {
-				t.Fatalf("Close() after crash error = %v", err)
-			}
-		})
+				output, err := command.CombinedOutput()
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != stateCrashExitCode {
+					t.Fatalf("crash child error = %v, output = %s", err, output)
+				}
+				files, err := NewStateFiles(t.Context(), layout)
+				if err != nil {
+					t.Fatalf("NewStateFiles() after crash error = %v", err)
+				}
+				guard, err := files.acquireStateGuard(t.Context(), StateBackend, stateGuardExclusive)
+				if err != nil {
+					closeErr := files.Close()
+					t.Fatalf("exclusive guard after crash error = %v; Close() error = %v", err, closeErr)
+				}
+				if err := files.closeStateObject(&guard); err != nil {
+					closeErr := files.Close()
+					t.Fatalf("guard close after crash error = %v; Close() error = %v", err, closeErr)
+				}
+				_, statErr := os.Stat(stateCrashLeafPath(layout, test.leafKind))
+				if test.wantMissing && !errors.Is(statErr, os.ErrNotExist) {
+					closeErr := files.Close()
+					t.Fatalf(
+						"destination after %s error = %v, want missing; Close() error = %v",
+						test.point,
+						statErr,
+						closeErr,
+					)
+				}
+				if !test.wantMissing && statErr != nil {
+					closeErr := files.Close()
+					t.Fatalf(
+						"destination after %s error = %v, want present; Close() error = %v",
+						test.point,
+						statErr,
+						closeErr,
+					)
+				}
+				if err := files.Close(); err != nil {
+					t.Fatalf("Close() after crash error = %v", err)
+				}
+			})
+		}
 	}
+}
+
+const stateCrashNonce = "00112233445566778899aabbccddeeff"
+
+func stateCrashLeafPath(layout *config.Layout, leafKind string) string {
+	leaf := ""
+	switch leafKind {
+	case "backup":
+		leaf = stateTransactionLeaf(StateBackend, "backup", stateCrashNonce)
+	case "intent":
+		leaf = stateIntentLeaf(StateBackend)
+	case "temp":
+		leaf = stateTransactionLeaf(StateBackend, "temp", stateCrashNonce)
+	case "staging":
+		leaf = stateTransactionLeaf(StateBackend, "intent", stateCrashNonce)
+	case "destination":
+		return layout.BackendStateFile()
+	default:
+		return ""
+	}
+	return filepath.Join(layout.StateDir(), leaf)
 }
 
 type stateTestLeaf int
@@ -3055,12 +3087,8 @@ func runStateRemoveCrashChild(t *testing.T, point string) {
 	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
 
 	openRelative := files.api.openRelative
-	closeHandle := files.api.closeHandle
 	setDisposition := files.api.setStateDisposition
-	identity := files.api.identity
-	var anchorHandle windows.Handle
 	var unlinkHandle windows.Handle
-	var unlinkClosed atomic.Bool
 	files.api.openRelative = func(
 		parent windows.Handle,
 		name string,
@@ -3068,10 +3096,7 @@ func runStateRemoveCrashChild(t *testing.T, point string) {
 	) (windows.Handle, error) {
 		handle, openErr := openRelative(parent, name, spec)
 		if openErr == nil && name == filepath.Base(layout.BackendStateFile()) {
-			switch spec {
-			case stateMutationOpenSpec():
-				anchorHandle = handle
-			case stateUnlinkOpenSpec():
+			if spec == stateUnlinkOpenSpec() {
 				unlinkHandle = handle
 			}
 		}
@@ -3090,25 +3115,102 @@ func runStateRemoveCrashChild(t *testing.T, point string) {
 		}
 		return err
 	}
-	files.api.closeHandle = func(handle windows.Handle) error {
-		err := closeHandle(handle)
-		if handle == unlinkHandle && err == nil {
-			unlinkClosed.Store(true)
-		}
-		return err
-	}
-	files.api.identity = func(handle windows.Handle) (objectIdentity, error) {
-		value, identityErr := identity(handle)
-		if identityErr == nil &&
-			handle == anchorHandle &&
-			unlinkClosed.Load() &&
+	files.afterUnlinkVerified = func(leaf string) {
+		if leaf == filepath.Base(layout.BackendStateFile()) &&
 			point == "after-anchor-verification" {
 			os.Exit(stateCrashExitCode)
 		}
-		return value, identityErr
 	}
 	_, err = files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
 	t.Fatalf("RemoveTransactionIfUnchanged() returned at crash point %q: %v", point, err)
+}
+
+func runStateLeafUnlinkCrashChild(t *testing.T, leafKind, point string) {
+	t.Helper()
+	root := os.Getenv("AUTO_MAS_STATE_CRASH_ROOT")
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	files, err := NewStateFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("NewStateFiles() error = %v", err)
+	}
+	guard, err := files.acquireStateGuard(t.Context(), StateBackend, stateGuardExclusive)
+	if err != nil {
+		t.Fatalf("acquireStateGuard() error = %v", err)
+	}
+	if err := files.ensurePOSIXUnlinkCapability(t.Context(), StateBackend); err != nil {
+		t.Fatalf("ensurePOSIXUnlinkCapability() error = %v", err)
+	}
+	leaf := filepath.Base(stateCrashLeafPath(layout, leafKind))
+	anchor, err := files.createStateLeaf(t.Context(), leaf)
+	if err != nil {
+		t.Fatalf("createStateLeaf(%q) error = %v", leaf, err)
+	}
+	payload := []byte("crash-unlink-" + leafKind)
+	if err := files.writeAllStateBytes(t.Context(), anchor, payload); err != nil {
+		t.Fatalf("writeAllStateBytes() error = %v", err)
+	}
+	if err := files.api.flushFile(anchor.handle); err != nil {
+		t.Fatalf("flushFile() error = %v", err)
+	}
+	identityValue, err := files.api.identity(anchor.handle)
+	if err != nil {
+		t.Fatalf("identity(anchor) error = %v", err)
+	}
+	anchor.identity = identityValue
+	proof := stateObjectProof{
+		stateIdentityProof: proofIdentityValue(identityValue),
+		Size:               int64(len(payload)),
+		Digest:             sha256.Sum256(payload),
+	}
+
+	openRelative := files.api.openRelative
+	setDisposition := files.api.setStateDisposition
+	var unlinkHandle windows.Handle
+	files.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		handle, openErr := openRelative(parent, name, spec)
+		if openErr == nil && name == leaf && spec == stateUnlinkOpenSpec() {
+			unlinkHandle = handle
+		}
+		return handle, openErr
+	}
+	files.api.setStateDisposition = func(
+		handle windows.Handle,
+		spec stateDispositionSpec,
+	) error {
+		if handle == unlinkHandle && point == "before-disposition" {
+			os.Exit(stateCrashExitCode)
+		}
+		dispositionErr := setDisposition(handle, spec)
+		if dispositionErr == nil && handle == unlinkHandle && point == "after-disposition" {
+			os.Exit(stateCrashExitCode)
+		}
+		return dispositionErr
+	}
+	files.afterUnlinkVerified = func(verifiedLeaf string) {
+		if verifiedLeaf == leaf && point == "after-anchor-verification" {
+			os.Exit(stateCrashExitCode)
+		}
+	}
+	err = files.unlinkStateObject(t.Context(), leaf, &anchor, &proof)
+	closeErr := errors.Join(
+		files.closeStateObject(&anchor),
+		files.closeStateObject(&guard),
+		files.Close(),
+	)
+	t.Fatalf(
+		"unlinkStateObject(%q) returned at crash point %q: %v; close error = %v",
+		leafKind,
+		point,
+		err,
+		closeErr,
+	)
 }
 
 func newStateFilesTestLayout(t *testing.T) *config.Layout {

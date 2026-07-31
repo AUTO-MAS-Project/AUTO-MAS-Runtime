@@ -30,9 +30,10 @@ const (
 )
 
 type stateFileDependencies struct {
-	api       pathAPI
-	waitGate  WaitFunc
-	fillNonce func([]byte) error
+	api                 pathAPI
+	waitGate            WaitFunc
+	fillNonce           func([]byte) error
+	afterUnlinkVerified func(string)
 }
 
 type stateGuardMode uint8
@@ -196,13 +197,14 @@ func newStateFilesWithDependencies(
 		return nil, errors.Join(err, closePinnedObjects(api, duplicates))
 	}
 	return &StateFiles{
-		layout:      layout,
-		api:         api,
-		waitGate:    dependencies.waitGate,
-		fillNonce:   dependencies.fillNonce,
-		owner:       &stateFileOwner{marker: 1},
-		pins:        [2]pinnedObject{duplicates[0], duplicates[1]},
-		probePassed: make(map[StateFileKind]bool, 4),
+		layout:              layout,
+		api:                 api,
+		waitGate:            dependencies.waitGate,
+		fillNonce:           dependencies.fillNonce,
+		afterUnlinkVerified: dependencies.afterUnlinkVerified,
+		owner:               &stateFileOwner{marker: 1},
+		pins:                [2]pinnedObject{duplicates[0], duplicates[1]},
+		probePassed:         make(map[StateFileKind]bool, 4),
 	}, nil
 }
 
@@ -1859,7 +1861,13 @@ func (f *StateFiles) unlinkStateObject(
 	if err := f.requireStateLeafAbsent(ctx, leaf); err != nil {
 		return err
 	}
-	return f.verifyStateAnchorReadable(ctx, object, expected)
+	if err := f.verifyStateAnchorReadable(ctx, object, expected); err != nil {
+		return err
+	}
+	if f.afterUnlinkVerified != nil {
+		f.afterUnlinkVerified(leaf)
+	}
+	return nil
 }
 
 func (f *StateFiles) verifyStateAnchorReadable(

@@ -69,15 +69,16 @@ type stateFileOwner struct {
 type StateFiles struct {
 	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed 与操作/关闭的句柄生命周期。
 
-	layout      *config.Layout
-	api         pathAPI
-	waitGate    WaitFunc
-	fillNonce   func([]byte) error
-	owner       *stateFileOwner
-	pins        [2]pinnedObject
-	probePassed map[StateFileKind]bool
-	closed      bool
-	closeErr    error
+	layout              *config.Layout
+	api                 pathAPI
+	waitGate            WaitFunc
+	fillNonce           func([]byte) error
+	afterUnlinkVerified func(string)
+	owner               *stateFileOwner
+	pins                [2]pinnedObject
+	probePassed         map[StateFileKind]bool
+	closed              bool
+	closeErr            error
 }
 
 // StateFileSnapshot 绑定读取内容与其物理文件身份。
