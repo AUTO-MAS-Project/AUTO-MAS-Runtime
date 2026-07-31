@@ -305,6 +305,82 @@ func (s *DownloadSession) PartPath() string {
 	return s.partPath
 }
 
+// PublishNoReplace 将已固定的临时文件原子发布到最终名称，且绝不替换既有对象。
+func (s *DownloadSession) PublishNoReplace(
+	ctx context.Context,
+) (PublishResult, error) {
+	if ctx == nil {
+		return PublishResult{}, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return PublishResult{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.state {
+	case downloadPublished:
+		return s.published, s.closeErr
+	case downloadAborted:
+		return PublishResult{}, ErrClosed
+	case downloadOpen:
+	default:
+		return PublishResult{}, ErrClosed
+	}
+	identity, err := s.api.identity(s.part.handle)
+	if err != nil {
+		return PublishResult{}, &FileError{
+			Operation: "identify",
+			Path:      s.partPath,
+			Err:       err,
+		}
+	}
+	if identity.volumeSerial != s.part.identity.volumeSerial ||
+		identity.fileID != s.part.identity.fileID {
+		return PublishResult{}, ErrIdentityChanged
+	}
+	if identity.numberOfLinks != 1 ||
+		identity.attributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+		return PublishResult{}, ErrUnsafeHardLink
+	}
+	if err := ctx.Err(); err != nil {
+		return PublishResult{}, err
+	}
+	if err := s.api.flushFile(s.part.handle); err != nil {
+		return PublishResult{}, &FileError{
+			Operation: "flush",
+			Path:      s.partPath,
+			Err:       err,
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return PublishResult{}, err
+	}
+	if err := renameByHandleWith(
+		s.part.handle,
+		s.pins[3].handle,
+		filepath.Base(s.path),
+		false,
+		s.api,
+	); err != nil {
+		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) ||
+			errors.Is(err, windows.ERROR_FILE_EXISTS) {
+			return PublishResult{}, errors.Join(ErrDestinationExists, err)
+		}
+		return PublishResult{}, &FileError{
+			Operation: "publish",
+			Path:      s.path,
+			Err:       err,
+		}
+	}
+	s.state = downloadPublished
+	s.published = PublishResult{Published: true}
+	s.closeErr = errors.Join(
+		closePinnedObject(s.api, &s.part),
+		closePinnedObjects(s.api, s.pins[:]),
+	)
+	return s.published, s.closeErr
+}
+
 // Abort 删除仍处于 open 状态的临时文件并关闭会话。
 func (s *DownloadSession) Abort(ctx context.Context) (AbortResult, error) {
 	if ctx == nil {

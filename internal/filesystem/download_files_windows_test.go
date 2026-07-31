@@ -415,6 +415,300 @@ func TestDownloadFiles_ConcurrentDifferentNames(t *testing.T) {
 	}
 }
 
+func TestDownloadSession_PublishNoReplaceFlushesAndKeepsFileID(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	if _, err := session.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	originalID := session.part.identity.fileID
+	result, err := session.PublishNoReplace(t.Context())
+	if err != nil || !result.Published {
+		t.Fatalf("PublishNoReplace() = %#v, %v", result, err)
+	}
+	got, err := os.ReadFile(session.Path())
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("final payload = %q, error = %v", got, err)
+	}
+	api := newProductionPathAPI()
+	handle, err := api.openPath(nativeWindowsPath(session.Path()), openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: false,
+	})
+	if err != nil {
+		t.Fatalf("open final error = %v", err)
+	}
+	identity, identityErr := api.identity(handle)
+	closeErr := api.closeHandle(handle)
+	if identityErr != nil || closeErr != nil {
+		t.Fatalf("final identity/close errors = %v/%v", identityErr, closeErr)
+	}
+	if identity.fileID != originalID {
+		t.Fatalf("final file ID = %x, want %x", identity.fileID, originalID)
+	}
+}
+
+func TestDownloadSession_PublishNeverReplacesCompetitor(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	if _, err := session.Write([]byte("session")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := os.WriteFile(session.Path(), []byte("competitor"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(competitor) error = %v", err)
+	}
+	result, err := session.PublishNoReplace(t.Context())
+	if result.Published || !errors.Is(err, ErrDestinationExists) {
+		t.Fatalf("PublishNoReplace() = %#v, %v, want occupied", result, err)
+	}
+	got, _ := os.ReadFile(session.Path())
+	if string(got) != "competitor" {
+		t.Fatalf("competitor = %q, want unchanged", got)
+	}
+	if _, err := session.Abort(t.Context()); err != nil {
+		t.Fatalf("Abort() error = %v", err)
+	}
+}
+
+func TestDownloadSession_PublishFailureRemainsAbortable(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	injected := errors.New("rename failed")
+	session.api.rename = func(
+		windows.Handle,
+		windows.Handle,
+		string,
+		bool,
+	) error {
+		return injected
+	}
+	result, err := session.PublishNoReplace(t.Context())
+	if result.Published || !errors.Is(err, injected) {
+		t.Fatalf("PublishNoReplace() = %#v, %v", result, err)
+	}
+	abort, err := session.Abort(t.Context())
+	if err != nil || !abort.Removed {
+		t.Fatalf("Abort() = %#v, %v, want removed", abort, err)
+	}
+}
+
+func TestDownloadSession_PublishReportsPublishedBeforeCloseError(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	injected := errors.New("close failed")
+	closeHandle := session.api.closeHandle
+	rename := session.api.rename
+	renamed := false
+	session.api.rename = func(
+		source windows.Handle,
+		parent windows.Handle,
+		name string,
+		replace bool,
+	) error {
+		err := rename(source, parent, name, replace)
+		renamed = err == nil
+		return err
+	}
+	session.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		if renamed {
+			renamed = false
+			return errors.Join(injected, err)
+		}
+		return err
+	}
+	result, err := session.PublishNoReplace(t.Context())
+	if !result.Published || !errors.Is(err, injected) {
+		t.Fatalf("PublishNoReplace() = %#v, %v, want published/injected", result, err)
+	}
+	if _, abortErr := session.Abort(t.Context()); !errors.Is(abortErr, ErrClosed) {
+		t.Fatalf("Abort() error = %v, want ErrClosed", abortErr)
+	}
+}
+
+func TestDownloadSession_AbortDeletesBySameHandle(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	originalID := session.part.identity.fileID
+	seenID := [16]byte{}
+	identity := session.api.identity
+	setDisposition := session.api.setDisposition
+	session.api.setDisposition = func(handle windows.Handle) error {
+		got, err := identity(handle)
+		if err != nil {
+			return err
+		}
+		seenID = got.fileID
+		return setDisposition(handle)
+	}
+	result, err := session.Abort(t.Context())
+	if err != nil || !result.Removed {
+		t.Fatalf("Abort() = %#v, %v", result, err)
+	}
+	if seenID != originalID {
+		t.Fatalf("disposed file ID = %x, want %x", seenID, originalID)
+	}
+}
+
+func TestDownloadSession_AbortIsIdempotentAfterCloseError(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	injected := errors.New("close failed")
+	closeHandle := session.api.closeHandle
+	dispositionCalls := 0
+	setDisposition := session.api.setDisposition
+	session.api.setDisposition = func(handle windows.Handle) error {
+		dispositionCalls++
+		return setDisposition(handle)
+	}
+	session.api.closeHandle = func(handle windows.Handle) error {
+		err := closeHandle(handle)
+		return errors.Join(injected, err)
+	}
+	first, firstErr := session.Abort(t.Context())
+	second, secondErr := session.Abort(t.Context())
+	if !first.Removed || second != first ||
+		!errors.Is(firstErr, injected) || !errors.Is(secondErr, injected) {
+		t.Fatalf("Abort results = %#v/%#v, errors = %v/%v", first, second, firstErr, secondErr)
+	}
+	if dispositionCalls != 1 {
+		t.Fatalf("disposition calls = %d, want 1", dispositionCalls)
+	}
+}
+
+func TestDownloadSession_AbortRejectsPublishedSession(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	if result, err := session.PublishNoReplace(t.Context()); err != nil || !result.Published {
+		t.Fatalf("PublishNoReplace() = %#v, %v", result, err)
+	}
+	if result, err := session.Abort(t.Context()); result.Removed || !errors.Is(err, ErrClosed) {
+		t.Fatalf("Abort() = %#v, %v, want state rejection", result, err)
+	}
+}
+
+func TestDownloadSession_StateTransitionsAreLinearized(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	start := make(chan struct{})
+	type outcome struct {
+		published bool
+		removed   bool
+		err       error
+	}
+	outcomes := make(chan outcome, 2)
+	go func() {
+		<-start
+		result, err := session.PublishNoReplace(t.Context())
+		outcomes <- outcome{published: result.Published, err: err}
+	}()
+	go func() {
+		<-start
+		result, err := session.Abort(t.Context())
+		outcomes <- outcome{removed: result.Removed, err: err}
+	}()
+	close(start)
+	first := <-outcomes
+	second := <-outcomes
+	successes := 0
+	for _, result := range []outcome{first, second} {
+		if result.published || result.removed {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("transition outcomes = %#v/%#v, want exactly one success", first, second)
+	}
+}
+
+func TestDownloadSession_PublishAndAbortContextsRejectedBeforeIO(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	t.Cleanup(func() { _ = session.closeForTest() })
+	flushCalls := 0
+	dispositionCalls := 0
+	session.api.flushFile = func(windows.Handle) error {
+		flushCalls++
+		return nil
+	}
+	session.api.setDisposition = func(windows.Handle) error {
+		dispositionCalls++
+		return nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := session.PublishNoReplace(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("PublishNoReplace() error = %v", err)
+	}
+	if _, err := session.Abort(nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Abort(nil) error = %v", err)
+	}
+	if flushCalls != 0 || dispositionCalls != 0 {
+		t.Fatalf("I/O calls = flush %d/disposition %d, want 0/0", flushCalls, dispositionCalls)
+	}
+}
+
+func TestDownloadSession_PublishCancellationAfterRenameKeepsPublished(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	rename := session.api.rename
+	session.api.rename = func(
+		source windows.Handle,
+		parent windows.Handle,
+		name string,
+		replace bool,
+	) error {
+		err := rename(source, parent, name, replace)
+		if err == nil {
+			cancel()
+		}
+		return err
+	}
+	result, err := session.PublishNoReplace(ctx)
+	if err != nil || !result.Published {
+		t.Fatalf("PublishNoReplace() = %#v, %v, want published/nil", result, err)
+	}
+}
+
+func TestDownloadSession_AbortCancellationAfterDispositionKeepsRemoved(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	setDisposition := session.api.setDisposition
+	session.api.setDisposition = func(handle windows.Handle) error {
+		err := setDisposition(handle)
+		if err == nil {
+			cancel()
+		}
+		return err
+	}
+	result, err := session.Abort(ctx)
+	if err != nil || !result.Removed {
+		t.Fatalf("Abort() = %#v, %v, want removed/nil", result, err)
+	}
+}
+
+func TestWindows_DownloadPublishesValidatedHandleWithoutReplacement(t *testing.T) {
+	session := newDownloadSessionForTest(t)
+	if _, err := session.Write([]byte("validated")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if result, err := session.PublishNoReplace(t.Context()); err != nil || !result.Published {
+		t.Fatalf("PublishNoReplace() = %#v, %v", result, err)
+	}
+	got, err := os.ReadFile(session.Path())
+	if err != nil || string(got) != "validated" {
+		t.Fatalf("published file = %q, error = %v", got, err)
+	}
+	if _, err := os.Stat(session.PartPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part path still exists: %v", err)
+	}
+}
+
+func newDownloadSessionForTest(t *testing.T) *DownloadSession {
+	t.Helper()
+	files, _ := newDownloadFixture(t)
+	session, err := files.Begin(t.Context(), "uv.zip")
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	t.Cleanup(func() { _ = session.closeForTest() })
+	return session
+}
+
 func newDownloadFixture(t *testing.T) (*DownloadFiles, *config.Layout) {
 	t.Helper()
 	layout := newDownloadTestLayout(t)
