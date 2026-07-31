@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -142,6 +144,31 @@ type DeleteResult struct {
 // Auditor 记录受控删除的双阶段审计事件。
 type Auditor interface {
 	RecordDeletion(ctx context.Context, record DeleteAuditRecord) error
+}
+
+// Operator 执行受管删除与原子重命名操作。
+type Operator struct {
+	layout          *config.Layout
+	auditor         Auditor
+	api             pathAPI
+	wait            WaitFunc
+	delays          []time.Duration
+	finishedContext func(context.Context) (context.Context, context.CancelFunc)
+}
+
+// Option 配置 Operator 的可注入等待策略。
+type Option func(*options) error
+
+type options struct {
+	wait      WaitFunc
+	delays    []time.Duration
+	waitSet   bool
+	delaysSet bool
+}
+
+type operatorDependencies struct {
+	api             pathAPI
+	finishedContext func(context.Context) (context.Context, context.CancelFunc)
 }
 
 // DeleteAuditPhase 标识删除审计的阶段。
