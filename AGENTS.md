@@ -35,7 +35,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** ✅ `7afd192` |
 | M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | T2.1~T2.7 **已完成** ✅ `149e8be` |
 | M3~M7、M9 | 未开始；M3 是下一功能阶段 |
-| M10 工程可维护性收敛 | T10.1 文档信息架构进行中；后续阶段见维护设计 |
+| M10 工程可维护性收敛 | T10.1 文档信息架构已完成 ✅ `ef24ea0`；后续阶段见维护设计 |
 
 代码现状：
 
