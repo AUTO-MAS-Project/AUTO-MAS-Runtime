@@ -22,7 +22,7 @@
 1. **先确认任务编号。** 实现类工作必须对应 `doc/任务拆分.md` 里的某个 `T<里程碑>.<序号>`；
    清单里没有的需求，先与用户确认并补进文档，再动手。
 2. **走既有四段式流程。** 设计文档 → 实现计划 → 严格 TDD 逐任务实现 → 每任务提交后审查。
-   非平凡任务先进入 plan mode 或产出 `doc/设计-T*.md`，取得确认后再写代码。
+   非平凡任务先进入 plan mode，或在 `doc/current/M<里程碑>/` 产出设计文档，取得确认后再写代码。
 3. **证据优先。** 声称“测试通过 / 构建成功”前必须实际执行并贴出输出；
    并发与 race 验证遵循 [AGENTS.md](AGENTS.md) 5.2～5.3，工具可用不能代替当次通过证据。
 4. **推送需授权。** `git push`、创建远端仓库/Release、任何把仓库内容发往外部服务的操作，
@@ -37,7 +37,7 @@
 本仓库的工作方式与以下 skill 高度匹配，遇到对应场景优先调用：
 
 - `brainstorming` — 在设计新功能、修改行为之前澄清意图与边界；
-- `writing-plans` / `executing-plans` — 产出与执行 `doc/计划-T*.md`；
+- `writing-plans` / `executing-plans` — 在 `doc/current/M<里程碑>/` 产出并执行当前任务计划；
 - `test-driven-development` — 本仓库强制 TDD，实现前先写失败测试；
 - `systematic-debugging` — 出现 bug、测试失败、异常行为时，先定位再改；
 - `verification-before-completion` — 宣称完成、提交或合并前的验证门；

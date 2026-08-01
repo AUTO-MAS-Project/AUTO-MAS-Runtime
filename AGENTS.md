@@ -27,19 +27,20 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-07-29）
+## 2. 当前状态（截至 2026-08-01）
 
 | 里程碑 | 状态 |
 | --- | --- |
-| M0 工程基础与最小 CI | T0.1~T0.3 完成；**T0.4 受阻**（远端 CI 全绿证据待补） |
+| M0 工程基础与最小 CI | T0.1~T0.4 **已完成** |
 | M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** ✅ `7afd192` |
-| M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | 未开始 ← **下一步** |
-| M3~M7、M9 | 未开始 |
+| M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | T2.1~T2.7 **已完成** ✅ `149e8be` |
+| M3~M7、M9 | 未开始；M3 是下一功能阶段 |
+| M10 工程可维护性收敛 | T10.1 文档信息架构进行中；后续阶段见维护设计 |
 
 代码现状：
 
-- `internal/protocol`（含 `contracttest` 子包）是**唯一有实现的包**，约 11.5k 行（含测试）；
-- 其余 `internal/*` 只有 `doc.go` 占位；
+- `internal/protocol`、`config`、`filesystem`、`logging`、`state`、`lock` 和 `mirror` 已实现；
+- `backend`、`gitrepo`、`health`、`process`、`uv` 仍只有占位；
 - `internal/cli/cli.go` 是骨架，`Run()` 固定返回 `"auto-mas-runtime dev"`；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
 
@@ -54,11 +55,13 @@ Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`�
 
 | 文档 | 内容 | 何时必读 |
 | --- | --- | --- |
+| [doc/README.md](doc/README.md) | 文档导航、分层与生命周期规则 | 查找任何项目文档时 |
 | [doc/架构设计.md](doc/架构设计.md) | 冻结的系统架构：边界、CLI 命令树、NDJSON 协议、错误码/退出码/stage/state 全集、Git 更新流程、uv 策略、目录安全、测试矩阵、验收标准 | 任何涉及对外契约的改动 |
 | [doc/契约补充-v1.md](doc/契约补充-v1.md) | 协议 v1 的 5 项定稿细节（C1~C5：固定端口 36163、身份注入环境变量、`failed` 字面量、`AUTO_MAS_SUPERVISED=1`、development 检查边界） | 涉及后端启动/健康检查/环境变量 |
 | [doc/任务拆分.md](doc/任务拆分.md) | 逐任务清单、依赖、验收项、决策记录 D1~D6、待决项 D-open-*、AUTO-MAS 侧 TODO、变更记录 | **每次开工前**确认自己在做哪个任务 |
 | [doc/代码审查清单.md](doc/代码审查清单.md) | 自动化门禁覆盖不到的架构边界检查 | 提交前自查、审查他人代码 |
-| `doc/设计-T*.md` / `doc/计划-T*.md` | 单个任务的设计与实现计划（每个任务一对） | 执行某个具体任务时 |
+| `doc/current/M*/` | 尚未完成任务的设计与实施计划 | 执行某个具体任务时 |
+| `doc/archive/M*/` | 已完成阶段仍有解释价值的设计与审查记录 | 追溯设计背景时 |
 
 **优先级：** 契约补充-v1（更具体） > 架构设计（概括） > 任务拆分（派生清单）。
 
@@ -172,12 +175,12 @@ if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
 ### 6.2 四段式（本仓库既有实践）
 
 ```text
-设计 doc/设计-T*.md  →  计划 doc/计划-T*.md  →  TDD 逐任务实现  →  审查 + 验收回写
+设计 doc/current/M*/设计-T*.md  →  计划 doc/current/M*/计划-T*.md  →  TDD 逐任务实现  →  审查 + 验收回写
 ```
 
 1. **设计**：目标、范围与边界（含明确的「不负责」）、API 形态、并发/失败语义；
 2. **计划**：拆成若干可独立提交的 Task，每个 Task 写明「文件 / 红灯 / 绿灯 / 验证与提交」，
-   固定测试函数名，验证命令直接可粘贴执行；
+   固定测试函数名，验证命令直接可粘贴执行；计划不复制大段最终代码，任务完成后删除并由 Git 历史追溯；
 3. **实现**：**严格 TDD**——先写失败测试并确认失败原因正确，再写最小实现；
 4. **审查**：每个 Task 提交后独立审查，Critical/Important 修完才进入下一个 Task；
    修复独立提交（`fix: ...`）。

@@ -4,9 +4,10 @@ AUTO-MAS Runtime is the Windows runtime manager for AUTO-MAS. It will provide a
 single `auto-mas-runtime.exe` that prepares the managed Go/Python environment,
 synchronizes the backend workspace, and supervises the backend process.
 
-The project is under active implementation. The architecture and task list are
-the source of truth:
+The project is under active implementation. Start from the documentation index;
+the architecture and task list remain the source of truth:
 
+- [Documentation index](doc/README.md)
 - [Architecture](doc/架构设计.md)
 - [Implementation tasks](doc/任务拆分.md)
 
