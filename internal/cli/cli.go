@@ -96,9 +96,14 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 		return protocol.ExitCodeInvalidArgument
 	}
 	d := &deps{ctx: ctx, io: io, options: values}
-	root := newRoot(d, io)
 
-	target, remaining, err := root.Find(args)
+	// 预解析树与正式执行树必须是两个独立实例：预解析树只用于定位目标、
+	// 探测 --help 与 output/protocol 预校验，随后即被丢弃；正式执行树
+	// 全新未解析，保证每个 flag 只被解析一次。否则 pflag StringArray 的
+	// Set 语义（首次赋值、之后追加）会让单个 --mirror 值在二次解析时
+	// 累积成两条，触发重复 kind 校验（T3.6 F1）。
+	probeRoot := newRoot(d, io)
+	target, remaining, err := probeRoot.Find(args)
 	if err != nil {
 		return parseFailure(io, err)
 	}
@@ -122,9 +127,9 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 	if err == nil && helpRequested {
 		// NDJSON 模式的帮助文本只允许出现在 stderr，stdout 必须保持机器可解析。
 		if mode == outputNDJSON {
-			root.SetOut(io.Err)
+			probeRoot.SetOut(io.Err)
 		} else {
-			root.SetOut(io.Out)
+			probeRoot.SetOut(io.Out)
 		}
 		if err := target.Help(); err != nil {
 			writeDiagnostic(io, err)
@@ -132,6 +137,9 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 		}
 		return protocol.ExitCodeSuccess
 	}
+	// 正式执行树：与预解析树同构但全新未解析，Cobra 内部只解析一次，
+	// 不继承预解析产生的任何 flag 状态。
+	root := newRoot(d, io)
 	if mode == outputNDJSON {
 		root.SetOut(io.Err)
 	} else {

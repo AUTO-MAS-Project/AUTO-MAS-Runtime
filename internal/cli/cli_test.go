@@ -314,6 +314,103 @@ func TestExecute_MirrorDuplicateKindExit2(t *testing.T) {
 	}
 }
 
+// TestExecute_MirrorSingleKindAccepted 证明单个 --mirror 值经 Execute
+// 全链路只解析一次：合法策略进入 hello→result 会话并以 0 退出。
+func TestExecute_MirrorSingleKindAccepted(t *testing.T) {
+	t.Parallel()
+	result := runCLI(
+		t,
+		context.Background(),
+		"--output", "ndjson",
+		"--mirror", "git=github",
+		"version",
+	)
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", result.exitCode, result.stderr)
+	}
+	events := parseNDJSON(t, result.stdout)
+	if eventType(events[0]) != string(protocol.TypeHello) {
+		t.Errorf("first event type = %q, want hello", eventType(events[0]))
+	}
+	if eventType(events[len(events)-1]) != string(protocol.TypeResult) {
+		t.Errorf("last event type = %q, want result", eventType(events[len(events)-1]))
+	}
+}
+
+// TestExecute_MirrorMultipleKindsAccepted 证明四种 kind 各一条时全部保留，
+// 且只解析一次（每种 kind 不因二次解析而重复）。
+func TestExecute_MirrorMultipleKindsAccepted(t *testing.T) {
+	t.Parallel()
+	result := runCLI(
+		t,
+		context.Background(),
+		"--output", "ndjson",
+		"--mirror", "git=cnb",
+		"--mirror", "uv=gh-proxy",
+		"--mirror", "python=gh-proxy",
+		"--mirror", "package-index=aliyun",
+		"version",
+	)
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", result.exitCode, result.stderr)
+	}
+	events := parseNDJSON(t, result.stdout)
+	if eventType(events[0]) != string(protocol.TypeHello) {
+		t.Errorf("first event type = %q, want hello", eventType(events[0]))
+	}
+	if eventType(events[len(events)-1]) != string(protocol.TypeResult) {
+		t.Errorf("last event type = %q, want result", eventType(events[len(events)-1]))
+	}
+}
+
+// TestExecute_MirrorDuplicateKindRejected 证明同一 kind 重复仍被拒绝：
+// 参数错误（stderr 诊断 + exit 2），stdout 无任何协议事件。
+func TestExecute_MirrorDuplicateKindRejected(t *testing.T) {
+	t.Parallel()
+	result := runCLI(
+		t,
+		context.Background(),
+		"--mirror", "git=cnb",
+		"--mirror", "git=github",
+		"version",
+	)
+	if result.exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout = %q, want empty (no protocol session)", result.stdout)
+	}
+	if !strings.Contains(result.stderr, "auto-mas-runtime: ") {
+		t.Errorf("stderr = %q, want auto-mas-runtime: prefix", result.stderr)
+	}
+}
+
+// TestExecute_MirrorOfflineConflictRejected 证明 --offline 与 --mirror
+// 互斥在 Execute 全链路仍生效，退出码 2 且不发射协议事件。
+func TestExecute_MirrorOfflineConflictRejected(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "--offline", "--mirror", "git=github", "version")
+	if result.exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout = %q, want empty (no protocol session)", result.stdout)
+	}
+}
+
+// TestExecute_MirrorWithHelpSucceeds 证明 --mirror 合法取值不阻断 --help：
+// 帮助文本 + exit 0（与 T3.5 F5 的 help 优先级语义一致）。
+func TestExecute_MirrorWithHelpSucceeds(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "--mirror", "git=github", "--help")
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stdout, "auto-mas-runtime") {
+		t.Errorf("stdout = %q, want help text", result.stdout)
+	}
+}
+
 func TestExecute_UnknownFlagExit2(t *testing.T) {
 	t.Parallel()
 	result := runCLI(t, context.Background(), "--bogus", "doctor")

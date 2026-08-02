@@ -49,7 +49,9 @@ func versionRunner(t *testing.T, terminal contracttest.Terminal) contracttest.Tr
 	}
 	code := Execute(
 		ctx,
-		[]string{"--output", "ndjson", "version"},
+		// success 路径固定携带一个 --mirror 值，防止预解析/正式执行
+		// 双解析问题再次绕过 Execute 全链路（T3.6 F1 回归护栏）。
+		[]string{"--output", "ndjson", "--mirror", "git=github", "version"},
 		IO{
 			In:  strings.NewReader(""),
 			Out: &stdout,
