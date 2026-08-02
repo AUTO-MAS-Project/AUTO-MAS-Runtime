@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
@@ -24,6 +26,7 @@ type options struct {
 	cwd           string
 	clock         func() time.Time
 	versionSource versionSourceFunc
+	doctorFactory doctorFactory
 }
 
 // Option 配置 Execute 的可注入测试依赖。
@@ -56,6 +59,9 @@ func applyOptions(values ...Option) (options, error) {
 		cwd:           mustGetwd(),
 		clock:         time.Now,
 		versionSource: version.Load,
+		doctorFactory: func(layout *config.Layout, probes doctor.Probes) (doctorService, error) {
+			return doctor.New(layout, probes)
+		},
 	}
 	for _, option := range values {
 		if option == nil {

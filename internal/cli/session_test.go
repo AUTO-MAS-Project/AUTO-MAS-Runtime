@@ -14,10 +14,10 @@ import (
 // result 恰好一次且最后、error/result 四元组一致、容器字段非空）。
 func TestExecute_FrameworkSatisfiesContract(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--output", "ndjson", "doctor")
+	result := runCLI(t, context.Background(), "--output", "ndjson", "repair")
 	contracttest.Assert(
 		t,
-		"doctor",
+		"repair",
 		contracttest.TerminalFailure,
 		[]byte(result.stdout),
 	)
@@ -25,7 +25,7 @@ func TestExecute_FrameworkSatisfiesContract(t *testing.T) {
 
 func TestExecute_NDJSONSessionErrorTupleMatchesResult(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--output", "ndjson", "doctor")
+	result := runCLI(t, context.Background(), "--output", "ndjson", "repair")
 	events := parseNDJSON(t, result.stdout)
 	var errorEvent, resultEvent parsedEvent
 	for _, event := range events {

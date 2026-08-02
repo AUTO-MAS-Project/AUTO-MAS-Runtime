@@ -92,7 +92,7 @@ func TestExecute_NoArgsPrintsHelp(t *testing.T) {
 
 func TestExecute_DefaultHumanOutput(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "doctor")
+	result := runCLI(t, context.Background(), "repair")
 	if result.exitCode != 2 {
 		t.Fatalf("exit code = %d, want 2", result.exitCode)
 	}
@@ -109,7 +109,7 @@ func TestExecute_DefaultHumanOutput(t *testing.T) {
 
 func TestExecute_NDJSONSessionHelloFirstResultLast(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--output", "ndjson", "doctor")
+	result := runCLI(t, context.Background(), "--output", "ndjson", "repair")
 	if result.exitCode != 2 {
 		t.Fatalf("exit code = %d, want 2", result.exitCode)
 	}
@@ -123,14 +123,14 @@ func TestExecute_NDJSONSessionHelloFirstResultLast(t *testing.T) {
 	if eventType(events[len(events)-1]) != string(protocol.TypeResult) {
 		t.Errorf("last event type = %q, want result", eventType(events[len(events)-1]))
 	}
-	if got := eventString(events[0], "command"); got != "doctor" {
-		t.Errorf("hello command = %q, want doctor", got)
+	if got := eventString(events[0], "command"); got != "repair" {
+		t.Errorf("hello command = %q, want repair", got)
 	}
 }
 
 func TestExecute_ProtocolMatchRunsSession(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--protocol", "1", "--output", "ndjson", "doctor")
+	result := runCLI(t, context.Background(), "--protocol", "1", "--output", "ndjson", "repair")
 	if result.exitCode != 2 {
 		t.Fatalf("exit code = %d, want 2", result.exitCode)
 	}
@@ -218,7 +218,7 @@ func TestExecute_ProtocolMismatchExit10(t *testing.T) {
 
 func TestExecute_OfflineAloneValid(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--offline", "--output", "ndjson", "doctor")
+	result := runCLI(t, context.Background(), "--offline", "--output", "ndjson", "repair")
 	if result.exitCode != 2 {
 		t.Fatalf("exit code = %d, want 2 (skeleton failure)", result.exitCode)
 	}
@@ -297,7 +297,7 @@ func TestExecute_ContextCancelledMapsToOperationCancelled(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result := runCLI(t, ctx, "--output", "ndjson", "doctor")
+	result := runCLI(t, ctx, "--output", "ndjson", "repair")
 	if result.exitCode != 130 {
 		t.Fatalf("exit code = %d, want 130", result.exitCode)
 	}

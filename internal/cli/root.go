@@ -51,7 +51,7 @@ func newRoot(deps *deps, io IO) *cobra.Command {
 	})
 	root.AddCommand(
 		versionCommand(deps),
-		skeletonCommand(deps, "doctor", "只读检查本机运行环境", protocol.StageDoctor),
+		doctorCommand(deps),
 		bootstrapCommand(deps),
 		workspaceGroup(deps),
 		environmentGroup(deps),

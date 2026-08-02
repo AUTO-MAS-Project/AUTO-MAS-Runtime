@@ -25,6 +25,7 @@ func TestLayout_FixedPathsMatchSpecification(t *testing.T) {
 		want string
 	}{
 		{name: "RepoDir", got: layout.RepoDir(), want: filepath.Join(root, "repo")},
+		{name: "RepoVersionFile", got: layout.RepoVersionFile(), want: filepath.Join(root, "repo", "res", "version.json")},
 		{name: "StateDir", got: layout.StateDir(), want: filepath.Join(root, "runtime-state")},
 		{name: "BackendStateFile", got: layout.BackendStateFile(), want: filepath.Join(root, "runtime-state", "backend.json")},
 		{name: "MutationStateFile", got: layout.MutationStateFile(), want: filepath.Join(root, "runtime-state", "mutation.json")},
@@ -163,6 +164,7 @@ type fixedPath struct {
 func fixedPaths(layout *config.Layout) []fixedPath {
 	return []fixedPath{
 		{name: "RepoDir", path: layout.RepoDir()},
+		{name: "RepoVersionFile", path: layout.RepoVersionFile()},
 		{name: "StateDir", path: layout.StateDir()},
 		{name: "BackendStateFile", path: layout.BackendStateFile()},
 		{name: "MutationStateFile", path: layout.MutationStateFile()},
