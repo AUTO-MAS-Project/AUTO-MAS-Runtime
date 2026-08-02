@@ -410,3 +410,68 @@ func TestDoctor_ErrorStringDoesNotExposePaths(t *testing.T) {
 		t.Error("errors.Is(serviceErr, cause) = false, want true")
 	}
 }
+
+// TestDoctor_ResultDetailsDoNotLeakPaths 证明错误检查项与整个 Report 的
+// wire 形态不包含任何绝对路径（含 JSON 转义形式），原始错误串只进 stderr/日志。
+func TestDoctor_ResultDetailsDoNotLeakPaths(t *testing.T) {
+	t.Parallel()
+	layout, root := healthyFixture(t)
+	probes := testProbes()
+	probes.UVVersion = func(context.Context, string) (string, error) {
+		return "", errors.New(root + `\runtime\tools\uv\0.8.0\uv.exe: access denied`)
+	}
+	probes.DiskFree = func(context.Context, string) (uint64, error) {
+		return 0, errors.New(root + `\app-root: disk probe failed`)
+	}
+	service := mustNewService(t, layout, probes)
+	report := runService(t, service)
+
+	reportData, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal(report) error = %v", err)
+	}
+	checksData, err := json.Marshal(report.Checks)
+	if err != nil {
+		t.Fatalf("Marshal(checks) error = %v", err)
+	}
+	escapedRoot := strings.ReplaceAll(root, `\`, `\\`)
+	for name, data := range map[string]string{
+		"report": string(reportData),
+		"checks": string(checksData),
+	} {
+		if strings.Contains(data, escapedRoot) {
+			t.Errorf("%s leaks app root path (escaped form): %s", name, data)
+		}
+		if strings.Contains(data, strings.ReplaceAll(root, `\`, `/`)) {
+			t.Errorf("%s leaks app root path (slash form): %s", name, data)
+		}
+	}
+}
+
+// TestDoctor_ErrorDetailsUseStableKinds 证明错误检查项的 details.error
+// 只使用稳定分类词（not-found/access-denied/invalid/timeout/other）。
+func TestDoctor_ErrorDetailsUseStableKinds(t *testing.T) {
+	t.Parallel()
+	stable := map[string]bool{
+		"not-found":     true,
+		"access-denied": true,
+		"invalid":       true,
+		"timeout":       true,
+		"other":         true,
+	}
+	checks := []Check{
+		errorCheck("a", "a", "msg", fs.ErrNotExist),
+		errorCheck("b", "b", "msg", fs.ErrPermission),
+		errorCheck("c", "c", "msg", context.DeadlineExceeded),
+		errorCheck("d", "d", "msg", errors.New(`C:\leak`)),
+	}
+	for _, check := range checks {
+		kind, ok := check.Details["error"].(string)
+		if !ok {
+			t.Fatalf("check %q details.error = %#v, want string", check.ID, check.Details["error"])
+		}
+		if !stable[kind] {
+			t.Errorf("check %q details.error = %q, want stable kind", check.ID, kind)
+		}
+	}
+}

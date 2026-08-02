@@ -24,6 +24,9 @@ const maxVersionFileBytes = 1 << 20
 // errStateFileTooLarge 表示状态文件超出只读检查的大小上限。
 var errStateFileTooLarge = errors.New("state file exceeds size limit")
 
+// errMalformedPayload 表示文件存在但内容不可解析，details 稳定分类为 invalid。
+var errMalformedPayload = errors.New("malformed payload")
+
 // Status 是单个检查项的稳定结果。
 type Status string
 
@@ -215,7 +218,7 @@ func (s *Service) checkUV(ctx context.Context) Check {
 			Name:    "uv 工具",
 			Status:  StatusError,
 			Message: "无法访问 uv 工具目录",
-			Details: map[string]any{"error": err.Error()},
+			Details: map[string]any{"error": errorKind(err)},
 		}
 	}
 	executables := make([]string, 0, len(entries))
@@ -261,7 +264,7 @@ func (s *Service) checkUV(ctx context.Context) Check {
 		Name:    "uv 工具",
 		Status:  StatusError,
 		Message: "无法识别 uv 版本",
-		Details: map[string]any{"error": lastErr.Error()},
+		Details: map[string]any{"error": errorKind(lastErr)},
 	}
 }
 
@@ -353,7 +356,9 @@ func (s *Service) checkRepo(ctx context.Context) Check {
 			Name:    "受管仓库",
 			Status:  StatusError,
 			Message: "版本文件不是有效 JSON",
-			Details: map[string]any{"error": err.Error()},
+			Details: map[string]any{
+				"error": errorKind(fmt.Errorf("%w: %v", errMalformedPayload, err)),
+			},
 		}
 	}
 	if payload.Version == "" {
@@ -512,7 +517,24 @@ func errorCheck(id, name, message string, cause error) Check {
 		Name:    name,
 		Status:  StatusError,
 		Message: message,
-		Details: map[string]any{"error": cause.Error()},
+		Details: map[string]any{"error": errorKind(cause)},
+	}
+}
+
+// errorKind 把底层错误映射为 doctor 检查项 details 的稳定分类词。
+// wire 上的 details 只允许稳定分类词，原始错误串只能进入 stderr 诊断或日志。
+func errorKind(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "not-found"
+	case errors.Is(err, fs.ErrPermission):
+		return "access-denied"
+	case errors.Is(err, errMalformedPayload), errors.Is(err, os.ErrInvalid):
+		return "invalid"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return "timeout"
+	default:
+		return "other"
 	}
 }
 
