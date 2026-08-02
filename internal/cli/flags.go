@@ -32,6 +32,37 @@ type globalOptions struct {
 	mirrorPolicy    mirror.Policy
 }
 
+// validateOutputAndProtocol 只校验 --output 与 --protocol 的语义，供 Execute
+// 在 help 分支之前调用：非法 output → 普通错误（退出码 2），协议不兼容 →
+// errProtocolMismatch（退出码 10），保证 --help 不压过这两项校验。
+func validateOutputAndProtocol(flags *pflag.FlagSet) (outputMode, error) {
+	rawOutput, err := flags.GetString("output")
+	if err != nil {
+		return "", err
+	}
+	var mode outputMode
+	switch rawOutput {
+	case string(outputHuman):
+		mode = outputHuman
+	case string(outputNDJSON):
+		mode = outputNDJSON
+	default:
+		return "", fmt.Errorf("invalid output mode %q, want human or ndjson", rawOutput)
+	}
+	rawProtocol, err := flags.GetString("protocol")
+	if err != nil {
+		return "", err
+	}
+	protocolVersion, err := strconv.Atoi(rawProtocol)
+	if err != nil {
+		return "", fmt.Errorf("invalid protocol %q, want integer", rawProtocol)
+	}
+	if protocolVersion != protocol.Version {
+		return "", errProtocolMismatch
+	}
+	return mode, nil
+}
+
 // parseGlobalOptions 在 Cobra 完成 flag 解析后执行全局参数语义校验。
 // 校验失败返回普通错误（退出码 2），协议不兼容返回 errProtocolMismatch（退出码 10）。
 func parseGlobalOptions(flags *pflag.FlagSet, cwd string) (globalOptions, error) {

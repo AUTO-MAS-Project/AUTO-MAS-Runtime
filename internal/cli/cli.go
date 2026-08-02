@@ -108,14 +108,20 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 	if err := target.ParseFlags(remaining); err != nil {
 		return parseFailure(io, err)
 	}
-	rawOutput, err := target.Flags().GetString("output")
+	// --help 不得压过 --output/--protocol 的语义校验（设计 §6 表格）：
+	// 进入 help 分支前先校验，非法 output → 2、协议不兼容 → 10，均不输出帮助。
+	mode, err := validateOutputAndProtocol(target.Flags())
 	if err != nil {
+		if errors.Is(err, errProtocolMismatch) {
+			writeDiagnostic(io, err)
+			return protocol.ExitCodeProtocolMismatch
+		}
 		return parseFailure(io, err)
 	}
 	helpRequested, err := target.Flags().GetBool("help")
 	if err == nil && helpRequested {
 		// NDJSON 模式的帮助文本只允许出现在 stderr，stdout 必须保持机器可解析。
-		if rawOutput == string(outputNDJSON) {
+		if mode == outputNDJSON {
 			root.SetOut(io.Err)
 		} else {
 			root.SetOut(io.Out)
@@ -126,7 +132,7 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 		}
 		return protocol.ExitCodeSuccess
 	}
-	if rawOutput == string(outputNDJSON) {
+	if mode == outputNDJSON {
 		root.SetOut(io.Err)
 	} else {
 		root.SetOut(io.Out)

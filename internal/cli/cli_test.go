@@ -216,6 +216,38 @@ func TestExecute_ProtocolMismatchExit10(t *testing.T) {
 	}
 }
 
+// TestExecute_InvalidOutputWithHelpExits2 证明 --help 不会压过非法
+// --output 的语义校验：非法 output → stderr 诊断 + 退出码 2，不输出帮助。
+func TestExecute_InvalidOutputWithHelpExits2(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "--output", "bogus", "--help")
+	if result.exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout = %q, want empty (help must not be printed)", result.stdout)
+	}
+	if !strings.Contains(result.stderr, "invalid output mode") {
+		t.Errorf("stderr = %q, want output diagnostic", result.stderr)
+	}
+}
+
+// TestExecute_ProtocolMismatchWithHelpExits10 证明 --help 不会压过
+// --protocol 不兼容的语义校验：协议不匹配 → stderr 诊断 + 退出码 10。
+func TestExecute_ProtocolMismatchWithHelpExits10(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "--protocol", "2", "--help")
+	if result.exitCode != 10 {
+		t.Fatalf("exit code = %d, want 10", result.exitCode)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout = %q, want empty (help must not be printed)", result.stdout)
+	}
+	if !strings.Contains(result.stderr, "protocol") {
+		t.Errorf("stderr = %q, want protocol diagnostic", result.stderr)
+	}
+}
+
 func TestExecute_OfflineAloneValid(t *testing.T) {
 	t.Parallel()
 	result := runCLI(t, context.Background(), "--offline", "--output", "ndjson", "repair")
