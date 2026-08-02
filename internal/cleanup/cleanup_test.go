@@ -420,6 +420,80 @@ func TestCleanup_RejectsJunctionPointingToUserData(t *testing.T) {
 	}
 }
 
+// TestService_JunctionPycacheRecordedAsFailed 证明名为 __pycache__ 的
+// Junction 不再被静默跳过：不跟随、不删除，记录稳定 failed 条目
+// python-cache-invalid-1，命令以 GIT_REPO_CLEANUP_FAILED 失败，progress
+// 发射 failed，用户数据与 junction 均原封不动。
+func TestService_JunctionPycacheRecordedAsFailed(t *testing.T) {
+	t.Parallel()
+	layout, _ := newTestLayout(t)
+	sentinel := filepath.Join(layout.DataDir(), "keep.txt")
+	writeFixtureFile(t, sentinel, []byte("user data"))
+	mustCreateJunction(t, filepath.Join(layout.RepoDir(), "__pycache__"), layout.DataDir())
+	service, _ := newTestService(t, layout)
+	emitter, stdout := newTestEmitter(t)
+
+	report, err := service.Run(context.Background(), emitter)
+	if err == nil {
+		t.Fatal("Run() error = nil, want GIT_REPO_CLEANUP_FAILED")
+	}
+	var cleanupErr *Error
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("Run() error type = %T, want *Error", err)
+	}
+	if cleanupErr.Code() != protocol.CodeGitRepoCleanupFailed {
+		t.Errorf("error code = %q, want GIT_REPO_CLEANUP_FAILED", cleanupErr.Code())
+	}
+	item := findItem(t, report, "python-cache-invalid-1")
+	if item.Status != ItemFailed {
+		t.Errorf("item status = %q, want failed: %+v", item.Status, item)
+	}
+	if code, _ := item.Details["code"].(string); code != string(protocol.CodeGitRepoCleanupFailed) {
+		t.Errorf("item details code = %q, want GIT_REPO_CLEANUP_FAILED", code)
+	}
+	if !dirExists(filepath.Join(layout.RepoDir(), "__pycache__")) {
+		t.Error("__pycache__ junction was removed; fail-closed requires it to remain")
+	}
+	if !fileExists(sentinel) {
+		t.Error("user data was removed through the junction")
+	}
+	progress := stdout.String()
+	if !strings.Contains(progress, "python-cache-invalid-1") {
+		t.Errorf("progress output lacks invalid item id: %s", progress)
+	}
+	if !strings.Contains(progress, `"status":"failed"`) {
+		t.Errorf("progress output lacks failed event: %s", progress)
+	}
+}
+
+// TestService_JunctionPycacheNotFollowed 证明枚举遍历没有进入
+// __pycache__ Junction 的目标目录：目标内嵌套的 __pycache__ 不被发现、
+// 内容不被删除，junction 本身保持存在。
+func TestService_JunctionPycacheNotFollowed(t *testing.T) {
+	t.Parallel()
+	layout, _ := newTestLayout(t)
+	target := layout.DataDir()
+	writeFixtureFile(t, filepath.Join(target, "__pycache__", "inner.pyc"), []byte("inner"))
+	mustCreateJunction(t, filepath.Join(layout.RepoDir(), "__pycache__"), target)
+	service, _ := newTestService(t, layout)
+
+	report, err := runService(t, service)
+	if err == nil {
+		t.Fatal("Run() error = nil, want GIT_REPO_CLEANUP_FAILED")
+	}
+	if !fileExists(filepath.Join(target, "__pycache__", "inner.pyc")) {
+		t.Error("traversal entered the junction target and removed content")
+	}
+	if !dirExists(filepath.Join(layout.RepoDir(), "__pycache__")) {
+		t.Error("__pycache__ junction was removed")
+	}
+	for _, item := range report.Items {
+		if item.ID == "python-cache-1" {
+			t.Errorf("traversal entered junction target and enumerated %q", item.ID)
+		}
+	}
+}
+
 func TestCleanup_RejectsTargetOutsideManagedRoot(t *testing.T) {
 	t.Parallel()
 	layout, _ := newTestLayout(t)

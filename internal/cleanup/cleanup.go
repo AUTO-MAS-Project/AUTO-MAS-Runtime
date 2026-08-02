@@ -321,8 +321,9 @@ func (s *Service) executeItem(
 }
 
 // enumeratePythonCaches 在 repo 下寻找 __pycache__ 目录。
-// 候选目录先经 filesystem.Canonicalize 验证普通目录身份，Junction/符号链接
-// 一律不删除并记为失败；遍历不跟随任何重解析点。
+// 候选目录先经 filesystem.Canonicalize 验证普通目录身份；名为 __pycache__
+// 的 Junction/符号链接目录不跟随、不删除，记为 failed 条目；非 __pycache__
+// 的 symlink/junction 目录保持静默跳过；遍历不跟随任何重解析点。
 func (s *Service) enumeratePythonCaches(ctx context.Context, cleanupOperationID string) ([]planItem, error) {
 	repo := s.layout.RepoDir()
 	if _, err := os.Stat(repo); err != nil {
@@ -333,6 +334,7 @@ func (s *Service) enumeratePythonCaches(ctx context.Context, cleanupOperationID 
 	}
 	var items []planItem
 	counter := 0
+	invalidCounter := 0
 	err := filepath.WalkDir(repo, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -340,7 +342,28 @@ func (s *Service) enumeratePythonCaches(ctx context.Context, cleanupOperationID 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
+		// Windows 的 Junction 在 DirEntry 中表现为 ModeIrregular 且
+		// IsDir()=false（Go 对 MOUNT_POINT 的 Lstat 分类），因此链接目录
+		// 统一按 ModeSymlink|ModeIrregular 识别，不依赖 IsDir。
+		linkType := entry.Type() & (os.ModeSymlink | os.ModeIrregular)
+		isLinkDir := linkType != 0 &&
+			(entry.IsDir() || entry.Type()&os.ModeIrregular != 0)
+		if entry.Name() == "__pycache__" && isLinkDir {
+			// 名为 __pycache__ 的 Junction/符号链接目录：不跟随、不删除，
+			// 按失败关闭语义记为 failed 条目（id 与 repo-update-invalid-<n>
+			// 同风格，保证 result.details.items 可寻址）。
+			invalidCounter++
+			items = append(items, planItem{
+				id:         "python-cache-invalid-" + strconv.Itoa(invalidCounter),
+				preStatus:  ItemFailed,
+				preMessage: "目录为不安全的链接",
+				preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
+			})
+			return fs.SkipDir
+		}
+		if linkType != 0 {
+			// 非 __pycache__ 的 symlink/junction 目录保持静默跳过（不跟随），
+			// 不新增条目。
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
