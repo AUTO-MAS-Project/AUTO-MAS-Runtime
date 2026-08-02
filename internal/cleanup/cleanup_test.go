@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -513,6 +514,35 @@ func TestCleanup_RepoUpdateNoTransactionFailClosed(t *testing.T) {
 	}
 }
 
+// TestCleanup_NoTransactionDoesNotCreateRuntimeState 证明无事务的
+// repo.update-* 失败关闭路径不会创建 runtime-state/ 或任何根目录条目。
+func TestCleanup_NoTransactionDoesNotCreateRuntimeState(t *testing.T) {
+	t.Parallel()
+	layout, root := newTestLayout(t)
+	updateDir, err := layout.RepoUpdateDir(testOperationID)
+	if err != nil {
+		t.Fatalf("RepoUpdateDir() error = %v", err)
+	}
+	writeFixtureFile(t, filepath.Join(updateDir, "partial"), []byte("stale"))
+	before := readRootEntries(t, root)
+	service, _ := newTestService(t, layout)
+
+	_, err = runService(t, service)
+	if err == nil {
+		t.Fatal("Run() error = nil, want no-transaction failure")
+	}
+	if !dirExists(updateDir) {
+		t.Error("repo.update directory was removed without state match")
+	}
+	if dirExists(layout.StateDir()) {
+		t.Error("runtime-state directory was created by fail-closed cleanup")
+	}
+	after := readRootEntries(t, root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("root entries changed:\nbefore=%v\nafter=%v", before, after)
+	}
+}
+
 func TestCleanup_PartialFailureReportsSideEffects(t *testing.T) {
 	t.Parallel()
 	layout, _ := newTestLayout(t)
@@ -556,6 +586,20 @@ func TestCleanup_PartialFailureReportsSideEffects(t *testing.T) {
 	if !dirExists(updateDir) {
 		t.Error("failed repo.update directory was removed")
 	}
+}
+
+// readRootEntries 返回根目录下的条目名列表，用于断言 cleanup 不新增根级目录。
+func readRootEntries(t *testing.T, root string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("ReadDir(%q) error = %v", root, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 func TestCleanup_ContextCancellation(t *testing.T) {

@@ -442,6 +442,16 @@ func (s *Service) enumerateRepoUpdates(ctx context.Context) ([]planItem, error) 
 // cleanup 已持有 mutation 租约，任何 peer 都不可能持有同一 Mutex，
 // 因此对端探测恒为 free，活动性由 PID 探针区分 stale/inconsistent。
 func (s *Service) classifyRepoUpdate(ctx context.Context, operationID string) (bool, string, error) {
+	// 无副作用的只读探测：更新状态文件不存在即视为无事务，失败关闭且
+	// 不打开 StateFiles，避免创建 runtime-state/ 与 .update.guard。
+	if _, err := os.Stat(s.layout.UpdateStateFile()); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, "no-transaction", nil
+		}
+		return false, "store-error", err
+	}
+	// 状态文件存在时复用现有事务读取路径；该路径只会建立已存在目录内的
+	// guard 协调 leaf，不会新增目录（runtime-state/ 此时已存在）。
 	store, err := state.NewStore(ctx, s.layout)
 	if err != nil {
 		return false, "store-error", err
