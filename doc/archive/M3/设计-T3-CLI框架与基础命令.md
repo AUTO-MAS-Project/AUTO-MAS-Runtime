@@ -356,6 +356,9 @@ type Probes struct {
 | `python-cache` | `DeletePythonCache` | `repo/` 下每个 `__pycache__` 目录 |
 | `repo-update-*` | `DeleteRepositoryUpdate` | app-root 下 `repo.update-<operationId>` |
 
+> T3.5 修订：按架构设计数据分类表补充 `build-cache` 条目（
+> `filesystem.DeleteBuildCache` → `runtime/cache/build`），与实现对齐。
+
 保护名单来自 `config.Layout.ProtectedRootDirs()`（config/data/history/script/
 debug/plugins/logs）以及 filesystem 内建拒绝（app-root、repo、state、
 logs、卷根、受管根外）。所有递归删除只经 `filesystem.Operator.RemoveTree`，

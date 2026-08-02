@@ -209,6 +209,13 @@ func (s *Service) buildPlan(ctx context.Context, cleanupOperationID string) ([]p
 			operationID: cleanupOperationID,
 			reason:      "cleanup",
 		},
+		{
+			id:          "build-cache",
+			kind:        filesystem.DeleteBuildCache,
+			target:      s.layout.BuildCacheDir(),
+			operationID: cleanupOperationID,
+			reason:      "cleanup",
+		},
 	}
 	pythonItems, err := s.enumeratePythonCaches(ctx, cleanupOperationID)
 	if err != nil {

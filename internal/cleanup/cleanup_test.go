@@ -227,8 +227,8 @@ func TestCleanup_RemovesUVCacheAndDownloadTemp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if report.Summary.Cleaned != 2 || report.Summary.Failed != 0 {
-		t.Fatalf("summary = %+v, want 2 cleaned", report.Summary)
+	if report.Summary.Cleaned != 2 || report.Summary.Skipped != 1 || report.Summary.Failed != 0 {
+		t.Fatalf("summary = %+v, want 2 cleaned and 1 skipped", report.Summary)
 	}
 	if dirExists(layout.UVCacheDir()) {
 		t.Error("uv cache dir still exists")
@@ -265,6 +265,59 @@ func TestCleanup_RemovesPythonCacheUnderRepo(t *testing.T) {
 	if !fileExists(filepath.Join(layout.RepoDir(), "app", "main.py")) {
 		t.Error("repo source file was removed")
 	}
+}
+
+// TestCleanup_RemovesBuildCache 证明 build-cache 条目：有内容时删除，
+// 目录不存在时 skipped，且不触碰保护名单目录。
+func TestCleanup_RemovesBuildCache(t *testing.T) {
+	t.Parallel()
+	t.Run("with content removes", func(t *testing.T) {
+		t.Parallel()
+		layout, _ := newTestLayout(t)
+		writeFixtureFile(t, filepath.Join(layout.BuildCacheDir(), "build.bin"), []byte("x"))
+		service, _ := newTestService(t, layout)
+
+		report, err := runService(t, service)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		item := findItem(t, report, "build-cache")
+		if item.Status != ItemCleaned {
+			t.Fatalf("build-cache status = %q, want cleaned: %+v", item.Status, item)
+		}
+		if dirExists(layout.BuildCacheDir()) {
+			t.Error("build cache dir still exists")
+		}
+	})
+	t.Run("absent skipped", func(t *testing.T) {
+		t.Parallel()
+		layout, _ := newTestLayout(t)
+		service, _ := newTestService(t, layout)
+
+		report, err := runService(t, service)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		item := findItem(t, report, "build-cache")
+		if item.Status != ItemSkipped {
+			t.Fatalf("build-cache status = %q, want skipped: %+v", item.Status, item)
+		}
+	})
+	t.Run("does not touch protected dirs", func(t *testing.T) {
+		t.Parallel()
+		layout, _ := newTestLayout(t)
+		writeFixtureFile(t, filepath.Join(layout.BuildCacheDir(), "build.bin"), []byte("x"))
+		sentinel := filepath.Join(layout.ConfigDir(), "keep.txt")
+		writeFixtureFile(t, sentinel, []byte("user data"))
+		service, _ := newTestService(t, layout)
+
+		if _, err := runService(t, service); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !fileExists(sentinel) {
+			t.Error("protected config sentinel was removed")
+		}
+	})
 }
 
 func TestCleanup_EmptyRootIdempotentSuccess(t *testing.T) {
