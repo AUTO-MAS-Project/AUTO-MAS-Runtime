@@ -30,8 +30,9 @@ func runOperation(
 	if err != nil {
 		return sessionSetupFailure(deps, err)
 	}
+	runtimeVersion := helloRuntimeVersion(ctx, deps.options.versionSource)
 	emitter, err := output.NewEmitter(
-		devRuntimeVersion,
+		runtimeVersion,
 		command,
 		[]string{},
 		protocol.WithClock(deps.options.clock),
@@ -47,6 +48,22 @@ func runOperation(
 		return emitFailure(deps, emitter, stage, err)
 	}
 	return emitSuccess(deps, emitter, stage, success)
+}
+
+// helloRuntimeVersion 读取版本来源填充 hello.runtimeVersion；
+// 读取失败时回退 dev 占位，不阻断协议会话（version 命令自身会报告该错误）。
+func helloRuntimeVersion(ctx context.Context, source versionSourceFunc) string {
+	if source == nil {
+		return devRuntimeVersion
+	}
+	info, err := source(ctx)
+	if err != nil {
+		return devRuntimeVersion
+	}
+	if info.Version == "" {
+		return devRuntimeVersion
+	}
+	return info.Version
 }
 
 func newProcessOutput(deps *deps) (*protocol.ProcessOutput, error) {

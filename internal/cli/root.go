@@ -50,7 +50,7 @@ func newRoot(deps *deps, io IO) *cobra.Command {
 		},
 	})
 	root.AddCommand(
-		skeletonCommand(deps, "version", "显示 Runtime 与协议版本", protocol.StageRuntimeHandshake),
+		versionCommand(deps),
 		skeletonCommand(deps, "doctor", "只读检查本机运行环境", protocol.StageDoctor),
 		bootstrapCommand(deps),
 		workspaceGroup(deps),

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
 
 // IO 显式注入单次执行的 stdin、stdout 与 stderr。
@@ -20,8 +21,9 @@ type IO struct {
 }
 
 type options struct {
-	cwd   string
-	clock func() time.Time
+	cwd           string
+	clock         func() time.Time
+	versionSource versionSourceFunc
 }
 
 // Option 配置 Execute 的可注入测试依赖。
@@ -51,8 +53,9 @@ func WithClock(clock func() time.Time) Option {
 
 func applyOptions(values ...Option) (options, error) {
 	result := options{
-		cwd:   mustGetwd(),
-		clock: time.Now,
+		cwd:           mustGetwd(),
+		clock:         time.Now,
+		versionSource: version.Load,
 	}
 	for _, option := range values {
 		if option == nil {
