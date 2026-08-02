@@ -137,6 +137,17 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 		}
 		return protocol.ExitCodeSuccess
 	}
+	// 组命令（不可运行）带未知子命令/多余位置参数按参数错误处理
+	// （T3.6 F3 决策）：stderr 诊断 + exit 2，不输出帮助、不发射协议事件；
+	// --help 已在上方优先返回，因此 workspace foo --help 仍走帮助路径。
+	// 根级未知命令由 probeRoot.Find 提前报错，不会到达这里。
+	if !target.Runnable() && len(target.Flags().Args()) > 0 {
+		return parseFailure(io, fmt.Errorf(
+			"unknown command %q for %q",
+			target.Flags().Args()[0],
+			target.Name(),
+		))
+	}
 	// 正式执行树：与预解析树同构但全新未解析，Cobra 内部只解析一次，
 	// 不继承预解析产生的任何 flag 状态。
 	root := newRoot(d, io)
