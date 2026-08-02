@@ -6,7 +6,22 @@ import (
 	"testing"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol/contracttest"
 )
+
+// TestExecute_FrameworkSatisfiesContract 用 contracttest.Assert 证明
+// 会话框架的失败终态满足完整 NDJSON 契约（hello 首发、sequence 递增、
+// result 恰好一次且最后、error/result 四元组一致、容器字段非空）。
+func TestExecute_FrameworkSatisfiesContract(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "--output", "ndjson", "doctor")
+	contracttest.Assert(
+		t,
+		"doctor",
+		contracttest.TerminalFailure,
+		[]byte(result.stdout),
+	)
+}
 
 func TestExecute_NDJSONSessionErrorTupleMatchesResult(t *testing.T) {
 	t.Parallel()
