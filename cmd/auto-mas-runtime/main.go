@@ -2,7 +2,7 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"os"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli"
@@ -10,12 +10,9 @@ import (
 
 func main() {
 	// 进程入口是唯一持有 os.Stdout 和 os.Stderr 的位置。
-	output, err := cli.Run()
-	if err == nil {
-		_, err = fmt.Fprintln(os.Stdout, output)
-	}
-	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	os.Exit(cli.Execute(
+		context.Background(),
+		os.Args[1:],
+		cli.IO{In: os.Stdin, Out: os.Stdout, Err: os.Stderr},
+	))
 }
