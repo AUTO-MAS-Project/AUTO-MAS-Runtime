@@ -120,18 +120,20 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 }
 
 // classifyFailure 把命令错误映射为冻结错误码与中文 message。
-// 取消优先映射为 OPERATION_CANCELLED；实现了 operationError 的错误保留其
-// 四元组；未知内部错误防御性映射为 OUTPUT_WRITE_FAILED。
+// 取消优先映射为 OPERATION_CANCELLED（设计 §13 顺序：context.Canceled 先于
+// operationError 匹配，避免被包装的取消被业务错误码吞掉）；实现了
+// operationError 的错误保留其四元组；未知内部错误防御性映射为
+// OUTPUT_WRITE_FAILED。
 func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, protocol.Stage, string, map[string]any) {
+	if errors.Is(err, context.Canceled) {
+		return protocol.CodeOperationCancelled, fallbackStage, "操作已取消", map[string]any{}
+	}
 	var operationErr operationError
 	if errors.As(err, &operationErr) {
 		code := operationErr.Code()
 		if protocol.IsKnownCode(code) {
 			return code, operationErr.Stage(), operationErr.Message(), operationErr.Details()
 		}
-	}
-	if errors.Is(err, context.Canceled) {
-		return protocol.CodeOperationCancelled, fallbackStage, "操作已取消", map[string]any{}
 	}
 	return protocol.CodeOutputWriteFailed, fallbackStage, "命令执行失败", map[string]any{}
 }

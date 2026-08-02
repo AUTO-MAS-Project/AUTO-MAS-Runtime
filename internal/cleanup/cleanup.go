@@ -277,7 +277,9 @@ func (s *Service) executeItem(
 		}
 		return item, nil
 	}
-	if !result.Removed && !result.Partial {
+	// Partial 只在 RemoveTree 返回错误时成立（已走 failed 分支），
+	// 因此成功返回后 !Removed 即代表目标不存在，跳过即可。
+	if !result.Removed {
 		item := Item{
 			ID:      entry.id,
 			Status:  ItemSkipped,

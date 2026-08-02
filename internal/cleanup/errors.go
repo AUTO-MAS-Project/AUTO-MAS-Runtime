@@ -1,6 +1,7 @@
 package cleanup
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -54,6 +55,16 @@ func (e *Error) Details() map[string]any { return e.details }
 
 // mapLockError 保留 lock 包冲突与操作故障的冻结错误码。
 func mapLockError(err error) error {
+	// 获取前/处理中取消优先映射 OPERATION_CANCELLED（设计 §13 顺序）。
+	if errors.Is(err, context.Canceled) {
+		return NewError(
+			protocol.CodeOperationCancelled,
+			protocol.StageCleanup,
+			"清理已取消",
+			map[string]any{},
+			err,
+		)
+	}
 	var conflict *lock.ConflictError
 	if errors.As(err, &conflict) {
 		return NewError(
@@ -75,6 +86,16 @@ func mapLockError(err error) error {
 
 // mapOperationError 保留 filesystem 错误码，其余错误使用兜底码。
 func mapOperationError(err error, fallback protocol.Code, message string) error {
+	// 取消优先于任何业务分类（设计 §13 顺序），被包装的 ctx 取消也必须命中 130。
+	if errors.Is(err, context.Canceled) {
+		return NewError(
+			protocol.CodeOperationCancelled,
+			protocol.StageCleanup,
+			"清理已取消",
+			map[string]any{},
+			err,
+		)
+	}
 	var fileErr *filesystem.Error
 	if errors.As(err, &fileErr) {
 		return NewError(

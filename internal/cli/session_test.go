@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol/contracttest"
 )
@@ -55,6 +58,60 @@ func TestExecute_NDJSONSessionErrorTupleMatchesResult(t *testing.T) {
 			errorEvent.object["remediation"],
 			resultEvent.object["remediation"],
 		)
+	}
+}
+
+// TestExecute_CancelledWrappedErrorMapsToExit130 证明即使业务错误声明了
+// 非取消错误码，只要错误链包含 context.Canceled，顶层映射仍以取消优先
+// （设计 §13 顺序），退出码 130 且 error/result code 均为 OPERATION_CANCELLED。
+func TestExecute_CancelledWrappedErrorMapsToExit130(t *testing.T) {
+	t.Parallel()
+	var stdout strings.Builder
+	var stderr strings.Builder
+	code := Execute(
+		context.Background(),
+		[]string{"--output", "ndjson", "doctor"},
+		IO{
+			In:  strings.NewReader(""),
+			Out: &stdout,
+			Err: &stderr,
+		},
+		WithCWD(t.TempDir()),
+		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
+			return fakeDoctorService{
+				run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
+					return doctor.Report{}, doctor.NewError(
+						protocol.CodeGitRepoCleanupFailed,
+						protocol.StageDoctor,
+						"清理失败",
+						map[string]any{},
+						fmt.Errorf("cleanup: %w", context.Canceled),
+					)
+				},
+			}, nil
+		}),
+	)
+	if code != 130 {
+		t.Fatalf("exit code = %d, want 130", code)
+	}
+	events := parseNDJSON(t, stdout.String())
+	var errorEvent, resultEvent parsedEvent
+	for _, event := range events {
+		switch eventType(event) {
+		case string(protocol.TypeError):
+			errorEvent = event
+		case string(protocol.TypeResult):
+			resultEvent = event
+		}
+	}
+	if got := eventString(errorEvent, "code"); got != string(protocol.CodeOperationCancelled) {
+		t.Errorf("error code = %q, want OPERATION_CANCELLED", got)
+	}
+	if got := eventString(resultEvent, "code"); got != string(protocol.CodeOperationCancelled) {
+		t.Errorf("result code = %q, want OPERATION_CANCELLED", got)
+	}
+	if got := eventString(resultEvent, "status"); got != "cancelled" {
+		t.Errorf("result status = %q, want cancelled", got)
 	}
 }
 

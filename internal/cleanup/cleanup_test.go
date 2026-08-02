@@ -578,6 +578,36 @@ func TestCleanup_ContextCancellation(t *testing.T) {
 	}
 }
 
+// TestCleanup_BuildPlanCancellationPropagatesContextError 证明 buildPlan 的
+// 枚举阶段在 ctx 取消时原样传播 context.Canceled，不包装成 40/70。
+func TestCleanup_BuildPlanCancellationPropagatesContextError(t *testing.T) {
+	t.Parallel()
+	layout, _ := newTestLayout(t)
+	writeFixtureFile(t, filepath.Join(layout.RepoDir(), "app", "main.py"), []byte("x"))
+	service, _ := newTestService(t, layout)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("enumerate python caches", func(t *testing.T) {
+		items, err := service.enumeratePythonCaches(ctx, testOperationID)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("enumeratePythonCaches() error = %v, want context.Canceled", err)
+		}
+		if items != nil {
+			t.Errorf("items = %v, want nil", items)
+		}
+	})
+	t.Run("build plan", func(t *testing.T) {
+		plan, err := service.buildPlan(ctx, testOperationID)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("buildPlan() error = %v, want context.Canceled", err)
+		}
+		if plan != nil {
+			t.Errorf("plan = %v, want nil", plan)
+		}
+	})
+}
+
 func TestCleanup_ResultDetailsDoNotLeakPaths(t *testing.T) {
 	t.Parallel()
 	layout, root := newTestLayout(t)
