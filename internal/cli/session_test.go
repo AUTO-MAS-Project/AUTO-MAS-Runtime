@@ -60,7 +60,7 @@ func TestExecute_NDJSONSessionErrorTupleMatchesResult(t *testing.T) {
 
 func TestExecute_ExitCodeFromResultCode(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--output", "ndjson", "cleanup")
+	result := runCLI(t, context.Background(), "--output", "ndjson", "bootstrap")
 	if result.exitCode != protocol.ExitCodeInvalidArgument {
 		t.Fatalf("exit code = %d, want %d", result.exitCode, protocol.ExitCodeInvalidArgument)
 	}

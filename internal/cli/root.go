@@ -58,7 +58,7 @@ func newRoot(deps *deps, io IO) *cobra.Command {
 		dependenciesGroup(deps),
 		backendGroup(deps),
 		skeletonCommand(deps, "repair", "修复运行环境", protocol.StageRepair),
-		skeletonCommand(deps, "cleanup", "清理可丢弃缓存与临时内容", protocol.StageCleanup),
+		cleanupCommand(deps),
 	)
 	return root
 }
