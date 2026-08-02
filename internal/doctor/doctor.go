@@ -423,28 +423,40 @@ func (s *Service) checkMutexes(ctx context.Context) Check {
 	if err != nil {
 		return errorCheck("mutex", "并发锁占用", "无法初始化锁探测", err)
 	}
-	defer func() {
-		_ = set.Close()
-	}()
 	backend, err := set.Probe(ctx, lock.KindBackend)
 	if err != nil {
-		return errorCheck("mutex", "并发锁占用", "backend 锁探测失败", err)
+		return errorCheck(
+			"mutex",
+			"并发锁占用",
+			"backend 锁探测失败",
+			errors.Join(err, set.Close()),
+		)
 	}
 	mutation, err := set.Probe(ctx, lock.KindMutation)
 	if err != nil {
-		return errorCheck("mutex", "并发锁占用", "mutation 锁探测失败", err)
+		return errorCheck(
+			"mutex",
+			"并发锁占用",
+			"mutation 锁探测失败",
+			errors.Join(err, set.Close()),
+		)
+	}
+	details := map[string]any{
+		"backend":           backend.Held,
+		"backendRecovered":  backend.Recovered,
+		"mutation":          mutation.Held,
+		"mutationRecovered": mutation.Recovered,
+	}
+	if closeErr := set.Close(); closeErr != nil {
+		// 探测已成功，仅收口失败：把故障计入该项，避免忽略资源清理错误。
+		return errorCheck("mutex", "并发锁占用", "锁探测收口失败", closeErr)
 	}
 	return Check{
 		ID:      "mutex",
 		Name:    "并发锁占用",
 		Status:  StatusOK,
 		Message: "锁占用探测完成",
-		Details: map[string]any{
-			"backend":           backend.Held,
-			"backendRecovered":  backend.Recovered,
-			"mutation":          mutation.Held,
-			"mutationRecovered": mutation.Recovered,
-		},
+		Details: details,
 	}
 }
 
