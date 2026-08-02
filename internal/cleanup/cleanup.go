@@ -378,6 +378,7 @@ func (s *Service) enumerateRepoUpdates(ctx context.Context) ([]planItem, error) 
 		return nil, err
 	}
 	var items []planItem
+	invalidCounter := 0
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "repo.update-") {
 			continue
@@ -385,8 +386,12 @@ func (s *Service) enumerateRepoUpdates(ctx context.Context) ([]planItem, error) 
 		operationID := strings.TrimPrefix(entry.Name(), "repo.update-")
 		expected, err := s.layout.RepoUpdateDir(operationID)
 		if err != nil || filepath.Base(expected) != entry.Name() {
+			// id 必须唯一且稳定（与 python-cache-<n> 同风格），
+			// 唯一 id 是 result.details.items 可寻址的前提；
+			// 枚举顺序由 os.ReadDir 的字典序保证稳定。
+			invalidCounter++
 			items = append(items, planItem{
-				id:         "repo-update-invalid",
+				id:         "repo-update-invalid-" + strconv.Itoa(invalidCounter),
 				preStatus:  ItemFailed,
 				preMessage: "目录身份不明确",
 				preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},

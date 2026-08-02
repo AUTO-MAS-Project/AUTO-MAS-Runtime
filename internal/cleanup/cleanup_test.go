@@ -514,6 +514,44 @@ func TestCleanup_RepoUpdateNoTransactionFailClosed(t *testing.T) {
 	}
 }
 
+// TestCleanup_InvalidRepoUpdateEntriesHaveUniqueIDs 证明多个非法
+// repo.update-* 目录产生两两不同的稳定条目 id，且全部失败关闭。
+func TestCleanup_InvalidRepoUpdateEntriesHaveUniqueIDs(t *testing.T) {
+	t.Parallel()
+	layout, _ := newTestLayout(t)
+	invalidDirs := []string{
+		filepath.Join(layout.AppRoot(), "repo.update-"),
+		filepath.Join(layout.AppRoot(), "repo.update-"+strings.Repeat("x", 200)),
+	}
+	for _, dir := range invalidDirs {
+		writeFixtureFile(t, filepath.Join(dir, "partial"), []byte("stale"))
+	}
+	service, _ := newTestService(t, layout)
+
+	report, err := runService(t, service)
+	if err == nil {
+		t.Fatal("Run() error = nil, want invalid entry failure")
+	}
+	seen := make(map[string]bool)
+	count := 0
+	for _, item := range report.Items {
+		if !strings.HasPrefix(item.ID, "repo-update-invalid") {
+			continue
+		}
+		count++
+		if seen[item.ID] {
+			t.Errorf("duplicate item id %q", item.ID)
+		}
+		seen[item.ID] = true
+		if item.Status != ItemFailed {
+			t.Errorf("item %q status = %q, want failed", item.ID, item.Status)
+		}
+	}
+	if count != 2 {
+		t.Fatalf("invalid items = %d, want 2: %+v", count, report.Items)
+	}
+}
+
 // TestCleanup_NoTransactionDoesNotCreateRuntimeState 证明无事务的
 // repo.update-* 失败关闭路径不会创建 runtime-state/ 或任何根目录条目。
 func TestCleanup_NoTransactionDoesNotCreateRuntimeState(t *testing.T) {
