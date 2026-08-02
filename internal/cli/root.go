@@ -96,6 +96,8 @@ func skeletonCommand(deps *deps, use, short string, stage protocol.Stage) *cobra
 	return &cobra.Command{
 		Use:   use,
 		Short: short,
+		// 叶子命令不接受位置参数，多余参数走参数错误路径（stderr + 退出码 2）。
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			deps.exitCode = runOperation(
 				deps.ctx,

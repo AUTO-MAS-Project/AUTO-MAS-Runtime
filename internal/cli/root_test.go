@@ -81,3 +81,34 @@ func TestExecute_HelpCommandHiddenFromTree(t *testing.T) {
 		t.Errorf("help output lists help command: %s", result.stdout)
 	}
 }
+
+// TestExecute_RejectsExtraPositionalArgs 证明所有叶子命令拒绝多余位置参数：
+// 走参数错误路径（stderr 诊断 + 退出码 2），不发射 hello/result。
+func TestExecute_RejectsExtraPositionalArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "version", args: []string{"version", "extra"}},
+		{name: "doctor", args: []string{"doctor", "extra"}},
+		{name: "cleanup", args: []string{"cleanup", "extra"}},
+		{name: "bootstrap", args: []string{"bootstrap", "extra"}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			result := runCLI(t, context.Background(), test.args...)
+			if result.exitCode != 2 {
+				t.Errorf("exit code = %d, want 2", result.exitCode)
+			}
+			if result.stdout != "" {
+				t.Errorf("stdout = %q, want empty (no protocol session)", result.stdout)
+			}
+			if !strings.Contains(result.stderr, "auto-mas-runtime: ") {
+				t.Errorf("stderr = %q, want auto-mas-runtime: prefix", result.stderr)
+			}
+		})
+	}
+}

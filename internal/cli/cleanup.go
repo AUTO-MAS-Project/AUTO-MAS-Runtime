@@ -14,6 +14,7 @@ func cleanupCommand(deps *deps) *cobra.Command {
 	return &cobra.Command{
 		Use:   "cleanup",
 		Short: "清理可丢弃缓存与临时内容",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			deps.exitCode = runOperation(
 				deps.ctx,

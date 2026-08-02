@@ -15,6 +15,7 @@ func versionCommand(deps *deps) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "显示 Runtime 与协议版本",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			deps.exitCode = runOperation(
 				deps.ctx,

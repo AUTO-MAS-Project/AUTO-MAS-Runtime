@@ -14,6 +14,7 @@ func doctorCommand(deps *deps) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "只读检查本机运行环境",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			deps.exitCode = runOperation(
 				deps.ctx,
