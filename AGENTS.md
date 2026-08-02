@@ -346,8 +346,9 @@ func NewProcessOutput(output io.Writer) (*ProcessOutput, error) { ... }
 - 时间用 `time.Duration`，不用裸 `int` 秒；含单位的字段名带单位（`timeoutSeconds` 只在 JSON 契约里出现）；
 - 长函数禁止裸返回（naked return）；
 - 枚举用具名类型 + 常量组 + `String()`，并提供合法性校验（现有 stage / status 即此模式）；
-- 不引入非必要依赖：当前 `go.mod` **零第三方依赖**，新增依赖需在任务文档中说明理由
-  （已规划的例外：go-git、`golang.org/x/sys/windows`、cobra）。
+- 不引入非必要依赖：当前生产依赖只有 `golang.org/x/sys/windows`；新增依赖需在任务文档中说明理由。
+  已批准方向：CLI 使用 Cobra、Git 使用 go-git、Windows 系统调用继续使用固定版本 `x/sys/windows`；
+  `google/go-cmp` 仅可用于测试结构比较。具体边界见 `doc/maintenance/现成库替换评估.md`。
 
 ### 8.9 stdout 所有权（最容易违反，务必逐条对照 `doc/代码审查清单.md`）
 
@@ -412,7 +413,8 @@ Go 测试惯例（[Go Code Review Comments](https://go.dev/wiki/CodeReviewCommen
 - **表驱动测试 + `t.Run` 子测试**，用例结构体带 `name` 字段；
 - 测试辅助函数第一行写 `t.Helper()`，失败行号才会指向调用处；
 - 临时目录用 `t.TempDir()`，清理用 `t.Cleanup()`，不手写 `defer os.RemoveAll`；
-- **只用标准库断言**，不引入 testify/gomega（`go.mod` 保持零第三方依赖）；
+- 普通条件、错误链、顺序和副作用使用标准库显式断言；结构体、slice、map 的语义比较可使用
+  仅测试依赖 `google/go-cmp`；不引入 testify/gomega，不建立通用 `assert` 包；
 - 失败信息写成 `got X, want Y` 形式，带上定位所需的输入；
 - 测试函数命名沿用仓库惯例 `TestType_Scenario`（如 `TestEmitter_ConcurrentResults`）；
   计划文档中固定的测试函数名不得随意改动；
