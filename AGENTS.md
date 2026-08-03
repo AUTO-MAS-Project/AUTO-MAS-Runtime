@@ -361,7 +361,7 @@ func NewProcessOutput(output io.Writer) (*ProcessOutput, error) { ... }
 - 新增输出路径时执行并逐项审查：
 
   ```powershell
-  rg -n 'os\.Stdout|fmt\.F?Print|log\.Print|json\.NewEncoder' --glob '*.go' .
+  rg -n 'os\.Stdout|fmt\.F?[Pp]rint|log\.[Pp]rint|json\.NewEncoder' --glob '*.go' .
   if ($LASTEXITCODE -gt 1) { throw "stdout ownership scan failed" }
   ```
 
