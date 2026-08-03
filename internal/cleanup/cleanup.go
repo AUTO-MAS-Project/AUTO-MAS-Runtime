@@ -124,6 +124,9 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (report Re
 			err,
 		)
 	}
+	if err := s.requireAppRoot(); err != nil {
+		return Report{}, err
+	}
 	set, err := lock.NewSet(ctx, s.layout)
 	if err != nil {
 		return Report{}, mapLockError(err)
@@ -191,6 +194,41 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (report Re
 		}
 	}
 	return report, nil
+}
+
+// requireAppRoot 在取锁前做只读前置校验：app-root 必须存在且是目录。
+//
+// 不做这一步时，lock.NewSet 打不开根目录句柄，错误被 mapLockError 兜底成
+// MUTEX_OPERATION_FAILED（exit 70、retryable=true、remediation=[retry,
+// run-doctor]）。真实原因是调用方给的 --app-root 指向不存在的目录，重试
+// 永远不会成功，而 retryable=true 会驱动 Electron 陷入无意义重试循环
+// （T3.7 F4）。只有「不存在」与「存在但非目录」两种可确定归因于参数的情形
+// 走这里，其余 stat 错误（如权限）保持既有 MUTEX_OPERATION_FAILED 路径。
+func (s *Service) requireAppRoot() error {
+	info, err := os.Stat(s.layout.AppRoot())
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return newInvalidAppRootError("应用根目录不存在", err)
+	case err != nil:
+		return nil
+	case !info.IsDir():
+		return newInvalidAppRootError(
+			"应用根目录不是目录",
+			errors.New("app root is not a directory"),
+		)
+	default:
+		return nil
+	}
+}
+
+func newInvalidAppRootError(message string, cause error) error {
+	return NewError(
+		protocol.CodeInvalidArgument,
+		protocol.StageCleanup,
+		message,
+		map[string]any{},
+		cause,
+	)
 }
 
 func (s *Service) buildPlan(ctx context.Context, cleanupOperationID string) ([]planItem, error) {

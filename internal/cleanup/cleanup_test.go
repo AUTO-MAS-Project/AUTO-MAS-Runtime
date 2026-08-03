@@ -341,6 +341,72 @@ func TestCleanup_EmptyRootIdempotentSuccess(t *testing.T) {
 	}
 }
 
+// TestService_MissingAppRootRejectedAsInvalidArgument 证明 app-root 不存在时
+// 不再返回 MUTEX_OPERATION_FAILED + retryable=true：真实原因是调用方给的
+// --app-root 指向不存在的目录，重试永远不会成功，可重试标志会驱动 Electron
+// 陷入无意义重试循环。改为 INVALID_ARGUMENT（exit 2、不可重试、run-doctor）。
+func TestService_MissingAppRootRejectedAsInvalidArgument(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	missing := filepath.Join(base, "does-not-exist")
+	layout, err := config.NewLayout(missing, base)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	service, _ := newTestService(t, layout)
+
+	_, err = runService(t, service)
+	if err == nil {
+		t.Fatal("Run() error = nil, want INVALID_ARGUMENT")
+	}
+	var cleanupErr *Error
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("Run() error type = %T, want *Error", err)
+	}
+	if cleanupErr.Code() != protocol.CodeInvalidArgument {
+		t.Errorf("error code = %q, want INVALID_ARGUMENT", cleanupErr.Code())
+	}
+	definition, ok := protocol.LookupErrorDefinition(cleanupErr.Code())
+	if !ok {
+		t.Fatalf("code %q has no frozen definition", cleanupErr.Code())
+	}
+	if definition.Retryable {
+		t.Errorf("code %q is retryable; a missing app-root never becomes present on retry", cleanupErr.Code())
+	}
+	if _, statErr := os.Stat(missing); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("app-root was created as a side effect: stat error = %v", statErr)
+	}
+}
+
+// TestService_AppRootNotDirectoryRejectedAsInvalidArgument 覆盖 app-root
+// 存在但不是目录的情形，走同一条参数错误路径。
+func TestService_AppRootNotDirectoryRejectedAsInvalidArgument(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	file := filepath.Join(base, "not-a-dir")
+	writeFixtureFile(t, file, []byte("x"))
+	layout, err := config.NewLayout(file, base)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	service, _ := newTestService(t, layout)
+
+	_, err = runService(t, service)
+	if err == nil {
+		t.Fatal("Run() error = nil, want INVALID_ARGUMENT")
+	}
+	var cleanupErr *Error
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("Run() error type = %T, want *Error", err)
+	}
+	if cleanupErr.Code() != protocol.CodeInvalidArgument {
+		t.Errorf("error code = %q, want INVALID_ARGUMENT", cleanupErr.Code())
+	}
+	if !fileExists(file) {
+		t.Error("app-root file was replaced or removed")
+	}
+}
+
 func TestCleanup_PreservesUserDataAndPlugins(t *testing.T) {
 	t.Parallel()
 	layout, _ := newTestLayout(t)
