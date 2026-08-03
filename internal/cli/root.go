@@ -11,7 +11,9 @@ import (
 )
 
 // newRoot 按架构文档命令树构建根命令，并注册全部全局参数与骨架命令。
-func newRoot(deps *deps, io IO) *cobra.Command {
+// 每次调用返回一棵全新的树：预解析与正式执行各用一棵，不共享任何 flag 状态
+// （设计 D2「无跨调用共享状态」）。
+func newRoot(deps *deps) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "auto-mas-runtime",
 		Short: "AUTO-MAS 本机运行时管理程序",

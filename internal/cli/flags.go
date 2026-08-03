@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -20,6 +21,15 @@ const (
 	outputHuman  outputMode = "human"
 	outputNDJSON outputMode = "ndjson"
 )
+
+// outWriter 返回该输出模式下人类可读文本（帮助、human renderer）应写入的通道。
+// ndjson 模式必须让出 stdout：那里只允许出现协议 NDJSON。
+func (m outputMode) outWriter(streams IO) io.Writer {
+	if m == outputNDJSON {
+		return streams.Err
+	}
+	return streams.Out
+}
 
 // errProtocolMismatch 表示调用方协议版本与 Runtime 不兼容，退出码 10。
 var errProtocolMismatch = errors.New("protocol version mismatch")

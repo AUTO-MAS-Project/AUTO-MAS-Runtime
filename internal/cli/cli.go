@@ -92,93 +92,53 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 	}
 	values, err := applyOptions(optionValues...)
 	if err != nil {
-		writeDiagnostic(io, err)
-		return protocol.ExitCodeInvalidArgument
+		return diagnosticExit(io, err)
 	}
 	d := &deps{ctx: ctx, io: io, options: values}
 
-	// 预解析树与正式执行树必须是两个独立实例：预解析树只用于定位目标、
-	// 探测 --help 与 output/protocol 预校验，随后即被丢弃；正式执行树
-	// 全新未解析，保证每个 flag 只被解析一次。否则 pflag StringArray 的
-	// Set 语义（首次赋值、之后追加）会让单个 --mirror 值在二次解析时
-	// 累积成两条，触发重复 kind 校验（T3.6 F1）。
-	probeRoot := newRoot(d, io)
-	target, remaining, err := probeRoot.Find(args)
+	// 解析：一次性预解析树只用于定位目标、判定输出模式与帮助，随后丢弃。
+	call, err := resolveInvocation(newRoot(d), args)
 	if err != nil {
-		return parseFailure(io, err)
+		return diagnosticExit(io, err)
 	}
-	// help flag 由 Cobra 在 execute 内初始化；预解析阶段必须先显式建立，
-	// 才能判断 --help 并把帮助文本路由到正确通道。
-	target.InitDefaultHelpFlag()
-	if err := target.ParseFlags(remaining); err != nil {
-		return parseFailure(io, err)
+	// 分派：只输出帮助的调用不建立协议会话。
+	if call.help {
+		return renderHelp(io, call)
 	}
-	// --help 不得压过 --output/--protocol 的语义校验（设计 §6 表格）：
-	// 进入 help 分支前先校验，非法 output → 2、协议不兼容 → 10，均不输出帮助。
-	mode, err := validateOutputAndProtocol(target.Flags())
-	if err != nil {
-		if errors.Is(err, errProtocolMismatch) {
-			writeDiagnostic(io, err)
-			return protocol.ExitCodeProtocolMismatch
-		}
-		return parseFailure(io, err)
-	}
-	helpRequested, err := target.Flags().GetBool("help")
-	if err == nil && helpRequested {
-		// NDJSON 模式的帮助文本只允许出现在 stderr，stdout 必须保持机器可解析。
-		if mode == outputNDJSON {
-			probeRoot.SetOut(io.Err)
-		} else {
-			probeRoot.SetOut(io.Out)
-		}
-		if err := target.Help(); err != nil {
-			writeDiagnostic(io, err)
-			return protocol.ExitCodePreconditionFailed
-		}
-		return protocol.ExitCodeSuccess
-	}
-	// 组命令（不可运行）带未知子命令/多余位置参数按参数错误处理
-	// （T3.6 F3 决策）：stderr 诊断 + exit 2，不输出帮助、不发射协议事件；
-	// --help 已在上方优先返回，因此 workspace foo --help 仍走帮助路径。
-	// 根级未知命令由 probeRoot.Find 提前报错，不会到达这里。
-	if !target.Runnable() && len(target.Flags().Args()) > 0 {
-		return parseFailure(io, fmt.Errorf(
-			"unknown command %q for %q",
-			target.Flags().Args()[0],
-			target.Name(),
-		))
-	}
-	// 正式执行树：与预解析树同构但全新未解析，Cobra 内部只解析一次，
-	// 不继承预解析产生的任何 flag 状态。
-	root := newRoot(d, io)
-	if mode == outputNDJSON {
-		root.SetOut(io.Err)
-	} else {
-		root.SetOut(io.Out)
-	}
-	root.SetErr(io.Err)
+	// 执行：正式执行树全新未解析，保证每个 flag 只被 Cobra 解析一次。
+	return executeTree(ctx, d, io, args, call.mode)
+}
+
+// executeTree 在一棵全新的命令树上执行本次调用并返回退出码。
+// 退出码来自命令自己写入的 deps.exitCode；只有树本身执行失败才走诊断通道。
+func executeTree(ctx context.Context, d *deps, streams IO, args []string, mode outputMode) int {
+	root := newRoot(d)
+	root.SetOut(mode.outWriter(streams))
+	root.SetErr(streams.Err)
 	root.SetArgs(args)
 	if err := root.ExecuteContext(ctx); err != nil {
-		if errors.Is(err, errProtocolMismatch) {
-			writeDiagnostic(io, err)
-			return protocol.ExitCodeProtocolMismatch
-		}
-		return parseFailure(io, err)
+		return diagnosticExit(streams, err)
 	}
 	return d.exitCode
 }
 
-func parseFailure(io IO, err error) int {
-	writeDiagnostic(io, err)
+// diagnosticExit 把解析或会话建立失败写到 stderr 并返回对应退出码。
+// 协议不兼容固定 10，其余按参数错误返回 2；两者都不触碰 stdout、
+// 不承诺 hello/result（设计 §6 表格）。
+func diagnosticExit(streams IO, err error) int {
+	writeDiagnostic(streams, err)
+	if errors.Is(err, errProtocolMismatch) {
+		return protocol.ExitCodeProtocolMismatch
+	}
 	return protocol.ExitCodeInvalidArgument
 }
 
 // writeDiagnostic 把解析或会话设置错误写到 stderr，不触碰 stdout。
-func writeDiagnostic(io IO, err error) {
-	if io.Err == nil {
+func writeDiagnostic(streams IO, err error) {
+	if streams.Err == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(io.Err, "auto-mas-runtime: %v\n", err)
+	_, _ = fmt.Fprintf(streams.Err, "auto-mas-runtime: %v\n", err)
 }
 
 // mustGetwd 返回进程当前目录；Getwd 失败时回退到 "."，

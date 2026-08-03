@@ -20,11 +20,7 @@ func parseTestOptions(t *testing.T, cwd string, args ...string) (globalOptions, 
 			clock: time.Now,
 		},
 	}
-	root := newRoot(deps, IO{
-		In:  strings.NewReader(""),
-		Out: &strings.Builder{},
-		Err: &strings.Builder{},
-	})
+	root := newRoot(deps)
 	target, remaining, err := root.Find(args)
 	if err != nil {
 		return globalOptions{}, err
