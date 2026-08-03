@@ -27,26 +27,29 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-08-01）
+## 2. 当前状态（截至 2026-08-03）
 
 | 里程碑 | 状态 |
 | --- | --- |
 | M0 工程基础与最小 CI | T0.1~T0.4 **已完成** |
-| M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** ✅ `7afd192` |
-| M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | T2.1~T2.7 **已完成** ✅ `149e8be` |
-| M3~M7、M9 | 未开始；M3 是下一功能阶段 |
-| M10 工程可维护性收敛 | T10.1 文档信息架构已完成 ✅ `ef24ea0`；后续阶段见维护设计 |
+| M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** |
+| M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | T2.1~T2.7 **已完成**；⛔ T2.8（filesystem 测试的 8.3 短文件名假设）待修，远端 CI 因此红灯 |
+| M3 CLI 框架与基础命令 | T3.1~T3.8 **已完成**（含三轮对抗性审查的修复与可维护性收敛） |
+| M4~M7、M9 | 未开始；M4 工作区同步是下一功能阶段 |
+| M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 
 代码现状：
 
-- `internal/protocol`、`config`、`filesystem`、`logging`、`state`、`lock` 和 `mirror` 已实现；
+- `internal/protocol`、`config`、`filesystem`、`logging`、`state`、`lock`、`mirror`、
+  `cli`、`doctor`、`cleanup`、`version` 已实现；
 - `backend`、`gitrepo`、`health`、`process`、`uv` 仍只有占位；
-- `internal/cli/cli.go` 是骨架，`Run()` 固定返回 `"auto-mas-runtime dev"`；
+- `internal/cli` 已按架构命令树注册全部命令，`version`/`doctor`/`cleanup` 为真实实现，
+  其余命令注册但返回 `UNSUPPORTED_MODE`；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
 
 Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`。
 本地 `main` 与 `origin/main` 的实际关系以 `git status -sb` / `git log --oneline -5` 为准，
-**不要依赖本文件里的哈希**（它会随每次提交过期）；T0.3 的推送授权状态见 `doc/任务拆分.md`。
+**不要依赖本文件里的哈希**（它会随每次提交过期）。
 特性分支 `codex/runtime-implementation` 在 `.worktrees/codex-runtime-implementation` 下。
 
 ---
@@ -213,7 +216,9 @@ if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
 ### 6.7 🚩 推送与外发需要明确授权
 
 `git push`、创建远端仓库/Release、向任何外部服务发送仓库内容，
-**必须先获得用户明确授权**。这是 T0.3 当前受阻的原因，不要自行“顺手推一下”。
+**必须先获得用户明确授权**，每次都要单独授权，不因上次批准过就顺手推一下。
+授权范围要说清楚：`git push` 推的是分支 tip，会连同全部未推送的祖先提交一起发布，
+先用 `git rev-list --left-right --count origin/main...HEAD` 确认实际数量再请求授权。
 
 ---
 
