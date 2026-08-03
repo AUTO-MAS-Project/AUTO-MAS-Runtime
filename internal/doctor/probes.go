@@ -12,10 +12,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// probeUVTimeout 是生产 uv 版本探测的固定超时。
+// probeUVTimeout 是单次 uv 版本探测的固定超时。
 // 15 秒足以覆盖正常 --version 执行与慢盘启动，同时保证挂死的 uv.exe
 // 不会让 doctor 无法结束（M3 尚无 stdin cancel 通道）。
 const probeUVTimeout = 15 * time.Second
+
+// probeUVBudget 是 uv 检查项的总预算，覆盖对全部候选版本目录的枚举。
+// 残留的历史版本目录会让 N 个候选各自消耗一次 probeUVTimeout；doctor 是
+// 只读诊断，整项超出一次探测的预算后继续枚举没有价值（T3.8 F13c）。
+const probeUVBudget = probeUVTimeout
 
 // ProductionProbes 返回生产环境探测实现。
 func ProductionProbes() Probes {

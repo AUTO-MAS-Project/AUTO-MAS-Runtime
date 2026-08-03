@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"sort"
@@ -111,6 +112,7 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (Report, e
 		return Report{}, err
 	}
 	var checks []Check
+	// 分派表要求统一签名，因此不需要 ctx 的检查函数也保留该参数（写成匿名参数）。
 	for _, run := range []func(context.Context) Check{
 		s.checkAppRoot,
 		s.checkLayout,
@@ -146,11 +148,10 @@ func emitCheck(emitter *protocol.Emitter, check Check) error {
 	}); err != nil {
 		return err
 	}
-	message := fmt.Sprintf("%s：%s", check.Name, check.Message)
 	return emitter.EmitProgress(protocol.ProgressEvent{
 		Stage:   protocol.StageDoctor,
 		Status:  progressForStatus(check.Status),
-		Message: message,
+		Message: fmt.Sprintf("%s：%s", check.Name, check.Message),
 	})
 }
 
@@ -199,11 +200,77 @@ func summarize(checks []Check) Summary {
 	return summary
 }
 
-func (s *Service) checkAppRoot(ctx context.Context) Check {
-	return checkDirectory(ctx, "app-root", "应用根目录", s.layout.AppRoot())
+// checkSpec 是一个检查项的稳定身份：wire 上的 id 与 human 输出用的中文名。
+// 每个检查项在这里出现一次，检查函数只描述判定，不再重复 id/name 字面量。
+type checkSpec struct {
+	id   string
+	name string
 }
 
-func (s *Service) checkLayout(ctx context.Context) Check {
+var (
+	specAppRoot      = checkSpec{id: "app-root", name: "应用根目录"}
+	specLayout       = checkSpec{id: "layout", name: "受管目录布局"}
+	specUV           = checkSpec{id: "uv", name: "uv 工具"}
+	specPython       = checkSpec{id: "python", name: "受管 Python"}
+	specRepo         = checkSpec{id: "repo", name: "受管仓库"}
+	specVenv         = checkSpec{id: "venv", name: "主项目虚拟环境"}
+	specRuntimeState = checkSpec{id: "runtime-state", name: "运行时状态文件"}
+	specMutex        = checkSpec{id: "mutex", name: "并发锁占用"}
+	specDisk         = checkSpec{id: "disk", name: "磁盘剩余空间"}
+)
+
+// result 构造该检查项的结果；details 为 nil 时归一化为空 map，
+// 保证 wire 上的 details 恒为对象而非 null。
+func (s checkSpec) result(status Status, message string, details map[string]any) Check {
+	if details == nil {
+		details = map[string]any{}
+	}
+	return Check{ID: s.id, Name: s.name, Status: status, Message: message, Details: details}
+}
+
+func (s checkSpec) ok(message string, details map[string]any) Check {
+	return s.result(StatusOK, message, details)
+}
+
+func (s checkSpec) missing(message string) Check {
+	return s.result(StatusMissing, message, nil)
+}
+
+// failed 报告确定的异常，details 为空：原因已由 message 表达。
+func (s checkSpec) failed(message string) Check {
+	return s.result(StatusError, message, nil)
+}
+
+// failedBecause 报告由底层错误引起的异常，details 只放稳定分类词。
+// 原始错误串绝不进 wire（T3.5 F6），只能进 stderr 诊断或日志。
+func (s checkSpec) failedBecause(message string, cause error) Check {
+	return s.result(StatusError, message, map[string]any{"error": errorKind(cause)})
+}
+
+// directory 是「目录存在且是目录」这一最常见判定的共用实现。
+func (s checkSpec) directory(path string) Check {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil && info.IsDir():
+		return s.ok("目录存在", nil)
+	case errors.Is(err, fs.ErrNotExist):
+		return s.missing("目录不存在")
+	case err != nil:
+		return s.failedBecause("无法访问目录", err)
+	default:
+		return s.failed("路径不是目录")
+	}
+}
+
+func (s *Service) checkAppRoot(context.Context) Check {
+	return specAppRoot.directory(s.layout.AppRoot())
+}
+
+func (s *Service) checkVenv(context.Context) Check {
+	return specVenv.directory(s.layout.VenvDir())
+}
+
+func (s *Service) checkLayout(context.Context) Check {
 	paths := map[string]string{
 		"repo":          s.layout.RepoDir(),
 		"runtime-state": s.layout.StateDir(),
@@ -222,47 +289,55 @@ func (s *Service) checkLayout(ctx context.Context) Check {
 			details[name] = "missing"
 			missingCount++
 			worst = worseStatus(worst, StatusMissing)
-		case err != nil:
-			details[name] = "error"
-			worst = StatusError
 		default:
 			details[name] = "error"
 			worst = StatusError
 		}
 	}
-	message := fmt.Sprintf("受管目录 %d 个中 %d 个缺失", len(paths), missingCount)
 	if worst == StatusError {
-		message = "受管目录存在类型异常"
+		return specLayout.result(worst, "受管目录存在类型异常", details)
 	}
-	return Check{
-		ID:      "layout",
-		Name:    "受管目录布局",
-		Status:  worst,
-		Message: message,
-		Details: details,
-	}
+	return specLayout.result(
+		worst,
+		fmt.Sprintf("受管目录 %d 个中 %d 个缺失", len(paths), missingCount),
+		details,
+	)
 }
 
 func (s *Service) checkUV(ctx context.Context) Check {
 	entries, err := os.ReadDir(s.layout.UVToolsDir())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return Check{
-				ID:      "uv",
-				Name:    "uv 工具",
-				Status:  StatusMissing,
-				Message: "未安装受管 uv",
-				Details: map[string]any{},
-			}
+			return specUV.missing("未安装受管 uv")
 		}
-		return Check{
-			ID:      "uv",
-			Name:    "uv 工具",
-			Status:  StatusError,
-			Message: "无法访问 uv 工具目录",
-			Details: map[string]any{"error": errorKind(err)},
-		}
+		return specUV.failedBecause("无法访问 uv 工具目录", err)
 	}
+	executables := s.uvExecutables(entries)
+	if len(executables) == 0 {
+		return specUV.missing("未找到受管 uv.exe")
+	}
+	// 整项总预算：单次探测已有固定超时，但残留的历史版本目录会让 N 个候选
+	// 串行消耗 N 倍时间。doctor 是只读诊断，整项超出一次探测的预算后继续
+	// 枚举没有价值（T3.8 F13c）。
+	probeCtx, cancel := context.WithTimeout(ctx, probeUVBudget)
+	defer cancel()
+	var lastErr error
+	for _, exe := range executables {
+		version, err := s.probes.UVVersion(probeCtx, exe)
+		if err != nil {
+			lastErr = err
+			if probeCtx.Err() != nil {
+				break
+			}
+			continue
+		}
+		return specUV.ok("uv 可用", map[string]any{"version": version})
+	}
+	return specUV.failedBecause("无法识别 uv 版本", lastErr)
+}
+
+// uvExecutables 返回受管 uv 版本目录下存在的 uv.exe，按路径排序保证结果稳定。
+func (s *Service) uvExecutables(entries []os.DirEntry) []string {
 	executables := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -277,155 +352,60 @@ func (s *Service) checkUV(ctx context.Context) Check {
 		}
 	}
 	sort.Strings(executables)
-	if len(executables) == 0 {
-		return Check{
-			ID:      "uv",
-			Name:    "uv 工具",
-			Status:  StatusMissing,
-			Message: "未找到受管 uv.exe",
-			Details: map[string]any{},
-		}
-	}
-	var lastErr error
-	for _, exe := range executables {
-		version, err := s.probes.UVVersion(ctx, exe)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return Check{
-			ID:      "uv",
-			Name:    "uv 工具",
-			Status:  StatusOK,
-			Message: "uv 可用",
-			Details: map[string]any{"version": version},
-		}
-	}
-	return Check{
-		ID:      "uv",
-		Name:    "uv 工具",
-		Status:  StatusError,
-		Message: "无法识别 uv 版本",
-		Details: map[string]any{"error": errorKind(lastErr)},
-	}
+	return executables
 }
 
-func (s *Service) checkPython(ctx context.Context) Check {
+func (s *Service) checkPython(context.Context) Check {
 	info, err := os.Stat(s.layout.PythonDir())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return Check{
-				ID:      "python",
-				Name:    "受管 Python",
-				Status:  StatusMissing,
-				Message: "未安装受管 Python",
-				Details: map[string]any{},
-			}
+			return specPython.missing("未安装受管 Python")
 		}
-		return errorCheck("python", "受管 Python", "无法访问 Python 目录", err)
+		return specPython.failedBecause("无法访问 Python 目录", err)
 	}
 	if !info.IsDir() {
-		return Check{
-			ID:      "python",
-			Name:    "受管 Python",
-			Status:  StatusError,
-			Message: "Python 路径不是目录",
-			Details: map[string]any{},
-		}
+		return specPython.failed("Python 路径不是目录")
 	}
-	exe := s.layout.PythonExecutable()
-	if fileInfo, err := os.Stat(exe); err != nil || fileInfo.IsDir() {
-		return Check{
-			ID:      "python",
-			Name:    "受管 Python",
-			Status:  StatusMissing,
-			Message: "未找到受管 python.exe",
-			Details: map[string]any{},
-		}
+	if fileInfo, err := os.Stat(s.layout.PythonExecutable()); err != nil || fileInfo.IsDir() {
+		return specPython.missing("未找到受管 python.exe")
 	}
-	return Check{
-		ID:      "python",
-		Name:    "受管 Python",
-		Status:  StatusOK,
-		Message: "Python 目录存在",
-		Details: map[string]any{},
-	}
+	return specPython.ok("Python 目录存在", nil)
 }
 
-func (s *Service) checkRepo(ctx context.Context) Check {
+func (s *Service) checkRepo(context.Context) Check {
 	repoInfo, err := os.Stat(s.layout.RepoDir())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return Check{
-				ID:      "repo",
-				Name:    "受管仓库",
-				Status:  StatusMissing,
-				Message: "repo 目录不存在",
-				Details: map[string]any{},
-			}
+			return specRepo.missing("repo 目录不存在")
 		}
-		return errorCheck("repo", "受管仓库", "无法访问 repo 目录", err)
+		return specRepo.failedBecause("无法访问 repo 目录", err)
 	}
 	if !repoInfo.IsDir() {
-		return Check{
-			ID:      "repo",
-			Name:    "受管仓库",
-			Status:  StatusError,
-			Message: "repo 路径不是目录",
-			Details: map[string]any{},
-		}
+		return specRepo.failed("repo 路径不是目录")
 	}
-	versionFile := s.layout.RepoVersionFile()
-	data, err := readBounded(versionFile, maxVersionFileBytes)
+	data, err := readBounded(s.layout.RepoVersionFile(), maxVersionFileBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return Check{
-				ID:      "repo",
-				Name:    "受管仓库",
-				Status:  StatusMissing,
-				Message: "版本文件缺失",
-				Details: map[string]any{},
-			}
+			return specRepo.missing("版本文件缺失")
 		}
-		return errorCheck("repo", "受管仓库", "无法读取版本文件", err)
+		return specRepo.failedBecause("无法读取版本文件", err)
 	}
 	var payload struct {
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return Check{
-			ID:      "repo",
-			Name:    "受管仓库",
-			Status:  StatusError,
-			Message: "版本文件不是有效 JSON",
-			Details: map[string]any{
-				"error": errorKind(fmt.Errorf("%w: %v", errMalformedPayload, err)),
-			},
-		}
+		return specRepo.failedBecause(
+			"版本文件不是有效 JSON",
+			fmt.Errorf("%w: %v", errMalformedPayload, err),
+		)
 	}
 	if payload.Version == "" {
-		return Check{
-			ID:      "repo",
-			Name:    "受管仓库",
-			Status:  StatusError,
-			Message: "版本文件缺少 version 字段",
-			Details: map[string]any{},
-		}
+		return specRepo.failed("版本文件缺少 version 字段")
 	}
-	return Check{
-		ID:      "repo",
-		Name:    "受管仓库",
-		Status:  StatusOK,
-		Message: "仓库与版本文件存在",
-		Details: map[string]any{"version": payload.Version},
-	}
+	return specRepo.ok("仓库与版本文件存在", map[string]any{"version": payload.Version})
 }
 
-func (s *Service) checkVenv(ctx context.Context) Check {
-	return checkDirectory(ctx, "venv", "主项目虚拟环境", s.layout.VenvDir())
-}
-
-func (s *Service) checkRuntimeState(ctx context.Context) Check {
+func (s *Service) checkRuntimeState(context.Context) Check {
 	files := map[string]string{
 		"backend":     s.layout.BackendStateFile(),
 		"mutation":    s.layout.MutationStateFile(),
@@ -442,51 +422,33 @@ func (s *Service) checkRuntimeState(ctx context.Context) Check {
 		case errors.Is(err, fs.ErrNotExist):
 			details[name] = "missing"
 			worst = worseStatus(worst, StatusMissing)
-		case err != nil:
-			details[name] = "error"
-			worst = StatusError
 		default:
 			details[name] = "error"
 			worst = StatusError
 		}
 	}
 	message := "runtime-state 文件完整"
-	if worst == StatusMissing {
+	switch worst {
+	case StatusMissing:
 		message = "runtime-state 存在缺失文件"
-	} else if worst == StatusError {
+	case StatusError:
 		message = "runtime-state 存在损坏或超限文件"
 	}
-	return Check{
-		ID:      "runtime-state",
-		Name:    "运行时状态文件",
-		Status:  worst,
-		Message: message,
-		Details: details,
-	}
+	return specRuntimeState.result(worst, message, details)
 }
 
 func (s *Service) checkMutexes(ctx context.Context) Check {
 	set, err := lock.NewSet(ctx, s.layout)
 	if err != nil {
-		return errorCheck("mutex", "并发锁占用", "无法初始化锁探测", err)
+		return specMutex.failedBecause("无法初始化锁探测", err)
 	}
 	backend, err := set.Probe(ctx, lock.KindBackend)
 	if err != nil {
-		return errorCheck(
-			"mutex",
-			"并发锁占用",
-			"backend 锁探测失败",
-			errors.Join(err, set.Close()),
-		)
+		return specMutex.failedBecause("backend 锁探测失败", errors.Join(err, set.Close()))
 	}
 	mutation, err := set.Probe(ctx, lock.KindMutation)
 	if err != nil {
-		return errorCheck(
-			"mutex",
-			"并发锁占用",
-			"mutation 锁探测失败",
-			errors.Join(err, set.Close()),
-		)
+		return specMutex.failedBecause("mutation 锁探测失败", errors.Join(err, set.Close()))
 	}
 	details := map[string]any{
 		"backend":           backend.Held,
@@ -496,71 +458,17 @@ func (s *Service) checkMutexes(ctx context.Context) Check {
 	}
 	if closeErr := set.Close(); closeErr != nil {
 		// 探测已成功，仅收口失败：把故障计入该项，避免忽略资源清理错误。
-		return errorCheck("mutex", "并发锁占用", "锁探测收口失败", closeErr)
+		return specMutex.failedBecause("锁探测收口失败", closeErr)
 	}
-	return Check{
-		ID:      "mutex",
-		Name:    "并发锁占用",
-		Status:  StatusOK,
-		Message: "锁占用探测完成",
-		Details: details,
-	}
+	return specMutex.ok("锁占用探测完成", details)
 }
 
 func (s *Service) checkDisk(ctx context.Context) Check {
 	free, err := s.probes.DiskFree(ctx, s.layout.AppRoot())
 	if err != nil {
-		return errorCheck("disk", "磁盘剩余空间", "磁盘探测失败", err)
+		return specDisk.failedBecause("磁盘探测失败", err)
 	}
-	return Check{
-		ID:      "disk",
-		Name:    "磁盘剩余空间",
-		Status:  StatusOK,
-		Message: "磁盘剩余空间可用",
-		Details: map[string]any{"freeBytes": free},
-	}
-}
-
-func checkDirectory(ctx context.Context, id, name, path string) Check {
-	info, err := os.Stat(path)
-	switch {
-	case err == nil && info.IsDir():
-		return Check{
-			ID:      id,
-			Name:    name,
-			Status:  StatusOK,
-			Message: "目录存在",
-			Details: map[string]any{},
-		}
-	case errors.Is(err, fs.ErrNotExist):
-		return Check{
-			ID:      id,
-			Name:    name,
-			Status:  StatusMissing,
-			Message: "目录不存在",
-			Details: map[string]any{},
-		}
-	case err != nil:
-		return errorCheck(id, name, "无法访问目录", err)
-	default:
-		return Check{
-			ID:      id,
-			Name:    name,
-			Status:  StatusError,
-			Message: "路径不是目录",
-			Details: map[string]any{},
-		}
-	}
-}
-
-func errorCheck(id, name, message string, cause error) Check {
-	return Check{
-		ID:      id,
-		Name:    name,
-		Status:  StatusError,
-		Message: message,
-		Details: map[string]any{"error": errorKind(cause)},
-	}
+	return specDisk.ok("磁盘剩余空间可用", map[string]any{"freeBytes": free})
 }
 
 // errorKind 把底层错误映射为 doctor 检查项 details 的稳定分类词。
@@ -580,15 +488,25 @@ func errorKind(err error) string {
 	}
 }
 
+// readBounded 读取至多 limit 字节；超过上限即报错。
+//
+// 用 io.LimitReader 而不是先 Stat 再 ReadFile：后者的上限只是咨询值，
+// Stat 与实际读取之间文件仍可增长（T3.8 F13b）。多读一个字节是为了区分
+// 「恰好等于上限」与「超过上限」。
 func readBounded(path string, limit int64) ([]byte, error) {
-	info, err := os.Stat(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	if info.Size() > limit {
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("%w (limit %d)", errStateFileTooLarge, limit)
 	}
-	return os.ReadFile(path)
+	return data, nil
 }
 
 func isJSONObject(data []byte) bool {
@@ -599,9 +517,11 @@ func isJSONObject(data []byte) bool {
 	return object != nil
 }
 
+// statusOrder 决定 worseStatus 的严重度顺序；提为包级避免每次比较重建 map。
+var statusOrder = map[Status]int{StatusOK: 0, StatusMissing: 1, StatusError: 2}
+
 func worseStatus(left, right Status) Status {
-	order := map[Status]int{StatusOK: 0, StatusMissing: 1, StatusError: 2}
-	if order[right] > order[left] {
+	if statusOrder[right] > statusOrder[left] {
 		return right
 	}
 	return left

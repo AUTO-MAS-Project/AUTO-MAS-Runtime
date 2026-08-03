@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -600,6 +601,85 @@ func TestDoctor_ResultDetailsDoNotLeakPaths(t *testing.T) {
 	}
 }
 
+// TestReadBounded_EnforcesLimitWithoutStat 证明大小上限由实际读取决定，
+// 而不是先 Stat 再 ReadFile 的咨询值：恰好等于上限的文件可读，
+// 超出一字节即报 errStateFileTooLarge。
+func TestReadBounded_EnforcesLimitWithoutStat(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		size    int
+		limit   int64
+		wantErr bool
+	}{
+		{name: "below limit", size: 4, limit: 8},
+		{name: "exactly at limit", size: 8, limit: 8},
+		{name: "one byte over limit", size: 9, limit: 8, wantErr: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "payload.bin")
+			writeFile(t, path, bytes.Repeat([]byte("x"), test.size))
+			data, err := readBounded(path, test.limit)
+			if test.wantErr {
+				if !errors.Is(err, errStateFileTooLarge) {
+					t.Fatalf("readBounded() error = %v, want errStateFileTooLarge", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readBounded() error = %v, want nil", err)
+			}
+			if len(data) != test.size {
+				t.Errorf("len(data) = %d, want %d", len(data), test.size)
+			}
+		})
+	}
+}
+
+// TestService_UVCheckHonoursTotalBudget 证明 uv 检查项有整项总预算：
+// 多个残留版本目录不会让探测串行叠加成 N 倍单次超时。探针替身在预算耗尽后
+// 立刻观察到 ctx 已取消，因此调用次数远小于候选数。
+func TestService_UVCheckHonoursTotalBudget(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	const candidates = 5
+	for i := range candidates {
+		uvDir, err := layout.UVVersionDir(fmt.Sprintf("0.8.%d", i))
+		if err != nil {
+			t.Fatalf("UVVersionDir() error = %v", err)
+		}
+		writeFile(t, filepath.Join(uvDir, "uv.exe"), nil)
+	}
+
+	var calls int
+	probes := testProbes()
+	probes.UVVersion = func(ctx context.Context, _ string) (string, error) {
+		calls++
+		// 第一个候选就耗尽整项预算：探针替身直接返回 ctx 的超时错误。
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	service := mustNewService(t, layout, probes)
+
+	budget, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	check := service.checkUV(budget)
+
+	if check.Status != StatusError {
+		t.Errorf("uv check status = %q, want error", check.Status)
+	}
+	if calls != 1 {
+		t.Errorf("UVVersion called %d times, want 1 (budget must stop enumeration)", calls)
+	}
+}
+
 // TestDoctor_ErrorDetailsUseStableKinds 证明错误检查项的 details.error
 // 只使用稳定分类词（not-found/access-denied/invalid/timeout/other）。
 func TestDoctor_ErrorDetailsUseStableKinds(t *testing.T) {
@@ -611,11 +691,12 @@ func TestDoctor_ErrorDetailsUseStableKinds(t *testing.T) {
 		"timeout":       true,
 		"other":         true,
 	}
+	spec := checkSpec{id: "probe", name: "探测"}
 	checks := []Check{
-		errorCheck("a", "a", "msg", fs.ErrNotExist),
-		errorCheck("b", "b", "msg", fs.ErrPermission),
-		errorCheck("c", "c", "msg", context.DeadlineExceeded),
-		errorCheck("d", "d", "msg", errors.New(`C:\leak`)),
+		spec.failedBecause("msg", fs.ErrNotExist),
+		spec.failedBecause("msg", fs.ErrPermission),
+		spec.failedBecause("msg", context.DeadlineExceeded),
+		spec.failedBecause("msg", errors.New(`C:\leak`)),
 	}
 	for _, check := range checks {
 		kind, ok := check.Details["error"].(string)
