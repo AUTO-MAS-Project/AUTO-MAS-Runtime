@@ -100,29 +100,68 @@ func New(layout *config.Layout, auditor filesystem.Auditor) (*Service, error) {
 	return &Service{layout: layout, auditor: auditor}, nil
 }
 
-// planItem 是清理计划中的单条目标。
+// planItem 是清理计划中的单条目标，只有两种互斥形态：
+//
+//   - 待删除目标（newDeleteItem）：携带 kind/target/operationID/reason，
+//     由 executeItem 交给 filesystem.Operator 执行；
+//   - 已定结果（newResolvedItem）：枚举阶段就已判定 skipped/failed，
+//     只携带 resolved，不再触碰文件系统。
+//
+// 用 resolved 指针表达这个二选一，避免八个字段互斥两组时的非法状态可表达
+// （例如同时带 target 和 preStatus）。两种构造函数是唯一入口。
 type planItem struct {
 	id          string
 	kind        filesystem.DeleteKind
 	target      string
 	operationID string
 	reason      string
-	preStatus   ItemStatus
-	preMessage  string
-	preDetails  map[string]any
+	resolved    *resolvedItem
 }
+
+// resolvedItem 是枚举阶段就已确定的条目结果。
+type resolvedItem struct {
+	status  ItemStatus
+	message string
+	details map[string]any
+}
+
+// newDeleteItem 构造一条待删除目标。
+func newDeleteItem(id string, kind filesystem.DeleteKind, target, operationID string) planItem {
+	return planItem{
+		id:          id,
+		kind:        kind,
+		target:      target,
+		operationID: operationID,
+		reason:      cleanupReason,
+	}
+}
+
+// newResolvedItem 构造一条枚举阶段已定结果的条目。
+func newResolvedItem(id string, status ItemStatus, message string, details map[string]any) planItem {
+	return planItem{
+		id:       id,
+		resolved: &resolvedItem{status: status, message: message, details: details},
+	}
+}
+
+// newFailedItem 构造一条失败关闭条目，details 固定复述 GIT_REPO_CLEANUP_FAILED。
+func newFailedItem(id, message string) planItem {
+	return newResolvedItem(
+		id,
+		ItemFailed,
+		message,
+		map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
+	)
+}
+
+// cleanupReason 是本命令写入删除审计的固定原因标识。
+const cleanupReason = "cleanup"
 
 // Run 获取 mutation 锁后执行清理计划。
 // 任一条目失败时命令返回 GIT_REPO_CLEANUP_FAILED，details 保留完整副作用报告。
 func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (report Report, err error) {
 	if err := ctx.Err(); err != nil {
-		return Report{}, NewError(
-			protocol.CodeOperationCancelled,
-			protocol.StageCleanup,
-			"清理已取消",
-			map[string]any{},
-			err,
-		)
+		return Report{}, newCancelledError(map[string]any{}, err)
 	}
 	if err := s.requireAppRoot(); err != nil {
 		return Report{}, err
@@ -146,13 +185,7 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (report Re
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		return Report{}, NewError(
-			protocol.CodeOperationCancelled,
-			protocol.StageCleanup,
-			"清理已取消",
-			map[string]any{},
-			err,
-		)
+		return Report{}, newCancelledError(map[string]any{}, err)
 	}
 	operator, err := filesystem.New(ctx, s.layout, s.auditor)
 	if err != nil {
@@ -166,13 +199,7 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (report Re
 	for _, entry := range plan {
 		if err := ctx.Err(); err != nil {
 			report.Summary = summarize(report.Items)
-			return report, NewError(
-				protocol.CodeOperationCancelled,
-				protocol.StageCleanup,
-				"清理已取消",
-				ReportDetails(report),
-				err,
-			)
+			return report, newCancelledError(ReportDetails(report), err)
 		}
 		item, err := s.executeItem(ctx, emitter, operator, entry)
 		if err != nil {
@@ -233,27 +260,9 @@ func newInvalidAppRootError(message string, cause error) error {
 
 func (s *Service) buildPlan(ctx context.Context, cleanupOperationID string) ([]planItem, error) {
 	items := []planItem{
-		{
-			id:          "uv-cache",
-			kind:        filesystem.DeleteUVCache,
-			target:      s.layout.UVCacheDir(),
-			operationID: cleanupOperationID,
-			reason:      "cleanup",
-		},
-		{
-			id:          "download-temp",
-			kind:        filesystem.DeleteDownloadTemporary,
-			target:      s.layout.DownloadCacheDir(),
-			operationID: cleanupOperationID,
-			reason:      "cleanup",
-		},
-		{
-			id:          "build-cache",
-			kind:        filesystem.DeleteBuildCache,
-			target:      s.layout.BuildCacheDir(),
-			operationID: cleanupOperationID,
-			reason:      "cleanup",
-		},
+		newDeleteItem("uv-cache", filesystem.DeleteUVCache, s.layout.UVCacheDir(), cleanupOperationID),
+		newDeleteItem("download-temp", filesystem.DeleteDownloadTemporary, s.layout.DownloadCacheDir(), cleanupOperationID),
+		newDeleteItem("build-cache", filesystem.DeleteBuildCache, s.layout.BuildCacheDir(), cleanupOperationID),
 	}
 	pythonItems, err := s.enumeratePythonCaches(ctx, cleanupOperationID)
 	if err != nil {
@@ -274,20 +283,20 @@ func (s *Service) executeItem(
 	operator *filesystem.Operator,
 	entry planItem,
 ) (Item, error) {
-	if entry.preStatus != "" {
+	if entry.resolved != nil {
 		if err := emitItemProgress(
 			emitter,
 			entry.id,
-			progressForStatus(entry.preStatus),
-			entry.preMessage,
+			progressForStatus(entry.resolved.status),
+			entry.resolved.message,
 		); err != nil {
 			return Item{}, err
 		}
 		return Item{
 			ID:      entry.id,
-			Status:  entry.preStatus,
-			Message: entry.preMessage,
-			Details: entry.preDetails,
+			Status:  entry.resolved.status,
+			Message: entry.resolved.message,
+			Details: entry.resolved.details,
 		}, nil
 	}
 	if err := emitItemProgress(
@@ -309,7 +318,7 @@ func (s *Service) executeItem(
 		item := Item{
 			ID:      entry.id,
 			Status:  ItemFailed,
-			Message: safeFailureMessage(code),
+			Message: messageForItemFailure(code),
 			Details: map[string]any{"code": string(code)},
 		}
 		if progressErr := emitItemProgress(
@@ -375,12 +384,7 @@ func isLinkDirEntry(entry fs.DirEntry) bool {
 // invalidLinkItem 构造「链接目录不跟随、不删除」的失败关闭条目。
 // id 形如 <prefix>-invalid-<n>，保证 result.details.items 可寻址。
 func invalidLinkItem(prefix string, counter int) planItem {
-	return planItem{
-		id:         prefix + "-invalid-" + strconv.Itoa(counter),
-		preStatus:  ItemFailed,
-		preMessage: "目录为不安全的链接",
-		preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
-	}
+	return newFailedItem(prefix+"-invalid-"+strconv.Itoa(counter), "目录为不安全的链接")
 }
 
 // enumeratePythonCaches 在 repo 下寻找 __pycache__ 目录。
@@ -426,21 +430,15 @@ func (s *Service) enumeratePythonCaches(ctx context.Context, cleanupOperationID 
 			counter++
 			id := "python-cache-" + strconv.Itoa(counter)
 			if _, err := filesystem.Canonicalize(path); err != nil {
-				items = append(items, planItem{
-					id:         id,
-					preStatus:  ItemFailed,
-					preMessage: "目录身份不明确",
-					preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
-				})
+				items = append(items, newFailedItem(id, "目录身份不明确"))
 				return fs.SkipDir
 			}
-			items = append(items, planItem{
-				id:          id,
-				kind:        filesystem.DeletePythonCache,
-				target:      path,
-				operationID: cleanupOperationID,
-				reason:      "cleanup",
-			})
+			items = append(items, newDeleteItem(
+				id,
+				filesystem.DeletePythonCache,
+				path,
+				cleanupOperationID,
+			))
 			return fs.SkipDir
 		}
 		return nil
@@ -484,88 +482,95 @@ func (s *Service) enumerateRepoUpdates(ctx context.Context) ([]planItem, error) 
 			// 唯一 id 是 result.details.items 可寻址的前提；
 			// 枚举顺序由 os.ReadDir 的字典序保证稳定。
 			invalidCounter++
-			items = append(items, planItem{
-				id:         "repo-update-invalid-" + strconv.Itoa(invalidCounter),
-				preStatus:  ItemFailed,
-				preMessage: "目录身份不明确",
-				preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
-			})
+			items = append(items, newFailedItem(
+				"repo-update-invalid-"+strconv.Itoa(invalidCounter),
+				"目录身份不明确",
+			))
 			continue
 		}
 		id := "repo-update-" + operationID
 		cleanable, outcome, err := s.classifyRepoUpdate(ctx, operationID)
 		switch {
 		case err != nil:
-			items = append(items, planItem{
-				id:         id,
-				preStatus:  ItemFailed,
-				preMessage: "状态校验失败",
-				preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
-			})
+			items = append(items, newFailedItem(id, "状态校验失败"))
 		case cleanable:
-			items = append(items, planItem{
-				id:          id,
-				kind:        filesystem.DeleteRepositoryUpdate,
-				target:      expected,
-				operationID: operationID,
-				reason:      "cleanup",
-			})
-		case outcome == "active":
-			items = append(items, planItem{
-				id:         id,
-				preStatus:  ItemSkipped,
-				preMessage: "更新仍在进行",
-			})
+			items = append(items, newDeleteItem(
+				id,
+				filesystem.DeleteRepositoryUpdate,
+				expected,
+				operationID,
+			))
+		case outcome == outcomeActive:
+			items = append(items, newResolvedItem(id, ItemSkipped, "更新仍在进行", nil))
 		default:
-			message := "状态身份不匹配"
-			switch outcome {
-			case "no-transaction":
-				message = "缺少更新事务"
-			case "identity-mismatch":
-				message = "目录身份与事务不匹配"
-			case "inconsistent":
-				message = "事务 PID 仍存活"
-			}
-			items = append(items, planItem{
-				id:         id,
-				preStatus:  ItemFailed,
-				preMessage: message,
-				preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
-			})
+			items = append(items, newFailedItem(id, messageForRepoUpdateOutcome(outcome)))
 		}
 	}
 	return items, nil
 }
 
+// repoUpdateOutcome 是 repo.update-* 身份判定的稳定分类。
+// 只用于选择条目文案，不出现在 wire 上。
+type repoUpdateOutcome string
+
+const (
+	outcomeNoTransaction    repoUpdateOutcome = "no-transaction"
+	outcomeIdentityMismatch repoUpdateOutcome = "identity-mismatch"
+	outcomeInconsistent     repoUpdateOutcome = "inconsistent"
+	outcomeActive           repoUpdateOutcome = "active"
+	outcomeStale            repoUpdateOutcome = "stale"
+	outcomeStoreError       repoUpdateOutcome = "store-error"
+	outcomeReadError        repoUpdateOutcome = "read-error"
+	outcomeUnknown          repoUpdateOutcome = "unknown"
+)
+
+// messageForRepoUpdateOutcome 返回失败关闭条目的中文原因。
+// 未列出的分类统一按「状态身份不匹配」处理：失败关闭不需要区分到底哪种不明。
+func messageForRepoUpdateOutcome(outcome repoUpdateOutcome) string {
+	switch outcome {
+	case outcomeNoTransaction:
+		return "缺少更新事务"
+	case outcomeIdentityMismatch:
+		return "目录身份与事务不匹配"
+	case outcomeInconsistent:
+		return "事务 PID 仍存活"
+	default:
+		return "状态身份不匹配"
+	}
+}
+
 // classifyRepoUpdate 读取 update 事务并判定是否可安全清理。
 // cleanup 已持有 mutation 租约，任何 peer 都不可能持有同一 Mutex，
 // 因此对端探测恒为 free，活动性由 PID 探针区分 stale/inconsistent。
-func (s *Service) classifyRepoUpdate(ctx context.Context, operationID string) (bool, string, error) {
+func (s *Service) classifyRepoUpdate(
+	ctx context.Context,
+	operationID string,
+) (bool, repoUpdateOutcome, error) {
 	// 无副作用的只读探测：更新状态文件不存在即视为无事务，失败关闭且
 	// 不打开 StateFiles，避免创建 runtime-state/ 与 .update.guard。
 	if _, err := os.Stat(s.layout.UpdateStateFile()); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return false, "no-transaction", nil
+			return false, outcomeNoTransaction, nil
 		}
-		return false, "store-error", err
+		return false, outcomeStoreError, err
 	}
 	// 状态文件存在时复用现有事务读取路径；该路径只会建立已存在目录内的
 	// guard 协调 leaf，不会新增目录（runtime-state/ 此时已存在）。
 	store, err := state.NewStore(ctx, s.layout)
 	if err != nil {
-		return false, "store-error", err
+		return false, outcomeStoreError, err
 	}
 	snapshot, err := store.ReadTransaction(ctx, state.TransactionUpdate)
 	closeErr := store.Close()
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
-			return false, "no-transaction", closeErr
+			return false, outcomeNoTransaction, closeErr
 		}
-		return false, "read-error", errors.Join(err, closeErr)
+		return false, outcomeReadError, errors.Join(err, closeErr)
 	}
 	transaction := snapshot.State()
 	if transaction.OperationID != operationID {
-		return false, "identity-mismatch", closeErr
+		return false, outcomeIdentityMismatch, closeErr
 	}
 	inspection := state.InspectTransaction(
 		ctx,
@@ -575,15 +580,15 @@ func (s *Service) classifyRepoUpdate(ctx context.Context, operationID string) (b
 		peerMutexProbe{},
 	)
 	if inspection.ProbeError != nil {
-		return false, "unknown", errors.Join(inspection.ProbeError, closeErr)
+		return false, outcomeUnknown, errors.Join(inspection.ProbeError, closeErr)
 	}
 	switch inspection.Activity {
 	case state.ActivityStale:
-		return true, "stale", closeErr
+		return true, outcomeStale, closeErr
 	case state.ActivityActive:
-		return false, "active", closeErr
+		return false, outcomeActive, closeErr
 	default:
-		return false, string(inspection.Activity), closeErr
+		return false, repoUpdateOutcome(inspection.Activity), closeErr
 	}
 }
 
@@ -634,17 +639,4 @@ func operationErrorCode(err error, fallback protocol.Code) protocol.Code {
 		return fileErr.Code()
 	}
 	return fallback
-}
-
-func safeFailureMessage(code protocol.Code) string {
-	switch code {
-	case protocol.CodePathOutsideManagedRoot:
-		return "目标超出受管根"
-	case protocol.CodeUnsafeReparsePoint:
-		return "目标为不安全的链接"
-	case protocol.CodeDirectoryOccupied:
-		return "目录被占用"
-	default:
-		return "删除失败"
-	}
 }

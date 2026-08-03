@@ -53,17 +53,23 @@ func (e *Error) Message() string { return e.message }
 
 func (e *Error) Details() map[string]any { return e.details }
 
+// newCancelledError 构造取消错误。取消在四处产生（取锁前、取锁后、条目边界、
+// lock/filesystem 错误映射），四处必须给出同一组四元组与文案，因此收敛到这里。
+func newCancelledError(details map[string]any, cause error) *Error {
+	return NewError(
+		protocol.CodeOperationCancelled,
+		protocol.StageCleanup,
+		messageForCode(protocol.CodeOperationCancelled),
+		details,
+		cause,
+	)
+}
+
 // mapLockError 保留 lock 包冲突与操作故障的冻结错误码。
 func mapLockError(err error) error {
 	// 获取前/处理中取消优先映射 OPERATION_CANCELLED（设计 §13 顺序）。
 	if errors.Is(err, context.Canceled) {
-		return NewError(
-			protocol.CodeOperationCancelled,
-			protocol.StageCleanup,
-			"清理已取消",
-			map[string]any{},
-			err,
-		)
+		return newCancelledError(map[string]any{}, err)
 	}
 	var conflict *lock.ConflictError
 	if errors.As(err, &conflict) {
@@ -78,7 +84,7 @@ func mapLockError(err error) error {
 	return NewError(
 		protocol.CodeMutexOperationFailed,
 		protocol.StageCleanup,
-		"Mutex 操作失败",
+		messageForCode(protocol.CodeMutexOperationFailed),
 		map[string]any{},
 		err,
 	)
@@ -88,13 +94,7 @@ func mapLockError(err error) error {
 func mapOperationError(err error, fallback protocol.Code, message string) error {
 	// 取消优先于任何业务分类（设计 §13 顺序），被包装的 ctx 取消也必须命中 130。
 	if errors.Is(err, context.Canceled) {
-		return NewError(
-			protocol.CodeOperationCancelled,
-			protocol.StageCleanup,
-			"清理已取消",
-			map[string]any{},
-			err,
-		)
+		return newCancelledError(map[string]any{}, err)
 	}
 	var fileErr *filesystem.Error
 	if errors.As(err, &fileErr) {
@@ -115,6 +115,10 @@ func mapOperationError(err error, fallback protocol.Code, message string) error 
 	)
 }
 
+// messageForCode 是 cleanup 内「错误码 → 中文文案」的唯一来源。
+// 此前条目级失败另有一份 safeFailureMessage，与本表重复三条
+// （PATH_OUTSIDE_MANAGED_ROOT / UNSAFE_REPARSE_POINT / DIRECTORY_OCCUPIED），
+// 改动文案要同时动两处（T3.8 F10）。
 func messageForCode(code protocol.Code) string {
 	switch code {
 	case protocol.CodeMutationInProgress:
@@ -135,5 +139,21 @@ func messageForCode(code protocol.Code) string {
 		return "目录被占用"
 	default:
 		return "清理失败"
+	}
+}
+
+// messageForItemFailure 返回单条清理目标失败时的中文原因。
+//
+// 共享文案全部取自 messageForCode，只有兜底不同：条目级失败描述的是这一个
+// 目标没删掉（「删除失败」），而 messageForCode 的兜底面向整条命令
+// （「清理失败」）。把差异收敛成这一个 default 分支，共享部分不再重复。
+func messageForItemFailure(code protocol.Code) string {
+	switch code {
+	case protocol.CodePathOutsideManagedRoot,
+		protocol.CodeUnsafeReparsePoint,
+		protocol.CodeDirectoryOccupied:
+		return messageForCode(code)
+	default:
+		return "删除失败"
 	}
 }

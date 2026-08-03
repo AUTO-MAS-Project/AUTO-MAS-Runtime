@@ -9,6 +9,35 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
+// TestMessageForItemFailure_SharesTableWithServiceMessages 固定 F10 的收敛结果：
+// 条目级与服务级对同一个错误码给出同一句文案，只有兜底按上下文不同。
+func TestMessageForItemFailure_SharesTableWithServiceMessages(t *testing.T) {
+	t.Parallel()
+	shared := []protocol.Code{
+		protocol.CodePathOutsideManagedRoot,
+		protocol.CodeUnsafeReparsePoint,
+		protocol.CodeDirectoryOccupied,
+	}
+	for _, code := range shared {
+		code := code
+		t.Run(string(code), func(t *testing.T) {
+			t.Parallel()
+			if got, want := messageForItemFailure(code), messageForCode(code); got != want {
+				t.Errorf("messageForItemFailure(%q) = %q, want %q", code, got, want)
+			}
+		})
+	}
+	t.Run("context specific fallback", func(t *testing.T) {
+		t.Parallel()
+		if got, want := messageForItemFailure(protocol.CodeGitRepoCleanupFailed), "删除失败"; got != want {
+			t.Errorf("item fallback = %q, want %q", got, want)
+		}
+		if got, want := messageForCode(protocol.CodeGitRepoCleanupFailed), "部分清理项目失败"; got != want {
+			t.Errorf("service message = %q, want %q", got, want)
+		}
+	})
+}
+
 // TestMapLockError_CancelledMapsToOperationCancelled 证明锁错误映射优先识别
 // 被包装的 context.Canceled，取消不会被误映射为 MUTEX_OPERATION_FAILED。
 func TestMapLockError_CancelledMapsToOperationCancelled(t *testing.T) {

@@ -74,32 +74,13 @@ func validateOutputAndProtocol(flags *pflag.FlagSet) (outputMode, error) {
 }
 
 // parseGlobalOptions 在 Cobra 完成 flag 解析后执行全局参数语义校验。
+// output/protocol 复用 validateOutputAndProtocol，与 Execute 预解析阶段
+// 保持同一份判定，不再各写一遍。
 // 校验失败返回普通错误（退出码 2），协议不兼容返回 errProtocolMismatch（退出码 10）。
 func parseGlobalOptions(flags *pflag.FlagSet, cwd string) (globalOptions, error) {
-	rawOutput, err := flags.GetString("output")
+	mode, err := validateOutputAndProtocol(flags)
 	if err != nil {
 		return globalOptions{}, err
-	}
-	var mode outputMode
-	switch rawOutput {
-	case string(outputHuman):
-		mode = outputHuman
-	case string(outputNDJSON):
-		mode = outputNDJSON
-	default:
-		return globalOptions{}, fmt.Errorf("invalid output mode %q, want human or ndjson", rawOutput)
-	}
-
-	rawProtocol, err := flags.GetString("protocol")
-	if err != nil {
-		return globalOptions{}, err
-	}
-	protocolVersion, err := strconv.Atoi(rawProtocol)
-	if err != nil {
-		return globalOptions{}, fmt.Errorf("invalid protocol %q, want integer", rawProtocol)
-	}
-	if protocolVersion != protocol.Version {
-		return globalOptions{}, errProtocolMismatch
 	}
 
 	rawAppRoot, err := flags.GetString("app-root")
@@ -111,23 +92,9 @@ func parseGlobalOptions(flags *pflag.FlagSet, cwd string) (globalOptions, error)
 		return globalOptions{}, fmt.Errorf("invalid app root %q: %w", rawAppRoot, err)
 	}
 
-	rawMirrors, err := flags.GetStringArray("mirror")
+	preferred, err := parseMirrorPreferences(flags)
 	if err != nil {
 		return globalOptions{}, err
-	}
-	preferred := make(map[mirror.Kind]string, len(rawMirrors))
-	seen := make(map[mirror.Kind]bool, len(rawMirrors))
-	for _, raw := range rawMirrors {
-		kindText, key, found := strings.Cut(raw, "=")
-		if !found || kindText == "" || key == "" {
-			return globalOptions{}, fmt.Errorf("invalid mirror %q, want <kind>=<key>", raw)
-		}
-		kind := mirror.Kind(kindText)
-		if seen[kind] {
-			return globalOptions{}, fmt.Errorf("duplicate mirror kind %q", kindText)
-		}
-		seen[kind] = true
-		preferred[kind] = key
 	}
 
 	offline, err := flags.GetBool("offline")
@@ -150,7 +117,28 @@ func parseGlobalOptions(flags *pflag.FlagSet, cwd string) (globalOptions, error)
 	return globalOptions{
 		layout:          layout,
 		output:          mode,
-		protocolVersion: protocolVersion,
+		protocolVersion: protocol.Version,
 		mirrorPolicy:    policy,
 	}, nil
+}
+
+// parseMirrorPreferences 解析可重复的 --mirror <kind>=<key>，同一 kind 只允许一次。
+func parseMirrorPreferences(flags *pflag.FlagSet) (map[mirror.Kind]string, error) {
+	rawMirrors, err := flags.GetStringArray("mirror")
+	if err != nil {
+		return nil, err
+	}
+	preferred := make(map[mirror.Kind]string, len(rawMirrors))
+	for _, raw := range rawMirrors {
+		kindText, key, found := strings.Cut(raw, "=")
+		if !found || kindText == "" || key == "" {
+			return nil, fmt.Errorf("invalid mirror %q, want <kind>=<key>", raw)
+		}
+		kind := mirror.Kind(kindText)
+		if _, seen := preferred[kind]; seen {
+			return nil, fmt.Errorf("duplicate mirror kind %q", kindText)
+		}
+		preferred[kind] = key
+	}
+	return preferred, nil
 }
