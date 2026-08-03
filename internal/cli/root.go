@@ -60,6 +60,13 @@ func newRoot(deps *deps, io IO) *cobra.Command {
 		skeletonCommand(deps, "repair", "修复运行环境", protocol.StageRepair),
 		cleanupCommand(deps),
 	)
+	// SetHelpCommand 只写 Command.helpCommand 字段，真正把它挂进子命令列表的是
+	// InitDefaultHelpCmd()，而 Cobra 只在 ExecuteC() 内部调用后者。Execute 的
+	// 预解析走的是 Find()，不经过 ExecuteC，因此必须在这里显式建立：否则预解析树
+	// 里根本没有 help，`help doctor` 会被 legacyArgs 判成未知命令（T3.7 F1）。
+	// 该调用同时保证预解析树与正式执行树的命令集合一致；它内部先 RemoveCommand
+	// 再 AddCommand，与 ExecuteC 的二次调用幂等。
+	root.InitDefaultHelpCmd()
 	return root
 }
 

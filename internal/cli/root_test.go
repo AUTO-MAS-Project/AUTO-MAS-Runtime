@@ -82,6 +82,53 @@ func TestExecute_HelpCommandHiddenFromTree(t *testing.T) {
 	}
 }
 
+// TestExecute_HelpCommandDelegatesToTarget 证明 help <command> 子命令可用：
+// root.go 用 SetHelpCommand 注册的自定义 help 只有在命令树执行
+// InitDefaultHelpCmd 之后才真正进入子命令列表，Execute 的预解析走的是
+// probeRoot.Find，因此必须由 Execute 显式建立，否则 help 是一段死代码。
+func TestExecute_HelpCommandDelegatesToTarget(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "help", "doctor")
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"doctor", "只读检查本机运行环境"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Errorf("stdout does not contain %q: %s", want, result.stdout)
+		}
+	}
+}
+
+// TestExecute_HelpCommandBareShowsRootHelp 证明裸 help 输出根命令帮助。
+func TestExecute_HelpCommandBareShowsRootHelp(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "help")
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"version", "doctor", "cleanup"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Errorf("stdout does not contain %q: %s", want, result.stdout)
+		}
+	}
+}
+
+// TestExecute_HelpCommandRoutesToStderrInNDJSON 证明 help 子命令与 --help
+// 走同一条输出路由：ndjson 模式下帮助文本只允许出现在 stderr。
+func TestExecute_HelpCommandRoutesToStderrInNDJSON(t *testing.T) {
+	t.Parallel()
+	result := runCLI(t, context.Background(), "--output", "ndjson", "help", "doctor")
+	if result.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", result.exitCode, result.stderr)
+	}
+	if result.stdout != "" {
+		t.Errorf("stdout = %q, want empty", result.stdout)
+	}
+	if !strings.Contains(result.stderr, "doctor") {
+		t.Errorf("stderr = %q, want doctor help text", result.stderr)
+	}
+}
+
 // TestExecute_RejectsExtraPositionalArgs 证明所有叶子命令拒绝多余位置参数：
 // 走参数错误路径（stderr 诊断 + 退出码 2），不发射 hello/result。
 func TestExecute_RejectsExtraPositionalArgs(t *testing.T) {
