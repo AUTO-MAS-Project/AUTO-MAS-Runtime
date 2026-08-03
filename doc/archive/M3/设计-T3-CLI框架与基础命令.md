@@ -334,6 +334,14 @@ type Probes struct {
 - 每个检查发射一条 progress 事件（running → succeeded/failed），
   human 模式由此获得可读逐项输出。
 
+> T3.7 F3 修订：progress 终态改为 `ok → succeeded`、`missing → skipped`、
+> `error → failed`（三个取值均在协议冻结全集内），并在全部检查项之后追加一条
+> 汇总 progress（`总数/正常/缺失/异常` 计数，状态取最差项）。原设计把
+> `missing` 与 `ok` 一并映射成 `succeeded`，而 human 是默认模式且 human
+> renderer 不渲染 `result.details`，导致一个空 app-root 的诊断在默认模式下
+> 满屏 `succeeded`，用户只能靠解析中文 message 后缀分辨——正是架构设计
+> 「调用方只按稳定字段判断」与 AGENTS 8.11 禁止依赖的做法。
+
 ## 12. cleanup 设计与安全语义
 
 服务包 `internal/cleanup`，`Run(ctx, emitter) (Report, error)`。

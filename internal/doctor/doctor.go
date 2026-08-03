@@ -66,6 +66,19 @@ type Summary struct {
 	Error   int
 }
 
+// Worst 返回本次诊断的最差检查项状态，用于汇总输出。
+// 空报告视为 ok：没有检查项就没有坏消息。
+func (s Summary) Worst() Status {
+	switch {
+	case s.Error > 0:
+		return StatusError
+	case s.Missing > 0:
+		return StatusMissing
+	default:
+		return StatusOK
+	}
+}
+
 // Report 是 doctor 的结构化输出。
 type Report struct {
 	Checks  []Check
@@ -119,7 +132,11 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (Report, e
 		}
 		checks = append(checks, check)
 	}
-	return Report{Checks: checks, Summary: summarize(checks)}, nil
+	summary := summarize(checks)
+	if err := emitSummary(emitter, summary); err != nil {
+		return Report{}, err
+	}
+	return Report{Checks: checks, Summary: summary}, nil
 }
 
 func emitCheck(emitter *protocol.Emitter, check Check) error {
@@ -130,16 +147,42 @@ func emitCheck(emitter *protocol.Emitter, check Check) error {
 	}); err != nil {
 		return err
 	}
-	status := protocol.ProgressSucceeded
-	if check.Status == StatusError {
-		status = protocol.ProgressFailed
-	}
 	message := fmt.Sprintf("%s：%s", check.Name, check.Message)
 	return emitter.EmitProgress(protocol.ProgressEvent{
 		Stage:   protocol.StageDoctor,
-		Status:  status,
+		Status:  progressForStatus(check.Status),
 		Message: message,
 	})
+}
+
+// emitSummary 在全部检查项之后发射一条汇总 progress。
+// human renderer 不渲染 result.details，若不发这一条，默认输出模式下
+// result.details.checks/summary 这张唯一的结构化检查表对用户完全不可见，
+// 只能靠逐条中文 message 自行汇总（AGENTS 8.11 禁止依赖的做法）。
+func emitSummary(emitter *protocol.Emitter, summary Summary) error {
+	return emitter.EmitProgress(protocol.ProgressEvent{
+		Stage:  protocol.StageDoctor,
+		Status: progressForStatus(summary.Worst()),
+		Message: fmt.Sprintf(
+			"诊断汇总：共 %d 项，正常 %d 项，缺失 %d 项，异常 %d 项",
+			summary.Total, summary.OK, summary.Missing, summary.Error,
+		),
+	})
+}
+
+// progressForStatus 把检查项状态映射为协议 progress 状态。
+// missing 必须映射 skipped 而非 succeeded：progress 状态是 human 模式下
+// 用户唯一能看到的机器语义，把「未安装受管 uv」渲染成 succeeded 会让一个
+// 空 app-root 报出满屏全绿（T3.7 F3）。三个取值都在冻结全集内。
+func progressForStatus(status Status) protocol.ProgressStatus {
+	switch status {
+	case StatusMissing:
+		return protocol.ProgressSkipped
+	case StatusError:
+		return protocol.ProgressFailed
+	default:
+		return protocol.ProgressSucceeded
+	}
 }
 
 func summarize(checks []Check) Summary {

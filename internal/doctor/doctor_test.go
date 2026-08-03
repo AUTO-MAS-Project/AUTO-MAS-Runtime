@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -217,6 +218,157 @@ func TestDoctor_MissingFixtureCollectsAllChecks(t *testing.T) {
 	if report.Summary.Total != 9 || report.Summary.Missing != 6 || report.Summary.Error != 0 {
 		t.Errorf("summary = %+v, want 9 total/6 missing/0 error", report.Summary)
 	}
+}
+
+// TestService_MissingCheckEmitsSkippedProgress 证明 missing 检查项不再伪装成
+// succeeded。human 是默认输出模式且 human renderer 不渲染 details，
+// result.details.checks 这张唯一的结构化检查表在默认模式下不可见，用户只能
+// 依赖 progress 状态；把 missing 渲染成 succeeded 等于对着 6 项缺失报全绿。
+func TestService_MissingCheckEmitsSkippedProgress(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	service := mustNewService(t, layout, testProbes())
+	emitter, stdout := newTestEmitter(t)
+	report, err := service.Run(context.Background(), emitter)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	statuses := terminalProgressStatuses(t, stdout.String())
+	for _, check := range report.Checks {
+		got, ok := statuses[check.Name]
+		if !ok {
+			t.Errorf("check %q emitted no terminal progress", check.ID)
+			continue
+		}
+		want := map[Status]string{
+			StatusOK:      string(protocol.ProgressSucceeded),
+			StatusMissing: string(protocol.ProgressSkipped),
+			StatusError:   string(protocol.ProgressFailed),
+		}[check.Status]
+		if got != want {
+			t.Errorf(
+				"check %q status %q emitted progress %q, want %q",
+				check.ID, check.Status, got, want,
+			)
+		}
+	}
+	if report.Summary.Missing == 0 {
+		t.Fatal("fixture produced no missing checks; test proves nothing")
+	}
+}
+
+// TestService_EmitsSummaryProgress 证明全部检查项之后追加一条汇总 progress，
+// 使 human 模式在不渲染 details 的前提下仍能看到诊断结论。
+func TestService_EmitsSummaryProgress(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		fixture    func(t *testing.T) *config.Layout
+		wantStatus string
+	}{
+		{
+			name: "healthy",
+			fixture: func(t *testing.T) *config.Layout {
+				t.Helper()
+				layout, _ := healthyFixture(t)
+				return layout
+			},
+			wantStatus: string(protocol.ProgressSucceeded),
+		},
+		{
+			name: "missing",
+			fixture: func(t *testing.T) *config.Layout {
+				t.Helper()
+				root := t.TempDir()
+				layout, err := config.NewLayout(root, root)
+				if err != nil {
+					t.Fatalf("NewLayout() error = %v", err)
+				}
+				return layout
+			},
+			wantStatus: string(protocol.ProgressSkipped),
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := mustNewService(t, test.fixture(t), testProbes())
+			emitter, stdout := newTestEmitter(t)
+			report, err := service.Run(context.Background(), emitter)
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			summary := lastProgressEvent(t, stdout.String())
+			if got := summary["status"]; got != test.wantStatus {
+				t.Errorf("summary progress status = %v, want %q", got, test.wantStatus)
+			}
+			message, _ := summary["message"].(string)
+			for _, want := range []string{
+				strconv.Itoa(report.Summary.Total),
+				strconv.Itoa(report.Summary.OK),
+				strconv.Itoa(report.Summary.Missing),
+				strconv.Itoa(report.Summary.Error),
+			} {
+				if !strings.Contains(message, want) {
+					t.Errorf("summary message %q lacks count %q", message, want)
+				}
+			}
+		})
+	}
+}
+
+// terminalProgressStatuses 把 NDJSON 中每个检查项的终态 progress 收集成
+// 「检查名 → status」映射；running 事件不计入。
+func terminalProgressStatuses(t *testing.T, stdout string) map[string]string {
+	t.Helper()
+	statuses := make(map[string]string)
+	for _, event := range progressEvents(t, stdout) {
+		status, _ := event["status"].(string)
+		if status == string(protocol.ProgressRunning) {
+			continue
+		}
+		message, _ := event["message"].(string)
+		name, _, found := strings.Cut(message, "：")
+		if !found {
+			continue
+		}
+		statuses[name] = status
+	}
+	return statuses
+}
+
+// lastProgressEvent 返回最后一条 progress 事件。
+func lastProgressEvent(t *testing.T, stdout string) map[string]any {
+	t.Helper()
+	events := progressEvents(t, stdout)
+	if len(events) == 0 {
+		t.Fatal("stdout contains no progress events")
+	}
+	return events[len(events)-1]
+}
+
+func progressEvents(t *testing.T, stdout string) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("Unmarshal(%q) error = %v", line, err)
+		}
+		if event["type"] == "progress" {
+			events = append(events, event)
+		}
+	}
+	return events
 }
 
 func TestDoctor_PartialFixtureKeepsAllCheckResults(t *testing.T) {
