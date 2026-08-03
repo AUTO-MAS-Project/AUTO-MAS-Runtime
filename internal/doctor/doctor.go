@@ -129,15 +129,28 @@ func (s *Service) Run(ctx context.Context, emitter *protocol.Emitter) (Report, e
 		}
 		check := run(ctx)
 		if err := emitCheck(emitter, check); err != nil {
-			return Report{}, err
+			return Report{}, newOutputError(err)
 		}
 		checks = append(checks, check)
 	}
 	summary := summarize(checks)
 	if err := emitSummary(emitter, summary); err != nil {
-		return Report{}, err
+		return Report{}, newOutputError(err)
 	}
 	return Report{Checks: checks, Summary: summary}, nil
+}
+
+// newOutputError 把协议事件发射失败映射为 OUTPUT_WRITE_FAILED。
+// 显式映射而不是交给 cli 的未知错误兜底：兜底码已改为 INTERNAL_ERROR
+// （T3.8 F13d），输出通道故障不该被报成 Runtime 内部缺陷。
+func newOutputError(cause error) *Error {
+	return NewError(
+		protocol.CodeOutputWriteFailed,
+		protocol.StageDoctor,
+		"诊断事件发射失败",
+		map[string]any{},
+		cause,
+	)
 }
 
 func emitCheck(emitter *protocol.Emitter, check Check) error {

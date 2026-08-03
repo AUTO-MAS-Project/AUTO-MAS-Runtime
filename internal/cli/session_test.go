@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -190,4 +191,51 @@ func equalStringSlices(left, right any) bool {
 		}
 	}
 	return true
+}
+
+// TestClassifyFailure_FallbackCodes 固定错误分类的三条优先级与兜底语义：
+// 取消先于一切；实现 operationError 的错误保留自己的四元组；无法映射的
+// 内部故障用 INTERNAL_ERROR 而不是 OUTPUT_WRITE_FAILED（T3.8 F13d）。
+func TestClassifyFailure_FallbackCodes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		err      error
+		wantCode protocol.Code
+	}{
+		{
+			name:     "wrapped cancellation wins",
+			err:      fmt.Errorf("run doctor: %w", context.Canceled),
+			wantCode: protocol.CodeOperationCancelled,
+		},
+		{
+			name: "operation error keeps its own code",
+			err: doctor.NewError(
+				protocol.CodeMutexOperationFailed,
+				protocol.StageDoctor,
+				"锁探测失败",
+				map[string]any{},
+				errors.New("probe failed"),
+			),
+			wantCode: protocol.CodeMutexOperationFailed,
+		},
+		{
+			name:     "unmappable internal failure",
+			err:      errors.New("something broke inside the runtime"),
+			wantCode: protocol.CodeInternalError,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			code, _, _, _ := classifyFailure(test.err, protocol.StageDoctor)
+			if code != test.wantCode {
+				t.Errorf("classifyFailure() code = %q, want %q", code, test.wantCode)
+			}
+			if !protocol.IsKnownCode(code) {
+				t.Errorf("classifyFailure() returned code %q outside the frozen set", code)
+			}
+		})
+	}
 }

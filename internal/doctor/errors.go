@@ -7,6 +7,9 @@ import (
 )
 
 // Error 描述 doctor 服务失败，供 cli 会话框架映射协议四元组。
+// 它实现 cli 侧消费方定义的 operationError 窄接口，是 doctor 与 cli 之间
+// 唯一的失败契约：生产路径用于协议事件发射失败（见 newOutputError），
+// cli 的注入式测试替身也用它构造服务级失败。
 type Error struct {
 	code    protocol.Code
 	stage   protocol.Stage

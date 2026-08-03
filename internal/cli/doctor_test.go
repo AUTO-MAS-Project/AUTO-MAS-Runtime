@@ -247,6 +247,10 @@ func TestDoctorCommand_HumanOutput(t *testing.T) {
 	}
 }
 
+// TestDoctor_FactorySetupErrorFallsBackToStableCode 证明服务构造失败这类
+// 无法映射到业务错误码的内部故障走 INTERNAL_ERROR 兜底，而不是
+// OUTPUT_WRITE_FAILED——后者的语义是协议输出通道写失败，用它兜底会把
+// Runtime 自身的缺陷伪装成输出故障（T3.8 F13d）。
 func TestDoctor_FactorySetupErrorFallsBackToStableCode(t *testing.T) {
 	t.Parallel()
 	var stdout strings.Builder
@@ -274,7 +278,7 @@ func TestDoctor_FactorySetupErrorFallsBackToStableCode(t *testing.T) {
 			errorEvent = event
 		}
 	}
-	if got := eventString(errorEvent, "code"); got != string(protocol.CodeOutputWriteFailed) {
-		t.Errorf("error code = %q, want OUTPUT_WRITE_FAILED", got)
+	if got := eventString(errorEvent, "code"); got != string(protocol.CodeInternalError) {
+		t.Errorf("error code = %q, want INTERNAL_ERROR", got)
 	}
 }

@@ -122,8 +122,11 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 // classifyFailure 把命令错误映射为冻结错误码与中文 message。
 // 取消优先映射为 OPERATION_CANCELLED（设计 §13 顺序：context.Canceled 先于
 // operationError 匹配，避免被包装的取消被业务错误码吞掉）；实现了
-// operationError 的错误保留其四元组；未知内部错误防御性映射为
-// OUTPUT_WRITE_FAILED。
+// operationError 的错误保留其四元组；未知内部错误映射为 INTERNAL_ERROR。
+//
+// 兜底码不用 OUTPUT_WRITE_FAILED：那个码的语义是协议输出通道写失败，用它
+// 兜底会把 Runtime 自身的缺陷伪装成输出故障，让排查从一开始就走错方向
+// （T3.8 F13d）。真正的输出写失败由各服务显式映射 OUTPUT_WRITE_FAILED。
 func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, protocol.Stage, string, map[string]any) {
 	if errors.Is(err, context.Canceled) {
 		return protocol.CodeOperationCancelled, fallbackStage, "操作已取消", map[string]any{}
@@ -135,7 +138,7 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 			return code, operationErr.Stage(), operationErr.Message(), operationErr.Details()
 		}
 	}
-	return protocol.CodeOutputWriteFailed, fallbackStage, "命令执行失败", map[string]any{}
+	return protocol.CodeInternalError, fallbackStage, "命令执行失败", map[string]any{}
 }
 
 func exitCodeFor(code protocol.Code) int {

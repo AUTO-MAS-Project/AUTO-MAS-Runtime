@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,6 +221,37 @@ func TestResolveInvocation_ProbeTreeMatchesExecutionTree(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("command tree is empty; the comparison proves nothing")
 	}
+}
+
+// TestNewRoot_HelpFlagUsageIsChinese 证明 Cobra 自动生成的 -h/--help 用法
+// 文案已本地化：帮助输出不再出现 "help for auto-mas-runtime" 这类与全中文
+// Short/Long 混排的英文默认值（T3.8 F13g）。
+func TestNewRoot_HelpFlagUsageIsChinese(t *testing.T) {
+	t.Parallel()
+	root := newRoot(newResolveTestRoot(t))
+	for _, cmd := range []*cobra.Command{root, mustFindCommand(t, root, "doctor")} {
+		flag := cmd.Flags().Lookup("help")
+		if flag == nil {
+			t.Fatalf("command %q has no help flag", cmd.CommandPath())
+		}
+		if strings.Contains(flag.Usage, "help for") {
+			t.Errorf("command %q help usage = %q, want localized text", cmd.CommandPath(), flag.Usage)
+		}
+		if !strings.Contains(flag.Usage, cmd.CommandPath()) {
+			t.Errorf("command %q help usage = %q, want it to name the command", cmd.CommandPath(), flag.Usage)
+		}
+	}
+}
+
+func mustFindCommand(t *testing.T, root *cobra.Command, name string) *cobra.Command {
+	t.Helper()
+	for _, child := range root.Commands() {
+		if child.Name() == name {
+			return child
+		}
+	}
+	t.Fatalf("root has no command %q", name)
+	return nil
 }
 
 // commandNames 返回命令树的全部命令路径，深度优先且顺序稳定。

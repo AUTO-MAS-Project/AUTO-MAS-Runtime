@@ -69,7 +69,21 @@ func newRoot(deps *deps) *cobra.Command {
 	// 该调用同时保证预解析树与正式执行树的命令集合一致；它内部先 RemoveCommand
 	// 再 AddCommand，与 ExecuteC 的二次调用幂等。
 	root.InitDefaultHelpCmd()
+	localizeHelpFlags(root)
 	return root
+}
+
+// localizeHelpFlags 把 Cobra 自动生成的 -h/--help 用法文案改成中文。
+// Cobra 的默认值是 "help for <command>"，与全中文的 Short/Long 混排；
+// 该 flag 在每个命令上按需惰性创建，因此逐个命令显式建立后覆写。
+func localizeHelpFlags(cmd *cobra.Command) {
+	cmd.InitDefaultHelpFlag()
+	if flag := cmd.Flags().Lookup("help"); flag != nil {
+		flag.Usage = "显示 " + cmd.CommandPath() + " 的帮助"
+	}
+	for _, child := range cmd.Commands() {
+		localizeHelpFlags(child)
+	}
 }
 
 // usageTemplate 与 Cobra 默认模板一致，仅把 Available Commands 过滤条件

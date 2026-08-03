@@ -28,6 +28,7 @@ func TestErrorDefinitionsMatchArchitectureDocument(t *testing.T) {
 		protocol.CodeProtocolMismatch,
 		protocol.CodeOperationCancelled,
 		protocol.CodeOutputWriteFailed,
+		protocol.CodeInternalError,
 		protocol.CodePathOutsideManagedRoot,
 		protocol.CodeUnsafeReparsePoint,
 		protocol.CodeDirectoryOccupied,

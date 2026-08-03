@@ -17,6 +17,7 @@ const (
 	CodeProtocolMismatch          Code = "PROTOCOL_MISMATCH"
 	CodeOperationCancelled        Code = "OPERATION_CANCELLED"
 	CodeOutputWriteFailed         Code = "OUTPUT_WRITE_FAILED"
+	CodeInternalError             Code = "INTERNAL_ERROR"
 	CodePathOutsideManagedRoot    Code = "PATH_OUTSIDE_MANAGED_ROOT"
 	CodeUnsafeReparsePoint        Code = "UNSAFE_REPARSE_POINT"
 	CodeDirectoryOccupied         Code = "DIRECTORY_OCCUPIED"
@@ -112,6 +113,7 @@ var errorDefinitions = []ErrorDefinition{
 	{Code: CodeProtocolMismatch, ExitCode: ExitCodeProtocolMismatch, Retryable: false, Remediation: []Remediation{RemediationUpdateDesktop}},
 	{Code: CodeOperationCancelled, ExitCode: ExitCodeOperationCancelled, Retryable: true, Remediation: []Remediation{RemediationRetry}},
 	{Code: CodeOutputWriteFailed, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationOpenLog, RemediationContactSupport}},
+	{Code: CodeInternalError, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationOpenLog, RemediationContactSupport}},
 	{Code: CodePathOutsideManagedRoot, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{RemediationRunDoctor}},
 	{Code: CodeUnsafeReparsePoint, ExitCode: ExitCodeOperationConflict, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
 	{Code: CodeDirectoryOccupied, ExitCode: ExitCodeOperationConflict, Retryable: true, Remediation: []Remediation{RemediationRetry}},
