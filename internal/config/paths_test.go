@@ -34,6 +34,7 @@ func TestLayout_FixedPathsMatchSpecification(t *testing.T) {
 		{name: "RuntimeDir", got: layout.RuntimeDir(), want: filepath.Join(root, "runtime")},
 		{name: "UVToolsDir", got: layout.UVToolsDir(), want: filepath.Join(root, "runtime", "tools", "uv")},
 		{name: "PythonDir", got: layout.PythonDir(), want: filepath.Join(root, "runtime", "environment", "python")},
+		{name: "PythonExecutable", got: layout.PythonExecutable(), want: filepath.Join(root, "runtime", "environment", "python", "python.exe")},
 		{name: "VenvDir", got: layout.VenvDir(), want: filepath.Join(root, "runtime", "environment", "venv")},
 		{name: "RuntimeCacheDir", got: layout.RuntimeCacheDir(), want: filepath.Join(root, "runtime", "cache")},
 		{name: "UVCacheDir", got: layout.UVCacheDir(), want: filepath.Join(root, "runtime", "cache", "uv")},
@@ -173,6 +174,7 @@ func fixedPaths(layout *config.Layout) []fixedPath {
 		{name: "RuntimeDir", path: layout.RuntimeDir()},
 		{name: "UVToolsDir", path: layout.UVToolsDir()},
 		{name: "PythonDir", path: layout.PythonDir()},
+		{name: "PythonExecutable", path: layout.PythonExecutable()},
 		{name: "VenvDir", path: layout.VenvDir()},
 		{name: "RuntimeCacheDir", path: layout.RuntimeCacheDir()},
 		{name: "UVCacheDir", path: layout.UVCacheDir()},
@@ -197,4 +199,21 @@ func newFixedPathsLayout(t *testing.T) *config.Layout {
 		t.Fatal(err)
 	}
 	return layout
+}
+
+// TestLayout_PythonExecutable 证明受管 python.exe 的路径归属 config：
+// 消费方（doctor 等）不得自行 filepath.Join(PythonDir(), "python.exe")，
+// 否则路径知识散落到业务包（AGENTS §4、T2.1 验收）。
+func TestLayout_PythonExecutable(t *testing.T) {
+	layout := newFixedPathsLayout(t)
+	got := layout.PythonExecutable()
+	if want := filepath.Join(layout.PythonDir(), "python.exe"); got != want {
+		t.Fatalf("PythonExecutable() = %q, want %q", got, want)
+	}
+	if filepath.Base(got) != "python.exe" {
+		t.Errorf("PythonExecutable() base = %q, want python.exe", filepath.Base(got))
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("PythonExecutable() = %q, want absolute path", got)
+	}
 }

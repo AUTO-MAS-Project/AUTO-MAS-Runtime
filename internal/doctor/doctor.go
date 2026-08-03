@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"sort"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -334,7 +333,7 @@ func (s *Service) checkPython(ctx context.Context) Check {
 			Details: map[string]any{},
 		}
 	}
-	exe := filepath.Join(s.layout.PythonDir(), "python.exe")
+	exe := s.layout.PythonExecutable()
 	if fileInfo, err := os.Stat(exe); err != nil || fileInfo.IsDir() {
 		return Check{
 			ID:      "python",

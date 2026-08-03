@@ -13,6 +13,7 @@ type layoutPaths struct {
 	runtimeDir           string
 	uvToolsDir           string
 	pythonDir            string
+	pythonExecutable     string
 	venvDir              string
 	runtimeCacheDir      string
 	uvCacheDir           string
@@ -34,6 +35,7 @@ func newLayoutPaths(root string) layoutPaths {
 	environmentDir := filepath.Join(runtimeDir, "environment")
 	cacheDir := filepath.Join(runtimeDir, "cache")
 	logsDir := filepath.Join(root, "logs")
+	pythonDir := filepath.Join(environmentDir, "python")
 
 	return layoutPaths{
 		repoDir:              filepath.Join(root, "repo"),
@@ -45,7 +47,8 @@ func newLayoutPaths(root string) layoutPaths {
 		environmentStateFile: filepath.Join(stateDir, "environment.json"),
 		runtimeDir:           runtimeDir,
 		uvToolsDir:           filepath.Join(runtimeDir, "tools", "uv"),
-		pythonDir:            filepath.Join(environmentDir, "python"),
+		pythonDir:            pythonDir,
+		pythonExecutable:     filepath.Join(pythonDir, "python.exe"),
 		venvDir:              filepath.Join(environmentDir, "venv"),
 		runtimeCacheDir:      cacheDir,
 		uvCacheDir:           filepath.Join(cacheDir, "uv"),
@@ -91,6 +94,10 @@ func (l *Layout) UVToolsDir() string { return l.paths.uvToolsDir }
 
 // PythonDir 返回受管 Python 目录。
 func (l *Layout) PythonDir() string { return l.paths.pythonDir }
+
+// PythonExecutable 返回受管 Python 解释器路径。
+// 消费方不得自行拼接 PythonDir() 与文件名：路径知识只能来自本包（AGENTS §4）。
+func (l *Layout) PythonExecutable() string { return l.paths.pythonExecutable }
 
 // VenvDir 返回受管 Python 虚拟环境目录。
 func (l *Layout) VenvDir() string { return l.paths.venvDir }
