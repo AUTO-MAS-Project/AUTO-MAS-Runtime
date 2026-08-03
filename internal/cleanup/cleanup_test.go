@@ -494,6 +494,102 @@ func TestService_JunctionPycacheNotFollowed(t *testing.T) {
 	}
 }
 
+// TestService_JunctionRepoUpdateRecordedAsFailed 证明名为
+// repo.update-<合法 operationId> 的 Junction 不再被静默忽略：Windows 下
+// Junction 的 DirEntry.IsDir() 为 false（ModeIrregular），此前被
+// enumerateRepoUpdates 的 !entry.IsDir() 过滤掉，命令 exit 0、无条目、
+// 无审计记录。现按失败关闭语义记为 repo-update-invalid-<n>。
+func TestService_JunctionRepoUpdateRecordedAsFailed(t *testing.T) {
+	t.Parallel()
+	layout, root := newTestLayout(t)
+	sentinel := filepath.Join(layout.DataDir(), "keep.txt")
+	writeFixtureFile(t, sentinel, []byte("user data"))
+	link := filepath.Join(root, "repo.update-"+testOperationID)
+	mustCreateJunction(t, link, layout.DataDir())
+	service, _ := newTestService(t, layout)
+	emitter, stdout := newTestEmitter(t)
+
+	report, err := service.Run(context.Background(), emitter)
+	if err == nil {
+		t.Fatal("Run() error = nil, want GIT_REPO_CLEANUP_FAILED")
+	}
+	var cleanupErr *Error
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("Run() error type = %T, want *Error", err)
+	}
+	if cleanupErr.Code() != protocol.CodeGitRepoCleanupFailed {
+		t.Errorf("error code = %q, want GIT_REPO_CLEANUP_FAILED", cleanupErr.Code())
+	}
+	item := findItem(t, report, "repo-update-invalid-1")
+	if item.Status != ItemFailed {
+		t.Errorf("item status = %q, want failed: %+v", item.Status, item)
+	}
+	if code, _ := item.Details["code"].(string); code != string(protocol.CodeGitRepoCleanupFailed) {
+		t.Errorf("item details code = %q, want GIT_REPO_CLEANUP_FAILED", code)
+	}
+	if !dirExists(link) {
+		t.Error("repo.update junction was removed; fail-closed requires it to remain")
+	}
+	if !fileExists(sentinel) {
+		t.Error("user data was removed through the junction")
+	}
+	progress := stdout.String()
+	if !strings.Contains(progress, "repo-update-invalid-1") {
+		t.Errorf("progress output lacks invalid item id: %s", progress)
+	}
+	if !strings.Contains(progress, `"status":"failed"`) {
+		t.Errorf("progress output lacks failed event: %s", progress)
+	}
+}
+
+// TestService_JunctionRepoUpdateNotFollowed 证明枚举没有跟随 Junction 进入
+// 用户数据目录：目标内容原封不动，且不产生指向目标的删除审计记录。
+func TestService_JunctionRepoUpdateNotFollowed(t *testing.T) {
+	t.Parallel()
+	layout, root := newTestLayout(t)
+	target := layout.DataDir()
+	nested := filepath.Join(target, "nested", "payload.txt")
+	writeFixtureFile(t, nested, []byte("payload"))
+	link := filepath.Join(root, "repo.update-"+testOperationID)
+	mustCreateJunction(t, link, target)
+	service, auditor := newTestService(t, layout)
+
+	if _, err := runService(t, service); err == nil {
+		t.Fatal("Run() error = nil, want GIT_REPO_CLEANUP_FAILED")
+	}
+	if !fileExists(nested) {
+		t.Error("traversal entered the junction target and removed content")
+	}
+	if !dirExists(link) {
+		t.Error("repo.update junction was removed")
+	}
+	for _, record := range auditor.recordsCopy() {
+		if strings.Contains(record.Target, "repo.update-") {
+			t.Errorf("audit recorded a deletion for the junction: %+v", record)
+		}
+	}
+}
+
+// TestService_NonRepoUpdateJunctionIgnored 证明 app-root 下与
+// repo.update- 前缀无关的 Junction 保持静默跳过，不产生条目、不使命令失败。
+func TestService_NonRepoUpdateJunctionIgnored(t *testing.T) {
+	t.Parallel()
+	layout, root := newTestLayout(t)
+	writeFixtureFile(t, filepath.Join(layout.DataDir(), "keep.txt"), []byte("user data"))
+	mustCreateJunction(t, filepath.Join(root, "unrelated-link"), layout.DataDir())
+	service, _ := newTestService(t, layout)
+
+	report, err := runService(t, service)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	for _, item := range report.Items {
+		if strings.HasPrefix(item.ID, "repo-update-") {
+			t.Errorf("unrelated junction produced item %q", item.ID)
+		}
+	}
+}
+
 func TestCleanup_RejectsTargetOutsideManagedRoot(t *testing.T) {
 	t.Parallel()
 	layout, _ := newTestLayout(t)

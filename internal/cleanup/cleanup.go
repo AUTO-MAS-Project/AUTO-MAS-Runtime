@@ -320,6 +320,31 @@ func (s *Service) executeItem(
 	return item, nil
 }
 
+// isLinkDirEntry 报告目录项是否是不可跟随的链接目录（Junction 或符号链接）。
+//
+// Windows 的 Junction 在 Lstat/DirEntry 中表现为 ModeIrregular 且 IsDir()=false
+// （Go 对 IO_REPARSE_TAG_MOUNT_POINT 的分类），符号链接则是 ModeSymlink。
+// 任何只靠 IsDir() 的过滤都会把 Junction 当成普通文件跳过——这正是 T3.6 F2
+// 与 T3.7 F2 两次缺陷的共同根因，因此判定收敛到这一个函数，两处枚举共用。
+func isLinkDirEntry(entry fs.DirEntry) bool {
+	mode := entry.Type()
+	if mode&os.ModeIrregular != 0 {
+		return true
+	}
+	return mode&os.ModeSymlink != 0 && entry.IsDir()
+}
+
+// invalidLinkItem 构造「链接目录不跟随、不删除」的失败关闭条目。
+// id 形如 <prefix>-invalid-<n>，保证 result.details.items 可寻址。
+func invalidLinkItem(prefix string, counter int) planItem {
+	return planItem{
+		id:         prefix + "-invalid-" + strconv.Itoa(counter),
+		preStatus:  ItemFailed,
+		preMessage: "目录为不安全的链接",
+		preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
+	}
+}
+
 // enumeratePythonCaches 在 repo 下寻找 __pycache__ 目录。
 // 候选目录先经 filesystem.Canonicalize 验证普通目录身份；名为 __pycache__
 // 的 Junction/符号链接目录不跟随、不删除，记为 failed 条目；非 __pycache__
@@ -342,28 +367,18 @@ func (s *Service) enumeratePythonCaches(ctx context.Context, cleanupOperationID 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// Windows 的 Junction 在 DirEntry 中表现为 ModeIrregular 且
-		// IsDir()=false（Go 对 MOUNT_POINT 的 Lstat 分类），因此链接目录
-		// 统一按 ModeSymlink|ModeIrregular 识别，不依赖 IsDir。
-		linkType := entry.Type() & (os.ModeSymlink | os.ModeIrregular)
-		isLinkDir := linkType != 0 &&
-			(entry.IsDir() || entry.Type()&os.ModeIrregular != 0)
-		if entry.Name() == "__pycache__" && isLinkDir {
-			// 名为 __pycache__ 的 Junction/符号链接目录：不跟随、不删除，
-			// 按失败关闭语义记为 failed 条目（id 与 repo-update-invalid-<n>
-			// 同风格，保证 result.details.items 可寻址）。
-			invalidCounter++
-			items = append(items, planItem{
-				id:         "python-cache-invalid-" + strconv.Itoa(invalidCounter),
-				preStatus:  ItemFailed,
-				preMessage: "目录为不安全的链接",
-				preDetails: map[string]any{"code": string(protocol.CodeGitRepoCleanupFailed)},
-			})
-			return fs.SkipDir
-		}
-		if linkType != 0 {
-			// 非 __pycache__ 的 symlink/junction 目录保持静默跳过（不跟随），
-			// 不新增条目。
+		if isLinkDirEntry(entry) {
+			if entry.Name() == "__pycache__" {
+				// 名为 __pycache__ 的 Junction/符号链接目录：不跟随、不删除，
+				// 按失败关闭语义记为 failed 条目。
+				invalidCounter++
+				items = append(items, invalidLinkItem("python-cache", invalidCounter))
+				return fs.SkipDir
+			}
+			// 非 __pycache__ 的链接目录静默跳过（不跟随），不新增条目。
+			// 只有 DirEntry 自报为目录时才用 SkipDir 阻止下降：对 Junction
+			// （IsDir()=false）返回 nil，避免 SkipDir 被 WalkDir 解释成
+			// 「跳过所在目录的剩余条目」。
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -410,7 +425,18 @@ func (s *Service) enumerateRepoUpdates(ctx context.Context) ([]planItem, error) 
 	var items []planItem
 	invalidCounter := 0
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "repo.update-") {
+		if !strings.HasPrefix(entry.Name(), "repo.update-") {
+			continue
+		}
+		if isLinkDirEntry(entry) {
+			// 名为 repo.update-* 的 Junction/符号链接：不跟随、不删除，记为
+			// failed 条目。这类目录名声称自己是受管更新暂存目录，静默跳过等于
+			// 对「危险路径（Junction 指向用户数据）拒绝」给出成功答案（T3.7 F2）。
+			invalidCounter++
+			items = append(items, invalidLinkItem("repo-update", invalidCounter))
+			continue
+		}
+		if !entry.IsDir() {
 			continue
 		}
 		operationID := strings.TrimPrefix(entry.Name(), "repo.update-")
