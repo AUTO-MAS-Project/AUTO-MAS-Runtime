@@ -415,12 +415,11 @@ func (s *Service) enumeratePythonCaches(ctx context.Context, cleanupOperationID 
 				// 按失败关闭语义记为 failed 条目。
 				invalidCounter++
 				items = append(items, invalidLinkItem("python-cache", invalidCounter))
-				return fs.SkipDir
 			}
-			// 非 __pycache__ 的链接目录静默跳过（不跟随），不新增条目。
-			// 只有 DirEntry 自报为目录时才用 SkipDir 阻止下降：对 Junction
-			// （IsDir()=false）返回 nil，避免 SkipDir 被 WalkDir 解释成
-			// 「跳过所在目录的剩余条目」。
+			// 不跟随链接目录。只有 DirEntry 自报为目录时才用 SkipDir 阻止下降：
+			// 对 Junction（IsDir()=false）返回 SkipDir 会被 WalkDir 解释成
+			// 「跳过所在目录的剩余条目」，把排在它后面的真实 __pycache__ 一并
+			// 吞掉；WalkDir 本来就不会下降到非目录条目，返回 nil 即可。
 			if entry.IsDir() {
 				return fs.SkipDir
 			}

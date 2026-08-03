@@ -656,6 +656,38 @@ func TestService_NonRepoUpdateJunctionIgnored(t *testing.T) {
 	}
 }
 
+// TestService_JunctionPycacheDoesNotHideSiblings 证明 __pycache__ Junction
+// 不会让同级后续条目被整体跳过。fs.SkipDir 作用于非目录条目时，WalkDir 的
+// 语义是「跳过所在目录的剩余条目」——Junction 的 DirEntry.IsDir() 为 false，
+// 因此对它返回 SkipDir 会连带吞掉排在后面的真实 __pycache__。
+func TestService_JunctionPycacheDoesNotHideSiblings(t *testing.T) {
+	t.Parallel()
+	layout, _ := newTestLayout(t)
+	writeFixtureFile(t, filepath.Join(layout.DataDir(), "keep.txt"), []byte("user data"))
+	// zzz 在字典序上排在 __pycache__ 之后，遍历时后被访问。
+	sibling := filepath.Join(layout.RepoDir(), "zzz", "__pycache__")
+	writeFixtureFile(t, filepath.Join(sibling, "module.pyc"), []byte("cache"))
+	mustCreateJunction(t, filepath.Join(layout.RepoDir(), "__pycache__"), layout.DataDir())
+	service, _ := newTestService(t, layout)
+
+	report, err := runService(t, service)
+	if err == nil {
+		t.Fatal("Run() error = nil, want GIT_REPO_CLEANUP_FAILED")
+	}
+	if item := findItem(t, report, "python-cache-invalid-1"); item.Status != ItemFailed {
+		t.Errorf("junction item status = %q, want failed", item.Status)
+	}
+	if item := findItem(t, report, "python-cache-1"); item.Status != ItemCleaned {
+		t.Errorf("sibling cache item status = %q, want cleaned: %+v", item.Status, item)
+	}
+	if dirExists(sibling) {
+		t.Error("sibling __pycache__ was not cleaned")
+	}
+	if !fileExists(filepath.Join(layout.DataDir(), "keep.txt")) {
+		t.Error("user data was removed through the junction")
+	}
+}
+
 func TestCleanup_RejectsTargetOutsideManagedRoot(t *testing.T) {
 	t.Parallel()
 	layout, _ := newTestLayout(t)
