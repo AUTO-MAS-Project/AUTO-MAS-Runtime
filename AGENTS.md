@@ -23,7 +23,10 @@ Vue 仍直接访问 Python 后端的 HTTP/WebSocket 业务接口。Runtime 只�
 **Runtime 不负责：** 业务 HTTP/WebSocket 代理、Python 插件依赖管理、自身自动更新、
 Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
-首版**仅支持 Windows**。
+首版正式发布**仅支持 Windows**。2026-08-04 起登记两项**规划中**扩展（决策 D7/D8，
+均不改变既有 Windows 契约）：跨平台适配（Linux 少数发行版 + macOS，Windows 仍为
+首要平台，M11）与 PostHog 遥测（计划阶段，M12）；详见 `doc/架构设计.md`
+「平台支持策略」「遥测策略」两节。
 
 ---
 
@@ -37,6 +40,8 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M3 CLI 框架与基础命令 | T3.1~T3.8 **已完成**（含三轮对抗性审查的修复与可维护性收敛） |
 | M4~M7、M9 | 未开始；M4 工作区同步是下一功能阶段 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
+| M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
+| M12 PostHog 遥测 | 规划中（决策 D8，2026-08-04 立项）；待 D-open-9 定稿，禁止提前实现 |
 
 代码现状：
 
