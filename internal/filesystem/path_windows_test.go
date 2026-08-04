@@ -156,8 +156,12 @@ func TestCanonicalize_AllowsOnlySafeNonexistentTail(t *testing.T) {
 	if !parent.Contains(got) {
 		t.Fatalf("Canonicalize(root).Contains(target) = false, want true")
 	}
-	if got.String() != target {
-		t.Fatalf("String() = %q, want %q", got.String(), target)
+	// 期望值必须由规范化后的 root 拼接得到：在启用 8.3 短文件名的环境下
+	// （如 CI runner 的 TEMP=C:\Users\RUNNER~1\...），Canonicalize 会正确地把
+	// 短名展开为长名，直接与未规范化的 target 原始串比较会误判为失败。
+	want := filepath.Join(parent.String(), "future", "leaf")
+	if got.String() != want {
+		t.Fatalf("String() = %q, want %q", got.String(), want)
 	}
 }
 

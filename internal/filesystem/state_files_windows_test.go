@@ -1526,11 +1526,15 @@ func TestNewStateFiles_VerificationFailureDoesNotRemoveCreatedDirectory(t *testi
 				t.Helper()
 				openPath := api.openPath
 				identity := api.identity
+				// 生产侧先用 finalPath 推导父目录再 openPath，拿到的始终是规范化长名。
+				// 若直接比 layout.AppRoot() 原始串，在启用 8.3 短文件名的环境下永远不
+				// 相等，注入会静默失效、构造函数意外成功，因此这里比规范化后的原生路径。
+				appRoot := mustCanonicalize(t, layout.AppRoot())
 				var parentHandle windows.Handle
 				api.openPath = func(path string, spec openSpec) (windows.Handle, error) {
 					handle, err := openPath(path, spec)
 					if err == nil && spec == parentIdentitySpec() &&
-						filepath.Clean(path) == filepath.Clean(nativeWindowsPath(layout.AppRoot())) {
+						filepath.Clean(path) == filepath.Clean(appRoot.Native()) {
 						parentHandle = handle
 					}
 					return handle, err
@@ -1564,6 +1568,11 @@ func TestNewStateFiles_VerificationFailureDoesNotRemoveCreatedDirectory(t *testi
 				layout,
 				stateFileDependencies{api: api, waitGate: defaultStateGateWait, fillNonce: fillCryptoNonce},
 			)
+			if files != nil {
+				// 构造意外成功时 files 仍持有 pin 句柄，不关闭会让 t.TempDir() 清理
+				// 报「文件被另一进程占用」，从而掩盖下面真正的断言失败信息。
+				t.Cleanup(func() { _ = files.Close() })
+			}
 			if files != nil || err == nil {
 				t.Fatalf("constructor = %#v, %v, want nil/error", files, err)
 			}
