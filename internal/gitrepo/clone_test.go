@@ -79,14 +79,14 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 		},
 	}
 	verifier := &fakeCloneVerifier{
-		verify: func(_ context.Context, request cloneVerificationRequest) (cloneVerification, error) {
+		verify: func(_ context.Context, request VerificationRequest) (Revision, error) {
 			if request.Target != target || request.Source.Key() != "cnb" {
 				t.Fatalf("Verify() target/source = %#v/%q, want target/cnb", request.Target, request.Source.Key())
 			}
 			if len(request.AllowedSources) != 2 {
 				t.Fatalf("Verify() allowed sources = %d, want 2", len(request.AllowedSources))
 			}
-			return cloneVerification{commit: testGitCommit}, nil
+			return newRevision(request.Target, testGitCommit, request.Source)
 		},
 	}
 	remover := &fakeTreeRemover{
@@ -113,7 +113,7 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
-	if result.Commit != testGitCommit || result.SourceKey != "cnb" {
+	if result.Revision.Commit() != testGitCommit || result.Revision.SourceKey() != "cnb" {
 		t.Fatalf("Fetch() result = %#v, want commit/cnb", result)
 	}
 	wantPath, err := layout.RepoUpdateDir("OPERATION-1")
@@ -163,8 +163,8 @@ func TestFetcher_RotatesWhenPreferredSourceLacksBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
-	if result.SourceKey != "github" {
-		t.Fatalf("SourceKey = %q, want github", result.SourceKey)
+	if result.Revision.SourceKey() != "github" {
+		t.Fatalf("SourceKey = %q, want github", result.Revision.SourceKey())
 	}
 	if len(listed) != 2 || !strings.Contains(listed[0], "cnb.cool") || !strings.Contains(listed[1], "github.com") {
 		t.Fatalf("listed sources = %#v, want cnb then github", listed)
@@ -411,10 +411,10 @@ func (f *fakeGitClient) Clone(ctx context.Context, path string, options git.Clon
 }
 
 type fakeCloneVerifier struct {
-	verify func(ctx context.Context, request cloneVerificationRequest) (cloneVerification, error)
+	verify func(ctx context.Context, request VerificationRequest) (Revision, error)
 }
 
-func (f *fakeCloneVerifier) Verify(ctx context.Context, request cloneVerificationRequest) (cloneVerification, error) {
+func (f *fakeCloneVerifier) Verify(ctx context.Context, request VerificationRequest) (Revision, error) {
 	return f.verify(ctx, request)
 }
 
@@ -506,8 +506,8 @@ func successfulFetcherDependencies(t *testing.T, client gitClient) fetcherDepend
 			},
 		},
 		verifier: &fakeCloneVerifier{
-			verify: func(context.Context, cloneVerificationRequest) (cloneVerification, error) {
-				return cloneVerification{commit: testGitCommit}, nil
+			verify: func(_ context.Context, request VerificationRequest) (Revision, error) {
+				return newRevision(request.Target, testGitCommit, request.Source)
 			},
 		},
 		emitProgress: (&progressRecorder{}).EmitProgress,

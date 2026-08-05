@@ -54,8 +54,7 @@ type FetchRequest struct {
 // FetchResult 保存已验证临时仓库的安全路径和最终来源事实。
 type FetchResult struct {
 	RepositoryPath string
-	Commit         string
-	SourceKey      string
+	Revision       Revision
 }
 
 type rotationRunner interface {
@@ -83,22 +82,16 @@ type treeRemover interface {
 	) (filesystem.DeleteResult, error)
 }
 
-type cloneVerificationRequest struct {
-	RepositoryPath string
-	Target         Target
-	Source         mirror.Source
-	AllowedSources []mirror.Source
-}
-
-type cloneVerification struct {
-	commit string
-}
-
 type cloneVerifier interface {
 	Verify(
 		ctx context.Context,
-		request cloneVerificationRequest,
-	) (cloneVerification, error)
+		request VerificationRequest,
+	) (Revision, error)
+}
+
+// ProgressEmitter 是 Fetcher 消费的单方法协议进度出口。
+type ProgressEmitter interface {
+	EmitProgress(event protocol.ProgressEvent) error
 }
 
 type progressEmitter func(event protocol.ProgressEvent) error
@@ -128,6 +121,27 @@ type Fetcher struct {
 	emitProgress   progressEmitter
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
+}
+
+// NewFetcher 创建使用 go-git 传输和真实静态校验器的仓库获取器。
+func NewFetcher(
+	layout *config.Layout,
+	rotator *mirror.Rotator,
+	remover *filesystem.Operator,
+	verifier *Verifier,
+	emitter ProgressEmitter,
+) (*Fetcher, error) {
+	if nilDependency(emitter) {
+		return nil, ErrInvalidFetcher
+	}
+	return newFetcherWithDependencies(fetcherDependencies{
+		layout:       layout,
+		rotator:      rotator,
+		git:          goGitClient{},
+		remover:      remover,
+		verifier:     verifier,
+		emitProgress: emitter.EmitProgress,
+	})
 }
 
 func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, error) {
@@ -219,10 +233,23 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 	if err != nil {
 		return FetchResult{}, mapFetchFailure(ctx, err, rotationResult.Reports)
 	}
+	revision, err := newRevision(
+		request.Target,
+		rotationResult.ActualCommit,
+		rotationResult.Source,
+	)
+	if err != nil {
+		return FetchResult{}, newError(
+			protocol.CodeInternalError,
+			protocol.StageWorkspaceVerify,
+			messageForCode(protocol.CodeInternalError),
+			map[string]any{},
+			fmt.Errorf("build fetched revision: %w", err),
+		)
+	}
 	return FetchResult{
 		RepositoryPath: repositoryPath,
-		Commit:         rotationResult.ActualCommit,
-		SourceKey:      rotationResult.Source.Key(),
+		Revision:       revision,
 	}, nil
 }
 
@@ -375,7 +402,7 @@ func (f *Fetcher) fetchAttempt(
 		)
 	}
 
-	verification, verifyErr := f.verifier.Verify(ctx, cloneVerificationRequest{
+	verification, verifyErr := f.verifier.Verify(ctx, VerificationRequest{
 		RepositoryPath: repositoryPath,
 		Target:         request.Target,
 		Source:         attempt.Source,
@@ -416,7 +443,10 @@ func (f *Fetcher) fetchAttempt(
 			true,
 		)
 	}
-	if !validCommit(verification.commit) {
+	if err := verification.validate(); err != nil ||
+		verification.Version() != request.Target.Version() ||
+		verification.Branch() != request.Target.Branch() ||
+		verification.SourceKey() != attempt.Source.Key() {
 		return f.finishFailedAttempt(
 			ctx,
 			request,
@@ -446,7 +476,7 @@ func (f *Fetcher) fetchAttempt(
 	}
 	return mirror.AttemptOutcome{
 		Kind:         mirror.OutcomeSucceeded,
-		ActualCommit: verification.commit,
+		ActualCommit: verification.Commit(),
 	}
 }
 
