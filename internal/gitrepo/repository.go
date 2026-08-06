@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -21,6 +22,7 @@ const (
 var (
 	errInvalidRevision       = errors.New("repository revision is invalid")
 	errInvalidRepositoryRead = errors.New("repository read request is invalid")
+	errInvalidRepositoryID   = errors.New("repository identity is invalid")
 	errVersionFileTooLarge   = errors.New("repository version file is too large")
 )
 
@@ -93,6 +95,57 @@ type repositorySnapshot struct {
 	tags           []string
 	versionMode    filemode.FileMode
 	versionPayload []byte
+}
+
+type repositoryIdentity struct {
+	version   string
+	branch    string
+	commit    string
+	sourceKey string
+}
+
+func repositoryIdentityFromSnapshot(snapshot repositorySnapshot) (repositoryIdentity, error) {
+	if !snapshot.nonBare || len(snapshot.remotes) != 1 {
+		return repositoryIdentity{}, errInvalidRepositoryID
+	}
+	remote := snapshot.remotes[0]
+	if remote.name != "origin" || len(remote.fetchURLs) != 1 || remote.mirror {
+		return repositoryIdentity{}, errInvalidRepositoryID
+	}
+	source, sourceAllowed := recoverySourceForURL(remote.fetchURLs[0])
+	if !sourceAllowed ||
+		!snapshot.headSymbolic || !validCommit(snapshot.commit) ||
+		!slices.Contains(snapshot.shallow, snapshot.commit) ||
+		len(snapshot.tags) != 0 || !snapshot.versionMode.IsRegular() {
+		return repositoryIdentity{}, errInvalidRepositoryID
+	}
+	version, err := parseRepositoryVersion(snapshot.versionPayload)
+	if err != nil {
+		return repositoryIdentity{}, fmt.Errorf("%w: version document: %w", errInvalidRepositoryID, err)
+	}
+	target, err := ParseTarget(version)
+	if err != nil || snapshot.headTarget != plumbing.NewBranchReferenceName(target.Branch()).String() {
+		return repositoryIdentity{}, errInvalidRepositoryID
+	}
+	return repositoryIdentity{
+		version:   target.Version(),
+		branch:    target.Branch(),
+		commit:    snapshot.commit,
+		sourceKey: source.Key(),
+	}, nil
+}
+
+func recoverySourceForURL(value string) (mirror.Source, bool) {
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		return mirror.Source{}, false
+	}
+	for _, source := range catalog.Sources(mirror.KindGit) {
+		if source.BaseURL() == value {
+			return source, true
+		}
+	}
+	return mirror.Source{}, false
 }
 
 type repositoryReader interface {
