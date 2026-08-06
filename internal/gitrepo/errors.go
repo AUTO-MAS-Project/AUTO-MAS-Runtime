@@ -88,6 +88,10 @@ func messageForCode(code protocol.Code) string {
 		return "仓库同步已取消"
 	case protocol.CodeOutputWriteFailed:
 		return "无法写入仓库同步进度"
+	case protocol.CodeDirectoryOccupied:
+		return "仓库目录正在被占用"
+	case protocol.CodeStateWriteFailed:
+		return "无法写入仓库更新状态"
 	case protocol.CodeNetworkUnavailable:
 		return "当前策略禁止访问 Git 网络源"
 	case protocol.CodeGitRemoteResolveFailed:
@@ -100,6 +104,8 @@ func messageForCode(code protocol.Code) string {
 		return "克隆的后端仓库无效"
 	case protocol.CodeGitVersionMismatch:
 		return "仓库版本与目标版本不一致"
+	case protocol.CodeGitRepoSwapFailed:
+		return "无法原子替换后端仓库"
 	case protocol.CodeGitRepoCleanupFailed:
 		return "无法清理仓库临时目录"
 	case protocol.CodeUpdateStateAmbiguous:

@@ -18,6 +18,7 @@ func TestRenameKind_AuthorizesExactLayoutPairs(t *testing.T) {
 	for _, kind := range []RenameKind{
 		RenameRepositoryToRetired,
 		RenameUpdateToRepository,
+		RenameRepositoryRollback,
 		RenameUVStagingToVersion,
 	} {
 		t.Run(kind.String(), func(t *testing.T) {
@@ -33,6 +34,26 @@ func TestRenameKind_AuthorizesExactLayoutPairs(t *testing.T) {
 				t.Fatalf("source still exists: %v", err)
 			}
 		})
+	}
+}
+
+func TestOperator_AtomicRenameRepositoryRollback(t *testing.T) {
+	operator, _, request := newRenameFixture(t, RenameRepositoryRollback)
+	marker := filepath.Join(request.Source, "previous-marker")
+	if err := os.WriteFile(marker, []byte("previous"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(marker) error = %v", err)
+	}
+
+	result, err := operator.AtomicRename(t.Context(), request)
+	if err != nil || !result.MutationApplied {
+		t.Fatalf("AtomicRename() = %#v, %v, want applied rollback", result, err)
+	}
+	got, err := os.ReadFile(filepath.Join(request.Destination, "previous-marker"))
+	if err != nil || string(got) != "previous" {
+		t.Fatalf("rollback marker = %q, %v, want previous", got, err)
+	}
+	if _, err := os.Lstat(request.Source); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rollback source still exists: %v", err)
 	}
 }
 
@@ -485,6 +506,9 @@ func newRenameFixture(
 		request.Destination, _ = layout.RepoPreviousDir(request.OperationID)
 	case RenameUpdateToRepository:
 		request.Source, _ = layout.RepoUpdateDir(request.OperationID)
+		request.Destination = layout.RepoDir()
+	case RenameRepositoryRollback:
+		request.Source, _ = layout.RepoPreviousDir(request.OperationID)
 		request.Destination = layout.RepoDir()
 	case RenameUVStagingToVersion:
 		request.Version = "0.9.0"

@@ -65,6 +65,7 @@ type RenameKind string
 const (
 	RenameRepositoryToRetired RenameKind = "repository_to_retired"
 	RenameUpdateToRepository  RenameKind = "update_to_repository"
+	RenameRepositoryRollback  RenameKind = "repository_rollback"
 	RenameUVStagingToVersion  RenameKind = "uv_staging_to_version"
 )
 
@@ -74,6 +75,7 @@ func (k RenameKind) Valid() bool {
 	switch k {
 	case RenameRepositoryToRetired,
 		RenameUpdateToRepository,
+		RenameRepositoryRollback,
 		RenameUVStagingToVersion:
 		return true
 	default:

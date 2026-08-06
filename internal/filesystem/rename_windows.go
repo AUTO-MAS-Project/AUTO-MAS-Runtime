@@ -217,6 +217,9 @@ func (o *Operator) expectedRenamePaths(
 	case RenameUpdateToRepository:
 		source, err := o.layout.RepoUpdateDir(request.OperationID)
 		return source, o.layout.RepoDir(), wrapLayoutArgument(err)
+	case RenameRepositoryRollback:
+		source, err := o.layout.RepoPreviousDir(request.OperationID)
+		return source, o.layout.RepoDir(), wrapLayoutArgument(err)
 	case RenameUVStagingToVersion:
 		source, sourceErr := o.layout.UVStagingDir(request.Version, request.OperationID)
 		destination, destinationErr := o.layout.UVVersionDir(request.Version)
