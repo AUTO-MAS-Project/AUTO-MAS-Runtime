@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/go-git/go-billy/v5/osfs"
 	git "github.com/go-git/go-git/v5"
 	gitcfg "github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
+	gitcache "github.com/go-git/go-git/v5/plumbing/cache"
+	gitstorage "github.com/go-git/go-git/v5/storage"
+	gitfilesystem "github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/memory"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -46,9 +49,10 @@ var ErrInvalidFetcher = errors.New("git fetcher is invalid")
 
 // FetchRequest 固定一次 Git 获取操作的目标、镜像计划和目录所有者。
 type FetchRequest struct {
-	Plan        mirror.Plan
-	Target      Target
-	OperationID string
+	Plan          mirror.Plan
+	Target        Target
+	OperationID   string
+	StageReporter StageReporter
 }
 
 // FetchResult 保存已验证临时仓库的安全路径和最终来源事实。
@@ -82,6 +86,16 @@ type treeRemover interface {
 	) (filesystem.DeleteResult, error)
 }
 
+type directoryLease interface {
+	Close() error
+}
+
+type directoryPreparer func(
+	ctx context.Context,
+	layout *config.Layout,
+	path string,
+) (directoryLease, error)
+
 type cloneVerifier interface {
 	Verify(
 		ctx context.Context,
@@ -106,6 +120,7 @@ type fetcherDependencies struct {
 	git            gitClient
 	remover        treeRemover
 	verifier       cloneVerifier
+	prepareDir     directoryPreparer
 	emitProgress   progressEmitter
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
@@ -118,6 +133,7 @@ type Fetcher struct {
 	git            gitClient
 	remover        treeRemover
 	verifier       cloneVerifier
+	prepareDir     directoryPreparer
 	emitProgress   progressEmitter
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
@@ -140,6 +156,7 @@ func NewFetcher(
 		git:          goGitClient{},
 		remover:      remover,
 		verifier:     verifier,
+		prepareDir:   prepareManagedDirectoryLease,
 		emitProgress: emitter.EmitProgress,
 	})
 }
@@ -163,6 +180,7 @@ func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, err
 		git:            dependencies.git,
 		remover:        dependencies.remover,
 		verifier:       dependencies.verifier,
+		prepareDir:     dependencies.prepareDir,
 		emitProgress:   dependencies.emitProgress,
 		caBundle:       append([]byte(nil), dependencies.caBundle...),
 		cleanupContext: dependencies.cleanupContext,
@@ -189,6 +207,10 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 			err,
 		)
 	}
+	reportFetchStage(request, protocol.StageWorkspaceClone)
+	if err := ctx.Err(); err != nil {
+		return FetchResult{}, f.cancelledError(err)
+	}
 	repositoryPath, err := f.layout.RepoUpdateDir(request.OperationID)
 	if err != nil {
 		return FetchResult{}, newError(
@@ -199,7 +221,10 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 			fmt.Errorf("derive repository update path: %w", err),
 		)
 	}
-	if err := requireTemporaryAbsent(repositoryPath); err != nil {
+	if err := requireTemporaryAbsent(ctx, f.layout, repositoryPath); err != nil {
+		if isCancellation(ctx, err) {
+			return FetchResult{}, f.cancelledError(err)
+		}
 		return FetchResult{}, newError(
 			protocol.CodeUpdateStateAmbiguous,
 			protocol.StageWorkspaceClone,
@@ -259,6 +284,7 @@ func (f *Fetcher) fetchAttempt(
 	repositoryPath string,
 	attempt mirror.Attempt,
 ) mirror.AttemptOutcome {
+	reportFetchStage(request, protocol.StageWorkspaceClone)
 	if attempt.Target.ProductVersion() != request.Target.Version() ||
 		attempt.Target.ReleaseBranch() != request.Target.Branch() {
 		return failedOutcome(
@@ -286,7 +312,7 @@ func (f *Fetcher) fetchAttempt(
 		attempt.Source.BaseURL(),
 		append([]byte(nil), f.caBundle...),
 	)
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, err) {
 		return f.finishFailedAttempt(
 			ctx,
 			request,
@@ -331,6 +357,40 @@ func (f *Fetcher) fetchAttempt(
 			false,
 		)
 	}
+	var lease directoryLease
+	if f.prepareDir != nil {
+		lease, err = f.prepareDir(ctx, f.layout, repositoryPath)
+		if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, err) {
+			return f.finishFailedAttempt(
+				ctx,
+				request,
+				repositoryPath,
+				mirror.OutcomeTargetFailure,
+				failureCancelled,
+				f.cancelledError(errors.Join(ctxErr, err)),
+				false,
+				lease,
+			)
+		}
+		if err != nil {
+			return f.finishFailedAttempt(
+				ctx,
+				request,
+				repositoryPath,
+				mirror.OutcomeTargetFailure,
+				failureVerifierContract,
+				newError(
+					protocol.CodeUpdateStateAmbiguous,
+					protocol.StageWorkspaceClone,
+					messageForCode(protocol.CodeUpdateStateAmbiguous),
+					map[string]any{},
+					err,
+				),
+				false,
+				lease,
+			)
+		}
+	}
 
 	progress := newCloneProgressWriter(f.emitProgress)
 	cloneErr := f.git.Clone(ctx, repositoryPath, git.CloneOptions{
@@ -354,9 +414,10 @@ func (f *Fetcher) fetchAttempt(
 			failureOutput,
 			f.outputError(errors.Join(progressErr, cloneErr)),
 			true,
+			lease,
 		)
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, cloneErr) {
 		return f.finishFailedAttempt(
 			ctx,
 			request,
@@ -365,6 +426,7 @@ func (f *Fetcher) fetchAttempt(
 			failureCancelled,
 			f.cancelledError(errors.Join(ctxErr, cloneErr)),
 			true,
+			lease,
 		)
 	}
 	if errors.Is(cloneErr, git.ErrRepositoryAlreadyExists) {
@@ -382,6 +444,7 @@ func (f *Fetcher) fetchAttempt(
 				cloneErr,
 			),
 			false,
+			lease,
 		)
 	}
 	if cloneErr != nil {
@@ -399,9 +462,11 @@ func (f *Fetcher) fetchAttempt(
 				cloneErr,
 			),
 			true,
+			lease,
 		)
 	}
 
+	reportFetchStage(request, protocol.StageWorkspaceVerify)
 	verification, verifyErr := f.verifier.Verify(ctx, VerificationRequest{
 		RepositoryPath: repositoryPath,
 		Target:         request.Target,
@@ -417,6 +482,7 @@ func (f *Fetcher) fetchAttempt(
 			failureCancelled,
 			f.cancelledError(errors.Join(ctxErr, verifyErr)),
 			true,
+			lease,
 		)
 	}
 	if verifyErr != nil {
@@ -441,6 +507,7 @@ func (f *Fetcher) fetchAttempt(
 				verifyErr,
 			),
 			true,
+			lease,
 		)
 	}
 	if err := verification.validate(); err != nil ||
@@ -461,7 +528,29 @@ func (f *Fetcher) fetchAttempt(
 				ErrInvalidFetcher,
 			),
 			true,
+			lease,
 		)
+	}
+	if lease != nil {
+		if closeErr := lease.Close(); closeErr != nil {
+			return f.finishFailedAttempt(
+				ctx,
+				request,
+				repositoryPath,
+				mirror.OutcomeTargetFailure,
+				failureCleanup,
+				newError(
+					protocol.CodeGitRepoCleanupFailed,
+					protocol.StageWorkspaceCleanup,
+					messageForCode(protocol.CodeGitRepoCleanupFailed),
+					map[string]any{},
+					closeErr,
+				),
+				true,
+				lease,
+			)
+		}
+		lease = nil
 	}
 	if err := f.emit(protocol.ProgressSucceeded, cloneProgressSuccessMessage); err != nil {
 		return f.finishFailedAttempt(
@@ -472,6 +561,7 @@ func (f *Fetcher) fetchAttempt(
 			failureOutput,
 			f.outputError(err),
 			true,
+			lease,
 		)
 	}
 	return mirror.AttemptOutcome{
@@ -488,7 +578,37 @@ func (f *Fetcher) finishFailedAttempt(
 	failureKind mirror.FailureKind,
 	operationErr *Error,
 	cleanup bool,
+	leaseValues ...directoryLease,
 ) mirror.AttemptOutcome {
+	var lease directoryLease
+	if len(leaseValues) > 0 {
+		lease = leaseValues[0]
+	}
+	if lease != nil {
+		if closeErr := lease.Close(); closeErr != nil {
+			if operationErr.Code() == protocol.CodeOutputWriteFailed ||
+				operationErr.Code() == protocol.CodeOperationCancelled {
+				operationErr = newError(
+					operationErr.Code(),
+					operationErr.Stage(),
+					operationErr.Message(),
+					operationErr.Details(),
+					errors.Join(operationErr, closeErr),
+				)
+			} else {
+				operationErr = newError(
+					protocol.CodeGitRepoCleanupFailed,
+					protocol.StageWorkspaceCleanup,
+					messageForCode(protocol.CodeGitRepoCleanupFailed),
+					map[string]any{},
+					errors.Join(operationErr, closeErr),
+				)
+				failureKind = failureCleanup
+			}
+			outcomeKind = mirror.OutcomeTargetFailure
+			cleanup = true
+		}
+	}
 	status := protocol.ProgressFailed
 	message := cloneProgressFailureMessage
 	if operationErr.Code() == protocol.CodeOperationCancelled {
@@ -503,6 +623,7 @@ func (f *Fetcher) finishFailedAttempt(
 		}
 	}
 	if cleanup {
+		reportFetchStage(request, protocol.StageWorkspaceCleanup)
 		if cleanupErr := f.cleanupTemporary(ctx, request, repositoryPath); cleanupErr != nil {
 			if operationErr.Code() == protocol.CodeOutputWriteFailed ||
 				operationErr.Code() == protocol.CodeOperationCancelled {
@@ -699,16 +820,33 @@ func containsBranch(references []*plumbing.Reference, branch string) bool {
 	return false
 }
 
-func requireTemporaryAbsent(path string) error {
-	_, err := os.Lstat(path)
-	switch {
-	case err == nil:
-		return errors.New("repository update path already exists")
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	default:
+func requireTemporaryAbsent(
+	ctx context.Context,
+	layout *config.Layout,
+	path string,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("inspect repository update path: %w", ErrInvalidFetcher)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	inspection, err := filesystem.InspectManagedDirectory(ctx, layout, path)
+	if err != nil {
 		return fmt.Errorf("inspect repository update path: %w", err)
 	}
+	if inspection.Exists {
+		return errors.New("repository update path already exists")
+	}
+	return nil
+}
+
+func prepareManagedDirectoryLease(
+	ctx context.Context,
+	layout *config.Layout,
+	path string,
+) (directoryLease, error) {
+	return filesystem.PrepareManagedDirectory(ctx, layout, path)
 }
 
 func validCommit(commit string) bool {
@@ -739,6 +877,12 @@ func validFetcher(fetcher *Fetcher) bool {
 		!nilDependency(fetcher.verifier) &&
 		fetcher.emitProgress != nil &&
 		fetcher.cleanupContext != nil
+}
+
+func reportFetchStage(request FetchRequest, stage protocol.Stage) {
+	if request.StageReporter != nil {
+		request.StageReporter(stage)
+	}
 }
 
 func nilDependency(value any) bool {
@@ -809,6 +953,16 @@ func (w *cloneProgressWriter) Err() error {
 
 type goGitClient struct{}
 
+// cloneStorage 只暴露 go-git 必需的 Storer 方法，避免触发有截断 pack 句柄缺陷的快捷写入路径。
+type cloneStorage struct {
+	gitstorage.Storer
+	init func() error
+}
+
+func (s cloneStorage) Init() error {
+	return s.init()
+}
+
 func (goGitClient) ListReferences(
 	ctx context.Context,
 	sourceURL string,
@@ -829,7 +983,17 @@ func (goGitClient) Clone(
 	path string,
 	options git.CloneOptions,
 ) error {
-	_, err := git.PlainCloneContext(ctx, path, false, &options)
+	worktree := osfs.New(path)
+	gitDirectory, err := worktree.Chroot(git.GitDirName)
+	if err != nil {
+		return fmt.Errorf("create git directory: %w", err)
+	}
+	diskStore := gitfilesystem.NewStorage(gitDirectory, gitcache.NewObjectLRUDefault())
+	store := cloneStorage{
+		Storer: diskStore,
+		init:   diskStore.Init,
+	}
+	_, err = git.CloneContext(ctx, store, worktree, &options)
 	return err
 }
 

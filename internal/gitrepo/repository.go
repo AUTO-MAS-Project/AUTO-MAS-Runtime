@@ -104,6 +104,12 @@ type repositoryIdentity struct {
 	sourceKey string
 }
 
+func (i repositoryIdentity) sameRevision(other repositoryIdentity) bool {
+	return i.version == other.version &&
+		i.branch == other.branch &&
+		i.commit == other.commit
+}
+
 func repositoryIdentityFromSnapshot(snapshot repositorySnapshot) (repositoryIdentity, error) {
 	if !snapshot.nonBare || len(snapshot.remotes) != 1 {
 		return repositoryIdentity{}, errInvalidRepositoryID

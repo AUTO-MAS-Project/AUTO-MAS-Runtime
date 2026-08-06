@@ -118,6 +118,10 @@ func messageForCode(code protocol.Code) string {
 		return "无法清理仓库临时目录"
 	case protocol.CodeUpdateStateAmbiguous:
 		return "仓库更新现场无法安全判定"
+	case protocol.CodePathOutsideManagedRoot:
+		return "受管路径超出允许范围"
+	case protocol.CodeUnsafeReparsePoint:
+		return "受管路径包含不安全重解析点"
 	case protocol.CodeMirrorExhausted:
 		return "所有 Git 网络源均不可用"
 	default:

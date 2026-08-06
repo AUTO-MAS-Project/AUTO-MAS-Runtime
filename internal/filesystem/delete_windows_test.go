@@ -43,6 +43,51 @@ func TestRemoveTree_RemovesManagedTreeByPinnedHandles(t *testing.T) {
 	assertAuditPhases(t, auditor.records, "succeeded")
 }
 
+func TestRemoveTree_RemovesReadOnlyFileByPinnedHandle(t *testing.T) {
+	operator, layout, auditor := newRemoveTreeFixture(t)
+	target := filepath.Join(layout.BuildCacheDir(), "pack.idx")
+	if err := os.WriteFile(target, []byte("index"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	targetUTF16, err := windows.UTF16PtrFromString(target)
+	if err != nil {
+		t.Fatalf("windows.UTF16PtrFromString() error = %v", err)
+	}
+	attributes, err := windows.GetFileAttributes(targetUTF16)
+	if err != nil {
+		t.Fatalf("windows.GetFileAttributes() error = %v", err)
+	}
+	if err := windows.SetFileAttributes(targetUTF16, attributes|windows.FILE_ATTRIBUTE_READONLY); err != nil {
+		t.Fatalf("windows.SetFileAttributes(readonly) error = %v", err)
+	}
+	attributes, err = windows.GetFileAttributes(targetUTF16)
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_READONLY == 0 {
+		t.Fatalf("readonly attributes = %#x, error = %v", attributes, err)
+	}
+
+	result, err := operator.RemoveTree(t.Context(), buildCacheDeleteRequest(layout))
+	if err != nil || !result.Removed || result.Partial || !result.AuditCompleted {
+		t.Fatalf("RemoveTree() = %#v, %v", result, err)
+	}
+	if _, err := os.Lstat(layout.BuildCacheDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target tree still exists: %v", err)
+	}
+	assertAuditPhases(t, auditor.records, "succeeded")
+}
+
+func TestDeleteDispositionFlags_IgnoreReadOnlyWithoutPOSIX(t *testing.T) {
+	want := uint32(
+		windows.FILE_DISPOSITION_DELETE |
+			windows.FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+	)
+	if got := deleteDispositionFlags(); got != want {
+		t.Fatalf("deleteDispositionFlags() = %#x, want %#x", got, want)
+	}
+	if deleteDispositionFlags()&windows.FILE_DISPOSITION_POSIX_SEMANTICS != 0 {
+		t.Fatalf("deleteDispositionFlags() = %#x, want no POSIX semantics", deleteDispositionFlags())
+	}
+}
+
 func TestRemoveTree_RejectsReparseWithoutDeletingLink(t *testing.T) {
 	operator, layout, _ := newRemoveTreeFixture(t)
 	external := t.TempDir()

@@ -203,6 +203,124 @@ func TestAtomicRename_RetriesOnlyTransientErrors(t *testing.T) {
 	}
 }
 
+func TestAtomicRename_RetriesPinSharingViolationBeforeRename(t *testing.T) {
+	operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
+	operator.delays = []time.Duration{10 * time.Millisecond}
+	openRelative := operator.api.openRelative
+	pinCalls := 0
+	operator.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		if name == filepath.Base(request.Source) && spec == renameSourceSpec() {
+			pinCalls++
+			if pinCalls == 1 {
+				return windows.InvalidHandle, windows.ERROR_SHARING_VIOLATION
+			}
+		}
+		return openRelative(parent, name, spec)
+	}
+	var waits []time.Duration
+	operator.wait = func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}
+
+	result, err := operator.AtomicRename(t.Context(), request)
+	if err != nil || !result.MutationApplied {
+		t.Fatalf("AtomicRename() = %#v, %v, want retry success", result, err)
+	}
+	if pinCalls != 2 || len(waits) != 1 || waits[0] != operator.delays[0] {
+		t.Fatalf("pin calls/waits = %d/%v, want 2/%v", pinCalls, waits, operator.delays)
+	}
+}
+
+func TestAtomicRename_DoesNotRetryParentAccessDeniedAsOccupied(t *testing.T) {
+	operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
+	openRelative := operator.api.openRelative
+	injected := false
+	operator.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		if !injected && spec == directoryPinSpec() {
+			injected = true
+			return windows.InvalidHandle, windows.ERROR_ACCESS_DENIED
+		}
+		return openRelative(parent, name, spec)
+	}
+	waitCalls := 0
+	operator.wait = func(context.Context, time.Duration) error {
+		waitCalls++
+		return nil
+	}
+
+	result, err := operator.AtomicRename(t.Context(), request)
+	if result.MutationApplied {
+		t.Fatalf("AtomicRename() result = %#v, want no mutation", result)
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("AtomicRename() error = %v, want access denied", err)
+	}
+	if waitCalls != 0 {
+		t.Fatalf("wait calls = %d, want 0 for non-leaf access failure", waitCalls)
+	}
+}
+
+func TestTransientRenamePinError_RejectsCloseFailure(t *testing.T) {
+	source := `C:\managed\repo`
+	openErr := &FileError{
+		Operation: "open-relative",
+		Path:      source,
+		Err:       windows.ERROR_ACCESS_DENIED,
+	}
+	closeErr := &FileError{
+		Operation: "close",
+		Path:      `C:\managed`,
+		Err:       windows.ERROR_ACCESS_DENIED,
+	}
+	if isTransientRenamePinError(openErr, source) != true {
+		t.Fatal("source leaf access failure was not classified as transient")
+	}
+	if isTransientRenamePinError(errors.Join(openErr, closeErr), source) {
+		t.Fatal("pin close failure was classified as transient")
+	}
+}
+
+func TestAtomicRename_MapsPinSharingViolationAfterRetryExhaustion(t *testing.T) {
+	operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
+	operator.delays = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
+	openRelative := operator.api.openRelative
+	pinCalls := 0
+	operator.api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		if name == filepath.Base(request.Source) && spec == renameSourceSpec() {
+			pinCalls++
+			return windows.InvalidHandle, windows.ERROR_LOCK_VIOLATION
+		}
+		return openRelative(parent, name, spec)
+	}
+	var waits []time.Duration
+	operator.wait = func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}
+
+	result, err := operator.AtomicRename(t.Context(), request)
+	if result.MutationApplied {
+		t.Fatalf("AtomicRename() = %#v, want pre-mutation occupied", result)
+	}
+	assertFilesystemCode(t, err, protocol.CodeDirectoryOccupied)
+	if pinCalls != len(operator.delays)+1 || len(waits) != len(operator.delays) {
+		t.Fatalf("pin calls/waits = %d/%v, want %d/%v", pinCalls, waits, len(operator.delays)+1, operator.delays)
+	}
+}
+
 func TestAtomicRename_UsesConfiguredDelaySequence(t *testing.T) {
 	operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
 	operator.delays = []time.Duration{

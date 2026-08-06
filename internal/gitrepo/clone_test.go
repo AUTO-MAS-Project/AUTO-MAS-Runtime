@@ -12,6 +12,7 @@ import (
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -25,6 +26,23 @@ var (
 	errTestResolve = errors.New("test resolve failure")
 	errTestClone   = errors.New("test clone failure")
 )
+
+func TestCloneStorage_DoesNotExposePackfileWriter(t *testing.T) {
+	called := false
+	store := cloneStorage{init: func() error {
+		called = true
+		return nil
+	}}
+	if err := store.Init(); err != nil || !called {
+		t.Fatalf("cloneStorage.Init() = %v, called = %t, want forwarded init", err, called)
+	}
+	if _, ok := any(store).(storer.PackfileWriter); ok {
+		t.Fatal("cloneStorage exposes PackfileWriter; truncated packs could leak tmp_pack handles")
+	}
+	if _, ok := any(&store).(storer.PackfileWriter); ok {
+		t.Fatal("*cloneStorage exposes PackfileWriter; truncated packs could leak tmp_pack handles")
+	}
+}
 
 func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 	target := mustParseTarget(t, "v5.4.0-beta.4")
@@ -105,10 +123,14 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 		caBundle:     caBundle,
 	})
 
+	var stages []protocol.Stage
 	result, err := fetcher.Fetch(t.Context(), FetchRequest{
 		Plan:        plan,
 		Target:      target,
 		OperationID: "OPERATION-1",
+		StageReporter: func(stage protocol.Stage) {
+			stages = append(stages, stage)
+		},
 	})
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
@@ -123,6 +145,9 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 	if result.RepositoryPath != wantPath {
 		t.Fatalf("RepositoryPath = %q, want %q", result.RepositoryPath, wantPath)
 	}
+	if !containsStageSequence(stages, protocol.StageWorkspaceClone, protocol.StageWorkspaceVerify) {
+		t.Fatalf("reported stages = %v, want clone/verify", stages)
+	}
 	events := progress.Events()
 	if len(events) < 3 {
 		t.Fatalf("progress event count = %d, want at least start/pulse/success", len(events))
@@ -134,6 +159,44 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 		if strings.Contains(event.Message, "secret") || strings.Contains(event.Message, "remote:") {
 			t.Fatalf("progress message exposes Git text: %q", event.Message)
 		}
+	}
+}
+
+func TestFetcher_PreCancelledPathInspectionReturnsCancelled(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	layout := mustGitLayout(t)
+	update, err := layout.RepoUpdateDir("OPERATION-PRE-CANCEL")
+	if err != nil {
+		t.Fatalf("RepoUpdateDir() error = %v", err)
+	}
+	if err := os.MkdirAll(update, 0o700); err != nil {
+		t.Fatalf("MkdirAll(update) error = %v", err)
+	}
+	clientCalled := false
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			clientCalled = true
+			return nil, nil
+		},
+		clone: func(context.Context, string, git.CloneOptions) error {
+			clientCalled = true
+			return nil
+		},
+	}
+	dependencies := successfulFetcherDependencies(t, client)
+	dependencies.layout = layout
+	fetcher := mustTestFetcher(t, dependencies)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err = fetcher.Fetch(ctx, FetchRequest{
+		Plan:        mustGitPlan(t, "cnb"),
+		Target:      target,
+		OperationID: "OPERATION-PRE-CANCEL",
+	})
+	assertGitrepoCode(t, err, protocol.CodeOperationCancelled)
+	if clientCalled {
+		t.Fatal("Git client called for pre-cancelled fetch")
 	}
 }
 
@@ -285,11 +348,15 @@ func TestFetcher_CancelCleansTemporaryRepository(t *testing.T) {
 		err    error
 	}
 	done := make(chan fetchOutcome, 1)
+	var stages []protocol.Stage
 	go func() {
 		result, err := fetcher.Fetch(ctx, FetchRequest{
 			Plan:        plan,
 			Target:      target,
 			OperationID: "OPERATION-CANCEL",
+			StageReporter: func(stage protocol.Stage) {
+				stages = append(stages, stage)
+			},
 		})
 		done <- fetchOutcome{result: result, err: err}
 	}()
@@ -312,6 +379,9 @@ func TestFetcher_CancelCleansTemporaryRepository(t *testing.T) {
 	}
 	if request.Kind != filesystem.DeleteRepositoryUpdate || request.Target != wantPath || request.OperationID != "OPERATION-CANCEL" {
 		t.Fatalf("cleanup request = %#v, want exact repository update", request)
+	}
+	if len(stages) == 0 || stages[len(stages)-1] != protocol.StageWorkspaceCleanup {
+		t.Fatalf("reported stages = %v, want cleanup last", stages)
 	}
 }
 

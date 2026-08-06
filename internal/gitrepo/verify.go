@@ -76,7 +76,7 @@ func (v *Verifier) Verify(
 	}
 
 	snapshot, err := v.reader.Inspect(ctx, request.RepositoryPath)
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, err) {
 		return Revision{}, verificationCancelledError(errors.Join(ctxErr, err))
 	}
 	if err != nil {

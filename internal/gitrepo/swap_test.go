@@ -22,6 +22,10 @@ func TestSwapper_ReplacesRepositoryAndDeletesRetiredTree(t *testing.T) {
 	operator := successfulSwapOperator(t)
 	transactions := &fakeSwapTransactionWriter{}
 	swapper := mustTestSwapper(t, layout, operator, transactions)
+	var stages []protocol.Stage
+	request.StageReporter = func(stage protocol.Stage) {
+		stages = append(stages, stage)
+	}
 
 	result, err := swapper.Swap(t.Context(), request)
 	if err != nil {
@@ -45,6 +49,24 @@ func TestSwapper_ReplacesRepositoryAndDeletesRetiredTree(t *testing.T) {
 	}
 	if got, want := transactions.stages, []protocol.Stage{protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup}; !equalStages(got, want) {
 		t.Fatalf("transaction stages = %v, want %v", got, want)
+	}
+	if got, want := stages, []protocol.Stage{protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup}; !equalStages(got, want) {
+		t.Fatalf("reported stages = %v, want %v", got, want)
+	}
+}
+
+func TestSwapper_PreCancelledPathInspectionReturnsCancelled(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FP0")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	swapper := mustTestSwapper(t, layout, successfulSwapOperator(t), &fakeSwapTransactionWriter{})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	result, err := swapper.Swap(ctx, request)
+	assertGitrepoCode(t, err, protocol.CodeOperationCancelled)
+	if result.MutationApplied {
+		t.Fatalf("Swap() result = %#v, want no mutation", result)
 	}
 }
 
@@ -330,6 +352,111 @@ func TestSwapper_StateWriteFailuresPreserveCommitFacts(t *testing.T) {
 		assertSwapMarker(t, filepath.Join(layout.RepoDir(), "new-only"), "new")
 		assertSwapMarker(t, filepath.Join(mustRepoPreviousDir(t, layout, request.Transaction.OperationID), "old-only"), "old")
 	})
+}
+
+func TestSwapper_ActiveCleanupDeadlineUsesCommittedErrorCodes(t *testing.T) {
+	t.Run("cleanup transaction is state failure", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FB2")
+		writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+		writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+		operator := successfulSwapOperator(t)
+		transactions := &fakeSwapTransactionWriter{writeErr: func(stage protocol.Stage) error {
+			if stage == protocol.StageWorkspaceCleanup {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}}
+		swapper := mustTestSwapper(t, layout, operator, transactions)
+
+		result, err := swapper.Swap(t.Context(), request)
+		assertGitrepoCode(t, err, protocol.CodeStateWriteFailed)
+		if !result.RepositoryActivated || result.CleanupCompleted {
+			t.Fatalf("Swap() result = %#v, want active repository with unfinished cleanup", result)
+		}
+	})
+
+	t.Run("retired cleanup is repository cleanup failure", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FB3")
+		writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+		writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+		operator := successfulSwapOperator(t)
+		operator.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			return filesystem.DeleteResult{}, context.DeadlineExceeded
+		}
+		swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+		result, err := swapper.Swap(t.Context(), request)
+		assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+		if !result.RepositoryActivated || result.CleanupCompleted {
+			t.Fatalf("Swap() result = %#v, want active repository with retained cleanup", result)
+		}
+	})
+}
+
+func TestSwapper_CancellationAfterActivationStillCompletesCleanup(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FB0")
+	writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	operator := successfulSwapOperator(t)
+	originalRename := operator.rename
+	renameCalls := 0
+	var removeContextErr error
+	operator.rename = func(renameCtx context.Context, renameRequest filesystem.RenameRequest) (filesystem.RenameResult, error) {
+		renameCalls++
+		result, err := originalRename(renameCtx, renameRequest)
+		if renameCalls == 2 && err == nil {
+			cancel()
+		}
+		return result, err
+	}
+	originalRemove := operator.remove
+	operator.remove = func(removeCtx context.Context, removeRequest filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+		removeContextErr = removeCtx.Err()
+		return originalRemove(removeCtx, removeRequest)
+	}
+	transactions := &cleanupContextObservingWriter{}
+	swapper := mustTestSwapper(t, layout, operator, transactions)
+
+	result, err := swapper.Swap(ctx, request)
+	if err != nil {
+		t.Fatalf("Swap() error = %v, want cleanup to complete after activation", err)
+	}
+	if !result.RepositoryActivated || !result.CleanupCompleted {
+		t.Fatalf("Swap() result = %#v, want active and clean", result)
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("parent context error = %v, want context.Canceled", ctx.Err())
+	}
+	if transactions.cleanupContextErr != nil {
+		t.Fatalf("cleanup transaction context error = %v, want nil", transactions.cleanupContextErr)
+	}
+	if removeContextErr != nil {
+		t.Fatalf("retired cleanup context error = %v, want nil", removeContextErr)
+	}
+}
+
+type cleanupContextObservingWriter struct {
+	cleanupContextErr error
+}
+
+func (w *cleanupContextObservingWriter) WriteTransaction(
+	ctx context.Context,
+	kind state.TransactionKind,
+	value state.TransactionState,
+) error {
+	if kind != state.TransactionUpdate {
+		return errors.New("unexpected transaction kind")
+	}
+	if value.Stage == protocol.StageWorkspaceCleanup {
+		w.cleanupContextErr = ctx.Err()
+	}
+	return nil
 }
 
 type fakeSwapOperator struct {

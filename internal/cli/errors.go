@@ -18,11 +18,12 @@ type operationError interface {
 
 // commandError 是 cli 内部使用的通用命令错误，同时承载协议映射字段。
 type commandError struct {
-	code    protocol.Code
-	stage   protocol.Stage
-	message string
-	details map[string]any
-	cause   error
+	code                  protocol.Code
+	stage                 protocol.Stage
+	message               string
+	details               map[string]any
+	cause                 error
+	controlInfrastructure bool
 }
 
 func (e *commandError) Error() string {
@@ -41,6 +42,10 @@ func (e *commandError) Stage() protocol.Stage { return e.stage }
 func (e *commandError) Message() string { return e.message }
 
 func (e *commandError) Details() map[string]any { return e.details }
+
+func (e *commandError) isControlInfrastructureError() bool {
+	return e != nil && e.controlInfrastructure
+}
 
 // notImplementedError 表示命令已注册但尚未实现，映射为 UNSUPPORTED_MODE。
 type notImplementedError struct {

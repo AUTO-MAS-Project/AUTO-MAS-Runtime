@@ -136,15 +136,25 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 }
 
 // classifyFailure 把命令错误映射为冻结错误码与中文 message。
-// 取消优先映射为 OPERATION_CANCELLED（设计 §13 顺序：context.Canceled 先于
-// operationError 匹配，避免被包装的取消被业务错误码吞掉）；实现了
-// operationError 的错误保留其四元组；未知内部错误映射为 INTERNAL_ERROR。
+// 已类型化或原始协议输出故障的 OUTPUT_WRITE_FAILED 优先于取消；除此之外取消
+// 优先于业务码，避免被包装的取消被业务错误码吞掉。实现了 operationError 的错误保留其四元组；
+// 未知内部错误映射为 INTERNAL_ERROR。
 //
 // 兜底码不用 OUTPUT_WRITE_FAILED：那个码的语义是协议输出通道写失败，用它
 // 兜底会把 Runtime 自身的缺陷伪装成输出故障，让排查从一开始就走错方向
-// （T3.8 F13d）。真正的输出写失败由各服务显式映射 OUTPUT_WRITE_FAILED。
+// （T3.8 F13d）。服务可显式映射以保留精确 stage；会话层仍识别原始协议输出故障，
+// 避免 version/cleanup 等直接发射 progress 的路径退化成 INTERNAL_ERROR。
 func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, protocol.Stage, string, map[string]any) {
-	if errors.Is(err, context.Canceled) {
+	if outputErr := findOperationErrorCode(err, protocol.CodeOutputWriteFailed); outputErr != nil {
+		return outputErr.Code(), outputErr.Stage(), outputErr.Message(), outputErr.Details()
+	}
+	if errors.Is(err, protocol.ErrOutputWriteFailed) {
+		return protocol.CodeOutputWriteFailed, fallbackStage, "协议输出失败", map[string]any{}
+	}
+	if controlErr := findControlInfrastructureError(err); controlErr != nil {
+		return controlErr.Code(), controlErr.Stage(), controlErr.Message(), controlErr.Details()
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		stage := fallbackStage
 		details := map[string]any{}
 		var operationErr operationError
@@ -166,6 +176,53 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 		}
 	}
 	return protocol.CodeInternalError, fallbackStage, "命令执行失败", map[string]any{}
+}
+
+func findControlInfrastructureError(err error) operationError {
+	if err == nil {
+		return nil
+	}
+	var marked interface {
+		operationError
+		isControlInfrastructureError() bool
+	}
+	if errors.As(err, &marked) && marked.isControlInfrastructureError() {
+		return marked
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range multi.Unwrap() {
+			if found := findControlInfrastructureError(child); found != nil {
+				return found
+			}
+		}
+		return nil
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		return findControlInfrastructureError(single.Unwrap())
+	}
+	return nil
+}
+
+func findOperationErrorCode(err error, want protocol.Code) operationError {
+	if err == nil {
+		return nil
+	}
+	var operationErr operationError
+	if errors.As(err, &operationErr) && operationErr.Code() == want {
+		return operationErr
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range multi.Unwrap() {
+			if found := findOperationErrorCode(child, want); found != nil {
+				return found
+			}
+		}
+		return nil
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		return findOperationErrorCode(single.Unwrap(), want)
+	}
+	return nil
 }
 
 func exitCodeFor(code protocol.Code) int {

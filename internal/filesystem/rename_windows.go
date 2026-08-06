@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/windows"
 
@@ -30,7 +31,19 @@ func (o *Operator) AtomicRename(
 	for attemptIndex := 0; ; attemptIndex++ {
 		attempt, err := o.pinRenameAttempt(ctx, request)
 		if err != nil {
-			return RenameResult{}, err
+			if !isTransientRenamePinError(err, request.Source) {
+				return RenameResult{}, err
+			}
+			if attemptIndex >= len(o.delays) {
+				return RenameResult{}, occupiedRenameError(request.Destination, err)
+			}
+			if err := ctx.Err(); err != nil {
+				return RenameResult{}, err
+			}
+			if err := o.wait(ctx, o.delays[attemptIndex]); err != nil {
+				return RenameResult{}, err
+			}
+			continue
 		}
 		err = renameByHandleWith(
 			attempt.source.handle,
@@ -168,6 +181,8 @@ func (o *Operator) pinRenameAttempt(
 		return nil, occupiedRenameError(destination.String(), ErrDestinationExists)
 	} else if !isWindowsNotFound(err) {
 		return nil, &FileError{Operation: "attributes", Path: destination.String(), Err: err}
+	} else if err := rejectMissingReparseChain(ctx, destination, o.api); err != nil {
+		return nil, err
 	}
 
 	rootParent, err := canonicalizeContextWith(ctx, filepath.Dir(o.layout.AppRoot()), o.api)
@@ -253,6 +268,47 @@ func isTransientRenameError(err error) bool {
 	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) ||
 		errors.Is(err, windows.ERROR_LOCK_VIOLATION) ||
 		errors.Is(err, windows.ERROR_ACCESS_DENIED)
+}
+
+func isTransientRenamePinError(err error, source string) bool {
+	if err == nil || source == "" {
+		return false
+	}
+	return isTransientRenamePinCause(err, source)
+}
+
+func isTransientRenamePinCause(err error, source string) bool {
+	if err == nil {
+		return false
+	}
+	if fileErr, ok := err.(*FileError); ok {
+		return fileErr.Operation == "open-relative" &&
+			sameRenamePath(fileErr.Path, source) &&
+			isTransientRenameError(fileErr.Err)
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		matched := false
+		for _, child := range multi.Unwrap() {
+			if child == nil {
+				continue
+			}
+			if !isTransientRenamePinCause(child, source) {
+				return false
+			}
+			matched = true
+		}
+		return matched
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		return isTransientRenamePinCause(single.Unwrap(), source)
+	}
+	return false
+}
+
+func sameRenamePath(left, right string) bool {
+	left = filepath.Clean(strings.ReplaceAll(left, "/", `\`))
+	right = filepath.Clean(strings.ReplaceAll(right, "/", `\`))
+	return strings.EqualFold(left, right)
 }
 
 func occupiedRenameError(path string, cause error) error {

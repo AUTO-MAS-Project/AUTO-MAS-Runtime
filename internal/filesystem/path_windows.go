@@ -26,6 +26,11 @@ type CanonicalPath struct {
 	volumeKey     string
 }
 
+// DirectoryInspection 描述受管目录的只读存在性事实。
+type DirectoryInspection struct {
+	Exists bool
+}
+
 type objectIdentity struct {
 	volumeSerial  uint64
 	fileID        [16]byte
@@ -95,6 +100,119 @@ type pinnedChain struct {
 // Canonicalize 将绝对 Windows 路径转换为失败关闭的规范值对象。
 func Canonicalize(path string) (CanonicalPath, error) {
 	return canonicalizeContextWith(context.Background(), path, newProductionPathAPI())
+}
+
+// InspectManagedDirectory 校验目录路径链不含重解析点，并返回目标是否存在。
+//
+// 该能力只读且不创建目录；不存在的末端允许保留，但所有已存在的祖先仍必须
+// 通过同一组句柄校验。调用方应把任何错误视为无法证明目录身份。
+func InspectManagedDirectory(
+	ctx context.Context,
+	layout *config.Layout,
+	path string,
+) (DirectoryInspection, error) {
+	return inspectManagedDirectoryWith(ctx, layout, path, newProductionPathAPI())
+}
+
+func inspectManagedDirectoryWith(
+	ctx context.Context,
+	layout *config.Layout,
+	path string,
+	api pathAPI,
+) (DirectoryInspection, error) {
+	if ctx == nil || layout == nil || path == "" || !api.valid() {
+		return DirectoryInspection{}, fmt.Errorf("%w: invalid managed-directory input", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return DirectoryInspection{}, err
+	}
+	target, err := canonicalizeContextWith(ctx, path, api)
+	if err != nil {
+		return DirectoryInspection{}, err
+	}
+	attributes, attributesErr := api.attributes(target.Native())
+	exists := attributesErr == nil
+	if attributesErr != nil && !isWindowsNotFound(attributesErr) {
+		return DirectoryInspection{}, &FileError{
+			Operation: "attributes",
+			Path:      target.String(),
+			Err:       attributesErr,
+		}
+	}
+	if exists && attributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return DirectoryInspection{}, &FileError{
+			Operation: "type",
+			Path:      target.String(),
+			Err:       ErrIdentityChanged,
+		}
+	}
+	if err := validateExistingLayoutPathWith(ctx, layout, path, api); err != nil {
+		return DirectoryInspection{}, err
+	}
+	if !exists {
+		if err := rejectMissingReparseChain(ctx, target, api); err != nil {
+			return DirectoryInspection{}, err
+		}
+	}
+	return DirectoryInspection{Exists: exists}, nil
+}
+
+// rejectMissingReparseChain 检查 GetFileAttributes 无法分辨的悬空重解析点。
+//
+// Win32 属性查询会跟随符号链接；当链接目标已消失时，它会把实际存在的链接
+// 报成 ERROR_FILE_NOT_FOUND。逐级以 OPEN_REPARSE_POINT 探测原始对象，避免把
+// 该对象当成安全的不存在末端交给后续 clone/rename 流程。
+func rejectMissingReparseChain(
+	ctx context.Context,
+	target CanonicalPath,
+	api pathAPI,
+) error {
+	current := target.String()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var probeErr error
+		for _, directory := range []bool{true, false} {
+			handle, err := api.openPath(nativeWindowsPath(current), reparseProbeSpec(directory))
+			if err != nil {
+				if !isWindowsNotFound(err) {
+					probeErr = err
+				}
+				continue
+			}
+			identity, identityErr := api.identity(handle)
+			closeErr := api.closeHandle(handle)
+			if identityErr != nil || closeErr != nil {
+				return errors.Join(
+					wrapFileError("identify-reparse-probe", current, identityErr),
+					wrapFileError("close-reparse-probe", current, closeErr),
+				)
+			}
+			if identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+				return unsafeReparseError(current)
+			}
+			return nil
+		}
+		if probeErr != nil {
+			return &FileError{Operation: "probe-reparse", Path: current, Err: probeErr}
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func reparseProbeSpec(directory bool) openSpec {
+	return openSpec{
+		access:    windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
+		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+		creation:  windows.OPEN_EXISTING,
+		options:   windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		directory: directory,
+	}
 }
 
 func canonicalizeContextWith(
@@ -539,6 +657,7 @@ const (
 	fileCaseSensitiveClass    = uint32(23)
 	fileDispositionDelete     = uint32(0x00000001)
 	fileDispositionPOSIX      = uint32(0x00000002)
+	fileDispositionIgnoreRead = uint32(0x00000010)
 	fileCaseSensitiveDir      = uint32(0x00000001)
 )
 
@@ -918,7 +1037,7 @@ type fileDispositionInfoEx struct {
 }
 
 func setDispositionWindows(handle windows.Handle) error {
-	extended := fileDispositionInfoEx{flags: fileDispositionDelete}
+	extended := fileDispositionInfoEx{flags: deleteDispositionFlags()}
 	err := setFileInformationWindows(
 		handle,
 		fileDispositionExClass,
@@ -941,6 +1060,10 @@ func setDispositionWindows(handle windows.Handle) error {
 		return fmt.Errorf("set disposition: %w", err)
 	}
 	return nil
+}
+
+func deleteDispositionFlags() uint32 {
+	return fileDispositionDelete | fileDispositionIgnoreRead
 }
 
 func setStateDispositionWindows(

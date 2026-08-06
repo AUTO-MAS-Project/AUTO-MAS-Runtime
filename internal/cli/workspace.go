@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -109,13 +110,17 @@ func runWorkspaceSync(
 	if err != nil {
 		return sessionSuccess{}, workspaceControlInfrastructureError(control.CurrentControlStage(), err)
 	}
+	controlDone := make(chan error, 1)
 	go func() {
 		readErr := reader.Run(controlContext)
-		if readErr != nil && !errors.Is(readErr, context.Canceled) &&
-			!errors.Is(readErr, context.DeadlineExceeded) {
-			control.SetReaderError(readErr)
-			cancel()
+		if readErr != nil {
+			contextStopped := isWorkspaceControlContextCancellation(controlContext, readErr)
+			if !contextStopped {
+				control.SetReaderError(readErr)
+				cancel()
+			}
 		}
+		controlDone <- readErr
 	}()
 	binding := &workspaceLogBinding{}
 	request := gitrepo.SyncRequest{
@@ -148,11 +153,21 @@ func runWorkspaceSync(
 		ControlCommandID: control.CommandID,
 	}
 	result, syncErr := service.Sync(controlContext, request)
-	stopWorkspaceControl(reader, deps.io.In)
+	stopErr := stopWorkspaceControl(reader, deps.io.In, controlDone)
+	if stopErr != nil {
+		syncErr = joinWorkspaceControlError(
+			syncErr,
+			workspaceControlInfrastructureError(control.CurrentControlStage(), stopErr),
+		)
+	}
 	controlErr := control.ReaderError()
 	if controlErr != nil {
-		syncErr = workspaceControlInfrastructureError(control.CurrentControlStage(), controlErr)
+		syncErr = joinWorkspaceControlError(
+			syncErr,
+			workspaceControlInfrastructureError(control.CurrentControlStage(), controlErr),
+		)
 	}
+	result = withWorkspaceControlCommandID(result, control.CommandID())
 	if syncErr != nil {
 		syncErr = addControlCommandID(syncErr, control.CommandID())
 		return sessionSuccess{}, syncErr
@@ -164,16 +179,40 @@ func runWorkspaceSync(
 	}, nil
 }
 
-func stopWorkspaceControl(reader *protocol.ControlReader, input io.Reader) {
+const workspaceControlJoinTimeout = time.Second
+
+func stopWorkspaceControl(
+	reader *protocol.ControlReader,
+	input io.Reader,
+	completed <-chan error,
+) error {
 	reader.StopAccepting()
-	closer, ok := input.(io.Closer)
-	if !ok {
-		return
-	}
 	if file, isFile := input.(*os.File); isFile && file == os.Stdin {
-		return
+		return nil
 	}
-	_ = closer.Close()
+	var closeErr error
+	if closer, ok := input.(io.Closer); ok {
+		// 非真实 stdin 的 owner 必须保证 Close 在有限时间内返回；否则无法在
+		// 不泄漏不可回收 goroutine 的前提下结束控制读取。真实 os.Stdin 不走这里。
+		closeErr = closer.Close()
+	}
+	timer := time.NewTimer(workspaceControlJoinTimeout)
+	defer timer.Stop()
+	select {
+	case readErr := <-completed:
+		if closeErr != nil {
+			return errors.Join(closeErr, readErr)
+		}
+		if readErr == context.Canceled || readErr == context.DeadlineExceeded {
+			return nil
+		}
+		return readErr
+	case <-timer.C:
+		if closeErr != nil {
+			return errors.Join(closeErr, errors.New("stdin control reader did not exit"))
+		}
+		return errors.New("stdin control reader did not exit")
+	}
 }
 
 func depsVersionValues(command *cobra.Command) ([]string, error) {
@@ -227,7 +266,7 @@ type workspaceStageEmitter struct {
 }
 
 func (e *workspaceStageEmitter) EmitProgress(event protocol.ProgressEvent) error {
-	e.control.SetStage(event.Stage)
+	// progress 的 stage 是事件所属阶段，不覆盖由业务动作下传的控制 stage。
 	return e.emitter.EmitProgress(event)
 }
 
@@ -295,13 +334,40 @@ func (c *workspaceControl) ReaderError() error {
 }
 
 func workspaceControlInfrastructureError(stage protocol.Stage, cause error) error {
-	return &commandError{
-		code:    protocol.CodeInternalError,
-		stage:   stage,
-		message: "stdin 控制通道读取失败",
-		details: map[string]any{},
-		cause:   cause,
+	code := protocol.CodeInternalError
+	message := "stdin 控制通道读取失败"
+	if errors.Is(cause, protocol.ErrOutputWriteFailed) {
+		code = protocol.CodeOutputWriteFailed
+		message = "协议输出失败"
 	}
+	return &commandError{
+		code:                  code,
+		stage:                 stage,
+		message:               message,
+		details:               map[string]any{},
+		cause:                 cause,
+		controlInfrastructure: true,
+	}
+}
+
+func withWorkspaceControlCommandID(result gitrepo.SyncResult, commandID string) gitrepo.SyncResult {
+	if commandID != "" {
+		result.ControlCommandID = commandID
+	}
+	return result
+}
+
+func joinWorkspaceControlError(businessErr, controlErr error) error {
+	return errors.Join(controlErr, businessErr)
+}
+
+func isWorkspaceControlContextCancellation(controlContext context.Context, readErr error) bool {
+	if controlContext == nil || controlContext.Err() == nil {
+		return false
+	}
+	// ControlReader 返回裸 sentinel 表示自身 context 已停止；带 read stdin control 包装的
+	// 同名错误来自底层 reader，必须保留为控制通道基础设施故障。
+	return readErr == context.Canceled || readErr == context.DeadlineExceeded
 }
 
 func addControlCommandID(err error, commandID string) error {

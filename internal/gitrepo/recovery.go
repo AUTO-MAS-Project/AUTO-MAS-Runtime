@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-
-	git "github.com/go-git/go-git/v5"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -79,7 +76,8 @@ func (s *stateRecoveryStore) WriteEnvironment(
 
 // RecoveryRequest 提供补写 repository_changed 所需的当前 Runtime 日志路径。
 type RecoveryRequest struct {
-	LogPath string
+	LogPath       string
+	StageReporter StageReporter
 }
 
 // RecoveryResult 保存恢复动作和已证明 active revision 的事实。
@@ -145,6 +143,7 @@ func (r *Recovery) Recover(
 		nilDependency(r.operator) || nilDependency(r.store) || nilDependency(r.reader) {
 		return RecoveryResult{}, recoveryInternalError(errInvalidRecovery)
 	}
+	reportRecoveryStage(request, protocol.StageWorkspaceCleanup)
 	transaction, err := r.store.ReadUpdate(ctx)
 	if errors.Is(err, state.ErrNotFound) {
 		return RecoveryResult{}, nil
@@ -188,7 +187,7 @@ func (r *Recovery) Recover(
 
 	switch transaction.state.Stage {
 	case protocol.StageWorkspaceClone, protocol.StageWorkspaceVerify:
-		return r.recoverBeforeSwap(ctx, transaction, paths, repository, update, previous)
+		return r.recoverBeforeSwap(ctx, transaction, paths, repository, update, previous, request.StageReporter)
 	case protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup:
 		return r.recoverSwap(ctx, request, transaction, paths, repository, update, previous)
 	default:
@@ -248,18 +247,16 @@ func (r *Recovery) classifyPath(
 	if err := ctx.Err(); err != nil {
 		return recoveryPath{}, err
 	}
-	info, err := os.Lstat(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return recoveryPath{kind: recoveryPathMissing}, nil
-	case err != nil:
+	inspection, err := filesystem.InspectManagedDirectory(ctx, r.layout, path)
+	if err != nil {
 		return recoveryPath{}, fmt.Errorf("inspect recovery path: %w", err)
-	case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
-		return recoveryPath{}, errRecoveryIdentityUnknown
+	}
+	if !inspection.Exists {
+		return recoveryPath{kind: recoveryPathMissing}, nil
 	}
 	snapshot, err := r.reader.Inspect(ctx, path)
 	if err != nil {
-		if allowIncomplete && errors.Is(err, git.ErrRepositoryNotExists) {
+		if allowIncomplete && !isCancellation(ctx, err) {
 			return recoveryPath{kind: recoveryPathIncomplete}, nil
 		}
 		return recoveryPath{}, fmt.Errorf("inspect recovery repository: %w", err)
@@ -290,7 +287,17 @@ func (r *Recovery) recoverBeforeSwap(
 	repository recoveryPath,
 	update recoveryPath,
 	previous recoveryPath,
+	reporter StageReporter,
 ) (RecoveryResult, error) {
+	if repository.isTarget(transaction.state.TargetVersion) &&
+		update.isTarget(transaction.state.TargetVersion) &&
+		!repository.identity.sameRevision(update.identity) {
+		return RecoveryResult{}, recoveryAmbiguousError(
+			transaction.state.Stage,
+			"multiple_target_commits",
+			errRecoveryIdentityUnknown,
+		)
+	}
 	if previous.kind != recoveryPathMissing ||
 		(repository.kind != recoveryPathMissing && repository.kind != recoveryPathValid) ||
 		(update.kind == recoveryPathValid && !update.isTarget(transaction.state.TargetVersion)) ||
@@ -310,11 +317,13 @@ func (r *Recovery) recoverBeforeSwap(
 			transaction.state.OperationID,
 			recoveryUpdateCleanupReason,
 			&result,
+			reporter,
+			false,
 		); err != nil {
 			return result, err
 		}
 	}
-	return r.finishRecovery(ctx, transaction, result)
+	return r.finishRecovery(ctx, transaction, result, reporter, false)
 }
 
 func (r *Recovery) recoverSwap(
@@ -336,13 +345,7 @@ func (r *Recovery) recoverSwap(
 		)
 	}
 	targetVersion := transaction.state.TargetVersion
-	targetCount := 0
-	for _, candidate := range []recoveryPath{repository, update, previous} {
-		if candidate.isTarget(targetVersion) {
-			targetCount++
-		}
-	}
-	if targetCount > 1 {
+	if hasMultipleTargetRevisions(targetVersion, repository, update, previous) {
 		return RecoveryResult{}, recoveryAmbiguousError(
 			transaction.state.Stage,
 			"multiple_target_candidates",
@@ -372,10 +375,12 @@ func (r *Recovery) recoverSwap(
 				transaction.state.OperationID,
 				recoveryUpdateCleanupReason,
 				&result,
+				request.StageReporter,
+				false,
 			); err != nil {
 				return result, err
 			}
-			return r.finishRecovery(ctx, transaction, result)
+			return r.finishRecovery(ctx, transaction, result, request.StageReporter, false)
 		}
 
 	case repository.kind == recoveryPathMissing:
@@ -389,6 +394,7 @@ func (r *Recovery) recoverSwap(
 				paths.repository,
 				transaction.state.OperationID,
 				&result,
+				request.StageReporter,
 			); err != nil {
 				return result, err
 			}
@@ -399,10 +405,12 @@ func (r *Recovery) recoverSwap(
 				transaction.state.OperationID,
 				recoveryUpdateCleanupReason,
 				&result,
+				request.StageReporter,
+				true,
 			); err != nil {
 				return result, err
 			}
-			return r.finishRecovery(ctx, transaction, result)
+			return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
 
 		case update.isTarget(targetVersion) && previous.kind == recoveryPathMissing:
 			plan, err := r.prepareEnvironment(ctx, request, update.identity)
@@ -417,13 +425,14 @@ func (r *Recovery) recoverSwap(
 				paths.repository,
 				transaction.state.OperationID,
 				&result,
+				request.StageReporter,
 			); err != nil {
 				return result, err
 			}
-			if err := r.applyEnvironment(ctx, plan, &result); err != nil {
+			if err := r.applyEnvironment(ctx, plan, &result, request.StageReporter, true); err != nil {
 				return result, err
 			}
-			return r.finishRecovery(ctx, transaction, result)
+			return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
 
 		case update.kind == recoveryPathMissing && previous.kind == recoveryPathValid:
 			result := RecoveryResult{}
@@ -434,10 +443,11 @@ func (r *Recovery) recoverSwap(
 				paths.repository,
 				transaction.state.OperationID,
 				&result,
+				request.StageReporter,
 			); err != nil {
 				return result, err
 			}
-			return r.finishRecovery(ctx, transaction, result)
+			return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
 		}
 	}
 
@@ -446,6 +456,25 @@ func (r *Recovery) recoverSwap(
 		"swap_shape",
 		errRecoveryIdentityUnknown,
 	)
+}
+
+func hasMultipleTargetRevisions(targetVersion string, candidates ...recoveryPath) bool {
+	var first repositoryIdentity
+	found := false
+	for _, candidate := range candidates {
+		if !candidate.isTarget(targetVersion) {
+			continue
+		}
+		if !found {
+			first = candidate.identity
+			found = true
+			continue
+		}
+		if !first.sameRevision(candidate.identity) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Recovery) completeActiveTarget(
@@ -469,14 +498,16 @@ func (r *Recovery) completeActiveTarget(
 			transaction.state.OperationID,
 			recoveryPreviousCleanupReason,
 			&result,
+			request.StageReporter,
+			true,
 		); err != nil {
 			return result, err
 		}
 	}
-	if err := r.applyEnvironment(ctx, plan, &result); err != nil {
+	if err := r.applyEnvironment(ctx, plan, &result, request.StageReporter, true); err != nil {
 		return result, err
 	}
-	return r.finishRecovery(ctx, transaction, result)
+	return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
 }
 
 type environmentRecoveryPlan struct {
@@ -489,6 +520,8 @@ func (r *Recovery) prepareEnvironment(
 	request RecoveryRequest,
 	identity repositoryIdentity,
 ) (environmentRecoveryPlan, error) {
+	// 环境补写属于 swap 提交后的状态收口，必须与目录 rename 使用同一 stage。
+	reportRecoveryStage(request, protocol.StageWorkspaceSwap)
 	environment, err := r.store.ReadEnvironment(ctx)
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
 		if isCancellation(ctx, err) {
@@ -542,11 +575,17 @@ func (r *Recovery) applyEnvironment(
 	ctx context.Context,
 	plan environmentRecoveryPlan,
 	result *RecoveryResult,
+	reporter StageReporter,
+	committed bool,
 ) error {
 	if !plan.write {
 		return nil
 	}
+	reportRecoveryStageValue(reporter, protocol.StageWorkspaceSwap)
 	if err := r.store.WriteEnvironment(ctx, plan.value); err != nil {
+		if committed {
+			return mapCommittedTransactionWriteFailure(protocol.StageWorkspaceSwap, err)
+		}
 		return mapTransactionWriteFailure(ctx, protocol.StageWorkspaceSwap, err)
 	}
 	result.EnvironmentWritten = true
@@ -560,7 +599,10 @@ func (r *Recovery) renameRecoveryRepository(
 	destination string,
 	operationID string,
 	result *RecoveryResult,
+	reporter StageReporter,
 ) error {
+	// rename 是恢复阶段唯一的目录激活动作，先更新 stage 再调用受控句柄能力。
+	reportRecoveryStageValue(reporter, protocol.StageWorkspaceSwap)
 	renameResult, err := r.operator.AtomicRename(ctx, filesystem.RenameRequest{
 		Kind:        kind,
 		Source:      source,
@@ -585,7 +627,11 @@ func (r *Recovery) removeRecoveryTree(
 	operationID string,
 	reason string,
 	result *RecoveryResult,
+	reporter StageReporter,
+	committed bool,
 ) error {
+	// 删除 update/previous 属于 cleanup；Recovery 的调用方可据此正确关联 warning。
+	reportRecoveryStageValue(reporter, protocol.StageWorkspaceCleanup)
 	deleteResult, err := r.operator.RemoveTree(ctx, filesystem.DeleteRequest{
 		Kind:        kind,
 		Target:      target,
@@ -594,6 +640,9 @@ func (r *Recovery) removeRecoveryTree(
 	})
 	result.MutationApplied = result.MutationApplied || deleteResult.Removed || deleteResult.Partial
 	if err != nil {
+		if committed {
+			return mapCommittedCleanupFailure(deleteResult, err)
+		}
 		if isCancellation(ctx, err) {
 			return recoveryCancelledError(protocol.StageWorkspaceCleanup, err)
 		}
@@ -606,6 +655,9 @@ func (r *Recovery) removeRecoveryTree(
 		)
 	}
 	if deleteResult.Partial || !deleteResult.AuditCompleted {
+		if committed {
+			return mapCommittedCleanupFailure(deleteResult, errRecoveryCleanupIncomplete)
+		}
 		return newError(
 			protocol.CodeGitRepoCleanupFailed,
 			protocol.StageWorkspaceCleanup,
@@ -621,9 +673,15 @@ func (r *Recovery) finishRecovery(
 	ctx context.Context,
 	transaction recoveryTransaction,
 	result RecoveryResult,
+	reporter StageReporter,
+	committed bool,
 ) (RecoveryResult, error) {
+	reportRecoveryStageValue(reporter, protocol.StageWorkspaceCleanup)
 	if err := transaction.remove(ctx); err != nil {
-		return result, mapTransactionWriteFailure(ctx, transaction.state.Stage, err)
+		if committed {
+			return result, mapCommittedTransactionWriteFailure(protocol.StageWorkspaceCleanup, err)
+		}
+		return result, mapTransactionWriteFailure(ctx, protocol.StageWorkspaceCleanup, err)
 	}
 	result.Recovered = true
 	result.TransactionRemoved = true
@@ -678,3 +736,13 @@ var (
 	_ recoveryStateStore = (*stateRecoveryStore)(nil)
 	_ repositoryReader   = goGitRepositoryReader{}
 )
+
+func reportRecoveryStage(request RecoveryRequest, stage protocol.Stage) {
+	reportRecoveryStageValue(request.StageReporter, stage)
+}
+
+func reportRecoveryStageValue(reporter StageReporter, stage protocol.Stage) {
+	if reporter != nil {
+		reporter(stage)
+	}
+}

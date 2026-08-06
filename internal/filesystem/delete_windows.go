@@ -309,6 +309,11 @@ func (o *Operator) pinDeleteTarget(
 			Err:       attributeErr,
 		}
 	}
+	if !exists {
+		if err := rejectMissingReparseChain(ctx, target, o.api); err != nil {
+			return nil, false, err
+		}
+	}
 	pinnedTarget := target
 	if exists {
 		pinnedTarget, err = canonicalizeContextWith(ctx, filepath.Dir(target.String()), o.api)

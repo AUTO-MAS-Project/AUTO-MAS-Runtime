@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	swapRenameReason  = "git-repository-swap"
-	swapCleanupReason = "git-repository-retired"
+	swapRenameReason   = "git-repository-swap"
+	swapCleanupReason  = "git-repository-retired"
+	swapCleanupTimeout = 30 * time.Second
 )
 
 var (
@@ -44,8 +45,9 @@ type updateTransactionWriter interface {
 
 // SwapRequest 把已验证 Revision 绑定到当前 update transaction。
 type SwapRequest struct {
-	Transaction state.TransactionState
-	Revision    Revision
+	Transaction   state.TransactionState
+	Revision      Revision
+	StageReporter StageReporter
 }
 
 // SwapResult 保存目录副作用、激活提交点和旧目录收口事实。
@@ -96,6 +98,10 @@ func (s *Swapper) Swap(ctx context.Context, request SwapRequest) (SwapResult, er
 	if err := validateSwapRequest(request); err != nil {
 		return SwapResult{}, swapInternalError(err)
 	}
+	reportSwapStage(request, protocol.StageWorkspaceSwap)
+	if err := ctx.Err(); err != nil {
+		return SwapResult{}, swapCancelledError(err)
+	}
 	previousPath, err := s.layout.RepoPreviousDir(request.Transaction.OperationID)
 	if err != nil {
 		return SwapResult{}, swapInternalError(fmt.Errorf("derive previous repository path: %w", err))
@@ -112,8 +118,11 @@ func (s *Swapper) Swap(ctx context.Context, request SwapRequest) (SwapResult, er
 		return result, mapTransactionWriteFailure(ctx, protocol.StageWorkspaceSwap, err)
 	}
 
-	previousExists, err := pathExists(previousPath)
+	previousExists, err := pathExists(ctx, s.layout, previousPath)
 	if err != nil {
+		if isCancellation(ctx, err) {
+			return result, swapCancelledError(err)
+		}
 		return result, newError(
 			protocol.CodeUpdateStateAmbiguous,
 			protocol.StageWorkspaceSwap,
@@ -132,8 +141,11 @@ func (s *Swapper) Swap(ctx context.Context, request SwapRequest) (SwapResult, er
 		)
 	}
 
-	repositoryExists, err := pathExists(s.layout.RepoDir())
+	repositoryExists, err := pathExists(ctx, s.layout, s.layout.RepoDir())
 	if err != nil {
+		if isCancellation(ctx, err) {
+			return result, swapCancelledError(err)
+		}
 		return result, swapFailureError(protocol.StageWorkspaceSwap, err)
 	}
 	if repositoryExists {
@@ -169,20 +181,26 @@ func (s *Swapper) Swap(ctx context.Context, request SwapRequest) (SwapResult, er
 		return result, swapFailureError(protocol.StageWorkspaceSwap, errSwapNotApplied)
 	}
 
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		swapCleanupTimeout,
+	)
+	defer cancelCleanup()
 	cleanupTransaction := swapTransaction
 	cleanupTransaction.Stage = protocol.StageWorkspaceCleanup
-	if err := s.transactions.WriteTransaction(ctx, state.TransactionUpdate, cleanupTransaction); err != nil {
-		return result, mapTransactionWriteFailure(ctx, protocol.StageWorkspaceCleanup, err)
+	reportSwapStage(request, protocol.StageWorkspaceCleanup)
+	if err := s.transactions.WriteTransaction(cleanupCtx, state.TransactionUpdate, cleanupTransaction); err != nil {
+		return result, mapCommittedTransactionWriteFailure(protocol.StageWorkspaceCleanup, err)
 	}
 	if repositoryExists {
-		deleteResult, deleteErr := s.operator.RemoveTree(ctx, filesystem.DeleteRequest{
+		deleteResult, deleteErr := s.operator.RemoveTree(cleanupCtx, filesystem.DeleteRequest{
 			Kind:        filesystem.DeleteRepositoryRetired,
 			Target:      previousPath,
 			OperationID: request.Transaction.OperationID,
 			Reason:      swapCleanupReason,
 		})
 		if deleteErr != nil || deleteResult.Partial || !deleteResult.AuditCompleted {
-			return result, mapRetiredCleanupFailure(ctx, deleteResult, deleteErr)
+			return result, mapCommittedRetiredCleanupFailure(deleteResult, deleteErr)
 		}
 	}
 	result.CleanupCompleted = true
@@ -201,16 +219,12 @@ func validateSwapRequest(request SwapRequest) error {
 	return nil
 }
 
-func pathExists(path string) (bool, error) {
-	_, err := os.Lstat(path)
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, os.ErrNotExist):
-		return false, nil
-	default:
+func pathExists(ctx context.Context, layout *config.Layout, path string) (bool, error) {
+	inspection, err := filesystem.InspectManagedDirectory(ctx, layout, path)
+	if err != nil {
 		return false, fmt.Errorf("inspect repository path: %w", err)
 	}
+	return inspection.Exists, nil
 }
 
 func mapRenameFailure(ctx context.Context, cause error) *Error {
@@ -261,6 +275,16 @@ func mapTransactionWriteFailure(
 	)
 }
 
+func mapCommittedTransactionWriteFailure(stage protocol.Stage, cause error) *Error {
+	return newError(
+		protocol.CodeStateWriteFailed,
+		stage,
+		messageForCode(protocol.CodeStateWriteFailed),
+		map[string]any{},
+		cause,
+	)
+}
+
 func mapRetiredCleanupFailure(
 	ctx context.Context,
 	result filesystem.DeleteResult,
@@ -278,6 +302,33 @@ func mapRetiredCleanupFailure(
 	if cause == nil {
 		cause = fmt.Errorf(
 			"retired repository cleanup incomplete: partial=%t audit=%t",
+			result.Partial,
+			result.AuditCompleted,
+		)
+	}
+	return newError(
+		protocol.CodeGitRepoCleanupFailed,
+		protocol.StageWorkspaceCleanup,
+		messageForCode(protocol.CodeGitRepoCleanupFailed),
+		map[string]any{},
+		cause,
+	)
+}
+
+func mapCommittedRetiredCleanupFailure(
+	result filesystem.DeleteResult,
+	cause error,
+) *Error {
+	return mapCommittedCleanupFailure(result, cause)
+}
+
+func mapCommittedCleanupFailure(
+	result filesystem.DeleteResult,
+	cause error,
+) *Error {
+	if cause == nil {
+		cause = fmt.Errorf(
+			"repository cleanup incomplete: partial=%t audit=%t",
 			result.Partial,
 			result.AuditCompleted,
 		)
@@ -315,6 +366,22 @@ func swapInternalError(cause error) *Error {
 		map[string]any{},
 		cause,
 	)
+}
+
+func swapCancelledError(cause error) *Error {
+	return newError(
+		protocol.CodeOperationCancelled,
+		protocol.StageWorkspaceSwap,
+		messageForCode(protocol.CodeOperationCancelled),
+		map[string]any{},
+		cause,
+	)
+}
+
+func reportSwapStage(request SwapRequest, stage protocol.Stage) {
+	if request.StageReporter != nil {
+		request.StageReporter(stage)
+	}
 }
 
 var (

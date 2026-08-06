@@ -191,9 +191,9 @@ func equalStringSlices(left, right any) bool {
 	return true
 }
 
-// TestClassifyFailure_FallbackCodes 固定错误分类的三条优先级与兜底语义：
-// 取消先于一切；实现 operationError 的错误保留自己的四元组；无法映射的
-// 内部故障用 INTERNAL_ERROR 而不是 OUTPUT_WRITE_FAILED（T3.8 F13d）。
+// TestClassifyFailure_FallbackCodes 固定错误分类的优先级与兜底语义：
+// 类型化输出故障先于取消，其他取消先于业务码；实现 operationError 的错误
+// 保留自己的四元组；无法映射的内部故障用 INTERNAL_ERROR（T3.8 F13d）。
 func TestClassifyFailure_FallbackCodes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -205,6 +205,27 @@ func TestClassifyFailure_FallbackCodes(t *testing.T) {
 			name:     "wrapped cancellation wins",
 			err:      fmt.Errorf("run doctor: %w", context.Canceled),
 			wantCode: protocol.CodeOperationCancelled,
+		},
+		{
+			name:     "wrapped deadline wins",
+			err:      fmt.Errorf("run doctor: %w", context.DeadlineExceeded),
+			wantCode: protocol.CodeOperationCancelled,
+		},
+		{
+			name: "typed output failure wins over wrapped cancellation",
+			err: &commandError{
+				code:    protocol.CodeOutputWriteFailed,
+				stage:   protocol.StageWorkspaceClone,
+				message: "无法写入仓库同步进度",
+				details: map[string]any{},
+				cause:   fmt.Errorf("render progress: %w", context.Canceled),
+			},
+			wantCode: protocol.CodeOutputWriteFailed,
+		},
+		{
+			name:     "raw protocol output failure is classified",
+			err:      fmt.Errorf("progress emission: %w", protocol.ErrOutputWriteFailed),
+			wantCode: protocol.CodeOutputWriteFailed,
 		},
 		{
 			name: "operation error keeps its own code",

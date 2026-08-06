@@ -13,6 +13,8 @@ import (
 var (
 	// ErrResultAlreadyEmitted 表示调用方试图发射第二个终态 result。
 	ErrResultAlreadyEmitted = errors.New("protocol result already emitted")
+	// ErrOutputWriteFailed 表示 renderer 已无法把协议事件写到目标输出。
+	ErrOutputWriteFailed = errors.New("protocol output write failed")
 	// ErrEventAfterResult 表示调用方试图在终态 result 后继续发射非 result 事件。
 	ErrEventAfterResult = errors.New("protocol event emitted after result")
 )
@@ -28,6 +30,19 @@ type ProcessOutput struct {
 	terminal       bool
 	warnings       []WarningSummary
 	warningCount   uint64
+}
+
+// outputWriteError 保留既有诊断文本，同时让调用方能稳定识别输出通道故障。
+type outputWriteError struct {
+	cause error
+}
+
+func (e *outputWriteError) Error() string {
+	return "write protocol event: " + e.cause.Error()
+}
+
+func (e *outputWriteError) Unwrap() []error {
+	return []error{ErrOutputWriteFailed, e.cause}
 }
 
 // Emitter 通过 ProcessOutput 写出类型化协议事件。
@@ -359,7 +374,7 @@ func cloneJSONValue(value any) any {
 }
 
 func (o *ProcessOutput) rememberWriteError(err error) error {
-	o.writeErr = fmt.Errorf("write protocol event: %w", err)
+	o.writeErr = &outputWriteError{cause: err}
 	return o.writeErr
 }
 

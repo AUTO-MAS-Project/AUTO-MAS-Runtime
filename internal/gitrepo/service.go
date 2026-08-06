@@ -154,30 +154,38 @@ func (s *Service) Check(ctx context.Context) (CheckResult, error) {
 	if err := ctx.Err(); err != nil {
 		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
 	}
-	rootInfo, err := os.Lstat(s.layout.AppRoot())
-	if errors.Is(err, os.ErrNotExist) {
-		return CheckResult{Reason: "missing"}, nil
+	root, err := filesystem.InspectManagedDirectory(ctx, s.layout, s.layout.AppRoot())
+	if isCancellation(ctx, err) {
+		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
+	}
+	if errors.Is(err, filesystem.ErrIdentityChanged) || isUnsafeManagedPath(err) {
+		return CheckResult{Reason: "invalid"}, nil
 	}
 	if err != nil {
 		return CheckResult{}, serviceCheckReadError(err)
 	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return CheckResult{Reason: "invalid"}, nil
-	}
-
-	repositoryInfo, err := os.Lstat(s.layout.RepoDir())
-	if errors.Is(err, os.ErrNotExist) {
+	if !root.Exists {
 		return CheckResult{Reason: "missing"}, nil
+	}
+	repository, err := filesystem.InspectManagedDirectory(ctx, s.layout, s.layout.RepoDir())
+	if isCancellation(ctx, err) {
+		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
+	}
+	if errors.Is(err, filesystem.ErrIdentityChanged) || isUnsafeManagedPath(err) {
+		return CheckResult{Reason: "invalid"}, nil
 	}
 	if err != nil {
 		return CheckResult{}, serviceCheckReadError(err)
 	}
-	if !repositoryInfo.IsDir() || repositoryInfo.Mode()&os.ModeSymlink != 0 {
-		return CheckResult{Reason: "invalid"}, nil
+	if !repository.Exists {
+		return CheckResult{Reason: "missing"}, nil
 	}
 
 	snapshot, err := s.reader.Inspect(ctx, s.layout.RepoDir())
 	if err := ctx.Err(); err != nil {
+		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
+	}
+	if isCancellation(ctx, err) {
 		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
 	}
 	if err != nil {
@@ -208,7 +216,8 @@ func (s *Service) Check(ctx context.Context) (CheckResult, error) {
 
 // Sync 按冻结顺序执行锁协调、恢复、Git 获取、整体替换和环境失效持久化。
 func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncResult, returnErr error) {
-	if ctx == nil {
+	if ctx == nil || s == nil || s.layout == nil || nilDependency(s.reader) ||
+		s.newLocks == nil || s.newRuntime == nil || s.buildPlan == nil {
 		return SyncResult{}, serviceInternalError(protocol.StageWorkspaceClone, errInvalidServiceRequest)
 	}
 	if err := validateSyncRequest(request); err != nil {
@@ -220,7 +229,13 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	if err := ctx.Err(); err != nil {
 		return SyncResult{}, serviceCancelledError(protocol.StageWorkspaceClone, err)
 	}
-	if err := requireExistingDirectory(s.layout.AppRoot()); err != nil {
+	if err := requireExistingDirectory(ctx, s.layout); err != nil {
+		if isCancellation(ctx, err) {
+			return SyncResult{}, serviceCancelledError(protocol.StageWorkspaceClone, err)
+		}
+		if code, ok := filesystemOperationCode(err); ok {
+			return SyncResult{}, newError(code, protocol.StageWorkspaceClone, messageForCode(code), map[string]any{}, err)
+		}
 		return SyncResult{}, serviceInvalidArgumentError(err)
 	}
 
@@ -263,7 +278,10 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	}
 
 	setStage(request, protocol.StageWorkspaceCleanup)
-	_, err = runtime.Recover(ctx, RecoveryRequest{LogPath: logger.LogPath()})
+	_, err = runtime.Recover(ctx, RecoveryRequest{
+		LogPath:       logger.LogPath(),
+		StageReporter: request.StageReporter,
+	})
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -297,10 +315,10 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		Stage:         protocol.StageWorkspaceClone,
 	})
 	if err != nil {
-		return SyncResult{}, serviceStateWriteError(protocol.StageWorkspaceClone, err)
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceClone, err))
 	}
 	if err := runtime.WriteTransaction(ctx, state.TransactionMutation, mutation); err != nil {
-		return SyncResult{}, mapStateWriteError(protocol.StageWorkspaceClone, err)
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, mapStateWriteError(protocol.StageWorkspaceClone, err))
 	}
 
 	check, err := s.Check(ctx)
@@ -309,6 +327,7 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	}
 	if check.Healthy && check.Version == request.Target.Version() &&
 		check.Branch == request.Target.Branch() {
+		setStage(request, protocol.StageWorkspaceCleanup)
 		if err := removeTransaction(ctx, runtime, state.TransactionMutation); err != nil {
 			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 		}
@@ -352,78 +371,88 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	if err := runtime.WriteTransaction(ctx, state.TransactionUpdate, update); err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, mapStateWriteError(protocol.StageWorkspaceClone, err))
 	}
+	setStage(request, protocol.StageWorkspaceClone)
 	if err := advanceTransactions(ctx, runtime, &mutation, &update, protocol.StageWorkspaceClone); err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
 
-	setStage(request, protocol.StageWorkspaceClone)
 	fetched, err := runtime.Fetch(ctx, FetchRequest{
-		Plan:        plan,
-		Target:      request.Target,
-		OperationID: request.OperationID,
+		Plan:          plan,
+		Target:        request.Target,
+		OperationID:   request.OperationID,
+		StageReporter: request.StageReporter,
 	})
 	if err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
+	setStage(request, protocol.StageWorkspaceVerify)
 	if err := advanceTransactions(ctx, runtime, &mutation, &update, protocol.StageWorkspaceVerify); err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
-	setStage(request, protocol.StageWorkspaceVerify)
 
 	setStage(request, protocol.StageWorkspaceSwap)
-	swapResult, swapErr := runtime.Swap(ctx, SwapRequest{Transaction: update, Revision: fetched.Revision})
+	swapResult, swapErr := runtime.Swap(ctx, SwapRequest{
+		Transaction:   update,
+		Revision:      fetched.Revision,
+		StageReporter: request.StageReporter,
+	})
 	active := swapResult.RepositoryActivated
-	if swapErr != nil && !active {
+	if !active {
+		if swapErr == nil {
+			swapErr = serviceInternalError(protocol.StageWorkspaceSwap, errors.New("repository swap did not activate target"))
+		}
+		if swapResult.MutationApplied {
+			if recoveryErr := s.recoverPartialSwap(ctx, request, runtime, logger.LogPath()); recoveryErr != nil {
+				return SyncResult{}, errors.Join(recoveryErr, swapErr)
+			}
+		}
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, swapErr)
 	}
-	if err := advanceMutation(ctx, runtime, &mutation, protocol.StageWorkspaceCleanup); err != nil && active {
-		swapErr = errors.Join(swapErr, err)
+	commitContext, cancelCommit := serviceCleanupContext(ctx)
+	defer cancelCommit()
+	setStage(request, protocol.StageWorkspaceCleanup)
+	if err := advanceMutation(commitContext, runtime, &mutation, protocol.StageWorkspaceCleanup); err != nil {
+		swapErr = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceCleanup, err), swapErr)
 	}
-	if active {
-		setStage(request, protocol.StageWorkspaceCleanup)
-		setStage(request, protocol.StageWorkspaceSwap)
-		broken, buildErr := runtime.NewBrokenEnvironment(environment.LastSuccessful, state.BrokenEnvironment{
-			TargetVersion: fetched.Revision.Version(),
-			Branch:        fetched.Revision.Branch(),
-			Commit:        fetched.Revision.Commit(),
-			Reason:        state.ReasonRepositoryChanged,
-			Stage:         protocol.StageWorkspaceSwap,
-			ExitCode:      0,
-			LogPath:       logger.LogPath(),
-		})
-		if buildErr != nil {
-			swapErr = errors.Join(swapErr, serviceStateWriteError(protocol.StageWorkspaceSwap, buildErr))
-		} else if writeErr := runtime.WriteEnvironment(ctx, broken); writeErr != nil {
-			swapErr = errors.Join(swapErr, mapStateWriteError(protocol.StageWorkspaceSwap, writeErr))
-		} else if transitionErr := machine.Transition(protocol.StateEnvironmentBroken); transitionErr != nil {
-			swapErr = errors.Join(swapErr, serviceInternalError(protocol.StageWorkspaceSwap, transitionErr))
-		} else if stateErr := emitState(request, protocol.StageWorkspaceSwap, protocol.StateEnvironmentBroken, "后端仓库已更新，主环境需要重新准备", map[string]any{
-			"version": fetched.Revision.Version(),
-			"branch":  fetched.Revision.Branch(),
-			"commit":  fetched.Revision.Commit(),
-		}); stateErr != nil {
-			swapErr = errors.Join(swapErr, stateErr)
-		}
-		if swapErr != nil {
-			return SyncResult{}, swapErr
-		}
-		if err := removeTransaction(ctx, runtime, state.TransactionUpdate); err != nil {
-			return SyncResult{}, err
-		}
-		if err := removeTransaction(ctx, runtime, state.TransactionMutation); err != nil {
-			return SyncResult{}, err
-		}
-		return SyncResult{
-			Revision:         fetched.Revision,
-			Changed:          true,
-			Status:           protocol.StateEnvironmentBroken,
-			ControlCommandID: controlCommandID(request),
-		}, nil
+	setStage(request, protocol.StageWorkspaceSwap)
+	broken, buildErr := runtime.NewBrokenEnvironment(environment.LastSuccessful, state.BrokenEnvironment{
+		TargetVersion: fetched.Revision.Version(),
+		Branch:        fetched.Revision.Branch(),
+		Commit:        fetched.Revision.Commit(),
+		Reason:        state.ReasonRepositoryChanged,
+		Stage:         protocol.StageWorkspaceSwap,
+		ExitCode:      0,
+		LogPath:       logger.LogPath(),
+	})
+	if buildErr != nil {
+		swapErr = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceSwap, buildErr), swapErr)
+	} else if writeErr := runtime.WriteEnvironment(commitContext, broken); writeErr != nil {
+		swapErr = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceSwap, writeErr), swapErr)
+	} else if transitionErr := machine.Transition(protocol.StateEnvironmentBroken); transitionErr != nil {
+		swapErr = joinPrimaryError(serviceInternalError(protocol.StageWorkspaceSwap, transitionErr), swapErr)
+	} else if stateErr := emitState(request, protocol.StageWorkspaceSwap, protocol.StateEnvironmentBroken, "后端仓库已更新，主环境需要重新准备", map[string]any{
+		"version": fetched.Revision.Version(),
+		"branch":  fetched.Revision.Branch(),
+		"commit":  fetched.Revision.Commit(),
+	}); stateErr != nil {
+		swapErr = joinPrimaryError(stateErr, swapErr)
 	}
 	if swapErr != nil {
-		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, swapErr)
+		return SyncResult{}, swapErr
 	}
-	return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceInternalError(protocol.StageWorkspaceSwap, errors.New("repository swap did not activate target")))
+	setStage(request, protocol.StageWorkspaceCleanup)
+	if err := removeTransaction(commitContext, runtime, state.TransactionUpdate); err != nil {
+		return SyncResult{}, serviceStateWriteError(protocol.StageWorkspaceCleanup, err)
+	}
+	if err := removeTransaction(commitContext, runtime, state.TransactionMutation); err != nil {
+		return SyncResult{}, serviceStateWriteError(protocol.StageWorkspaceCleanup, err)
+	}
+	return SyncResult{
+		Revision:         fetched.Revision,
+		Changed:          true,
+		Status:           protocol.StateEnvironmentBroken,
+		ControlCommandID: controlCommandID(request),
+	}, nil
 }
 
 func (s *Service) finishPreSwap(
@@ -433,6 +462,7 @@ func (s *Service) finishPreSwap(
 	machine *protocol.LifecycleMachine,
 	cause error,
 ) error {
+	setStage(request, protocol.StageWorkspaceCleanup)
 	if machine != nil {
 		if rollbackErr := machine.RollbackPreparation(); rollbackErr == nil {
 			if emitErr := emitState(request, protocol.StageWorkspaceCleanup, machine.Initial(), "仓库同步未改变当前工作区", map[string]any{}); emitErr != nil {
@@ -442,7 +472,7 @@ func (s *Service) finishPreSwap(
 	}
 	cleanupContext, cancel := serviceCleanupContext(ctx)
 	defer cancel()
-	if !preserveUpdateTransaction(s.layout, request.OperationID, cause) {
+	if !preserveUpdateTransaction(cleanupContext, s.layout, request.OperationID, cause) {
 		if cleanupErr := removeTransaction(cleanupContext, runtime, state.TransactionUpdate); cleanupErr != nil {
 			cause = errors.Join(cause, cleanupErr)
 		}
@@ -451,6 +481,28 @@ func (s *Service) finishPreSwap(
 		cause = errors.Join(cause, cleanupErr)
 	}
 	return cause
+}
+
+func (s *Service) recoverPartialSwap(
+	ctx context.Context,
+	request SyncRequest,
+	runtime syncRuntime,
+	logPath string,
+) error {
+	cleanupContext, cancel := serviceCleanupContext(ctx)
+	defer cancel()
+	setStage(request, protocol.StageWorkspaceCleanup)
+	result, err := runtime.Recover(cleanupContext, RecoveryRequest{
+		LogPath:       logPath,
+		StageReporter: request.StageReporter,
+	})
+	if err != nil {
+		return err
+	}
+	if !result.Recovered || !result.TransactionRemoved {
+		return serviceInternalError(protocol.StageWorkspaceCleanup, errors.New("partial swap recovery did not complete"))
+	}
+	return nil
 }
 
 func (s *Service) cancelBeforeSwap(
@@ -473,10 +525,20 @@ func (s *Service) cancelBeforeSwap(
 }
 
 func serviceCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx == nil || ctx.Err() == nil {
-		return ctx, func() {}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	return context.WithTimeout(context.WithoutCancel(ctx), serviceCleanupTimeout)
+}
+
+func joinPrimaryError(primary, secondary error) error {
+	if primary == nil {
+		return secondary
+	}
+	if secondary == nil {
+		return primary
+	}
+	return errors.Join(primary, secondary)
 }
 
 func readStableEnvironment(
@@ -545,7 +607,12 @@ func removeTransaction(
 	return nil
 }
 
-func preserveUpdateTransaction(layout *config.Layout, operationID string, cause error) bool {
+func preserveUpdateTransaction(
+	ctx context.Context,
+	layout *config.Layout,
+	operationID string,
+	cause error,
+) bool {
 	if layout == nil || operationID == "" {
 		return true
 	}
@@ -553,11 +620,11 @@ func preserveUpdateTransaction(layout *config.Layout, operationID string, cause 
 	if err != nil {
 		return true
 	}
-	_, err = os.Lstat(path)
-	if err == nil {
+	inspection, err := filesystem.InspectManagedDirectory(ctx, layout, path)
+	if err != nil {
 		return true
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	if inspection.Exists {
 		return true
 	}
 	var operationErr *Error
@@ -583,15 +650,39 @@ func validateSyncRequest(request SyncRequest) error {
 	return nil
 }
 
-func requireExistingDirectory(path string) error {
-	info, err := os.Lstat(path)
+func requireExistingDirectory(ctx context.Context, layout *config.Layout) error {
+	inspection, err := filesystem.InspectManagedDirectory(ctx, layout, layout.AppRoot())
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("app root is not a directory")
+	if !inspection.Exists {
+		return errors.New("app root does not exist")
 	}
 	return nil
+}
+
+func isUnsafeManagedPath(err error) bool {
+	var coded interface{ Code() protocol.Code }
+	if errors.As(err, &coded) {
+		switch coded.Code() {
+		case protocol.CodeUnsafeReparsePoint, protocol.CodePathOutsideManagedRoot:
+			return true
+		}
+	}
+	return errors.Is(err, filesystem.ErrUnsupportedCaseSensitivity)
+}
+
+func filesystemOperationCode(err error) (protocol.Code, bool) {
+	var coded interface{ Code() protocol.Code }
+	if !errors.As(err, &coded) {
+		return "", false
+	}
+	switch coded.Code() {
+	case protocol.CodePathOutsideManagedRoot, protocol.CodeUnsafeReparsePoint:
+		return coded.Code(), true
+	default:
+		return "", false
+	}
 }
 
 func checkSnapshotReason(snapshot repositorySnapshot) string {
@@ -844,22 +935,22 @@ func joinServiceCloseError(
 ) error {
 	if runtime != nil {
 		if err := runtime.Close(); err != nil {
-			current = errors.Join(current, serviceStateWriteError(protocol.StageWorkspaceCleanup, err))
+			current = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceCleanup, err), current)
 		}
 	}
 	if lease != nil {
 		if err := lease.Close(); err != nil {
-			current = errors.Join(current, mapMutexFailure(err))
+			current = joinPrimaryError(mapMutexFailure(err), current)
 		}
 	}
 	if locks != nil {
 		if err := locks.Close(); err != nil {
-			current = errors.Join(current, mapMutexFailure(err))
+			current = joinPrimaryError(mapMutexFailure(err), current)
 		}
 	}
 	if logger != nil {
 		if err := logger.Close(); err != nil {
-			current = errors.Join(current, serviceInternalError(protocol.StageWorkspaceCleanup, err))
+			current = joinPrimaryError(serviceInternalError(protocol.StageWorkspaceCleanup, err), current)
 		}
 	}
 	return current

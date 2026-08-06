@@ -331,6 +331,9 @@ func TestRendererFailureIsSticky(t *testing.T) {
 	if warningErr == nil || warningErr.Error() != "write protocol event: renderer failed" {
 		t.Fatalf("EmitWarning() error = %v, want wrapped renderer error", warningErr)
 	}
+	if !errors.Is(warningErr, protocol.ErrOutputWriteFailed) {
+		t.Fatalf("EmitWarning() error = %v, want ErrOutputWriteFailed", warningErr)
+	}
 	progressErr := emitter.EmitProgress(protocol.ProgressEvent{})
 	if progressErr != warningErr {
 		t.Errorf("subsequent error = %v, want same error value %v", progressErr, warningErr)
@@ -492,7 +495,7 @@ func testNDJSONWriteFailureIsSticky(t *testing.T, name, message string, destinat
 		t.Fatalf("NewEmitter() error = %v, want successful hello", err)
 	}
 	firstErr := emitter.EmitLog(protocol.LogEvent{Message: message})
-	if firstErr == nil || !errors.Is(firstErr, sentinel) || firstErr.Error() != "write protocol event: "+sentinel.Error() {
+	if firstErr == nil || !errors.Is(firstErr, sentinel) || !errors.Is(firstErr, protocol.ErrOutputWriteFailed) || firstErr.Error() != "write protocol event: "+sentinel.Error() {
 		t.Fatalf("EmitLog() error = %v, want wrapped sentinel", firstErr)
 	}
 	lines := ndjsonLines(t, contents())
