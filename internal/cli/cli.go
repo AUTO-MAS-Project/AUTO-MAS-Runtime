@@ -11,6 +11,8 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
@@ -23,10 +25,12 @@ type IO struct {
 }
 
 type options struct {
-	cwd           string
-	clock         func() time.Time
-	versionSource versionSourceFunc
-	doctorFactory doctorFactory
+	cwd                    string
+	clock                  func() time.Time
+	versionSource          versionSourceFunc
+	doctorFactory          doctorFactory
+	workspaceFactory       workspaceFactory
+	workspaceLoggerFactory workspaceLoggerFactory
 }
 
 // Option 配置 Execute 的可注入测试依赖。
@@ -61,6 +65,26 @@ func applyOptions(values ...Option) (options, error) {
 		versionSource: version.Load,
 		doctorFactory: func(layout *config.Layout, probes doctor.Probes) (doctorService, error) {
 			return doctor.New(layout, probes)
+		},
+		workspaceFactory: func(layout *config.Layout) (workspaceService, error) {
+			return gitrepo.NewService(layout)
+		},
+		workspaceLoggerFactory: func(
+			ctx context.Context,
+			layout *config.Layout,
+			stderr io.Writer,
+			command string,
+			operationID string,
+			clock func() time.Time,
+		) (workspaceLogger, error) {
+			return logging.New(
+				ctx,
+				layout,
+				stderr,
+				command,
+				operationID,
+				logging.WithClock(clock),
+			)
 		},
 	}
 	for _, option := range values {

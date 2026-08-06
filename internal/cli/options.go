@@ -3,9 +3,14 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
@@ -42,3 +47,56 @@ func WithDoctorFactory(factory doctorFactory) Option {
 		return nil
 	}
 }
+
+// workspaceService 是 cli 消费的 workspace 应用服务窄接口。
+type workspaceService interface {
+	Check(ctx context.Context) (gitrepo.CheckResult, error)
+	Sync(ctx context.Context, request gitrepo.SyncRequest) (gitrepo.SyncResult, error)
+}
+
+// workspaceFactory 构造只在调用方法时产生副作用的 workspace 服务。
+type workspaceFactory func(layout *config.Layout) (workspaceService, error)
+
+// WithWorkspaceFactory 注入 workspace 服务工厂，供命令与契约测试隔离真实 Git/Mutex。
+func WithWorkspaceFactory(factory workspaceFactory) Option {
+	return func(values *options) error {
+		if factory == nil {
+			return errors.New("cli workspace factory must not be nil")
+		}
+		values.workspaceFactory = factory
+		return nil
+	}
+}
+
+// workspaceLogger 是本次同步日志与删除审计共用的窄能力。
+type workspaceLogger interface {
+	gitrepo.OperationLogger
+	Record(
+		ctx context.Context,
+		level logging.Level,
+		message string,
+		details map[string]any,
+	) (logging.WriteResult, error)
+}
+
+type workspaceLoggerFactory func(
+	ctx context.Context,
+	layout *config.Layout,
+	stderr io.Writer,
+	command string,
+	operationID string,
+	clock func() time.Time,
+) (workspaceLogger, error)
+
+// WithWorkspaceLoggerFactory 注入 Runtime logger 工厂，主要供取消与契约测试使用。
+func WithWorkspaceLoggerFactory(factory workspaceLoggerFactory) Option {
+	return func(values *options) error {
+		if factory == nil {
+			return errors.New("cli workspace logger factory must not be nil")
+		}
+		values.workspaceLoggerFactory = factory
+		return nil
+	}
+}
+
+var _ filesystem.Auditor = (*workspaceLogBinding)(nil)

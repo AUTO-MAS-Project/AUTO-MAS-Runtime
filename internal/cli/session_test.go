@@ -133,8 +133,6 @@ func TestExecute_UnimplementedCommandStableError(t *testing.T) {
 	t.Parallel()
 	commands := []string{
 		"bootstrap",
-		"workspace check",
-		"workspace sync",
 		"environment check",
 		"environment ensure",
 		"environment repair",

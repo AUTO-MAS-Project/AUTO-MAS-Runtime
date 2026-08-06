@@ -15,6 +15,7 @@ const devRuntimeVersion = "dev"
 type sessionSuccess struct {
 	message string
 	details map[string]any
+	status  string
 }
 
 // runOperation 是 hello → 执行 → result 的统一协议会话框架。
@@ -26,6 +27,17 @@ func runOperation(
 	stage protocol.Stage,
 	run func(context.Context, *protocol.Emitter) (sessionSuccess, error),
 ) int {
+	return runOperationWithCapabilities(ctx, deps, command, stage, nil, run)
+}
+
+func runOperationWithCapabilities(
+	ctx context.Context,
+	deps *deps,
+	command string,
+	stage protocol.Stage,
+	capabilities []string,
+	run func(context.Context, *protocol.Emitter) (sessionSuccess, error),
+) int {
 	output, err := newProcessOutput(deps)
 	if err != nil {
 		return sessionSetupFailure(deps, err)
@@ -34,7 +46,7 @@ func runOperation(
 	emitter, err := output.NewEmitter(
 		runtimeVersion,
 		command,
-		[]string{},
+		capabilities,
 		protocol.WithClock(deps.options.clock),
 	)
 	if err != nil {
@@ -88,7 +100,11 @@ func sessionSetupFailure(deps *deps, err error) int {
 }
 
 func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, success sessionSuccess) int {
-	result := protocol.NewSuccessResult(stage, "succeeded", success.message, success.details)
+	status := success.status
+	if status == "" {
+		status = "succeeded"
+	}
+	result := protocol.NewSuccessResult(stage, status, success.message, success.details)
 	if err := emitter.EmitResult(result); err != nil {
 		writeDiagnostic(deps.io, err)
 		return protocol.ExitCodePreconditionFailed
@@ -129,7 +145,18 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 // （T3.8 F13d）。真正的输出写失败由各服务显式映射 OUTPUT_WRITE_FAILED。
 func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, protocol.Stage, string, map[string]any) {
 	if errors.Is(err, context.Canceled) {
-		return protocol.CodeOperationCancelled, fallbackStage, "操作已取消", map[string]any{}
+		stage := fallbackStage
+		details := map[string]any{}
+		var operationErr operationError
+		if errors.As(err, &operationErr) {
+			if protocol.IsKnownStage(operationErr.Stage()) {
+				stage = operationErr.Stage()
+			}
+			for key, value := range operationErr.Details() {
+				details[key] = value
+			}
+		}
+		return protocol.CodeOperationCancelled, stage, "操作已取消", details
 	}
 	var operationErr operationError
 	if errors.As(err, &operationErr) {

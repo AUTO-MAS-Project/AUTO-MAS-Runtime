@@ -82,6 +82,8 @@ func (e *Error) Details() map[string]any {
 
 func messageForCode(code protocol.Code) string {
 	switch code {
+	case protocol.CodeInvalidArgument:
+		return "应用根目录无效"
 	case protocol.CodeInvalidVersion:
 		return "目标版本无效"
 	case protocol.CodeOperationCancelled:
@@ -90,6 +92,12 @@ func messageForCode(code protocol.Code) string {
 		return "无法写入仓库同步进度"
 	case protocol.CodeDirectoryOccupied:
 		return "仓库目录正在被占用"
+	case protocol.CodeMutationInProgress:
+		return "另一个受管变更正在进行"
+	case protocol.CodeBackendStillRunning:
+		return "后端仍在运行"
+	case protocol.CodeMutexOperationFailed:
+		return "无法协调仓库同步锁"
 	case protocol.CodeStateWriteFailed:
 		return "无法写入仓库更新状态"
 	case protocol.CodeNetworkUnavailable:

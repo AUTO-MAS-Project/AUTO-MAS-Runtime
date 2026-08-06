@@ -145,16 +145,10 @@ func bootstrapCommand(deps *deps) *cobra.Command {
 func workspaceGroup(deps *deps) *cobra.Command {
 	group := &cobra.Command{Use: "workspace", Short: "受管后端仓库操作"}
 	group.AddCommand(
-		skeletonCommand(deps, "check", "只读检查受管仓库", protocol.StageWorkspaceCheck),
+		workspaceCheckCommand(deps),
 		workspaceSyncCommand(deps),
 	)
 	return group
-}
-
-func workspaceSyncCommand(deps *deps) *cobra.Command {
-	command := skeletonCommand(deps, "sync", "同步受管仓库到目标版本", protocol.StageWorkspaceSwap)
-	command.Flags().String("version", "", "目标版本（例如 v5.4.0-beta.1）")
-	return command
 }
 
 func environmentGroup(deps *deps) *cobra.Command {
