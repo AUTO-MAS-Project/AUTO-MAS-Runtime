@@ -151,6 +151,83 @@ func TestPrepareManagedDirectory_CancellationAfterCreateRemovesCreatedTarget(t *
 	}
 }
 
+func TestPrepareManagedDirectory_CloseFailurePreservesCreatedTarget(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.Mkdir(appRoot, 0o700); err != nil {
+		t.Fatalf("os.Mkdir(app-root) error = %v", err)
+	}
+	layout := directoryTestLayout(t, appRoot, root)
+	target := filepath.Join(layout.AppRoot(), "repo.update-close-failure")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	api := newProductionPathAPI()
+	originalCreate := api.ntCreateRelative
+	originalIdentity := api.identity
+	originalOpenRelative := api.openRelative
+	originalClose := api.closeHandle
+	createdHandle := windows.InvalidHandle
+	closeCalls := 0
+	deleteOpenCalls := 0
+	api.ntCreateRelative = func(
+		parent windows.Handle,
+		name string,
+		spec ntCreateSpec,
+	) (windows.Handle, error) {
+		handle, err := originalCreate(parent, name, spec)
+		if err == nil {
+			createdHandle = handle
+		}
+		return handle, err
+	}
+	api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		value, err := originalIdentity(handle)
+		if err == nil && handle == createdHandle {
+			cancel()
+		}
+		return value, err
+	}
+	api.openRelative = func(
+		parent windows.Handle,
+		name string,
+		spec openSpec,
+	) (windows.Handle, error) {
+		if spec.access&windows.DELETE != 0 {
+			deleteOpenCalls++
+		}
+		return originalOpenRelative(parent, name, spec)
+	}
+	api.closeHandle = func(handle windows.Handle) error {
+		if handle == createdHandle {
+			closeCalls++
+			return errors.New("injected close failure")
+		}
+		return originalClose(handle)
+	}
+
+	lease, err := prepareManagedDirectoryWithAPI(ctx, layout, target, api)
+	if lease != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepareManagedDirectoryWithAPI() = lease:%v err:%v, want cancellation", lease, err)
+	}
+	if got, want := closeCalls, managedDirectoryCloseAttempts; got != want {
+		t.Fatalf("created handle close calls = %d, want %d", got, want)
+	}
+	if deleteOpenCalls != 0 {
+		t.Fatalf("delete reopen calls = %d, want 0 after close exhaustion", deleteOpenCalls)
+	}
+	if _, statErr := os.Lstat(target); statErr != nil {
+		t.Fatalf("created target was removed after close exhaustion: %v", statErr)
+	}
+	if createdHandle != windows.InvalidHandle {
+		if closeErr := originalClose(createdHandle); closeErr != nil {
+			t.Fatalf("close injected handle for test cleanup: %v", closeErr)
+		}
+	}
+	if removeErr := os.Remove(target); removeErr != nil {
+		t.Fatalf("remove preserved target after test cleanup: %v", removeErr)
+	}
+}
+
 func TestPrepareManagedDirectory_RejectsReparseReplacement(t *testing.T) {
 	root := t.TempDir()
 	appRoot := filepath.Join(root, "app")

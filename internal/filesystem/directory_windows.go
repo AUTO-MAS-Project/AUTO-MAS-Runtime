@@ -149,9 +149,12 @@ func prepareManagedDirectoryWithAPI(
 		))
 	}
 	cleanupCreated := func(operationErr error) (*DirectoryLease, error) {
+		closeErr := closeHandleWithRetry(handle, target.String(), api)
+		if closeErr != nil {
+			return fail(errors.Join(operationErr, closeErr))
+		}
 		return fail(errors.Join(
 			operationErr,
-			closeHandleWithRetry(handle, target.String(), api),
 			deleteCreatedDirectory(chain.objects[len(chain.objects)-1], leaf, target, identity, api),
 		))
 	}
