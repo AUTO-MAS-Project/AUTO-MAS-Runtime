@@ -55,7 +55,8 @@ func validVersion(version string) bool {
 	}
 	if strings.Contains(version, "..") ||
 		strings.Contains(version, "@{") ||
-		strings.HasSuffix(version, ".") {
+		strings.HasSuffix(version, ".") ||
+		strings.HasSuffix(version, ".lock") {
 		return false
 	}
 	for i := 1; i < len(version); i++ {

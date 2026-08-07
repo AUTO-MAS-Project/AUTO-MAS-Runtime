@@ -249,6 +249,7 @@ func (goGitRepositoryReader) Inspect(
 	}
 	for {
 		if err := ctx.Err(); err != nil {
+			// go-git 的 ReferenceIter.Close 无返回值，只能尽力释放迭代器。
 			tags.Close()
 			return repositorySnapshot{}, err
 		}
@@ -262,6 +263,7 @@ func (goGitRepositoryReader) Inspect(
 		}
 		snapshot.tags = append(snapshot.tags, reference.Name().String())
 	}
+	// go-git 的 ReferenceIter.Close 无返回值；调用仅用于释放迭代器。
 	tags.Close()
 
 	versionFile, err := commit.File(repositoryVersionTreePath)

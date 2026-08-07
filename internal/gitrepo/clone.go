@@ -26,6 +26,7 @@ import (
 const (
 	maxCloneProgressPulses = 64
 	cloneCleanupTimeout    = 30 * time.Second
+	directoryCloseAttempts = 3
 
 	cloneProgressStartMessage     = "正在获取后端仓库"
 	cloneProgressPulseMessage     = "正在接收后端仓库数据"
@@ -45,7 +46,10 @@ const (
 	failureVerifierContract  mirror.FailureKind = "verifier_contract"
 )
 
-var ErrInvalidFetcher = errors.New("git fetcher is invalid")
+var (
+	ErrInvalidFetcher           = errors.New("git fetcher is invalid")
+	errDirectoryIdentityMissing = errors.New("verified repository directory identity is unavailable")
+)
 
 // FetchRequest 固定一次 Git 获取操作的目标、镜像计划和目录所有者。
 type FetchRequest struct {
@@ -57,8 +61,9 @@ type FetchRequest struct {
 
 // FetchResult 保存已验证临时仓库的安全路径和最终来源事实。
 type FetchResult struct {
-	RepositoryPath string
-	Revision       Revision
+	RepositoryPath    string
+	Revision          Revision
+	DirectoryIdentity *filesystem.DirectoryIdentity
 }
 
 type rotationRunner interface {
@@ -88,6 +93,7 @@ type treeRemover interface {
 
 type directoryLease interface {
 	Close() error
+	Identity() *filesystem.DirectoryIdentity
 }
 
 type directoryPreparer func(
@@ -247,12 +253,15 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 		)
 	}
 
+	var directoryIdentity *filesystem.DirectoryIdentity
 	rotationResult, err := f.rotator.Run(
 		ctx,
 		request.Plan,
 		mirrorTarget,
 		func(attemptCtx context.Context, attempt mirror.Attempt) mirror.AttemptOutcome {
-			return f.fetchAttempt(attemptCtx, request, repositoryPath, attempt)
+			return f.fetchAttempt(attemptCtx, request, repositoryPath, attempt, func(identity *filesystem.DirectoryIdentity) {
+				directoryIdentity = identity
+			})
 		},
 	)
 	if err != nil {
@@ -273,8 +282,9 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 		)
 	}
 	return FetchResult{
-		RepositoryPath: repositoryPath,
-		Revision:       revision,
+		RepositoryPath:    repositoryPath,
+		Revision:          revision,
+		DirectoryIdentity: directoryIdentity,
 	}, nil
 }
 
@@ -283,6 +293,7 @@ func (f *Fetcher) fetchAttempt(
 	request FetchRequest,
 	repositoryPath string,
 	attempt mirror.Attempt,
+	captureDirectoryIdentity func(*filesystem.DirectoryIdentity),
 ) mirror.AttemptOutcome {
 	reportFetchStage(request, protocol.StageWorkspaceClone)
 	if attempt.Target.ProductVersion() != request.Target.Version() ||
@@ -368,7 +379,7 @@ func (f *Fetcher) fetchAttempt(
 				mirror.OutcomeTargetFailure,
 				failureCancelled,
 				f.cancelledError(errors.Join(ctxErr, err)),
-				false,
+				lease != nil,
 				lease,
 			)
 		}
@@ -386,7 +397,7 @@ func (f *Fetcher) fetchAttempt(
 					map[string]any{},
 					err,
 				),
-				false,
+				lease != nil,
 				lease,
 			)
 		}
@@ -531,9 +542,55 @@ func (f *Fetcher) fetchAttempt(
 			lease,
 		)
 	}
+	var directoryIdentity *filesystem.DirectoryIdentity
 	if lease != nil {
-		if closeErr := lease.Close(); closeErr != nil {
+		identityLease, ok := lease.(interface {
+			Identity() *filesystem.DirectoryIdentity
+		})
+		if !ok {
 			return f.finishFailedAttempt(
+				ctx,
+				request,
+				repositoryPath,
+				mirror.OutcomeTargetFailure,
+				failureVerifierContract,
+				newError(
+					protocol.CodeUpdateStateAmbiguous,
+					protocol.StageWorkspaceVerify,
+					messageForCode(protocol.CodeUpdateStateAmbiguous),
+					map[string]any{"reason": "directory_identity_unavailable"},
+					errDirectoryIdentityMissing,
+				),
+				true,
+				lease,
+			)
+		}
+		directoryIdentity = identityLease.Identity()
+		if directoryIdentity == nil {
+			return f.finishFailedAttempt(
+				ctx,
+				request,
+				repositoryPath,
+				mirror.OutcomeTargetFailure,
+				failureVerifierContract,
+				newError(
+					protocol.CodeUpdateStateAmbiguous,
+					protocol.StageWorkspaceVerify,
+					messageForCode(protocol.CodeUpdateStateAmbiguous),
+					map[string]any{"reason": "directory_identity_unavailable"},
+					errDirectoryIdentityMissing,
+				),
+				true,
+				lease,
+			)
+		}
+	}
+	if captureDirectoryIdentity != nil {
+		captureDirectoryIdentity(directoryIdentity)
+	}
+	if lease != nil {
+		if closeErr := closeDirectoryLease(lease); closeErr != nil {
+			return f.finishFailedAttemptWithIdentity(
 				ctx,
 				request,
 				repositoryPath,
@@ -546,14 +603,14 @@ func (f *Fetcher) fetchAttempt(
 					map[string]any{},
 					closeErr,
 				),
-				true,
-				lease,
+				false,
+				directoryIdentity,
 			)
 		}
 		lease = nil
 	}
 	if err := f.emit(protocol.ProgressSucceeded, cloneProgressSuccessMessage); err != nil {
-		return f.finishFailedAttempt(
+		return f.finishFailedAttemptWithIdentity(
 			ctx,
 			request,
 			repositoryPath,
@@ -561,6 +618,7 @@ func (f *Fetcher) fetchAttempt(
 			failureOutput,
 			f.outputError(err),
 			true,
+			directoryIdentity,
 			lease,
 		)
 	}
@@ -580,33 +638,53 @@ func (f *Fetcher) finishFailedAttempt(
 	cleanup bool,
 	leaseValues ...directoryLease,
 ) mirror.AttemptOutcome {
+	return f.finishFailedAttemptWithIdentity(
+		ctx,
+		request,
+		repositoryPath,
+		outcomeKind,
+		failureKind,
+		operationErr,
+		cleanup,
+		nil,
+		leaseValues...,
+	)
+}
+
+func (f *Fetcher) finishFailedAttemptWithIdentity(
+	ctx context.Context,
+	request FetchRequest,
+	repositoryPath string,
+	outcomeKind mirror.OutcomeKind,
+	failureKind mirror.FailureKind,
+	operationErr *Error,
+	cleanup bool,
+	expectedIdentity *filesystem.DirectoryIdentity,
+	leaseValues ...directoryLease,
+) mirror.AttemptOutcome {
 	var lease directoryLease
 	if len(leaseValues) > 0 {
 		lease = leaseValues[0]
 	}
+	if expectedIdentity == nil && lease != nil {
+		if identityLease, ok := lease.(interface {
+			Identity() *filesystem.DirectoryIdentity
+		}); ok {
+			expectedIdentity = identityLease.Identity()
+		}
+	}
 	if lease != nil {
-		if closeErr := lease.Close(); closeErr != nil {
-			if operationErr.Code() == protocol.CodeOutputWriteFailed ||
-				operationErr.Code() == protocol.CodeOperationCancelled {
-				operationErr = newError(
-					operationErr.Code(),
-					operationErr.Stage(),
-					operationErr.Message(),
-					operationErr.Details(),
-					errors.Join(operationErr, closeErr),
-				)
-			} else {
-				operationErr = newError(
-					protocol.CodeGitRepoCleanupFailed,
-					protocol.StageWorkspaceCleanup,
-					messageForCode(protocol.CodeGitRepoCleanupFailed),
-					map[string]any{},
-					errors.Join(operationErr, closeErr),
-				)
-				failureKind = failureCleanup
-			}
+		if closeErr := closeDirectoryLease(lease); closeErr != nil {
+			operationErr = newError(
+				protocol.CodeGitRepoCleanupFailed,
+				protocol.StageWorkspaceCleanup,
+				messageForCode(protocol.CodeGitRepoCleanupFailed),
+				map[string]any{},
+				errors.Join(operationErr, closeErr),
+			)
+			failureKind = failureCleanup
 			outcomeKind = mirror.OutcomeTargetFailure
-			cleanup = true
+			cleanup = false
 		}
 	}
 	status := protocol.ProgressFailed
@@ -624,7 +702,7 @@ func (f *Fetcher) finishFailedAttempt(
 	}
 	if cleanup {
 		reportFetchStage(request, protocol.StageWorkspaceCleanup)
-		if cleanupErr := f.cleanupTemporary(ctx, request, repositoryPath); cleanupErr != nil {
+		if cleanupErr := f.cleanupTemporary(ctx, request, repositoryPath, expectedIdentity); cleanupErr != nil {
 			if operationErr.Code() == protocol.CodeOutputWriteFailed ||
 				operationErr.Code() == protocol.CodeOperationCancelled {
 				operationErr = newError(
@@ -650,10 +728,26 @@ func (f *Fetcher) finishFailedAttempt(
 	return failedOutcome(outcomeKind, failureKind, operationErr)
 }
 
+func closeDirectoryLease(lease directoryLease) error {
+	if lease == nil {
+		return nil
+	}
+	closeErrors := make([]error, 0, directoryCloseAttempts)
+	for range directoryCloseAttempts {
+		if err := lease.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+			continue
+		}
+		return nil
+	}
+	return errors.Join(closeErrors...)
+}
+
 func (f *Fetcher) cleanupTemporary(
 	ctx context.Context,
 	request FetchRequest,
 	repositoryPath string,
+	expectedIdentity *filesystem.DirectoryIdentity,
 ) error {
 	cleanupCtx, cancel := f.cleanupContext(ctx)
 	if cleanupCtx == nil || cancel == nil {
@@ -661,10 +755,11 @@ func (f *Fetcher) cleanupTemporary(
 	}
 	defer cancel()
 	result, err := f.remover.RemoveTree(cleanupCtx, filesystem.DeleteRequest{
-		Kind:        filesystem.DeleteRepositoryUpdate,
-		Target:      repositoryPath,
-		OperationID: request.OperationID,
-		Reason:      cloneCleanupReason,
+		Kind:             filesystem.DeleteRepositoryUpdate,
+		Target:           repositoryPath,
+		OperationID:      request.OperationID,
+		Reason:           cloneCleanupReason,
+		ExpectedIdentity: expectedIdentity,
 	})
 	if err != nil {
 		return fmt.Errorf("remove repository update: %w", err)
@@ -728,6 +823,20 @@ func mapFetchFailure(
 			cause,
 		)
 	}
+	// Rotator 会把 attempt 的错误和 context 一起包装；清理使用的是脱离业务
+	// context 的独立 deadline，因此不能仅凭 errors.Is(DeadlineExceeded) 把它
+	// 误报为普通取消。只有当前 attempt 明确进入 cleanup_failed 时才提升该码；
+	// 若 Rotator 已将当前 attempt 标记为 cancelled，业务取消仍保持最高优先级。
+	if ctx.Err() == nil && lastAttemptWasCleanupFailure(reports) &&
+		hasErrorCode(cause, protocol.CodeGitRepoCleanupFailed) {
+		return newError(
+			protocol.CodeGitRepoCleanupFailed,
+			protocol.StageWorkspaceCleanup,
+			messageForCode(protocol.CodeGitRepoCleanupFailed),
+			details,
+			cause,
+		)
+	}
 	if ctx.Err() != nil || errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
 		return newError(
 			protocol.CodeOperationCancelled,
@@ -762,6 +871,15 @@ func mapFetchFailure(
 		details,
 		cause,
 	)
+}
+
+func lastAttemptWasCleanupFailure(reports []mirror.AttemptReport) bool {
+	if len(reports) == 0 {
+		return false
+	}
+	last := reports[len(reports)-1]
+	return last.Outcome != mirror.OutcomeCancelled &&
+		last.FailureKind == failureCleanup
 }
 
 func attemptDetails(reports []mirror.AttemptReport) map[string]any {

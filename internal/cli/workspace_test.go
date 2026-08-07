@@ -29,6 +29,7 @@ func TestWorkspaceSyncCommand_ValidatesVersion(t *testing.T) {
 	for _, args := range [][]string{
 		{"--output", "ndjson", "workspace", "sync"},
 		{"--output", "ndjson", "workspace", "sync", "--version", "v1.0.0", "--version", "v1.0.1"},
+		{"--output", "ndjson", "workspace", "sync", "--version", "vfoo.lock"},
 	} {
 		var stdout, stderr bytes.Buffer
 		code := Execute(context.Background(), args, IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, options...)
@@ -73,6 +74,96 @@ func TestWorkspaceSyncCommand_CancelFromStdin(t *testing.T) {
 	details, ok := result.object["details"].(map[string]any)
 	if !ok || details["controlCommandId"] != commandID {
 		t.Fatalf("result details = %#v, want commandId", result.object["details"])
+	}
+}
+
+func TestWorkspaceSyncCommand_CommittedDeadlineKeepsBusinessFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		code     protocol.Code
+		message  string
+		wantExit int
+	}{
+		{
+			name:     "state write",
+			code:     protocol.CodeStateWriteFailed,
+			message:  "无法写入仓库更新状态",
+			wantExit: protocol.ExitCodeOperationConflict,
+		},
+		{
+			name:     "retired cleanup",
+			code:     protocol.CodeGitRepoCleanupFailed,
+			message:  "无法清理仓库临时目录",
+			wantExit: protocol.ExitCodeGitFailure,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var stdout, stderr bytes.Buffer
+			code := Execute(
+				context.Background(),
+				[]string{"--output", "ndjson", "workspace", "sync", "--version", "v1.0.0"},
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithCWD(t.TempDir()),
+				WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) {
+					return workspaceTestService{sync: func(context.Context, gitrepo.SyncRequest) (gitrepo.SyncResult, error) {
+						return gitrepo.SyncResult{}, workspaceCommittedError{
+							code:    test.code,
+							message: test.message,
+							cause:   context.DeadlineExceeded,
+						}
+					}}, nil
+				}),
+				WithWorkspaceLoggerFactory(workspaceTestLoggerFactory),
+			)
+			if code != test.wantExit {
+				t.Fatalf("exit code = %d, want %d", code, test.wantExit)
+			}
+			events := parseNDJSON(t, stdout.String())
+			result := events[len(events)-1]
+			if got := eventString(result, "code"); got != string(test.code) {
+				t.Fatalf("result code = %q, want %s", got, test.code)
+			}
+			if got := eventString(result, "status"); got != "failed" {
+				t.Fatalf("result status = %q, want failed", got)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSyncCommand_PreCommitCleanupDeadlineKeepsCleanupFailure(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--output", "ndjson", "workspace", "sync", "--version", "v1.0.0"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(t.TempDir()),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) {
+			return workspaceTestService{sync: func(context.Context, gitrepo.SyncRequest) (gitrepo.SyncResult, error) {
+				return gitrepo.SyncResult{}, &commandError{
+					code:    protocol.CodeGitRepoCleanupFailed,
+					stage:   protocol.StageWorkspaceCleanup,
+					message: "无法清理仓库临时目录",
+					details: map[string]any{},
+					cause:   context.DeadlineExceeded,
+				}
+			}}, nil
+		}),
+		WithWorkspaceLoggerFactory(workspaceTestLoggerFactory),
+	)
+	if code != protocol.ExitCodeGitFailure {
+		t.Fatalf("exit code = %d, want %d", code, protocol.ExitCodeGitFailure)
+	}
+	events := parseNDJSON(t, stdout.String())
+	result := events[len(events)-1]
+	if got := eventString(result, "code"); got != string(protocol.CodeGitRepoCleanupFailed) {
+		t.Fatalf("result code = %q, want GIT_REPO_CLEANUP_FAILED", got)
+	}
+	if got := eventString(result, "status"); got != "failed" {
+		t.Fatalf("result status = %q, want failed", got)
 	}
 }
 
@@ -225,6 +316,29 @@ func TestWorkspaceControlErrorOutranksBusinessCancellation(t *testing.T) {
 	}
 }
 
+func TestAddControlCommandID_PreservesCommittedClassification(t *testing.T) {
+	const commandID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	err := addControlCommandID(
+		workspaceCommittedError{
+			code:    protocol.CodeStateWriteFailed,
+			message: "无法写入仓库更新状态",
+			cause:   context.DeadlineExceeded,
+		},
+		commandID,
+	)
+	code, stage, _, details := classifyFailure(err, protocol.StageWorkspaceClone)
+	if code != protocol.CodeStateWriteFailed || stage != protocol.StageWorkspaceCleanup {
+		t.Fatalf(
+			"classifyFailure() = %s/%s, want STATE_WRITE_FAILED/workspace.cleanup",
+			code,
+			stage,
+		)
+	}
+	if got := details["controlCommandId"]; got != commandID {
+		t.Fatalf("controlCommandId = %#v, want %q", got, commandID)
+	}
+}
+
 func TestWorkspaceControlReaderContextCancellation_DistinguishesReaderOrigin(t *testing.T) {
 	canceledContext, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -360,6 +474,28 @@ type workspaceTestService struct {
 	check func(context.Context) (gitrepo.CheckResult, error)
 	sync  func(context.Context, gitrepo.SyncRequest) (gitrepo.SyncResult, error)
 }
+
+type workspaceCommittedError struct {
+	code    protocol.Code
+	message string
+	cause   error
+}
+
+func (e workspaceCommittedError) Error() string {
+	return "committed state write failed: " + e.cause.Error()
+}
+
+func (e workspaceCommittedError) Unwrap() error { return e.cause }
+
+func (e workspaceCommittedError) Code() protocol.Code { return e.code }
+
+func (e workspaceCommittedError) Stage() protocol.Stage { return protocol.StageWorkspaceCleanup }
+
+func (e workspaceCommittedError) Message() string { return e.message }
+
+func (e workspaceCommittedError) Details() map[string]any { return map[string]any{} }
+
+func (e workspaceCommittedError) Committed() bool { return true }
 
 func (s workspaceTestService) Check(ctx context.Context) (gitrepo.CheckResult, error) {
 	if s.check != nil {

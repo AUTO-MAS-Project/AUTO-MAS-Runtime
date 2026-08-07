@@ -65,12 +65,13 @@ type SyncRequest struct {
 
 // CheckResult 是 workspace check 的稳定业务结果，不携带路径或 remote URL。
 type CheckResult struct {
-	Healthy bool
-	Version string
-	Branch  string
-	Commit  string
-	Source  string
-	Reason  string
+	Healthy           bool
+	Version           string
+	Branch            string
+	Commit            string
+	Source            string
+	Reason            string
+	directoryIdentity *filesystem.DirectoryIdentity
 }
 
 // SyncResult 是 workspace sync 的稳定业务结果。
@@ -181,7 +182,43 @@ func (s *Service) Check(ctx context.Context) (CheckResult, error) {
 		return CheckResult{Reason: "missing"}, nil
 	}
 
-	snapshot, err := s.reader.Inspect(ctx, s.layout.RepoDir())
+	lease, err := filesystem.PinManagedDirectory(ctx, s.layout, s.layout.RepoDir())
+	if isCancellation(ctx, err) {
+		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
+	}
+	if errors.Is(err, filesystem.ErrIdentityChanged) || isUnsafeManagedPath(err) {
+		return CheckResult{Reason: "invalid"}, nil
+	}
+	if err != nil {
+		return CheckResult{}, serviceCheckReadError(err)
+	}
+	if lease == nil {
+		return CheckResult{}, serviceCheckReadError(errDirectoryIdentityMissing)
+	}
+	directoryIdentity := lease.Identity()
+	if directoryIdentity == nil {
+		closeErr := lease.Close()
+		return CheckResult{}, serviceCheckReadError(errors.Join(errDirectoryIdentityMissing, closeErr))
+	}
+	if repository.Identity == nil || !repository.Identity.Equal(directoryIdentity) {
+		closeErr := lease.Close()
+		if closeErr != nil {
+			return CheckResult{}, serviceCheckReadError(errors.Join(filesystem.ErrIdentityChanged, closeErr))
+		}
+		return CheckResult{Reason: "invalid"}, nil
+	}
+	snapshot, inspectErr := s.reader.Inspect(ctx, s.layout.RepoDir())
+	closeErr := lease.Close()
+	if closeErr != nil {
+		inspectErr = errors.Join(inspectErr, closeErr)
+	}
+	err = inspectErr
+	if closeErr != nil {
+		if isCancellation(ctx, err) {
+			return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
+		}
+		return CheckResult{}, serviceCheckReadError(err)
+	}
 	if err := ctx.Err(); err != nil {
 		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
 	}
@@ -192,25 +229,29 @@ func (s *Service) Check(ctx context.Context) (CheckResult, error) {
 		if errors.Is(err, os.ErrPermission) {
 			return CheckResult{}, serviceCheckReadError(err)
 		}
-		return CheckResult{Reason: "invalid"}, nil
+		return CheckResult{Reason: "invalid", directoryIdentity: directoryIdentity}, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return CheckResult{}, serviceCancelledError(protocol.StageWorkspaceCheck, err)
 	}
 	if reason := checkSnapshotReason(snapshot); reason != "" {
-		return CheckResult{Reason: reason}, nil
+		return CheckResult{Reason: reason, directoryIdentity: directoryIdentity}, nil
 	}
 	identity, err := repositoryIdentityFromSnapshot(snapshot)
 	if err != nil {
-		return CheckResult{Reason: checkSnapshotReason(snapshot)}, nil
+		return CheckResult{
+			Reason:            checkSnapshotReason(snapshot),
+			directoryIdentity: directoryIdentity,
+		}, nil
 	}
 	return CheckResult{
-		Healthy: true,
-		Version: identity.version,
-		Branch:  identity.branch,
-		Commit:  identity.commit,
-		Source:  identity.sourceKey,
-		Reason:  "ok",
+		Healthy:           true,
+		Version:           identity.version,
+		Branch:            identity.branch,
+		Commit:            identity.commit,
+		Source:            identity.sourceKey,
+		Reason:            "ok",
+		directoryIdentity: directoryIdentity,
 	}, nil
 }
 
@@ -391,10 +432,47 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	}
 
 	setStage(request, protocol.StageWorkspaceSwap)
+	environmentCommitted := false
 	swapResult, swapErr := runtime.Swap(ctx, SwapRequest{
-		Transaction:   update,
-		Revision:      fetched.Revision,
-		StageReporter: request.StageReporter,
+		Transaction:    update,
+		Revision:       fetched.Revision,
+		ActiveIdentity: check.directoryIdentity,
+		UpdateIdentity: fetched.DirectoryIdentity,
+		StageReporter:  request.StageReporter,
+		CommitEnvironment: func(commitCtx context.Context, revision Revision) error {
+			setStage(request, protocol.StageWorkspaceCleanup)
+			if err := advanceMutation(commitCtx, runtime, &mutation, protocol.StageWorkspaceCleanup); err != nil {
+				return serviceCommittedStateWriteError(protocol.StageWorkspaceCleanup, err)
+			}
+			setStage(request, protocol.StageWorkspaceSwap)
+			broken, err := runtime.NewBrokenEnvironment(environment.LastSuccessful, state.BrokenEnvironment{
+				TargetVersion: revision.Version(),
+				Branch:        revision.Branch(),
+				Commit:        revision.Commit(),
+				Reason:        state.ReasonRepositoryChanged,
+				Stage:         protocol.StageWorkspaceSwap,
+				ExitCode:      0,
+				LogPath:       logger.LogPath(),
+			})
+			if err != nil {
+				return serviceCommittedStateWriteError(protocol.StageWorkspaceSwap, err)
+			}
+			if err := runtime.WriteEnvironment(commitCtx, broken); err != nil {
+				return serviceCommittedStateWriteError(protocol.StageWorkspaceSwap, err)
+			}
+			if err := machine.Transition(protocol.StateEnvironmentBroken); err != nil {
+				return serviceCommittedInternalError(protocol.StageWorkspaceSwap, err)
+			}
+			if err := emitState(request, protocol.StageWorkspaceSwap, protocol.StateEnvironmentBroken, "后端仓库已更新，主环境需要重新准备", map[string]any{
+				"version": revision.Version(),
+				"branch":  revision.Branch(),
+				"commit":  revision.Commit(),
+			}); err != nil {
+				return serviceCommittedOperationError(err)
+			}
+			environmentCommitted = true
+			return nil
+		},
 	})
 	active := swapResult.RepositoryActivated
 	if !active {
@@ -408,44 +486,23 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		}
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, swapErr)
 	}
-	commitContext, cancelCommit := serviceCleanupContext(ctx)
-	defer cancelCommit()
-	setStage(request, protocol.StageWorkspaceCleanup)
-	if err := advanceMutation(commitContext, runtime, &mutation, protocol.StageWorkspaceCleanup); err != nil {
-		swapErr = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceCleanup, err), swapErr)
-	}
-	setStage(request, protocol.StageWorkspaceSwap)
-	broken, buildErr := runtime.NewBrokenEnvironment(environment.LastSuccessful, state.BrokenEnvironment{
-		TargetVersion: fetched.Revision.Version(),
-		Branch:        fetched.Revision.Branch(),
-		Commit:        fetched.Revision.Commit(),
-		Reason:        state.ReasonRepositoryChanged,
-		Stage:         protocol.StageWorkspaceSwap,
-		ExitCode:      0,
-		LogPath:       logger.LogPath(),
-	})
-	if buildErr != nil {
-		swapErr = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceSwap, buildErr), swapErr)
-	} else if writeErr := runtime.WriteEnvironment(commitContext, broken); writeErr != nil {
-		swapErr = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceSwap, writeErr), swapErr)
-	} else if transitionErr := machine.Transition(protocol.StateEnvironmentBroken); transitionErr != nil {
-		swapErr = joinPrimaryError(serviceInternalError(protocol.StageWorkspaceSwap, transitionErr), swapErr)
-	} else if stateErr := emitState(request, protocol.StageWorkspaceSwap, protocol.StateEnvironmentBroken, "后端仓库已更新，主环境需要重新准备", map[string]any{
-		"version": fetched.Revision.Version(),
-		"branch":  fetched.Revision.Branch(),
-		"commit":  fetched.Revision.Commit(),
-	}); stateErr != nil {
-		swapErr = joinPrimaryError(stateErr, swapErr)
-	}
 	if swapErr != nil {
 		return SyncResult{}, swapErr
 	}
+	if !environmentCommitted {
+		return SyncResult{}, serviceCommittedInternalError(
+			protocol.StageWorkspaceSwap,
+			errors.New("repository swap skipped environment commit callback"),
+		)
+	}
+	commitContext, cancelCommit := serviceCleanupContext(ctx)
+	defer cancelCommit()
 	setStage(request, protocol.StageWorkspaceCleanup)
 	if err := removeTransaction(commitContext, runtime, state.TransactionUpdate); err != nil {
-		return SyncResult{}, serviceStateWriteError(protocol.StageWorkspaceCleanup, err)
+		return SyncResult{}, serviceCommittedStateWriteError(protocol.StageWorkspaceCleanup, err)
 	}
 	if err := removeTransaction(commitContext, runtime, state.TransactionMutation); err != nil {
-		return SyncResult{}, serviceStateWriteError(protocol.StageWorkspaceCleanup, err)
+		return SyncResult{}, serviceCommittedStateWriteError(protocol.StageWorkspaceCleanup, err)
 	}
 	return SyncResult{
 		Revision:         fetched.Revision,
@@ -901,6 +958,28 @@ func serviceStateWriteError(stage protocol.Stage, cause error) *Error {
 	return newError(protocol.CodeStateWriteFailed, stage, messageForCode(protocol.CodeStateWriteFailed), map[string]any{}, cause)
 }
 
+func serviceCommittedStateWriteError(stage protocol.Stage, cause error) *Error {
+	return newCommittedError(protocol.CodeStateWriteFailed, stage, messageForCode(protocol.CodeStateWriteFailed), map[string]any{}, cause)
+}
+
+func serviceCommittedInternalError(stage protocol.Stage, cause error) *Error {
+	return newCommittedError(protocol.CodeInternalError, stage, messageForCode(protocol.CodeInternalError), map[string]any{}, cause)
+}
+
+func serviceCommittedOperationError(cause error) *Error {
+	var operationErr *Error
+	if errors.As(cause, &operationErr) {
+		return newCommittedError(
+			operationErr.Code(),
+			operationErr.Stage(),
+			operationErr.Message(),
+			operationErr.Details(),
+			cause,
+		)
+	}
+	return serviceCommittedInternalError(protocol.StageWorkspaceSwap, cause)
+}
+
 func mapStateWriteError(stage protocol.Stage, cause error) *Error {
 	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
 		return serviceCancelledError(stage, cause)
@@ -917,7 +996,11 @@ func serviceInternalError(stage protocol.Stage, cause error) *Error {
 }
 
 func mapMutexFailure(cause error) *Error {
-	if operation, ok := cause.(interface{ Code() protocol.Code }); ok {
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		return serviceCancelledError(protocol.StageWorkspaceClone, cause)
+	}
+	var operation interface{ Code() protocol.Code }
+	if errors.As(cause, &operation) {
 		code := operation.Code()
 		if code == protocol.CodeBackendStillRunning || code == protocol.CodeMutationInProgress || code == protocol.CodeMutexOperationFailed {
 			return newError(code, protocol.StageWorkspaceClone, messageForCode(code), map[string]any{}, cause)

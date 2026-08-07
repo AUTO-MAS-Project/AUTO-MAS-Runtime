@@ -381,6 +381,74 @@ func TestRemoveTree_ContextsRejectedBeforeIO(t *testing.T) {
 	}
 }
 
+func TestRemoveTree_RejectsClassifiedIdentityMismatch(t *testing.T) {
+	operator, layout, _ := newRemoveTreeFixture(t)
+	inspection, err := InspectManagedDirectory(t.Context(), layout, layout.BuildCacheDir())
+	if err != nil || !inspection.Exists || inspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory() = %#v, %v, want existing identity", inspection, err)
+	}
+	expected := *inspection.Identity
+	expected.fileID[0]++
+	marker := filepath.Join(layout.BuildCacheDir(), "must-survive.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile(marker) error = %v", err)
+	}
+	result, err := operator.RemoveTree(t.Context(), DeleteRequest{
+		Kind:             DeleteBuildCache,
+		Target:           layout.BuildCacheDir(),
+		OperationID:      "operation-identity-mismatch",
+		Reason:           "identity mismatch",
+		ExpectedIdentity: &expected,
+	})
+	if result.Removed || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("RemoveTree() = %#v, %v, want identity rejection without mutation", result, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker after identity rejection: %v", err)
+	}
+}
+
+func TestRemoveTree_RejectsReplacementAfterClassification(t *testing.T) {
+	operator, layout, _ := newRemoveTreeFixture(t)
+	inspection, err := InspectManagedDirectory(t.Context(), layout, layout.BuildCacheDir())
+	if err != nil || !inspection.Exists || inspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory() = %#v, %v, want existing identity", inspection, err)
+	}
+	expected := *inspection.Identity
+	classifiedMarker := filepath.Join(layout.BuildCacheDir(), "classified-marker.txt")
+	if err := os.WriteFile(classifiedMarker, []byte("classified"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(classified marker) error = %v", err)
+	}
+	original := layout.BuildCacheDir() + "-classified"
+	if err := os.Rename(layout.BuildCacheDir(), original); err != nil {
+		t.Fatalf("os.Rename(classified tree) error = %v", err)
+	}
+	if err := os.Mkdir(layout.BuildCacheDir(), 0o700); err != nil {
+		t.Fatalf("os.Mkdir(replacement) error = %v", err)
+	}
+	marker := filepath.Join(layout.BuildCacheDir(), "replacement-marker.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(marker) error = %v", err)
+	}
+
+	result, err := operator.RemoveTree(t.Context(), DeleteRequest{
+		Kind:             DeleteBuildCache,
+		Target:           layout.BuildCacheDir(),
+		OperationID:      "operation-replacement-identity",
+		Reason:           "replacement identity",
+		ExpectedIdentity: &expected,
+	})
+	if result.Removed || result.Partial || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("RemoveTree() = %#v, %v, want identity rejection without mutation", result, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("replacement marker after identity rejection: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(original, "classified-marker.txt")); err != nil || string(got) != "classified" {
+		t.Fatalf("classified marker after identity rejection = %q, %v", got, err)
+	}
+}
+
 func TestRemoveTree_CancellationAfterDispositionKeepsApplied(t *testing.T) {
 	operator, layout, _ := newRemoveTreeFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())

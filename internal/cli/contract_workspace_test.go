@@ -18,6 +18,63 @@ func TestWorkspaceContract(t *testing.T) {
 	contracttest.Register(t, "workspace sync", workspaceContractRunner)
 }
 
+// TestWorkspaceCheckContract 以通用契约测试固定 workspace check 的三种终态。
+func TestWorkspaceCheckContract(t *testing.T) {
+	contracttest.Register(t, "workspace check", workspaceCheckContractRunner)
+}
+
+func workspaceCheckContractRunner(t *testing.T, terminal contracttest.Terminal) contracttest.Transcript {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	ctx := context.Background()
+	service := workspaceTestService{}
+	wantExit := protocol.ExitCodeSuccess
+	switch terminal {
+	case contracttest.TerminalSuccess:
+		service.check = func(context.Context) (gitrepo.CheckResult, error) {
+			return gitrepo.CheckResult{
+				Healthy: true,
+				Version: "v1.0.0",
+				Branch:  "release/v1.0.0",
+				Commit:  strings.Repeat("a", 40),
+				Source:  "github",
+				Reason:  "ok",
+			}, nil
+		}
+	case contracttest.TerminalFailure:
+		service.check = func(context.Context) (gitrepo.CheckResult, error) {
+			return gitrepo.CheckResult{}, &commandError{
+				code:    protocol.CodeGitRepositoryInvalid,
+				stage:   protocol.StageWorkspaceCheck,
+				message: "受管后端仓库无效",
+				details: map[string]any{},
+			}
+		}
+		definition, _ := protocol.LookupErrorDefinition(protocol.CodeGitRepositoryInvalid)
+		wantExit = definition.ExitCode
+	case contracttest.TerminalCancelled:
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		ctx = cancelled
+		wantExit = protocol.ExitCodeOperationCancelled
+	default:
+		t.Fatalf("unexpected terminal %q", terminal)
+	}
+	code := Execute(
+		ctx,
+		[]string{"--output", "ndjson", "workspace", "check"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(t.TempDir()),
+		WithClock(func() time.Time { return time.Date(2026, 8, 6, 8, 0, 0, 0, time.UTC) }),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return service, nil }),
+		WithWorkspaceLoggerFactory(workspaceTestLoggerFactory),
+	)
+	if code != wantExit {
+		t.Errorf("exit code = %d, want %d", code, wantExit)
+	}
+	return contracttest.Transcript{Stdout: stdout.Bytes()}
+}
+
 func workspaceContractRunner(t *testing.T, terminal contracttest.Terminal) contracttest.Transcript {
 	t.Helper()
 	var stdout, stderr bytes.Buffer

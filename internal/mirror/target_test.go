@@ -125,6 +125,7 @@ func TestNewTarget_RejectsUnsafeFields(t *testing.T) {
 		{name: "product dot dot", spec: TargetSpec{ProductVersion: "v5..3"}},
 		{name: "product reflog", spec: TargetSpec{ProductVersion: "v5@{1}"}},
 		{name: "product trailing dot", spec: TargetSpec{ProductVersion: "v5.3."}},
+		{name: "product lock suffix", spec: TargetSpec{ProductVersion: "vfoo.lock"}},
 		{name: "product control", spec: TargetSpec{ProductVersion: "v5\n3"}},
 		{name: "product too long", spec: TargetSpec{ProductVersion: "v" + strings.Repeat("a", 128)}},
 		{name: "branch prefix", spec: TargetSpec{ReleaseBranch: "main"}},
@@ -136,7 +137,9 @@ func TestNewTarget_RejectsUnsafeFields(t *testing.T) {
 			},
 		},
 		{name: "uv unsafe", spec: TargetSpec{UVVersion: "0.8 beta"}},
+		{name: "uv lock suffix", spec: TargetSpec{UVVersion: "0.8.lock"}},
 		{name: "python unsafe", spec: TargetSpec{PythonVersion: `3.12\10`}},
+		{name: "python lock suffix", spec: TargetSpec{PythonVersion: "3.12.lock"}},
 		{name: "digest short", spec: TargetSpec{LockDigest: "abcd"}},
 		{name: "digest non hex", spec: TargetSpec{LockDigest: strings.Repeat("z", 64)}},
 	}

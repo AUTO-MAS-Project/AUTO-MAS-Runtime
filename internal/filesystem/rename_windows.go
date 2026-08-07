@@ -45,6 +45,9 @@ func (o *Operator) AtomicRename(
 			}
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return RenameResult{}, errors.Join(err, attempt.close())
+		}
 		err = renameByHandleWith(
 			attempt.source.handle,
 			attempt.parent.handle,
@@ -199,6 +202,14 @@ func (o *Operator) pinRenameAttempt(
 	if err != nil {
 		return nil, err
 	}
+	sourceObject := &sourceChain.objects[len(sourceChain.objects)-1]
+	if request.ExpectedSourceIdentity != nil &&
+		!matchesDirectoryIdentity(request.ExpectedSourceIdentity, sourceObject.identity) {
+		return nil, errors.Join(
+			&FileError{Operation: "rename-source-identity", Path: source.String(), Err: ErrIdentityChanged},
+			sourceChain.close(),
+		)
+	}
 	parentCanonical, err := canonicalizeContextWith(ctx, filepath.Dir(destination.String()), o.api)
 	if err != nil {
 		return nil, errors.Join(err, sourceChain.close())
@@ -216,7 +227,7 @@ func (o *Operator) pinRenameAttempt(
 	return &renameAttempt{
 		sourceChain: sourceChain,
 		parentChain: parentChain,
-		source:      &sourceChain.objects[len(sourceChain.objects)-1],
+		source:      sourceObject,
 		parent:      &parentChain.objects[len(parentChain.objects)-1],
 		destination: destination,
 	}, nil

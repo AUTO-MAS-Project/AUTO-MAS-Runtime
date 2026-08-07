@@ -136,8 +136,9 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 }
 
 // classifyFailure 把命令错误映射为冻结错误码与中文 message。
-// 已类型化或原始协议输出故障的 OUTPUT_WRITE_FAILED 优先于取消；除此之外取消
-// 优先于业务码，避免被包装的取消被业务错误码吞掉。实现了 operationError 的错误保留其四元组；
+// 已类型化或原始协议输出故障的 OUTPUT_WRITE_FAILED 优先于取消；已跨提交点的
+// 类型化错误随后保留实际持久化事实；除此之外取消优先于业务码，避免被包装的取消
+// 被业务错误码吞掉。实现了 operationError 的错误保留其四元组；
 // 未知内部错误映射为 INTERNAL_ERROR。
 //
 // 兜底码不用 OUTPUT_WRITE_FAILED：那个码的语义是协议输出通道写失败，用它
@@ -153,6 +154,21 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 	}
 	if controlErr := findControlInfrastructureError(err); controlErr != nil {
 		return controlErr.Code(), controlErr.Stage(), controlErr.Message(), controlErr.Details()
+	}
+	if committedErr := findCommittedOperationError(err); committedErr != nil {
+		code := committedErr.Code()
+		if protocol.IsKnownCode(code) {
+			return code, committedErr.Stage(), committedErr.Message(), committedErr.Details()
+		}
+	}
+	// 独立 cleanup context 的 deadline 需要保留 workspace.cleanup 的清理事实；
+	// 其他阶段（例如 doctor）即使业务码恰好是 cleanup_failed，仍遵循取消优先。
+	if cleanupErr := findOperationErrorCode(err, protocol.CodeGitRepoCleanupFailed); cleanupErr != nil &&
+		cleanupErr.Stage() == protocol.StageWorkspaceCleanup {
+		var primary operationError
+		if !errors.As(err, &primary) || primary.Code() == protocol.CodeGitRepoCleanupFailed {
+			return cleanupErr.Code(), cleanupErr.Stage(), cleanupErr.Message(), cleanupErr.Details()
+		}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		stage := fallbackStage
@@ -176,6 +192,27 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 		}
 	}
 	return protocol.CodeInternalError, fallbackStage, "命令执行失败", map[string]any{}
+}
+
+func findCommittedOperationError(err error) operationError {
+	if err == nil {
+		return nil
+	}
+	if committedErr, ok := err.(committedOperationError); ok && committedErr.Committed() {
+		return committedErr
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range multi.Unwrap() {
+			if found := findCommittedOperationError(child); found != nil {
+				return found
+			}
+		}
+		return nil
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		return findCommittedOperationError(single.Unwrap())
+	}
+	return nil
 }
 
 func findControlInfrastructureError(err error) operationError {

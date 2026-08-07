@@ -91,6 +91,8 @@ type RenameRequest struct {
 	OperationID string
 	Version     string
 	Reason      string
+	// ExpectedSourceIdentity 可选地约束源目录必须仍是分类时的同一目录叶子。
+	ExpectedSourceIdentity *DirectoryIdentity
 }
 
 // RenameResult 报告重命名副作用是否已经生效。

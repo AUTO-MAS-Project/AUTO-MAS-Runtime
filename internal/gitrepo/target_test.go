@@ -57,6 +57,7 @@ func TestParseTarget_InvalidVersions(t *testing.T) {
 		{name: "dot dot", version: "v5..4"},
 		{name: "reflog syntax", version: "v5@{1}"},
 		{name: "trailing dot", version: "v5.4."},
+		{name: "lock suffix", version: "vfoo.lock"},
 		{name: "git ref colon", version: "v5:4"},
 		{name: "git ref tilde", version: "v5~4"},
 		{name: "too many bytes", version: "v" + strings.Repeat("a", 128)},

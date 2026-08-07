@@ -132,6 +132,8 @@ type DeleteRequest struct {
 	OperationID string
 	Version     string
 	Reason      string
+	// ExpectedIdentity 可选地约束删除目标必须仍是分类时的同一目录叶子。
+	ExpectedIdentity *DirectoryIdentity
 }
 
 // DeleteResult 报告删除副作用与审计收口事实。

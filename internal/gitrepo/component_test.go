@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,6 +164,24 @@ func TestComponent_GitAcquisitionMatrix(t *testing.T) {
 			Plan: plan, Target: componentTarget(t, "v2.0.0"), OperationID: componentOperationID(3),
 		})
 		assertComponentErrorCode(t, err, protocol.CodeGitBranchNotFound)
+		assertNoComponentTemporaryDirectories(t, layout)
+		server.assertNoServerErrors(t)
+	})
+
+	t.Run("discovery transport failure maps resolve error", func(t *testing.T) {
+		repository := newGitFixtureRepository(t, gitFixtureCommit{label: "target", version: "v1.0.0"})
+		repository.setBranch(t, "v1.0.0", "target")
+		server := newGitHTTPSFixture(t, map[string]*gitFixtureRepository{"origin": repository})
+		server.setFault("origin", gitFixtureFault{discoveryStatus: http.StatusServiceUnavailable})
+		source := server.source(t, "origin", "origin", true)
+		layout := componentLayout(t)
+		fetcher, _ := componentFetcher(t, layout, server.caBundle)
+		_, err := fetcher.Fetch(t.Context(), FetchRequest{
+			Plan:        gitFixturePlan(t, []mirror.Source{source}, ""),
+			Target:      componentTarget(t, "v1.0.0"),
+			OperationID: componentOperationID(31),
+		})
+		assertComponentErrorCode(t, err, protocol.CodeGitRemoteResolveFailed)
 		assertNoComponentTemporaryDirectories(t, layout)
 		server.assertNoServerErrors(t)
 	})
@@ -492,7 +511,19 @@ func TestComponent_GitReplacementMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewSwapper() error = %v", err)
 		}
-		_, err = swapper.Swap(t.Context(), SwapRequest{Transaction: tx, Revision: fetched.Revision})
+		activeInspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, layout.RepoDir())
+		if err != nil {
+			t.Fatalf("InspectManagedDirectory(active) error = %v", err)
+		}
+		_, err = swapper.Swap(t.Context(), SwapRequest{
+			Transaction:    tx,
+			Revision:       fetched.Revision,
+			ActiveIdentity: activeInspection.Identity,
+			UpdateIdentity: fetched.DirectoryIdentity,
+			CommitEnvironment: func(context.Context, Revision) error {
+				return nil
+			},
+		})
 		assertComponentErrorCode(t, err, protocol.CodeDirectoryOccupied)
 		if got, readErr := os.ReadFile(layout.RepoVersionFile()); readErr != nil || !strings.Contains(string(got), "v1.0.0") {
 			t.Fatalf("old repository after occupied swap = %q, %v", got, readErr)
@@ -773,12 +804,27 @@ func componentActivate(
 	if err != nil {
 		t.Fatalf("Fetch(%s) error = %v", target.Version(), err)
 	}
+	if fetched.DirectoryIdentity == nil {
+		t.Fatalf("Fetch(%s) DirectoryIdentity = nil, want lease identity token", target.Version())
+	}
 	tx := componentWriteUpdateTransaction(t, store, target, operationID)
 	swapper, err := NewSwapper(layout, operator, store)
 	if err != nil {
 		t.Fatalf("NewSwapper() error = %v", err)
 	}
-	result, err := swapper.Swap(t.Context(), SwapRequest{Transaction: tx, Revision: fetched.Revision})
+	activeInspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, layout.RepoDir())
+	if err != nil {
+		t.Fatalf("InspectManagedDirectory(active) error = %v", err)
+	}
+	result, err := swapper.Swap(t.Context(), SwapRequest{
+		Transaction:    tx,
+		Revision:       fetched.Revision,
+		ActiveIdentity: activeInspection.Identity,
+		UpdateIdentity: fetched.DirectoryIdentity,
+		CommitEnvironment: func(context.Context, Revision) error {
+			return nil
+		},
+	})
 	if err != nil {
 		t.Fatalf("Swap(%s) error = %v", target.Version(), err)
 	}

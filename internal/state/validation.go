@@ -35,7 +35,7 @@ func validateProductVersion(value string) error {
 		return validationError("version")
 	}
 	if strings.Contains(value, "..") || strings.Contains(value, "@{") ||
-		strings.HasSuffix(value, ".") {
+		strings.HasSuffix(value, ".") || strings.HasSuffix(value, ".lock") {
 		return validationError("version")
 	}
 	for i := 1; i < len(value); i++ {
@@ -50,7 +50,7 @@ func validateProductVersion(value string) error {
 func validateToolVersion(value string) error {
 	if len(value) == 0 || len(value) > maxToolVersionBytes ||
 		strings.Contains(value, "..") || strings.Contains(value, "@{") ||
-		strings.HasSuffix(value, ".") {
+		strings.HasSuffix(value, ".") || strings.HasSuffix(value, ".lock") {
 		return validationError("toolVersion")
 	}
 	for i := 0; i < len(value); i++ {

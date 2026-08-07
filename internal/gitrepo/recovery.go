@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -15,6 +17,7 @@ const (
 	recoveryUpdateCleanupReason   = "git-recovery-update"
 	recoveryPreviousCleanupReason = "git-recovery-previous"
 	recoveryRenameReason          = "git-recovery-rename"
+	recoveryCleanupTimeout        = 30 * time.Second
 )
 
 var (
@@ -172,7 +175,9 @@ func (r *Recovery) Recover(
 		return RecoveryResult{}, recoveryInternalError(err)
 	}
 	allowIncompleteUpdate := transaction.state.Stage == protocol.StageWorkspaceClone
-	repository, err := r.classifyPath(ctx, paths.repository, false)
+	allowDamagedRepository := transaction.state.Stage == protocol.StageWorkspaceClone ||
+		transaction.state.Stage == protocol.StageWorkspaceVerify
+	repository, err := r.classifyPath(ctx, paths.repository, allowDamagedRepository)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "repository_unknown", err)
 	}
@@ -227,8 +232,9 @@ const (
 )
 
 type recoveryPath struct {
-	kind     recoveryPathKind
-	identity repositoryIdentity
+	kind              recoveryPathKind
+	identity          repositoryIdentity
+	directoryIdentity *filesystem.DirectoryIdentity
 }
 
 func (p recoveryPath) exists() bool {
@@ -254,10 +260,37 @@ func (r *Recovery) classifyPath(
 	if !inspection.Exists {
 		return recoveryPath{kind: recoveryPathMissing}, nil
 	}
-	snapshot, err := r.reader.Inspect(ctx, path)
+	if inspection.Identity == nil {
+		return recoveryPath{}, errRecoveryIdentityUnknown
+	}
+	lease, err := filesystem.PinManagedDirectory(ctx, r.layout, path)
 	if err != nil {
-		if allowIncomplete && !isCancellation(ctx, err) {
-			return recoveryPath{kind: recoveryPathIncomplete}, nil
+		return recoveryPath{}, fmt.Errorf("pin recovery path: %w", err)
+	}
+	if lease == nil {
+		return recoveryPath{}, errRecoveryIdentityUnknown
+	}
+	directoryIdentity := lease.Identity()
+	if directoryIdentity == nil {
+		closeErr := lease.Close()
+		return recoveryPath{}, errors.Join(errRecoveryIdentityUnknown, closeErr)
+	}
+	if !inspection.Identity.Equal(directoryIdentity) {
+		closeErr := lease.Close()
+		return recoveryPath{}, errors.Join(filesystem.ErrIdentityChanged, closeErr)
+	}
+	snapshot, inspectErr := r.reader.Inspect(ctx, path)
+	closeErr := lease.Close()
+	if closeErr != nil {
+		inspectErr = errors.Join(inspectErr, closeErr)
+	}
+	err = inspectErr
+	if closeErr != nil {
+		return recoveryPath{}, fmt.Errorf("close recovery path lease: %w", err)
+	}
+	if err != nil {
+		if allowIncomplete && !isCancellation(ctx, err) && !errors.Is(err, os.ErrPermission) {
+			return recoveryPath{kind: recoveryPathIncomplete, directoryIdentity: directoryIdentity}, nil
 		}
 		return recoveryPath{}, fmt.Errorf("inspect recovery repository: %w", err)
 	}
@@ -265,7 +298,11 @@ func (r *Recovery) classifyPath(
 	if err != nil {
 		return recoveryPath{}, err
 	}
-	return recoveryPath{kind: recoveryPathValid, identity: identity}, nil
+	return recoveryPath{
+		kind:              recoveryPathValid,
+		identity:          identity,
+		directoryIdentity: directoryIdentity,
+	}, nil
 }
 
 func (r *Recovery) classificationError(
@@ -289,6 +326,15 @@ func (r *Recovery) recoverBeforeSwap(
 	previous recoveryPath,
 	reporter StageReporter,
 ) (RecoveryResult, error) {
+	// 首次安装尚未创建 update 时可只清理事务；update 已能证明目标 revision 时，
+	// 缺失 repo 意味着唯一有效候选无法恢复，必须保留现场。
+	if repository.kind == recoveryPathMissing && update.isTarget(transaction.state.TargetVersion) {
+		return RecoveryResult{}, recoveryAmbiguousError(
+			transaction.state.Stage,
+			"pre_swap_repository_missing",
+			errRecoveryIdentityUnknown,
+		)
+	}
 	if repository.isTarget(transaction.state.TargetVersion) &&
 		update.isTarget(transaction.state.TargetVersion) &&
 		!repository.identity.sameRevision(update.identity) {
@@ -299,7 +345,7 @@ func (r *Recovery) recoverBeforeSwap(
 		)
 	}
 	if previous.kind != recoveryPathMissing ||
-		(repository.kind != recoveryPathMissing && repository.kind != recoveryPathValid) ||
+		(repository.kind != recoveryPathMissing && repository.kind != recoveryPathIncomplete && repository.kind != recoveryPathValid) ||
 		(update.kind == recoveryPathValid && !update.isTarget(transaction.state.TargetVersion)) ||
 		(update.kind == recoveryPathIncomplete && transaction.state.Stage != protocol.StageWorkspaceClone) {
 		return RecoveryResult{}, recoveryAmbiguousError(
@@ -316,6 +362,7 @@ func (r *Recovery) recoverBeforeSwap(
 			paths.update,
 			transaction.state.OperationID,
 			recoveryUpdateCleanupReason,
+			update.directoryIdentity,
 			&result,
 			reporter,
 			false,
@@ -374,6 +421,7 @@ func (r *Recovery) recoverSwap(
 				paths.update,
 				transaction.state.OperationID,
 				recoveryUpdateCleanupReason,
+				update.directoryIdentity,
 				&result,
 				request.StageReporter,
 				false,
@@ -393,46 +441,64 @@ func (r *Recovery) recoverSwap(
 				paths.previous,
 				paths.repository,
 				transaction.state.OperationID,
+				previous.directoryIdentity,
 				&result,
 				request.StageReporter,
 			); err != nil {
 				return result, err
 			}
+			cleanupCtx, cancelCleanup := recoveryCommittedContext(ctx)
+			defer cancelCleanup()
 			if err := r.removeRecoveryTree(
-				ctx,
+				cleanupCtx,
 				filesystem.DeleteRepositoryUpdate,
 				paths.update,
 				transaction.state.OperationID,
 				recoveryUpdateCleanupReason,
+				update.directoryIdentity,
 				&result,
 				request.StageReporter,
 				true,
 			); err != nil {
 				return result, err
 			}
-			return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
+			return r.finishRecovery(cleanupCtx, transaction, result, request.StageReporter, true)
 
 		case update.isTarget(targetVersion) && previous.kind == recoveryPathMissing:
-			plan, err := r.prepareEnvironment(ctx, request, update.identity)
+			plan, err := r.prepareEnvironment(ctx, request, update.identity, false)
 			if err != nil {
 				return RecoveryResult{}, err
 			}
 			result := recoveryResultWithIdentity(update.identity, false)
-			if err := r.renameRecoveryRepository(
+			renameErr := r.renameRecoveryRepository(
 				ctx,
 				filesystem.RenameUpdateToRepository,
 				paths.update,
 				paths.repository,
 				transaction.state.OperationID,
+				update.directoryIdentity,
 				&result,
 				request.StageReporter,
-			); err != nil {
+			)
+			if renameErr != nil {
+				if !result.MutationApplied {
+					return result, renameErr
+				}
+				// rename 已激活目标但收尾报告错误时，先脱离业务取消持久化
+				// repository_changed；保留 transaction 让下一次 Recovery 收口现场。
+				cleanupCtx, cancelCleanup := recoveryCommittedContext(ctx)
+				defer cancelCleanup()
+				if environmentErr := r.applyEnvironment(cleanupCtx, plan, &result, request.StageReporter, true); environmentErr != nil {
+					return result, errors.Join(renameErr, environmentErr)
+				}
+				return result, renameErr
+			}
+			cleanupCtx, cancelCleanup := recoveryCommittedContext(ctx)
+			defer cancelCleanup()
+			if err := r.applyEnvironment(cleanupCtx, plan, &result, request.StageReporter, true); err != nil {
 				return result, err
 			}
-			if err := r.applyEnvironment(ctx, plan, &result, request.StageReporter, true); err != nil {
-				return result, err
-			}
-			return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
+			return r.finishRecovery(cleanupCtx, transaction, result, request.StageReporter, true)
 
 		case update.kind == recoveryPathMissing && previous.kind == recoveryPathValid:
 			result := RecoveryResult{}
@@ -442,12 +508,15 @@ func (r *Recovery) recoverSwap(
 				paths.previous,
 				paths.repository,
 				transaction.state.OperationID,
+				previous.directoryIdentity,
 				&result,
 				request.StageReporter,
 			); err != nil {
 				return result, err
 			}
-			return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
+			cleanupCtx, cancelCleanup := recoveryCommittedContext(ctx)
+			defer cancelCleanup()
+			return r.finishRecovery(cleanupCtx, transaction, result, request.StageReporter, true)
 		}
 	}
 
@@ -485,18 +554,26 @@ func (r *Recovery) completeActiveTarget(
 	identity repositoryIdentity,
 	previous recoveryPath,
 ) (RecoveryResult, error) {
-	plan, err := r.prepareEnvironment(ctx, request, identity)
+	cleanupCtx, cancelCleanup := recoveryCommittedContext(ctx)
+	defer cancelCleanup()
+	plan, err := r.prepareEnvironment(cleanupCtx, request, identity, true)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
 	result := recoveryResultWithIdentity(identity, true)
+	// active repo 已跨过 swap 提交点；先持久化 repository_changed，避免
+	// retired cleanup 失败时稳定状态仍宣称旧仓库可用。
+	if err := r.applyEnvironment(cleanupCtx, plan, &result, request.StageReporter, true); err != nil {
+		return result, err
+	}
 	if previous.exists() {
 		if err := r.removeRecoveryTree(
-			ctx,
+			cleanupCtx,
 			filesystem.DeleteRepositoryRetired,
 			paths.previous,
 			transaction.state.OperationID,
 			recoveryPreviousCleanupReason,
+			previous.directoryIdentity,
 			&result,
 			request.StageReporter,
 			true,
@@ -504,10 +581,11 @@ func (r *Recovery) completeActiveTarget(
 			return result, err
 		}
 	}
-	if err := r.applyEnvironment(ctx, plan, &result, request.StageReporter, true); err != nil {
-		return result, err
-	}
-	return r.finishRecovery(ctx, transaction, result, request.StageReporter, true)
+	return r.finishRecovery(cleanupCtx, transaction, result, request.StageReporter, true)
+}
+
+func recoveryCommittedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), recoveryCleanupTimeout)
 }
 
 type environmentRecoveryPlan struct {
@@ -519,18 +597,29 @@ func (r *Recovery) prepareEnvironment(
 	ctx context.Context,
 	request RecoveryRequest,
 	identity repositoryIdentity,
+	committed bool,
 ) (environmentRecoveryPlan, error) {
 	// 环境补写属于 swap 提交后的状态收口，必须与目录 rename 使用同一 stage。
 	reportRecoveryStage(request, protocol.StageWorkspaceSwap)
 	environment, err := r.store.ReadEnvironment(ctx)
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
 		if isCancellation(ctx, err) {
+			if committed {
+				return environmentRecoveryPlan{}, newCommittedError(
+					protocol.CodeStateWriteFailed,
+					protocol.StageWorkspaceSwap,
+					messageForCode(protocol.CodeStateWriteFailed),
+					map[string]any{},
+					err,
+				)
+			}
 			return environmentRecoveryPlan{}, recoveryCancelledError(protocol.StageWorkspaceSwap, err)
 		}
-		return environmentRecoveryPlan{}, recoveryAmbiguousError(
+		return environmentRecoveryPlan{}, recoveryAmbiguousErrorWithCommitted(
 			protocol.StageWorkspaceSwap,
 			"environment_unreadable",
 			err,
+			committed,
 		)
 	}
 	lastSuccessful := state.Revision{}
@@ -546,6 +635,15 @@ func (r *Recovery) prepareEnvironment(
 		}
 	}
 	if request.LogPath == "" {
+		if committed {
+			return environmentRecoveryPlan{}, newCommittedError(
+				protocol.CodeInternalError,
+				protocol.StageWorkspaceSwap,
+				messageForCode(protocol.CodeInternalError),
+				map[string]any{},
+				errInvalidRecoveryRequest,
+			)
+		}
 		return environmentRecoveryPlan{}, recoveryInternalError(errInvalidRecoveryRequest)
 	}
 	value, err := r.store.NewBrokenEnvironment(lastSuccessful, state.BrokenEnvironment{
@@ -560,6 +658,15 @@ func (r *Recovery) prepareEnvironment(
 		LogPath:       request.LogPath,
 	})
 	if err != nil {
+		if committed {
+			return environmentRecoveryPlan{}, newCommittedError(
+				protocol.CodeStateWriteFailed,
+				protocol.StageWorkspaceSwap,
+				messageForCode(protocol.CodeStateWriteFailed),
+				map[string]any{},
+				err,
+			)
+		}
 		return environmentRecoveryPlan{}, newError(
 			protocol.CodeStateWriteFailed,
 			protocol.StageWorkspaceSwap,
@@ -598,21 +705,31 @@ func (r *Recovery) renameRecoveryRepository(
 	source string,
 	destination string,
 	operationID string,
+	expectedSourceIdentity *filesystem.DirectoryIdentity,
 	result *RecoveryResult,
 	reporter StageReporter,
 ) error {
 	// rename 是恢复阶段唯一的目录激活动作，先更新 stage 再调用受控句柄能力。
 	reportRecoveryStageValue(reporter, protocol.StageWorkspaceSwap)
 	renameResult, err := r.operator.AtomicRename(ctx, filesystem.RenameRequest{
-		Kind:        kind,
-		Source:      source,
-		Destination: destination,
-		OperationID: operationID,
-		Reason:      recoveryRenameReason,
+		Kind:                   kind,
+		Source:                 source,
+		Destination:            destination,
+		OperationID:            operationID,
+		Reason:                 recoveryRenameReason,
+		ExpectedSourceIdentity: expectedSourceIdentity,
 	})
 	result.MutationApplied = result.MutationApplied || renameResult.MutationApplied
 	if err != nil {
-		return mapRenameFailure(ctx, err)
+		if isAmbiguousFilesystemError(err) && !renameResult.MutationApplied {
+			return recoveryAmbiguousError(protocol.StageWorkspaceSwap, "directory_identity_changed", err)
+		}
+		return mapRenameFailure(
+			ctx,
+			err,
+			renameResult.MutationApplied,
+			kind == filesystem.RenameUpdateToRepository && renameResult.MutationApplied,
+		)
 	}
 	if !renameResult.MutationApplied {
 		return swapFailureError(protocol.StageWorkspaceSwap, errSwapNotApplied)
@@ -626,6 +743,7 @@ func (r *Recovery) removeRecoveryTree(
 	target string,
 	operationID string,
 	reason string,
+	expectedIdentity *filesystem.DirectoryIdentity,
 	result *RecoveryResult,
 	reporter StageReporter,
 	committed bool,
@@ -633,13 +751,20 @@ func (r *Recovery) removeRecoveryTree(
 	// 删除 update/previous 属于 cleanup；Recovery 的调用方可据此正确关联 warning。
 	reportRecoveryStageValue(reporter, protocol.StageWorkspaceCleanup)
 	deleteResult, err := r.operator.RemoveTree(ctx, filesystem.DeleteRequest{
-		Kind:        kind,
-		Target:      target,
-		OperationID: operationID,
-		Reason:      reason,
+		Kind:             kind,
+		Target:           target,
+		OperationID:      operationID,
+		Reason:           reason,
+		ExpectedIdentity: expectedIdentity,
 	})
 	result.MutationApplied = result.MutationApplied || deleteResult.Removed || deleteResult.Partial
 	if err != nil {
+		if isAmbiguousFilesystemError(err) {
+			if committed {
+				return mapCommittedCleanupFailure(deleteResult, err)
+			}
+			return recoveryAmbiguousError(protocol.StageWorkspaceCleanup, "directory_identity_changed", err)
+		}
 		if committed {
 			return mapCommittedCleanupFailure(deleteResult, err)
 		}
@@ -703,7 +828,20 @@ func recoveryAmbiguousError(
 	reason string,
 	cause error,
 ) *Error {
-	return newError(
+	return recoveryAmbiguousErrorWithCommitted(stage, reason, cause, false)
+}
+
+func recoveryAmbiguousErrorWithCommitted(
+	stage protocol.Stage,
+	reason string,
+	cause error,
+	committed bool,
+) *Error {
+	constructor := newError
+	if committed {
+		constructor = newCommittedError
+	}
+	return constructor(
 		protocol.CodeUpdateStateAmbiguous,
 		stage,
 		messageForCode(protocol.CodeUpdateStateAmbiguous),

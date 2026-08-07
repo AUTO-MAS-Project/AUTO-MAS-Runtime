@@ -74,6 +74,83 @@ func TestPrepareManagedDirectory_RejectsExistingAndCancelledTargets(t *testing.T
 	}
 }
 
+func TestPrepareManagedDirectory_CancellationAfterParentPinStopsBeforeCreate(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.Mkdir(appRoot, 0o700); err != nil {
+		t.Fatalf("Mkdir(app-root) error = %v", err)
+	}
+	layout := directoryTestLayout(t, appRoot, root)
+	target := filepath.Join(layout.AppRoot(), "repo.update-cancelled-after-pin")
+	ctx, cancel := context.WithCancel(t.Context())
+	api := newProductionPathAPI()
+	caseSensitive := api.caseSensitive
+	api.caseSensitive = func(handle windows.Handle) (bool, error) {
+		value, err := caseSensitive(handle)
+		if err == nil {
+			cancel()
+		}
+		return value, err
+	}
+
+	lease, err := prepareManagedDirectoryWithAPI(ctx, layout, target, api)
+	if lease != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf(
+			"prepareManagedDirectoryWithAPI() = lease:%v err:%v, want pre-create cancellation",
+			lease,
+			err,
+		)
+	}
+	if _, statErr := os.Lstat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("cancelled target exists: %v", statErr)
+	}
+}
+
+func TestPrepareManagedDirectory_CancellationAfterCreateRemovesCreatedTarget(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.Mkdir(appRoot, 0o700); err != nil {
+		t.Fatalf("Mkdir(app-root) error = %v", err)
+	}
+	layout := directoryTestLayout(t, appRoot, root)
+	target := filepath.Join(layout.AppRoot(), "repo.update-cancelled-after-create")
+	ctx, cancel := context.WithCancel(t.Context())
+	api := newProductionPathAPI()
+	ntCreateRelative := api.ntCreateRelative
+	identity := api.identity
+	createdHandle := windows.InvalidHandle
+	api.ntCreateRelative = func(
+		parent windows.Handle,
+		name string,
+		spec ntCreateSpec,
+	) (windows.Handle, error) {
+		handle, err := ntCreateRelative(parent, name, spec)
+		if err == nil {
+			createdHandle = handle
+		}
+		return handle, err
+	}
+	api.identity = func(handle windows.Handle) (objectIdentity, error) {
+		value, err := identity(handle)
+		if err == nil && handle == createdHandle {
+			cancel()
+		}
+		return value, err
+	}
+
+	lease, err := prepareManagedDirectoryWithAPI(ctx, layout, target, api)
+	if lease != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf(
+			"prepareManagedDirectoryWithAPI() = lease:%v err:%v, want post-create cancellation",
+			lease,
+			err,
+		)
+	}
+	if _, statErr := os.Lstat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("cancelled target exists: %v", statErr)
+	}
+}
+
 func TestPrepareManagedDirectory_RejectsReparseReplacement(t *testing.T) {
 	root := t.TempDir()
 	appRoot := filepath.Join(root, "app")
@@ -102,6 +179,36 @@ func TestPrepareManagedDirectory_RejectsReparseReplacement(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("external directory was modified: %v", entries)
+	}
+}
+
+func TestPinManagedDirectory_HoldsExistingIdentityUntilClose(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.MkdirAll(filepath.Join(appRoot, "repo"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	layout := directoryTestLayout(t, appRoot, root)
+	inspection, err := InspectManagedDirectory(t.Context(), layout, layout.RepoDir())
+	if err != nil || !inspection.Exists || inspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory() = %#v, %v, want existing identity", inspection, err)
+	}
+	lease, err := PinManagedDirectory(t.Context(), layout, layout.RepoDir())
+	if err != nil {
+		t.Fatalf("PinManagedDirectory() error = %v", err)
+	}
+	if lease.Identity() == nil || !matchesDirectoryIdentity(inspection.Identity, *lease.Identity()) {
+		t.Fatalf("lease identity = %#v, want inspected identity %#v", lease.Identity(), inspection.Identity)
+	}
+	retired := filepath.Join(appRoot, "repo.retired")
+	if err := os.Rename(layout.RepoDir(), retired); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("Rename(repo while pinned) error = %v, want sharing violation", err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatalf("lease.Close() error = %v", err)
+	}
+	if err := os.Rename(layout.RepoDir(), retired); err != nil {
+		t.Fatalf("Rename(repo after close) error = %v", err)
 	}
 }
 

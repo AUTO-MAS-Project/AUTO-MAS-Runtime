@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -50,8 +51,221 @@ func TestSwapper_ReplacesRepositoryAndDeletesRetiredTree(t *testing.T) {
 	if got, want := transactions.stages, []protocol.Stage{protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup}; !equalStages(got, want) {
 		t.Fatalf("transaction stages = %v, want %v", got, want)
 	}
-	if got, want := stages, []protocol.Stage{protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup}; !equalStages(got, want) {
+	if got, want := stages, []protocol.Stage{
+		protocol.StageWorkspaceSwap,
+		protocol.StageWorkspaceCleanup,
+		protocol.StageWorkspaceCleanup,
+	}; !equalStages(got, want) {
 		t.Fatalf("reported stages = %v, want %v", got, want)
+	}
+}
+
+func TestSwapper_CommitsEnvironmentBeforeRetiredCleanup(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FCG")
+	writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	base := successfulSwapOperator(t)
+	var order []string
+	request.CommitEnvironment = func(_ context.Context, revision Revision) error {
+		if revision != request.Revision {
+			t.Fatalf("CommitEnvironment() revision = %#v, want %#v", revision, request.Revision)
+		}
+		order = append(order, "environment")
+		return nil
+	}
+	operator := &fakeSwapOperator{
+		rename: base.rename,
+		remove: func(ctx context.Context, cleanup filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			order = append(order, "previous")
+			return base.remove(ctx, cleanup)
+		},
+	}
+	swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+	result, err := swapper.Swap(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Swap() error = %v", err)
+	}
+	if !result.RepositoryActivated || !result.CleanupCompleted {
+		t.Fatalf("Swap() result = %#v, want active and clean", result)
+	}
+	if got, want := order, []string{"environment", "previous"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("commit order = %v, want %v", got, want)
+	}
+}
+
+func TestSwapper_EnvironmentCommitFailurePreservesRetiredRepository(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FCH")
+	writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	request.CommitEnvironment = func(context.Context, Revision) error {
+		return errors.New("environment write failed")
+	}
+	base := successfulSwapOperator(t)
+	base.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+		t.Fatal("RemoveTree() called after environment commit failure")
+		return filesystem.DeleteResult{}, nil
+	}
+	swapper := mustTestSwapper(t, layout, base, &fakeSwapTransactionWriter{})
+
+	result, err := swapper.Swap(t.Context(), request)
+	assertCommittedGitrepoCode(t, err, protocol.CodeStateWriteFailed)
+	if !result.RepositoryActivated || result.CleanupCompleted {
+		t.Fatalf("Swap() result = %#v, want active repository with retained previous", result)
+	}
+	assertSwapMarker(t, filepath.Join(layout.RepoDir(), "new-only"), "new")
+	assertSwapMarker(t, filepath.Join(mustRepoPreviousDir(t, layout, request.Transaction.OperationID), "old-only"), "old")
+}
+
+func TestSwapper_MissingEnvironmentCommitFailsBeforeMutation(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FCJ")
+	request.CommitEnvironment = nil
+	writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	operator := &fakeSwapOperator{
+		rename: func(context.Context, filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			t.Fatal("AtomicRename() called without environment commit callback")
+			return filesystem.RenameResult{}, nil
+		},
+		remove: func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called without environment commit callback")
+			return filesystem.DeleteResult{}, nil
+		},
+	}
+	swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+	result, err := swapper.Swap(t.Context(), request)
+	assertGitrepoCode(t, err, protocol.CodeInternalError)
+	if result.MutationApplied || result.RepositoryActivated {
+		t.Fatalf("Swap() result = %#v, want no mutation", result)
+	}
+	assertSwapMarker(t, filepath.Join(layout.RepoDir(), "old-only"), "old")
+	assertSwapMarker(t, filepath.Join(mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only"), "new")
+}
+
+func TestSwapper_PropagatesDirectoryIdentityTokensToRenames(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FC5")
+	writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	base := successfulSwapOperator(t)
+	var renames []filesystem.RenameRequest
+	var cleanup filesystem.DeleteRequest
+	operator := &fakeSwapOperator{
+		rename: func(ctx context.Context, rename filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			renames = append(renames, rename)
+			return base.rename(ctx, rename)
+		},
+		remove: func(ctx context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			cleanup = request
+			return base.remove(ctx, request)
+		},
+	}
+	swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+	if _, err := swapper.Swap(t.Context(), request); err != nil {
+		t.Fatalf("Swap() error = %v", err)
+	}
+	if len(renames) != 2 {
+		t.Fatalf("rename count = %d, want 2", len(renames))
+	}
+	if renames[0].ExpectedSourceIdentity == nil {
+		t.Fatal("first rename ExpectedSourceIdentity = nil, want active repository token")
+	}
+	if renames[1].ExpectedSourceIdentity != request.UpdateIdentity {
+		t.Fatalf("second rename ExpectedSourceIdentity = %p, want fetched token %p", renames[1].ExpectedSourceIdentity, request.UpdateIdentity)
+	}
+	if cleanup.ExpectedIdentity != request.ActiveIdentity {
+		t.Fatalf("cleanup ExpectedIdentity = %p, want active repository token %p", cleanup.ExpectedIdentity, request.ActiveIdentity)
+	}
+}
+
+func TestSwapper_RetiredIdentityChangeFailsClosed(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FCB")
+	writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	base := successfulSwapOperator(t)
+	operator := &fakeSwapOperator{
+		rename: base.rename,
+		remove: func(_ context.Context, cleanup filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			if cleanup.ExpectedIdentity != request.ActiveIdentity {
+				t.Fatalf("cleanup ExpectedIdentity = %p, want active repository token %p", cleanup.ExpectedIdentity, request.ActiveIdentity)
+			}
+			return filesystem.DeleteResult{}, filesystem.ErrIdentityChanged
+		},
+	}
+	swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+	result, err := swapper.Swap(t.Context(), request)
+	assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+	if !result.RepositoryActivated || !result.MutationApplied || result.CleanupCompleted {
+		t.Fatalf("Swap() result = %#v, want active repository with retained retired directory", result)
+	}
+	if _, err := os.Lstat(layout.RepoDir()); err != nil {
+		t.Fatalf("active repository after cleanup identity rejection: %v", err)
+	}
+	previous := mustRepoPreviousDir(t, layout, request.Transaction.OperationID)
+	if _, err := os.Lstat(previous); err != nil {
+		t.Fatalf("retired repository after cleanup identity rejection: %v", err)
+	}
+}
+
+func TestSwapper_MissingUpdateIdentityHasNoDirectorySideEffects(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FC6")
+	request.UpdateIdentity = nil
+	writeSwapMarker(t, layout.RepoDir(), "must-survive.txt", "old")
+	operator := &fakeSwapOperator{
+		rename: func(context.Context, filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			t.Fatal("AtomicRename() called without update identity")
+			return filesystem.RenameResult{}, nil
+		},
+		remove: func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called without update identity")
+			return filesystem.DeleteResult{}, nil
+		},
+	}
+	swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+	result, err := swapper.Swap(t.Context(), request)
+	assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+	if result.MutationApplied || result.RepositoryActivated {
+		t.Fatalf("Swap() result = %#v, want no mutation", result)
+	}
+	if _, err := os.Stat(filepath.Join(layout.RepoDir(), "must-survive.txt")); err != nil {
+		t.Fatalf("active marker after missing identity rejection: %v", err)
+	}
+}
+
+func TestSwapper_MissingActiveIdentityHasNoDirectorySideEffects(t *testing.T) {
+	layout := mustGitLayout(t)
+	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FC8")
+	request.ActiveIdentity = nil
+	writeSwapMarker(t, layout.RepoDir(), "must-survive.txt", "old")
+	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+	operator := &fakeSwapOperator{
+		rename: func(context.Context, filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			t.Fatal("AtomicRename() called without active identity")
+			return filesystem.RenameResult{}, nil
+		},
+		remove: func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called without active identity")
+			return filesystem.DeleteResult{}, nil
+		},
+	}
+	swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+	result, err := swapper.Swap(t.Context(), request)
+	assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+	if result.MutationApplied || result.RepositoryActivated {
+		t.Fatalf("Swap() result = %#v, want no mutation", result)
+	}
+	if _, err := os.Stat(filepath.Join(layout.RepoDir(), "must-survive.txt")); err != nil {
+		t.Fatalf("active marker after missing identity rejection: %v", err)
 	}
 }
 
@@ -73,6 +287,9 @@ func TestSwapper_PreCancelledPathInspectionReturnsCancelled(t *testing.T) {
 func TestSwapper_FirstInstallationSkipsRetiredCleanup(t *testing.T) {
 	layout := mustGitLayout(t)
 	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FA2")
+	if err := os.RemoveAll(layout.RepoDir()); err != nil {
+		t.Fatalf("RemoveAll(repository fixture) error = %v", err)
+	}
 	writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
 	operator := successfulSwapOperator(t)
 	operator.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
@@ -94,6 +311,9 @@ func TestSwapper_FirstInstallationSkipsRetiredCleanup(t *testing.T) {
 func TestSwapper_PreexistingPreviousFailsClosed(t *testing.T) {
 	layout := mustGitLayout(t)
 	request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FA3")
+	if err := os.RemoveAll(layout.RepoDir()); err != nil {
+		t.Fatalf("RemoveAll(repository fixture) error = %v", err)
+	}
 	update := mustRepoUpdateDir(t, layout, request.Transaction.OperationID)
 	previous := mustRepoPreviousDir(t, layout, request.Transaction.OperationID)
 	writeSwapMarker(t, update, "new-only", "new")
@@ -222,6 +442,38 @@ func TestSwapper_RenamePostMutationErrorPreservesFacts(t *testing.T) {
 		assertSwapMarker(t, filepath.Join(update, "new-only"), "new")
 	})
 
+	t.Run("first rename applied with cancellation cause", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FA4")
+		writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+		update := mustRepoUpdateDir(t, layout, request.Transaction.OperationID)
+		writeSwapMarker(t, update, "new-only", "new")
+		operator := successfulSwapOperator(t)
+		operator.rename = func(_ context.Context, rename filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			if err := os.Rename(rename.Source, rename.Destination); err != nil {
+				return filesystem.RenameResult{}, err
+			}
+			return filesystem.RenameResult{MutationApplied: true}, context.DeadlineExceeded
+		}
+		operator.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called after first rename cancellation")
+			return filesystem.DeleteResult{}, nil
+		}
+		swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+		result, err := swapper.Swap(t.Context(), request)
+		assertGitrepoCode(t, err, protocol.CodeGitRepoSwapFailed)
+		var operationErr *Error
+		if !errors.As(err, &operationErr) || operationErr.Committed() {
+			t.Fatalf("error = %v, want non-committed swap failure", err)
+		}
+		if !result.MutationApplied || result.RepositoryActivated {
+			t.Fatalf("Swap() result = %#v, want retired mutation without activation", result)
+		}
+		assertSwapMarker(t, filepath.Join(mustRepoPreviousDir(t, layout, request.Transaction.OperationID), "old-only"), "old")
+		assertSwapMarker(t, filepath.Join(update, "new-only"), "new")
+	})
+
 	t.Run("second rename applied", func(t *testing.T) {
 		layout := mustGitLayout(t)
 		request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FA5")
@@ -252,6 +504,36 @@ func TestSwapper_RenamePostMutationErrorPreservesFacts(t *testing.T) {
 		}
 		assertSwapMarker(t, filepath.Join(layout.RepoDir(), "new-only"), "new")
 		assertSwapMarker(t, filepath.Join(mustRepoPreviousDir(t, layout, request.Transaction.OperationID), "old-only"), "old")
+	})
+
+	t.Run("second rename applied with cancellation cause", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		request := validSwapRequest(t, layout, "01ARZ3NDEKTSV4RRFFQ69G5FA6")
+		writeSwapMarker(t, layout.RepoDir(), "old-only", "old")
+		writeSwapMarker(t, mustRepoUpdateDir(t, layout, request.Transaction.OperationID), "new-only", "new")
+		operator := successfulSwapOperator(t)
+		renameCalls := 0
+		operator.rename = func(_ context.Context, rename filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			renameCalls++
+			if err := os.Rename(rename.Source, rename.Destination); err != nil {
+				return filesystem.RenameResult{}, err
+			}
+			if renameCalls == 2 {
+				return filesystem.RenameResult{MutationApplied: true}, context.DeadlineExceeded
+			}
+			return filesystem.RenameResult{MutationApplied: true}, nil
+		}
+		operator.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called after second rename cancellation")
+			return filesystem.DeleteResult{}, nil
+		}
+		swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
+
+		result, err := swapper.Swap(t.Context(), request)
+		assertCommittedGitrepoCode(t, err, protocol.CodeGitRepoSwapFailed)
+		if !result.MutationApplied || !result.RepositoryActivated {
+			t.Fatalf("Swap() result = %#v, want active mutation fact", result)
+		}
 	})
 }
 
@@ -388,7 +670,7 @@ func TestSwapper_ActiveCleanupDeadlineUsesCommittedErrorCodes(t *testing.T) {
 		swapper := mustTestSwapper(t, layout, operator, &fakeSwapTransactionWriter{})
 
 		result, err := swapper.Swap(t.Context(), request)
-		assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+		assertCommittedGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
 		if !result.RepositoryActivated || result.CleanupCompleted {
 			t.Fatalf("Swap() result = %#v, want active repository with retained cleanup", result)
 		}
@@ -534,6 +816,21 @@ func validSwapRequest(t *testing.T, layout *config.Layout, operationID string) S
 	if err != nil {
 		t.Fatalf("newRevision() error = %v", err)
 	}
+	updatePath := mustRepoUpdateDir(t, layout, operationID)
+	if err := os.MkdirAll(updatePath, 0o700); err != nil {
+		t.Fatalf("MkdirAll(update) error = %v", err)
+	}
+	inspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, updatePath)
+	if err != nil || !inspection.Exists || inspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory(update) = %#v, %v, want identity", inspection, err)
+	}
+	if err := os.MkdirAll(layout.RepoDir(), 0o700); err != nil {
+		t.Fatalf("MkdirAll(repository) error = %v", err)
+	}
+	repositoryInspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, layout.RepoDir())
+	if err != nil || !repositoryInspection.Exists || repositoryInspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory(repository) = %#v, %v, want identity", repositoryInspection, err)
+	}
 	return SwapRequest{
 		Transaction: state.TransactionState{
 			SchemaVersion: state.SchemaVersion,
@@ -544,7 +841,12 @@ func validSwapRequest(t *testing.T, layout *config.Layout, operationID string) S
 			TargetVersion: target.Version(),
 			Stage:         protocol.StageWorkspaceVerify,
 		},
-		Revision: revision,
+		Revision:       revision,
+		ActiveIdentity: repositoryInspection.Identity,
+		UpdateIdentity: inspection.Identity,
+		CommitEnvironment: func(context.Context, Revision) error {
+			return nil
+		},
 	}
 }
 

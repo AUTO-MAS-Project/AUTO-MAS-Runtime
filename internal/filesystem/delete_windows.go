@@ -179,6 +179,12 @@ func (o *Operator) authorizeDeleteRequest(
 		return authorizedDelete{}, err
 	}
 	root := &chain.objects[len(chain.objects)-1]
+	if request.ExpectedIdentity != nil && !matchesDirectoryIdentity(request.ExpectedIdentity, root.identity) {
+		return authorizedDelete{}, errors.Join(
+			&FileError{Operation: "delete-identity", Path: target.String(), Err: ErrIdentityChanged},
+			chain.close(),
+		)
+	}
 	return authorizedDelete{
 		request: request,
 		target:  target,

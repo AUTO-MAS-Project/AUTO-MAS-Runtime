@@ -102,7 +102,8 @@ func New(layout *config.Layout, auditor filesystem.Auditor) (*Service, error) {
 
 // planItem 是清理计划中的单条目标，只有两种互斥形态：
 //
-//   - 待删除目标（newDeleteItem）：携带 kind/target/operationID/reason，
+//   - 待删除目标（newDeleteItem）：携带 kind/target/operationID/reason；
+//     可清理的 repo.update-* 还携带枚举时取得的 expectedIdentity，
 //     由 executeItem 交给 filesystem.Operator 执行；
 //   - 已定结果（newResolvedItem）：枚举阶段就已判定 skipped/failed，
 //     只携带 resolved，不再触碰文件系统。
@@ -110,12 +111,13 @@ func New(layout *config.Layout, auditor filesystem.Auditor) (*Service, error) {
 // 用 resolved 指针表达这个二选一，避免八个字段互斥两组时的非法状态可表达
 // （例如同时带 target 和 preStatus）。两种构造函数是唯一入口。
 type planItem struct {
-	id          string
-	kind        filesystem.DeleteKind
-	target      string
-	operationID string
-	reason      string
-	resolved    *resolvedItem
+	id               string
+	kind             filesystem.DeleteKind
+	target           string
+	operationID      string
+	reason           string
+	expectedIdentity *filesystem.DirectoryIdentity
+	resolved         *resolvedItem
 }
 
 // resolvedItem 是枚举阶段就已确定的条目结果。
@@ -127,12 +129,27 @@ type resolvedItem struct {
 
 // newDeleteItem 构造一条待删除目标。
 func newDeleteItem(id string, kind filesystem.DeleteKind, target, operationID string) planItem {
+	return newDeleteItemWithIdentity(id, kind, target, operationID, nil)
+}
+
+// newDeleteItemWithIdentity 构造带目录身份凭据的待删除目标。
+//
+// 只有枚举阶段已证明目录身份的 repo.update-* 才传入 token；缓存条目保持
+// nil，交由 filesystem.Operator 按其固定布局规则重新授权。
+func newDeleteItemWithIdentity(
+	id string,
+	kind filesystem.DeleteKind,
+	target string,
+	operationID string,
+	expectedIdentity *filesystem.DirectoryIdentity,
+) planItem {
 	return planItem{
-		id:          id,
-		kind:        kind,
-		target:      target,
-		operationID: operationID,
-		reason:      cleanupReason,
+		id:               id,
+		kind:             kind,
+		target:           target,
+		operationID:      operationID,
+		reason:           cleanupReason,
+		expectedIdentity: expectedIdentity,
 	}
 }
 
@@ -308,10 +325,11 @@ func (s *Service) executeItem(
 		return Item{}, err
 	}
 	result, err := operator.RemoveTree(ctx, filesystem.DeleteRequest{
-		Kind:        entry.kind,
-		Target:      entry.target,
-		OperationID: entry.operationID,
-		Reason:      entry.reason,
+		Kind:             entry.kind,
+		Target:           entry.target,
+		OperationID:      entry.operationID,
+		Reason:           entry.reason,
+		ExpectedIdentity: entry.expectedIdentity,
 	})
 	if err != nil {
 		code := operationErrorCode(err, protocol.CodeGitRepoCleanupFailed)
@@ -487,17 +505,38 @@ func (s *Service) enumerateRepoUpdates(ctx context.Context) ([]planItem, error) 
 			))
 			continue
 		}
+		inspection, inspectErr := filesystem.InspectManagedDirectory(ctx, s.layout, expected)
+		if inspectErr != nil {
+			if errors.Is(inspectErr, context.Canceled) || errors.Is(inspectErr, context.DeadlineExceeded) {
+				return nil, inspectErr
+			}
+			invalidCounter++
+			items = append(items, newFailedItem(
+				"repo-update-invalid-"+strconv.Itoa(invalidCounter),
+				"目录身份不明确",
+			))
+			continue
+		}
+		if !inspection.Exists || inspection.Identity == nil {
+			invalidCounter++
+			items = append(items, newFailedItem(
+				"repo-update-invalid-"+strconv.Itoa(invalidCounter),
+				"目录身份不明确",
+			))
+			continue
+		}
 		id := "repo-update-" + operationID
 		cleanable, outcome, err := s.classifyRepoUpdate(ctx, operationID)
 		switch {
 		case err != nil:
 			items = append(items, newFailedItem(id, "状态校验失败"))
 		case cleanable:
-			items = append(items, newDeleteItem(
+			items = append(items, newDeleteItemWithIdentity(
 				id,
 				filesystem.DeleteRepositoryUpdate,
 				expected,
 				operationID,
+				inspection.Identity,
 			))
 		case outcome == outcomeActive:
 			items = append(items, newResolvedItem(id, ItemSkipped, "更新仍在进行", nil))

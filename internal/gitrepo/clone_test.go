@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -385,6 +386,146 @@ func TestFetcher_CancelCleansTemporaryRepository(t *testing.T) {
 	}
 }
 
+func TestFetcher_CleanupDeadlineRemainsCleanupFailure(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			return targetBranchReferences(target), nil
+		},
+		clone: func(context.Context, string, git.CloneOptions) error {
+			return errTestClone
+		},
+	}
+	deps := successfulFetcherDependencies(t, client)
+	cleanupDeadline := time.Now().Add(-time.Second)
+	deps.cleanupContext = func(context.Context) (context.Context, context.CancelFunc) {
+		return context.WithDeadline(context.Background(), cleanupDeadline)
+	}
+	deps.remover = &fakeTreeRemover{
+		remove: func(ctx context.Context, _ filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				t.Fatalf("cleanup context error = %v, want deadline exceeded", ctx.Err())
+			}
+			return filesystem.DeleteResult{}, ctx.Err()
+		},
+	}
+	fetcher := mustTestFetcher(t, deps)
+
+	_, err := fetcher.Fetch(t.Context(), FetchRequest{
+		Plan:        mustGitPlan(t, "cnb"),
+		Target:      target,
+		OperationID: "OPERATION-CLEANUP-DEADLINE",
+	})
+	assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch() error = %v, want retained cleanup deadline", err)
+	}
+}
+
+func TestFetcher_OperationCancellationOutranksCleanupDeadline(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	cloneEntered := make(chan struct{})
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			return targetBranchReferences(target), nil
+		},
+		clone: func(ctx context.Context, _ string, _ git.CloneOptions) error {
+			close(cloneEntered)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	deps := successfulFetcherDependencies(t, client)
+	cleanupDeadline := time.Now().Add(-time.Second)
+	deps.cleanupContext = func(context.Context) (context.Context, context.CancelFunc) {
+		return context.WithDeadline(context.Background(), cleanupDeadline)
+	}
+	deps.remover = &fakeTreeRemover{
+		remove: func(ctx context.Context, _ filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				t.Fatalf("cleanup context error = %v, want deadline exceeded", ctx.Err())
+			}
+			return filesystem.DeleteResult{}, ctx.Err()
+		},
+	}
+	fetcher := mustTestFetcher(t, deps)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() {
+		_, err := fetcher.Fetch(ctx, FetchRequest{
+			Plan:        mustGitPlan(t, "cnb"),
+			Target:      target,
+			OperationID: "OPERATION-CANCEL-CLEANUP-DEADLINE",
+		})
+		done <- err
+	}()
+	<-cloneEntered
+	cancel()
+	err := <-done
+	assertGitrepoCode(t, err, protocol.CodeOperationCancelled)
+}
+
+// TestFetcher_PrepareCancellationCleansCreatedRepository 证明目录租约已创建后
+// 取消仍必须使用独立收口 context 删除本次临时目录，而不是只关闭租约留下现场。
+func TestFetcher_PrepareCancellationCleansCreatedRepository(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	layout := mustGitLayout(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	var cleanupRequest filesystem.DeleteRequest
+	cleanupCalled := make(chan struct{}, 1)
+	var expected *filesystem.DirectoryIdentity
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			return targetBranchReferences(target), nil
+		},
+		clone: func(context.Context, string, git.CloneOptions) error {
+			t.Fatal("Clone() called after prepare cancellation")
+			return nil
+		},
+	}
+	deps := successfulFetcherDependencies(t, client)
+	deps.layout = layout
+	deps.prepareDir = func(_ context.Context, _ *config.Layout, path string) (directoryLease, error) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, err
+		}
+		inspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, path)
+		if err != nil || !inspection.Exists || inspection.Identity == nil {
+			return nil, errors.Join(err, errDirectoryIdentityMissing)
+		}
+		expected = inspection.Identity
+		lease := &identityTestLease{identity: inspection.Identity}
+		cancel()
+		return lease, nil
+	}
+	deps.remover = &fakeTreeRemover{
+		remove: func(_ context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			cleanupRequest = request
+			cleanupCalled <- struct{}{}
+			return filesystem.DeleteResult{Removed: true, AuditCompleted: true}, nil
+		},
+	}
+	fetcher := mustTestFetcher(t, deps)
+
+	_, err := fetcher.Fetch(ctx, FetchRequest{
+		Plan:        mustGitPlan(t, "cnb"),
+		Target:      target,
+		OperationID: "OPERATION-PREPARE-CANCEL",
+	})
+	assertGitrepoCode(t, err, protocol.CodeOperationCancelled)
+	select {
+	case <-cleanupCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RemoveTree() was not called after prepare cancellation")
+	}
+	if cleanupRequest.ExpectedIdentity == nil || expected == nil ||
+		!reflect.DeepEqual(cleanupRequest.ExpectedIdentity, expected) {
+		t.Fatalf("cleanup ExpectedIdentity = %#v, want %#v", cleanupRequest.ExpectedIdentity, expected)
+	}
+}
+
 func TestFetcher_ExistingTemporaryRepositoryIsPreserved(t *testing.T) {
 	target := mustParseTarget(t, "v5.4.0")
 	layout := mustGitLayout(t)
@@ -431,6 +572,198 @@ func TestFetcher_ExistingTemporaryRepositoryIsPreserved(t *testing.T) {
 	}
 	if got, readErr := os.ReadFile(marker); readErr != nil || string(got) != "foreign" {
 		t.Fatalf("marker after Fetch() = %q, %v; want preserved", got, readErr)
+	}
+}
+
+func TestFetcher_FailureCleanupCarriesDirectoryIdentity(t *testing.T) {
+	tests := []struct {
+		name       string
+		cloneErr   error
+		emitErr    error
+		wantCode   protocol.Code
+		wantVerify bool
+	}{
+		{
+			name:     "clone failure",
+			cloneErr: errTestClone,
+			wantCode: protocol.CodeGitCloneFailed,
+		},
+		{
+			name:       "success progress failure after lease close",
+			emitErr:    errors.New("progress output failed"),
+			wantCode:   protocol.CodeOutputWriteFailed,
+			wantVerify: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := mustParseTarget(t, "v5.4.0")
+			layout := mustGitLayout(t)
+			var cleanupRequest filesystem.DeleteRequest
+			var expected *filesystem.DirectoryIdentity
+			client := &fakeGitClient{
+				list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+					return targetBranchReferences(target), nil
+				},
+				clone: func(_ context.Context, path string, _ git.CloneOptions) error {
+					if test.cloneErr == nil {
+						return nil
+					}
+					return test.cloneErr
+				},
+			}
+			deps := successfulFetcherDependencies(t, client)
+			deps.layout = layout
+			deps.prepareDir = func(_ context.Context, _ *config.Layout, path string) (directoryLease, error) {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					return nil, err
+				}
+				inspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, path)
+				if err != nil || !inspection.Exists || inspection.Identity == nil {
+					return nil, errors.Join(err, errDirectoryIdentityMissing)
+				}
+				expected = inspection.Identity
+				return &identityTestLease{identity: inspection.Identity}, nil
+			}
+			deps.remover = &fakeTreeRemover{
+				remove: func(_ context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+					cleanupRequest = request
+					return filesystem.DeleteResult{Removed: true, AuditCompleted: true}, nil
+				},
+			}
+			if test.emitErr != nil {
+				deps.emitProgress = func(event protocol.ProgressEvent) error {
+					if event.Status == protocol.ProgressSucceeded {
+						return test.emitErr
+					}
+					return nil
+				}
+			}
+			if test.wantVerify {
+				deps.verifier = &fakeCloneVerifier{
+					verify: func(_ context.Context, request VerificationRequest) (Revision, error) {
+						return newRevision(request.Target, testGitCommit, request.Source)
+					},
+				}
+			}
+			fetcher := mustTestFetcher(t, deps)
+			_, err := fetcher.Fetch(t.Context(), FetchRequest{
+				Plan:        mustGitPlan(t, "cnb"),
+				Target:      target,
+				OperationID: "OPERATION-CLEANUP-IDENTITY",
+			})
+			assertGitrepoCode(t, err, test.wantCode)
+			if cleanupRequest.ExpectedIdentity == nil {
+				t.Fatal("cleanup ExpectedIdentity = nil, want lease token")
+			}
+			if expected == nil || !reflect.DeepEqual(cleanupRequest.ExpectedIdentity, expected) {
+				t.Fatalf("cleanup ExpectedIdentity = %#v, want %#v", cleanupRequest.ExpectedIdentity, expected)
+			}
+		})
+	}
+}
+
+func TestFetcher_DirectoryLeaseCloseRetriesUntilSuccess(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	layout := mustGitLayout(t)
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			return targetBranchReferences(target), nil
+		},
+		clone: func(context.Context, string, git.CloneOptions) error {
+			return nil
+		},
+	}
+	closeFailure := errors.New("transient lease close failure")
+	lease := &scriptedDirectoryLease{closeErrors: []error{closeFailure, nil}}
+	deps := successfulFetcherDependencies(t, client)
+	deps.layout = layout
+	deps.prepareDir = func(_ context.Context, _ *config.Layout, path string) (directoryLease, error) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, err
+		}
+		inspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, path)
+		if err != nil || inspection.Identity == nil {
+			return nil, errors.Join(err, errDirectoryIdentityMissing)
+		}
+		lease.identity = inspection.Identity
+		return lease, nil
+	}
+	deps.remover = &fakeTreeRemover{
+		remove: func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called after lease close retry succeeded")
+			return filesystem.DeleteResult{}, nil
+		},
+	}
+	fetcher := mustTestFetcher(t, deps)
+
+	result, err := fetcher.Fetch(t.Context(), FetchRequest{
+		Plan:        mustGitPlan(t, "cnb"),
+		Target:      target,
+		OperationID: "OPERATION-CLOSE-RETRY",
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if result.DirectoryIdentity == nil {
+		t.Fatal("Fetch() DirectoryIdentity = nil, want verified lease identity")
+	}
+	if lease.closeCalls != 2 {
+		t.Fatalf("lease Close() calls = %d, want 2", lease.closeCalls)
+	}
+}
+
+func TestFetcher_DirectoryLeaseCloseExhaustionPreservesTemporaryRepository(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	layout := mustGitLayout(t)
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			return targetBranchReferences(target), nil
+		},
+		clone: func(context.Context, string, git.CloneOptions) error {
+			return nil
+		},
+	}
+	closeFailure := errors.New("persistent lease close failure")
+	lease := &scriptedDirectoryLease{closeErrors: []error{
+		closeFailure,
+		closeFailure,
+		closeFailure,
+	}}
+	deps := successfulFetcherDependencies(t, client)
+	deps.layout = layout
+	var updatePath string
+	deps.prepareDir = func(_ context.Context, _ *config.Layout, path string) (directoryLease, error) {
+		updatePath = path
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, err
+		}
+		inspection, err := filesystem.InspectManagedDirectory(t.Context(), layout, path)
+		if err != nil || inspection.Identity == nil {
+			return nil, errors.Join(err, errDirectoryIdentityMissing)
+		}
+		lease.identity = inspection.Identity
+		return lease, nil
+	}
+	deps.remover = &fakeTreeRemover{
+		remove: func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			t.Fatal("RemoveTree() called while lease close remained unresolved")
+			return filesystem.DeleteResult{}, nil
+		},
+	}
+	fetcher := mustTestFetcher(t, deps)
+
+	_, err := fetcher.Fetch(t.Context(), FetchRequest{
+		Plan:        mustGitPlan(t, "cnb"),
+		Target:      target,
+		OperationID: "OPERATION-CLOSE-EXHAUSTED",
+	})
+	assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+	if lease.closeCalls != directoryCloseAttempts {
+		t.Fatalf("lease Close() calls = %d, want %d", lease.closeCalls, directoryCloseAttempts)
+	}
+	if _, statErr := os.Lstat(updatePath); statErr != nil {
+		t.Fatalf("temporary repository after close exhaustion = %v, want preserved", statErr)
 	}
 }
 
@@ -490,6 +823,43 @@ func (f *fakeCloneVerifier) Verify(ctx context.Context, request VerificationRequ
 
 type fakeTreeRemover struct {
 	remove func(ctx context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error)
+}
+
+type identityTestLease struct {
+	identity *filesystem.DirectoryIdentity
+}
+
+func (l *identityTestLease) Close() error { return nil }
+
+func (l *identityTestLease) Identity() *filesystem.DirectoryIdentity {
+	if l == nil || l.identity == nil {
+		return nil
+	}
+	identity := *l.identity
+	return &identity
+}
+
+type scriptedDirectoryLease struct {
+	identity    *filesystem.DirectoryIdentity
+	closeErrors []error
+	closeCalls  int
+}
+
+func (l *scriptedDirectoryLease) Close() error {
+	l.closeCalls++
+	index := l.closeCalls - 1
+	if index >= len(l.closeErrors) {
+		return nil
+	}
+	return l.closeErrors[index]
+}
+
+func (l *scriptedDirectoryLease) Identity() *filesystem.DirectoryIdentity {
+	if l == nil || l.identity == nil {
+		return nil
+	}
+	identity := *l.identity
+	return &identity
 }
 
 func (f *fakeTreeRemover) RemoveTree(ctx context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
@@ -607,5 +977,19 @@ func assertGitrepoCode(t *testing.T, err error, want protocol.Code) {
 	}
 	if got := operationErr.Code(); got != want {
 		t.Fatalf("error code = %q, want %q (error = %v)", got, want, err)
+	}
+}
+
+func assertCommittedGitrepoCode(t *testing.T, err error, want protocol.Code) {
+	t.Helper()
+	var operationErr *Error
+	if !errors.As(err, &operationErr) {
+		t.Fatalf("error = %v, want *Error", err)
+	}
+	if got := operationErr.Code(); got != want {
+		t.Fatalf("error code = %q, want %q (error = %v)", got, want, err)
+	}
+	if !operationErr.Committed() {
+		t.Fatalf("error = %v, want committed failure", err)
 	}
 }

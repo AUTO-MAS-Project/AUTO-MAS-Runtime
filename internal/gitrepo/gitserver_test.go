@@ -224,6 +224,7 @@ func (b *gitFixtureBarrier) releaseRequest() {
 
 type gitFixtureFault struct {
 	discovery         *gitFixtureBarrier
+	discoveryStatus   int
 	pack              *gitFixtureBarrier
 	response          *gitFixtureBarrier
 	responseRead      *gitFixtureBarrier
@@ -413,6 +414,10 @@ func (f *gitHTTPSFixture) serveDiscovery(
 		return
 	}
 	if err := fault.discovery.wait(request.Context()); err != nil {
+		return
+	}
+	if fault.discoveryStatus != 0 {
+		writer.WriteHeader(fault.discoveryStatus)
 		return
 	}
 	advertisement, err := session.AdvertisedReferencesContext(request.Context())

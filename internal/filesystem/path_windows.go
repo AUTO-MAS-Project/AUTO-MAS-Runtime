@@ -28,15 +28,14 @@ type CanonicalPath struct {
 
 // DirectoryInspection 描述受管目录的只读存在性事实。
 type DirectoryInspection struct {
-	Exists bool
+	Exists   bool
+	Identity *DirectoryIdentity
 }
 
-type objectIdentity struct {
-	volumeSerial  uint64
-	fileID        [16]byte
-	attributes    uint32
-	numberOfLinks uint32
-	size          int64
+type objectIdentity = DirectoryIdentity
+
+func matchesDirectoryIdentity(expected *DirectoryIdentity, actual objectIdentity) bool {
+	return expected.Equal(&actual)
 }
 
 type directoryEntry struct {
@@ -153,8 +152,54 @@ func inspectManagedDirectoryWith(
 		if err := rejectMissingReparseChain(ctx, target, api); err != nil {
 			return DirectoryInspection{}, err
 		}
+		return DirectoryInspection{Exists: false}, nil
 	}
-	return DirectoryInspection{Exists: exists}, nil
+	identity, err := inspectExistingDirectoryIdentity(ctx, layout, target, api)
+	if err != nil {
+		return DirectoryInspection{}, err
+	}
+	return DirectoryInspection{Exists: true, Identity: &identity}, nil
+}
+
+func inspectExistingDirectoryIdentity(
+	ctx context.Context,
+	layout *config.Layout,
+	target CanonicalPath,
+	api pathAPI,
+) (objectIdentity, error) {
+	root, err := canonicalizeContextWith(ctx, layout.AppRoot(), api)
+	if err != nil {
+		return objectIdentity{}, err
+	}
+	if root.Equal(target) {
+		handle, err := api.openPath(target.Native(), directoryPinSpec())
+		if err != nil {
+			return objectIdentity{}, &FileError{Operation: "open-directory-identity", Path: target.String(), Err: err}
+		}
+		identity, identityErr := api.identity(handle)
+		if identityErr != nil {
+			return objectIdentity{}, errors.Join(
+				identityErr,
+				wrapFileError("close", target.String(), api.closeHandle(handle)),
+			)
+		}
+		if err := validatePinnedDirectory(ctx, pinnedObject{path: target, handle: handle, identity: identity}, api); err != nil {
+			return objectIdentity{}, errors.Join(err, api.closeHandle(handle))
+		}
+		if err := api.closeHandle(handle); err != nil {
+			return objectIdentity{}, wrapFileError("close", target.String(), err)
+		}
+		return identity, nil
+	}
+	chain, err := openPinnedChainWith(ctx, root, target, directoryPinSpec(), api)
+	if err != nil {
+		return objectIdentity{}, err
+	}
+	identity := chain.objects[len(chain.objects)-1].identity
+	if err := chain.close(); err != nil {
+		return objectIdentity{}, err
+	}
+	return identity, nil
 }
 
 // rejectMissingReparseChain 检查 GetFileAttributes 无法分辨的悬空重解析点。

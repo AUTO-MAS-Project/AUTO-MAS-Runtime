@@ -16,6 +16,12 @@ type operationError interface {
 	Details() map[string]any
 }
 
+// committedOperationError 标记已经跨过不可逆提交点的应用服务错误。
+type committedOperationError interface {
+	operationError
+	Committed() bool
+}
+
 // commandError 是 cli 内部使用的通用命令错误，同时承载协议映射字段。
 type commandError struct {
 	code                  protocol.Code
@@ -24,6 +30,7 @@ type commandError struct {
 	details               map[string]any
 	cause                 error
 	controlInfrastructure bool
+	committed             bool
 }
 
 func (e *commandError) Error() string {
@@ -42,6 +49,8 @@ func (e *commandError) Stage() protocol.Stage { return e.stage }
 func (e *commandError) Message() string { return e.message }
 
 func (e *commandError) Details() map[string]any { return e.details }
+
+func (e *commandError) Committed() bool { return e != nil && e.committed }
 
 func (e *commandError) isControlInfrastructureError() bool {
 	return e != nil && e.controlInfrastructure

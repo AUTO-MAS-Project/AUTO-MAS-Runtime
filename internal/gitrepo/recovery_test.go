@@ -12,12 +12,69 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"golang.org/x/sys/windows"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 )
+
+func TestRecovery_ClassifyPathPinsRepositoryDuringReader(t *testing.T) {
+	layout := mustGitLayout(t)
+	writeRecoveryRepository(t, layout.RepoDir(), "v5.4.0", recoverySourceURL(t), "active")
+	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), layout.RepoDir())
+	if err != nil {
+		t.Fatalf("Inspect(repository) error = %v", err)
+	}
+	reader := &blockingServiceReader{
+		snapshot: snapshot,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	recovery, err := newRecoveryWithDependencies(
+		layout,
+		successfulRecoveryOperator(t),
+		&fakeRecoveryStore{},
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("newRecoveryWithDependencies() error = %v", err)
+	}
+	type classifyResult struct {
+		path recoveryPath
+		err  error
+	}
+	resultCh := make(chan classifyResult, 1)
+	go func() {
+		classified, classifyErr := recovery.classifyPath(t.Context(), layout.RepoDir(), false)
+		resultCh <- classifyResult{path: classified, err: classifyErr}
+	}()
+	select {
+	case <-reader.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not reach barrier")
+	}
+	retired := filepath.Join(layout.AppRoot(), "repo.reader-race")
+	// A->hold 是 A/B/A 置换的第一步；lease 存活期间必须在这里失败。
+	renameErr := os.Rename(layout.RepoDir(), retired)
+	if !errors.Is(renameErr, windows.ERROR_SHARING_VIOLATION) &&
+		!errors.Is(renameErr, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("Rename(repo while recovery reader is active) error = %v, want sharing/access denial", renameErr)
+	}
+	close(reader.release)
+	select {
+	case classified := <-resultCh:
+		if classified.err != nil {
+			t.Fatalf("classifyPath() error = %v", classified.err)
+		}
+		if classified.path.kind != recoveryPathValid || classified.path.directoryIdentity == nil {
+			t.Fatalf("classifyPath() = %#v, want valid path with identity", classified.path)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("classifyPath() did not finish after reader release")
+	}
+}
 
 func TestRecovery_CloneInterrupted(t *testing.T) {
 	layout := mustGitLayout(t)
@@ -43,6 +100,254 @@ func TestRecovery_CloneInterrupted(t *testing.T) {
 	}
 	if store.environmentWrites != 0 {
 		t.Fatalf("environment writes = %d, want 0", store.environmentWrites)
+	}
+}
+
+func TestRecovery_ClassificationIdentityTokenPropagatesToCleanup(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FC4", protocol.StageWorkspaceClone, "v5.4.0")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeSwapMarker(t, update, "partial", "clone")
+	if err := os.MkdirAll(filepath.Join(update, ".git", "objects"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(partial git) error = %v", err)
+	}
+	writeRecoveryRepository(t, layout.RepoDir(), "v5.3.0", recoverySourceURL(t), "old")
+	base := successfulRecoveryOperator(t)
+	var captured filesystem.DeleteRequest
+	operator := &fakeRecoveryOperator{
+		rename: base.rename,
+		remove: func(ctx context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			captured = request
+			return base.remove(ctx, request)
+		},
+	}
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, operator, store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !result.Recovered || !result.MutationApplied || !result.TransactionRemoved {
+		t.Fatalf("Recover() result = %#v, want cleaned transaction", result)
+	}
+	if captured.ExpectedIdentity == nil {
+		t.Fatal("RemoveTree() ExpectedIdentity = nil, want classification token")
+	}
+}
+
+func TestRecovery_DirectoryIdentityChangeFailsAmbiguous(t *testing.T) {
+	t.Run("cleanup", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FC9", protocol.StageWorkspaceClone, "v5.4.0")
+		update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+		writeSwapMarker(t, update, "partial", "clone")
+		writeRecoveryRepository(t, layout.RepoDir(), "v5.3.0", recoverySourceURL(t), "old")
+		store := &fakeRecoveryStore{transaction: &tx}
+		operator := &fakeRecoveryOperator{
+			rename: func(context.Context, filesystem.RenameRequest) (filesystem.RenameResult, error) {
+				t.Fatal("AtomicRename() called after cleanup identity changed")
+				return filesystem.RenameResult{}, nil
+			},
+			remove: func(_ context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+				if request.ExpectedIdentity == nil {
+					t.Fatal("RemoveTree() ExpectedIdentity = nil, want classification token")
+				}
+				return filesystem.DeleteResult{}, filesystem.ErrIdentityChanged
+			},
+		}
+		recovery := mustTestRecovery(t, layout, operator, store)
+
+		result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+		assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+		if result.MutationApplied || result.TransactionRemoved || store.transactionRemoved {
+			t.Fatalf("Recover() result = %#v, want no mutation and retained transaction", result)
+		}
+		if _, err := os.Lstat(update); err != nil {
+			t.Fatalf("update directory after identity rejection: %v", err)
+		}
+	})
+
+	t.Run("rename", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCA", protocol.StageWorkspaceSwap, "v5.4.0")
+		update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+		writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+		store := &fakeRecoveryStore{transaction: &tx}
+		operator := &fakeRecoveryOperator{
+			rename: func(_ context.Context, request filesystem.RenameRequest) (filesystem.RenameResult, error) {
+				if request.ExpectedSourceIdentity == nil {
+					t.Fatal("AtomicRename() ExpectedSourceIdentity = nil, want classification token")
+				}
+				return filesystem.RenameResult{}, filesystem.ErrIdentityChanged
+			},
+			remove: func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+				t.Fatal("RemoveTree() called after rename identity changed")
+				return filesystem.DeleteResult{}, nil
+			},
+		}
+		recovery := mustTestRecovery(t, layout, operator, store)
+
+		result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+		assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+		if result.MutationApplied || result.EnvironmentWritten || result.TransactionRemoved ||
+			store.environmentWrites != 0 || store.transactionRemoved {
+			t.Fatalf("Recover() result = %#v, want zero side effects and retained transaction", result)
+		}
+		if _, err := os.Lstat(update); err != nil {
+			t.Fatalf("update directory after identity rejection: %v", err)
+		}
+		if _, err := os.Lstat(layout.RepoDir()); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("repository path after identity rejection: %v", err)
+		}
+	})
+}
+
+func TestRecovery_CommittedRetiredIdentityChangeFailsCleanup(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCD", protocol.StageWorkspaceCleanup, "v5.4.0")
+	writeRecoveryRepository(t, layout.RepoDir(), "v5.4.0", recoverySourceURL(t), "target")
+	previous := mustRepoPreviousDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, previous, "v5.3.0", recoverySourceURL(t), "old")
+	store := &fakeRecoveryStore{transaction: &tx}
+	operator := &fakeRecoveryOperator{
+		remove: func(_ context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+			if request.ExpectedIdentity == nil {
+				t.Fatal("RemoveTree() ExpectedIdentity = nil, want retired token")
+			}
+			return filesystem.DeleteResult{}, filesystem.ErrIdentityChanged
+		},
+	}
+	recovery := mustTestRecovery(t, layout, operator, store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+	if result.TransactionRemoved || store.transactionRemoved || !result.EnvironmentWritten {
+		t.Fatalf("Recover() result = %#v, want persisted environment and retained cleanup transaction", result)
+	}
+	if _, err := os.Lstat(layout.RepoDir()); err != nil {
+		t.Fatalf("active repository after retired identity rejection: %v", err)
+	}
+	if _, err := os.Lstat(previous); err != nil {
+		t.Fatalf("retired repository after identity rejection: %v", err)
+	}
+}
+
+func TestRecovery_CancellationAfterActivationStillCompletesCommit(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCC", protocol.StageWorkspaceSwap, "v5.4.0")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	store := &fakeRecoveryStore{transaction: &tx}
+	base := successfulRecoveryOperator(t)
+	operator := &fakeRecoveryOperator{
+		rename: func(renameCtx context.Context, request filesystem.RenameRequest) (filesystem.RenameResult, error) {
+			result, err := base.rename(renameCtx, request)
+			cancel()
+			return result, err
+		},
+		remove: base.remove,
+	}
+	recovery := mustTestRecovery(t, layout, operator, store)
+
+	result, err := recovery.Recover(ctx, RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !result.Recovered || !result.MutationApplied || !result.EnvironmentWritten || !result.TransactionRemoved {
+		t.Fatalf("Recover() result = %#v, want committed recovery", result)
+	}
+	if store.writeContextErr != nil || store.removeContextErr != nil {
+		t.Fatalf("committed contexts = write:%v remove:%v, want live", store.writeContextErr, store.removeContextErr)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("parent context remains live, want cancellation after activation")
+	}
+}
+
+func TestRecovery_PreSwapMissingRepositoryHasNoSideEffects(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FC7", protocol.StageWorkspaceVerify, "v5.4.0")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, noSideEffectRecoveryOperator(t), store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+	if result.MutationApplied || result.EnvironmentWritten || result.TransactionRemoved || store.transactionRemoved {
+		t.Fatalf("Recover() result = %#v, want no side effects", result)
+	}
+	if _, err := os.Lstat(update); err != nil {
+		t.Fatalf("update directory after ambiguous recovery: %v", err)
+	}
+}
+
+func TestRecovery_PreCloneFirstInstallWithoutDirectoriesClearsTransaction(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCF", protocol.StageWorkspaceClone, "v5.4.0")
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, noSideEffectRecoveryOperator(t), store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !result.Recovered || !result.TransactionRemoved || result.MutationApplied {
+		t.Fatalf("Recover() result = %#v, want transaction-only cleanup", result)
+	}
+	if !store.transactionRemoved {
+		t.Fatal("update transaction remains, want removed empty first-install transaction")
+	}
+}
+
+func TestRecovery_DamagedRepositoryKeepsIdentityForPreSwapCleanup(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCE", protocol.StageWorkspaceVerify, "v5.4.0")
+	if err := os.MkdirAll(layout.RepoDir(), 0o700); err != nil {
+		t.Fatalf("MkdirAll(damaged repository) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(layout.RepoDir(), "damaged-marker.txt"), []byte("damaged"), 0o600); err != nil {
+		t.Fatalf("WriteFile(damaged marker) error = %v", err)
+	}
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, successfulRecoveryOperator(t), store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !result.Recovered || !result.MutationApplied || !result.TransactionRemoved {
+		t.Fatalf("Recover() result = %#v, want cleaned pre-swap transaction", result)
+	}
+	if _, err := os.Stat(filepath.Join(layout.RepoDir(), "damaged-marker.txt")); err != nil {
+		t.Fatalf("damaged active repository after cleanup: %v", err)
+	}
+	if _, err := os.Lstat(update); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("update directory remains: %v", err)
+	}
+}
+
+func TestRecovery_VerifyUnknownRemoteHasNoSideEffects(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCG", protocol.StageWorkspaceVerify, "v5.4.0")
+	writeRecoveryRepository(t, layout.RepoDir(), "v5.3.0", "https://example.test/untrusted.git", "untrusted")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, noSideEffectRecoveryOperator(t), store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+	if result.MutationApplied || result.EnvironmentWritten || result.TransactionRemoved || store.transactionRemoved {
+		t.Fatalf("Recover() result = %#v, want no side effects", result)
+	}
+	if _, err := os.Lstat(update); err != nil {
+		t.Fatalf("update directory after ambiguous recovery: %v", err)
 	}
 }
 
@@ -115,6 +420,45 @@ func TestRecovery_BetweenRenamesRollsBack(t *testing.T) {
 	}
 	if !containsStageSequence(stages, protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup) {
 		t.Fatalf("reported stages = %v, want swap before cleanup", stages)
+	}
+}
+
+func TestRecovery_RollbackRenameCancellationAfterMutationIsSwapFailure(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FB3", protocol.StageWorkspaceSwap, "v5.4.0")
+	previous := mustRepoPreviousDir(t, layout, tx.state.OperationID)
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, previous, "v5.3.0", recoverySourceURL(t), "old")
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	operator := successfulRecoveryOperator(t)
+	operator.rename = func(_ context.Context, request filesystem.RenameRequest) (filesystem.RenameResult, error) {
+		if err := os.Rename(request.Source, request.Destination); err != nil {
+			return filesystem.RenameResult{}, err
+		}
+		return filesystem.RenameResult{MutationApplied: true}, context.DeadlineExceeded
+	}
+	operator.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+		t.Fatal("RemoveTree() called after rollback rename cancellation")
+		return filesystem.DeleteResult{}, nil
+	}
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, operator, store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	assertGitrepoCode(t, err, protocol.CodeGitRepoSwapFailed)
+	var operationErr *Error
+	if !errors.As(err, &operationErr) || operationErr.Committed() {
+		t.Fatalf("error = %v, want non-committed swap failure", err)
+	}
+	if !result.MutationApplied || result.Recovered || result.TransactionRemoved || store.transactionRemoved {
+		t.Fatalf("Recover() result = %#v, want applied rollback with retained transaction", result)
+	}
+	assertSwapMarker(t, filepath.Join(layout.RepoDir(), "marker-old"), "old")
+	if _, err := os.Lstat(previous); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("previous directory remains after rollback rename: %v", err)
+	}
+	if _, err := os.Lstat(update); err != nil {
+		t.Fatalf("update directory missing after rollback rename: %v", err)
 	}
 }
 
@@ -578,6 +922,35 @@ func TestRecovery_FirstInstallRenameFailureDoesNotClaimMutation(t *testing.T) {
 	assertSwapMarker(t, filepath.Join(update, "marker-target"), "target")
 }
 
+func TestRecovery_ActivationRenameCancellationAfterMutationIsCommittedFailure(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FBB", protocol.StageWorkspaceSwap, "v5.4.0")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	operator := successfulRecoveryOperator(t)
+	operator.rename = func(_ context.Context, request filesystem.RenameRequest) (filesystem.RenameResult, error) {
+		if err := os.Rename(request.Source, request.Destination); err != nil {
+			return filesystem.RenameResult{}, err
+		}
+		return filesystem.RenameResult{MutationApplied: true}, context.DeadlineExceeded
+	}
+	operator.remove = func(context.Context, filesystem.DeleteRequest) (filesystem.DeleteResult, error) {
+		t.Fatal("RemoveTree() called after activation rename cancellation")
+		return filesystem.DeleteResult{}, nil
+	}
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, operator, store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	assertCommittedGitrepoCode(t, err, protocol.CodeGitRepoSwapFailed)
+	if !result.MutationApplied || !result.EnvironmentWritten || result.TransactionRemoved || store.transactionRemoved {
+		t.Fatalf("Recover() result = %#v, want active mutation, persisted environment and retained transaction", result)
+	}
+	if _, err := os.Stat(layout.RepoDir()); err != nil {
+		t.Fatalf("active repository missing after applied rename: %v", err)
+	}
+}
+
 func TestRecovery_StateWriteFailureRetainsTransaction(t *testing.T) {
 	layout := mustGitLayout(t)
 	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FB5", protocol.StageWorkspaceSwap, "v5.4.0")
@@ -609,6 +982,24 @@ func TestRecovery_StateWriteFailureRetainsTransaction(t *testing.T) {
 }
 
 func TestRecovery_ActiveCleanupDeadlineUsesCommittedErrorCodes(t *testing.T) {
+	t.Run("environment read is state failure", func(t *testing.T) {
+		layout := mustGitLayout(t)
+		tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FC0", protocol.StageWorkspaceCleanup, "v5.4.0")
+		writeRecoveryRepository(t, layout.RepoDir(), "v5.4.0", recoverySourceURL(t), "target")
+		store := &fakeRecoveryStore{
+			transaction:        &tx,
+			environmentSet:     true,
+			readEnvironmentErr: context.DeadlineExceeded,
+		}
+		recovery := mustTestRecovery(t, layout, successfulRecoveryOperator(t), store)
+
+		result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+		assertCommittedGitrepoCode(t, err, protocol.CodeStateWriteFailed)
+		if result.TransactionRemoved || store.transactionRemoved {
+			t.Fatalf("Recover() result = %#v, want retained active transaction", result)
+		}
+	})
+
 	t.Run("environment write is state failure", func(t *testing.T) {
 		layout := mustGitLayout(t)
 		tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FC1", protocol.StageWorkspaceCleanup, "v5.4.0")
@@ -625,7 +1016,7 @@ func TestRecovery_ActiveCleanupDeadlineUsesCommittedErrorCodes(t *testing.T) {
 		recovery := mustTestRecovery(t, layout, successfulRecoveryOperator(t), store)
 
 		result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
-		assertGitrepoCode(t, err, protocol.CodeStateWriteFailed)
+		assertCommittedGitrepoCode(t, err, protocol.CodeStateWriteFailed)
 		if result.TransactionRemoved || store.transactionRemoved {
 			t.Fatalf("Recover() result = %#v, want active transaction retained", result)
 		}
@@ -652,9 +1043,9 @@ func TestRecovery_ActiveCleanupDeadlineUsesCommittedErrorCodes(t *testing.T) {
 		recovery := mustTestRecovery(t, layout, operator, store)
 
 		result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
-		assertGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
-		if result.TransactionRemoved || store.transactionRemoved {
-			t.Fatalf("Recover() result = %#v, want active transaction retained", result)
+		assertCommittedGitrepoCode(t, err, protocol.CodeGitRepoCleanupFailed)
+		if result.TransactionRemoved || store.transactionRemoved || !result.EnvironmentWritten {
+			t.Fatalf("Recover() result = %#v, want environment persisted and active transaction retained", result)
 		}
 	})
 
@@ -674,7 +1065,7 @@ func TestRecovery_ActiveCleanupDeadlineUsesCommittedErrorCodes(t *testing.T) {
 		recovery := mustTestRecovery(t, layout, successfulRecoveryOperator(t), store)
 
 		result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
-		assertGitrepoCode(t, err, protocol.CodeStateWriteFailed)
+		assertCommittedGitrepoCode(t, err, protocol.CodeStateWriteFailed)
 		if !result.EnvironmentWritten || result.TransactionRemoved || store.transactionRemoved {
 			t.Fatalf("Recover() result = %#v, want environment completion with retained transaction", result)
 		}
@@ -822,7 +1213,9 @@ type fakeRecoveryStore struct {
 	readEnvironmentErr error
 	environmentWrites  int
 	writeErr           error
+	writeContextErr    error
 	removeErr          error
+	removeContextErr   error
 }
 
 func (s *fakeRecoveryStore) ReadUpdate(context.Context) (recoveryTransaction, error) {
@@ -860,8 +1253,9 @@ func (s *fakeRecoveryStore) NewBrokenEnvironment(
 	}, nil
 }
 
-func (s *fakeRecoveryStore) WriteEnvironment(_ context.Context, value state.EnvironmentState) error {
+func (s *fakeRecoveryStore) WriteEnvironment(ctx context.Context, value state.EnvironmentState) error {
 	s.environmentWrites++
+	s.writeContextErr = ctx.Err()
 	if s.writeErr != nil {
 		return s.writeErr
 	}
@@ -870,7 +1264,8 @@ func (s *fakeRecoveryStore) WriteEnvironment(_ context.Context, value state.Envi
 	return nil
 }
 
-func (s *fakeRecoveryStore) removeTransaction(context.Context) error {
+func (s *fakeRecoveryStore) removeTransaction(ctx context.Context) error {
+	s.removeContextErr = ctx.Err()
 	if s.removeErr != nil {
 		return s.removeErr
 	}

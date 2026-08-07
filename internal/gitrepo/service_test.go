@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
+	"golang.org/x/sys/windows"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -53,11 +54,76 @@ func TestService_CheckIsReadOnly(t *testing.T) {
 	if !result.Healthy || result.Reason != "ok" {
 		t.Fatalf("Check() = %#v, want healthy ok", result)
 	}
+	if result.directoryIdentity == nil {
+		t.Fatal("Check() directory identity = nil, want active repository token")
+	}
 	if calledLocks || calledRuntime {
 		t.Fatalf("Check() touched mutation runtime: locks=%t runtime=%t", calledLocks, calledRuntime)
 	}
 	if after := directoryNames(t, root); strings.Join(before, "\x00") != strings.Join(after, "\x00") {
 		t.Fatalf("Check() changed app-root entries: before=%v after=%v", before, after)
+	}
+}
+
+func TestService_CheckPinsRepositoryDuringReader(t *testing.T) {
+	root := t.TempDir()
+	layout := testServiceLayout(t, root)
+	if err := os.Mkdir(layout.RepoDir(), 0o755); err != nil {
+		t.Fatalf("Mkdir(repo) error = %v", err)
+	}
+	reader := &blockingServiceReader{
+		snapshot: testServiceSnapshot("v1.0.0"),
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	service, err := newServiceWithDependencies(
+		layout,
+		reader,
+		func(context.Context, *config.Layout) (mutationLockSet, error) {
+			t.Fatal("Check() acquired mutation locks")
+			return nil, nil
+		},
+		func(context.Context, *config.Layout, SyncRequest, OperationLogger) (syncRuntime, error) {
+			t.Fatal("Check() built mutation runtime")
+			return nil, nil
+		},
+		func(mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
+	)
+	if err != nil {
+		t.Fatalf("newServiceWithDependencies() error = %v", err)
+	}
+	type checkResult struct {
+		result CheckResult
+		err    error
+	}
+	resultCh := make(chan checkResult, 1)
+	go func() {
+		result, checkErr := service.Check(t.Context())
+		resultCh <- checkResult{result: result, err: checkErr}
+	}()
+	select {
+	case <-reader.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not reach barrier")
+	}
+	retired := filepath.Join(layout.AppRoot(), "repo.reader-race")
+	// 第一步 A->hold 必须被 lease 拦截；若它成功，后续可构造 B->repo->A 的 ABA。
+	renameErr := os.Rename(layout.RepoDir(), retired)
+	if !errors.Is(renameErr, windows.ERROR_SHARING_VIOLATION) &&
+		!errors.Is(renameErr, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("Rename(repo while Check reader is active) error = %v, want sharing/access denial", renameErr)
+	}
+	close(reader.release)
+	select {
+	case checked := <-resultCh:
+		if checked.err != nil {
+			t.Fatalf("Check() error = %v", checked.err)
+		}
+		if !checked.result.Healthy {
+			t.Fatalf("Check() = %#v, want healthy result", checked.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Check() did not finish after reader release")
 	}
 }
 
@@ -123,6 +189,12 @@ func TestService_SyncActualSwapInvalidatesReadyEnvironment(t *testing.T) {
 	target := mustServiceTarget(t, "v1.0.0")
 	runtime.fetchResult = FetchResult{Revision: testServiceRevision(target, "c")}
 	runtime.swapResult = SwapResult{Revision: runtime.fetchResult.Revision, RepositoryActivated: true, MutationApplied: true, CleanupCompleted: true}
+	runtime.swap = func(_ context.Context, request SwapRequest) (SwapResult, error) {
+		if request.ActiveIdentity == nil {
+			t.Fatal("Swap() ActiveIdentity = nil, want ordinary invalid repository token")
+		}
+		return runtime.swapResult, nil
+	}
 	service := newTestService(t, layout, reader, runtime, nil)
 	result, err := service.Sync(context.Background(), testSyncRequest(target))
 	if err != nil {
@@ -172,7 +244,10 @@ func TestService_SyncNoOpPreservesStableState(t *testing.T) {
 func TestService_SyncRejectsRunningBackend(t *testing.T) {
 	root := t.TempDir()
 	layout := testServiceLayout(t, root)
-	locks := &serviceTestLocks{acquireErr: serviceCodedError{code: protocol.CodeBackendStillRunning}}
+	locks := &serviceTestLocks{acquireErr: errors.Join(
+		serviceCodedError{code: protocol.CodeBackendStillRunning},
+		nil,
+	)}
 	service, err := newServiceWithDependencies(
 		layout,
 		&serviceTestReader{},
@@ -193,6 +268,50 @@ func TestService_SyncRejectsRunningBackend(t *testing.T) {
 	var operationErr *Error
 	if !errors.As(err, &operationErr) || operationErr.Code() != protocol.CodeBackendStillRunning {
 		t.Fatalf("Sync() error = %v, want BACKEND_STILL_RUNNING", err)
+	}
+}
+
+func TestMapMutexFailure_WrappedCodesAndCancellation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		cause    error
+		wantCode protocol.Code
+	}{
+		{
+			name: "wrapped backend conflict",
+			cause: errors.Join(
+				serviceCodedError{code: protocol.CodeBackendStillRunning},
+				nil,
+			),
+			wantCode: protocol.CodeBackendStillRunning,
+		},
+		{
+			name: "cancellation outranks wrapped conflict",
+			cause: errors.Join(
+				context.Canceled,
+				serviceCodedError{code: protocol.CodeBackendStillRunning},
+			),
+			wantCode: protocol.CodeOperationCancelled,
+		},
+		{
+			name: "deadline outranks wrapped conflict",
+			cause: errors.Join(
+				context.DeadlineExceeded,
+				serviceCodedError{code: protocol.CodeMutationInProgress},
+			),
+			wantCode: protocol.CodeOperationCancelled,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := mapMutexFailure(test.cause)
+			if got.Code() != test.wantCode {
+				t.Fatalf("mapMutexFailure() code = %q, want %q", got.Code(), test.wantCode)
+			}
+		})
 	}
 }
 
@@ -251,7 +370,7 @@ func TestService_ActiveCleanupDeadlineIsStateFailure(t *testing.T) {
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
 	_, err := service.Sync(t.Context(), testSyncRequest(target))
-	assertGitrepoCode(t, err, protocol.CodeStateWriteFailed)
+	assertCommittedGitrepoCode(t, err, protocol.CodeStateWriteFailed)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Sync() error = %v, want retained deadline cause", err)
 	}
@@ -506,6 +625,22 @@ type serviceTestReader struct {
 	err      error
 }
 
+type blockingServiceReader struct {
+	snapshot repositorySnapshot
+	entered  chan struct{}
+	release  chan struct{}
+}
+
+func (r *blockingServiceReader) Inspect(ctx context.Context, _ string) (repositorySnapshot, error) {
+	close(r.entered)
+	select {
+	case <-r.release:
+		return r.snapshot, nil
+	case <-ctx.Done():
+		return repositorySnapshot{}, ctx.Err()
+	}
+}
+
 func (r *serviceTestReader) Inspect(context.Context, string) (repositorySnapshot, error) {
 	if r.err != nil {
 		return repositorySnapshot{}, r.err
@@ -602,10 +737,21 @@ func (r *serviceTestRuntime) Fetch(context.Context, FetchRequest) (FetchResult, 
 }
 func (r *serviceTestRuntime) Swap(ctx context.Context, request SwapRequest) (SwapResult, error) {
 	r.swapCalls++
+	var result SwapResult
+	var err error
 	if r.swap != nil {
-		return r.swap(ctx, request)
+		result, err = r.swap(ctx, request)
+	} else {
+		result, err = r.swapResult, r.swapErr
 	}
-	return r.swapResult, r.swapErr
+	if result.RepositoryActivated && request.CommitEnvironment != nil {
+		commitCtx, cancel := serviceCleanupContext(ctx)
+		defer cancel()
+		if commitErr := request.CommitEnvironment(commitCtx, result.Revision); commitErr != nil {
+			return result, joinPrimaryError(commitErr, err)
+		}
+	}
+	return result, err
 }
 func (r *serviceTestRuntime) NewBrokenEnvironment(last state.Revision, broken state.BrokenEnvironment) (state.EnvironmentState, error) {
 	return state.EnvironmentState{SchemaVersion: state.SchemaVersion, Status: protocol.StateEnvironmentBroken, LastSuccessful: last, Broken: &broken}, nil

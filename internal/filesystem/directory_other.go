@@ -18,3 +18,11 @@ func prepareManagedDirectory(
 ) (*DirectoryLease, error) {
 	return nil, errManagedDirectoryUnsupported
 }
+
+func pinManagedDirectory(
+	context.Context,
+	*config.Layout,
+	string,
+) (*DirectoryLease, error) {
+	return nil, errManagedDirectoryUnsupported
+}

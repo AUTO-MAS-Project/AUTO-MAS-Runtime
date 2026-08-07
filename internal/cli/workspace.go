@@ -380,11 +380,12 @@ func addControlCommandID(err error, commandID string) error {
 	}
 	details["controlCommandId"] = commandID
 	return &commandError{
-		code:    code,
-		stage:   stage,
-		message: message,
-		details: details,
-		cause:   err,
+		code:      code,
+		stage:     stage,
+		message:   message,
+		details:   details,
+		cause:     err,
+		committed: findCommittedOperationError(err) != nil,
 	}
 }
 

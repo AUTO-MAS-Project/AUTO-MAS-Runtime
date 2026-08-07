@@ -265,11 +265,13 @@ func TestSafeValidators_RejectUnsafeAndAcceptFrozenForms(t *testing.T) {
 		{name: "product_parent", call: func() error { return validateProductVersion("v5..4") }},
 		{name: "product_ref", call: func() error { return validateProductVersion("v5@{1}") }},
 		{name: "product_trailing_dot", call: func() error { return validateProductVersion("v5.") }},
+		{name: "product_lock_suffix", call: func() error { return validateProductVersion("vfoo.lock") }},
 		{name: "product_too_long", call: func() error { return validateProductVersion("v" + strings.Repeat("a", 128)) }},
 		{name: "tool_path", call: func() error { return validateToolVersion(`3.12\bin`) }},
 		{name: "tool_c0_control", call: func() error { return validateToolVersion("3.12\n") }},
 		{name: "tool_del_control", call: func() error { return validateToolVersion("3.12\u007f") }},
 		{name: "tool_c1_control", call: func() error { return validateToolVersion("3.12\u0085") }},
+		{name: "tool_lock_suffix", call: func() error { return validateToolVersion("3.12.lock") }},
 		{name: "log_c0_control", call: func() error {
 			return validateRuntimeLogPath(layout, filepath.Join(layout.RuntimeLogDir(), "run\n.log"))
 		}},

@@ -8,11 +8,12 @@ import (
 
 // Error 描述工作区 Git 服务失败，供 CLI 映射协议四元组。
 type Error struct {
-	code    protocol.Code
-	stage   protocol.Stage
-	message string
-	details map[string]any
-	cause   error
+	code      protocol.Code
+	stage     protocol.Stage
+	message   string
+	details   map[string]any
+	cause     error
+	committed bool
 }
 
 func newError(
@@ -29,6 +30,18 @@ func newError(
 		details: details,
 		cause:   cause,
 	}
+}
+
+func newCommittedError(
+	code protocol.Code,
+	stage protocol.Stage,
+	message string,
+	details map[string]any,
+	cause error,
+) *Error {
+	err := newError(code, stage, message, details, cause)
+	err.committed = true
+	return err
 }
 
 func (e *Error) Error() string {
@@ -78,6 +91,11 @@ func (e *Error) Details() map[string]any {
 		return nil
 	}
 	return e.details
+}
+
+// Committed 报告错误是否发生在仓库激活提交点之后。
+func (e *Error) Committed() bool {
+	return e != nil && e.committed
 }
 
 func messageForCode(code protocol.Code) string {

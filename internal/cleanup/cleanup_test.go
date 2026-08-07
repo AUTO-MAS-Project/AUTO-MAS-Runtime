@@ -816,6 +816,81 @@ func TestCleanup_RepoUpdateIdentityMismatchFailClosed(t *testing.T) {
 	}
 }
 
+// TestCleanup_RepoUpdateReplacementAfterPlanningFailsClosed 证明计划枚举后
+// 目录叶子被替换时，执行阶段不会按同名路径删除替换目录。
+func TestCleanup_RepoUpdateReplacementAfterPlanningFailsClosed(t *testing.T) {
+	layout, _ := newTestLayout(t)
+	updateDir, err := layout.RepoUpdateDir(testOperationID)
+	if err != nil {
+		t.Fatalf("RepoUpdateDir() error = %v", err)
+	}
+	writeFixtureFile(t, filepath.Join(updateDir, "partial"), []byte("original"))
+	writeUpdateTransaction(t, layout, testOperationID)
+	service, auditor := newTestService(t, layout)
+
+	plan, err := service.buildPlan(t.Context(), testOperationID)
+	if err != nil {
+		t.Fatalf("buildPlan() error = %v", err)
+	}
+	var updateItem planItem
+	for _, candidate := range plan {
+		if candidate.id == "repo-update-"+testOperationID {
+			updateItem = candidate
+			break
+		}
+	}
+	if updateItem.target == "" {
+		t.Fatalf("buildPlan() did not produce update item: %+v", plan)
+	}
+	if updateItem.expectedIdentity == nil {
+		t.Fatal("repo.update plan item identity = nil, want enumeration token")
+	}
+
+	retired := updateDir + ".replaced"
+	if err := os.Rename(updateDir, retired); err != nil {
+		t.Fatalf("rename original update directory: %v", err)
+	}
+	writeFixtureFile(t, filepath.Join(updateDir, "replacement", "user-data.txt"), []byte("must remain"))
+
+	for _, directory := range append([]string{
+		layout.AppRoot(),
+		layout.RepoDir(),
+		layout.StateDir(),
+		layout.RuntimeDir(),
+		layout.RuntimeCacheDir(),
+		layout.UVCacheDir(),
+		layout.DownloadCacheDir(),
+		layout.BuildCacheDir(),
+		layout.LogsDir(),
+		layout.RuntimeLogDir(),
+	}, layout.ProtectedRootDirs()...) {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", directory, err)
+		}
+	}
+	operator, err := filesystem.New(t.Context(), layout, auditor)
+	if err != nil {
+		t.Fatalf("filesystem.New() error = %v", err)
+	}
+	emitter, _ := newTestEmitter(t)
+	item, executeErr := service.executeItem(t.Context(), emitter, operator, updateItem)
+	if executeErr != nil {
+		t.Fatalf("executeItem() error = %v, want item-level failure", executeErr)
+	}
+	if item.Status != ItemFailed {
+		t.Fatalf("executeItem() item = %+v, want failed", item)
+	}
+	if !fileExists(filepath.Join(updateDir, "replacement", "user-data.txt")) {
+		t.Fatal("replacement directory was deleted after plan identity changed")
+	}
+	if !dirExists(updateDir) {
+		t.Fatal("replacement directory was removed")
+	}
+	if !dirExists(retired) {
+		t.Fatal("original directory was unexpectedly removed during setup")
+	}
+}
+
 func TestCleanup_RepoUpdateNoTransactionFailClosed(t *testing.T) {
 	t.Parallel()
 	layout, _ := newTestLayout(t)

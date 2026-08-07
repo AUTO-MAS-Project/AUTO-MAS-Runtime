@@ -148,7 +148,8 @@ func validVersionValue(value string) bool {
 	if len(value) == 0 || len(value) > 128 ||
 		strings.Contains(value, "..") ||
 		strings.Contains(value, "@{") ||
-		strings.HasSuffix(value, ".") {
+		strings.HasSuffix(value, ".") ||
+		strings.HasSuffix(value, ".lock") {
 		return false
 	}
 	for i := 0; i < len(value); i++ {

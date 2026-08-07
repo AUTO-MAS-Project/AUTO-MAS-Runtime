@@ -57,6 +57,67 @@ func TestOperator_AtomicRenameRepositoryRollback(t *testing.T) {
 	}
 }
 
+func TestAtomicRename_RejectsClassifiedSourceIdentityMismatch(t *testing.T) {
+	operator, layout, request := newRenameFixture(t, RenameRepositoryRollback)
+	inspection, err := InspectManagedDirectory(t.Context(), layout, request.Source)
+	if err != nil || !inspection.Exists || inspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory() = %#v, %v, want existing identity", inspection, err)
+	}
+	expected := *inspection.Identity
+	expected.fileID[0]++
+	marker := filepath.Join(request.Source, "must-survive.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("WriteFile(marker) error = %v", err)
+	}
+	request.ExpectedSourceIdentity = &expected
+	result, err := operator.AtomicRename(t.Context(), request)
+	if result.MutationApplied || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("AtomicRename() = %#v, %v, want identity rejection without mutation", result, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker after identity rejection: %v", err)
+	}
+}
+
+func TestAtomicRename_RejectsReplacementAfterClassification(t *testing.T) {
+	operator, layout, request := newRenameFixture(t, RenameRepositoryRollback)
+	inspection, err := InspectManagedDirectory(t.Context(), layout, request.Source)
+	if err != nil || !inspection.Exists || inspection.Identity == nil {
+		t.Fatalf("InspectManagedDirectory() = %#v, %v, want existing identity", inspection, err)
+	}
+	expected := *inspection.Identity
+	classifiedMarker := filepath.Join(request.Source, "classified-marker.txt")
+	if err := os.WriteFile(classifiedMarker, []byte("classified"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(classified marker) error = %v", err)
+	}
+	original := request.Source + "-classified"
+	if err := os.Rename(request.Source, original); err != nil {
+		t.Fatalf("os.Rename(classified source) error = %v", err)
+	}
+	if err := os.Mkdir(request.Source, 0o700); err != nil {
+		t.Fatalf("os.Mkdir(replacement) error = %v", err)
+	}
+	marker := filepath.Join(request.Source, "replacement-marker.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(marker) error = %v", err)
+	}
+	request.ExpectedSourceIdentity = &expected
+
+	result, err := operator.AtomicRename(t.Context(), request)
+	if result.MutationApplied || !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("AtomicRename() = %#v, %v, want identity rejection without mutation", result, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("replacement marker after identity rejection: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(original, "classified-marker.txt")); err != nil || string(got) != "classified" {
+		t.Fatalf("classified marker after identity rejection = %q, %v", got, err)
+	}
+	if _, err := os.Lstat(request.Destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination after identity rejection: %v", err)
+	}
+}
+
 func TestAtomicRename_RejectsInvalidFieldsBeforeWin32(t *testing.T) {
 	operator, _, valid := newRenameFixture(t, RenameRepositoryToRetired)
 	attributeCalls := 0
@@ -407,6 +468,53 @@ func TestAtomicRename_ContextCancelsWaitAndStopsRetries(t *testing.T) {
 	result, err := operator.AtomicRename(ctx, request)
 	if result.MutationApplied || !errors.Is(err, context.Canceled) {
 		t.Fatalf("AtomicRename() = %#v, %v", result, err)
+	}
+}
+
+func TestAtomicRename_CancellationAfterPinStopsBeforeMutation(t *testing.T) {
+	operator, layout, request := newRenameFixture(t, RenameRepositoryToRetired)
+	ctx, cancel := context.WithCancel(t.Context())
+	caseSensitive := operator.api.caseSensitive
+	finalPath := operator.api.finalPath
+	parentChecks := 0
+	operator.api.caseSensitive = func(handle windows.Handle) (bool, error) {
+		value, err := caseSensitive(handle)
+		if err != nil {
+			return value, err
+		}
+		path, pathErr := finalPath(handle)
+		if pathErr == nil {
+			display, displayErr := displayWindowsPath(path)
+			if displayErr == nil && sameRenamePath(display, layout.AppRoot()) {
+				parentChecks++
+				if parentChecks == 2 {
+					cancel()
+				}
+			}
+		}
+		return value, nil
+	}
+	renameCalls := 0
+	rename := operator.api.rename
+	operator.api.rename = func(
+		source windows.Handle,
+		parent windows.Handle,
+		name string,
+		replace bool,
+	) error {
+		renameCalls++
+		return rename(source, parent, name, replace)
+	}
+
+	result, err := operator.AtomicRename(ctx, request)
+	if result.MutationApplied || !errors.Is(err, context.Canceled) {
+		t.Fatalf("AtomicRename() = %#v, %v, want pre-mutation cancellation", result, err)
+	}
+	if renameCalls != 0 {
+		t.Fatalf("rename calls = %d, want 0 after cancellation", renameCalls)
+	}
+	if _, statErr := os.Stat(request.Source); statErr != nil {
+		t.Fatalf("source after cancellation: %v", statErr)
 	}
 }
 
