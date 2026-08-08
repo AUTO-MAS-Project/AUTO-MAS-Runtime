@@ -246,6 +246,9 @@ func TestValidateEnvironment_OperationFailedToolRequirements(t *testing.T) {
 		toolsRequired bool
 	}{
 		{stage: protocol.StageWorkspaceCleanup},
+		{stage: protocol.StageUVCheck},
+		{stage: protocol.StageUVDownload},
+		{stage: protocol.StageUVVerify},
 		{stage: protocol.StagePythonCheck},
 		{stage: protocol.StagePythonInstall, toolsRequired: true},
 		{stage: protocol.StageDependenciesCheck, toolsRequired: true},
@@ -300,9 +303,6 @@ func TestValidateEnvironment_RejectsUnresolvedRepositoryFailure(t *testing.T) {
 
 	store := newTestStore(t, completeFakeStateFiles(), fixedStateTime)
 	for _, stage := range []protocol.Stage{
-		protocol.StageUVCheck,
-		protocol.StageUVDownload,
-		protocol.StageUVVerify,
 		protocol.StageWorkspaceSwap,
 		protocol.StageBootstrap,
 		protocol.StageRepair,
@@ -355,7 +355,7 @@ func TestValidateEnvironment_UsesSharedSafeVersionRules(t *testing.T) {
 	}
 }
 
-func TestStore_UVPreparationFailureDoesNotCreateBrokenState(t *testing.T) {
+func TestStore_UVPreparationFailureCanCreateBrokenState(t *testing.T) {
 	t.Parallel()
 
 	writeCalls := 0
@@ -371,8 +371,12 @@ func TestStore_UVPreparationFailureDoesNotCreateBrokenState(t *testing.T) {
 	store := newTestStore(t, files, fixedStateTime)
 	details := validOperationFailed(store)
 	details.Stage = protocol.StageUVVerify
-	if _, err := store.NewBrokenEnvironment(validLastSuccessful(), details); err == nil {
-		t.Fatal("NewBrokenEnvironment(uv.verify) error = nil, want rejection")
+	value, err := store.NewBrokenEnvironment(validLastSuccessful(), details)
+	if err != nil {
+		t.Fatalf("NewBrokenEnvironment(uv.verify) error = %v, want success", err)
+	}
+	if value.Status != protocol.StateEnvironmentBroken || value.Broken == nil || value.Broken.Stage != protocol.StageUVVerify {
+		t.Fatalf("broken state = %#v, want uv.verify failure", value)
 	}
 	if writeCalls != 0 {
 		t.Fatalf("WriteAtomic calls = %d, want 0", writeCalls)

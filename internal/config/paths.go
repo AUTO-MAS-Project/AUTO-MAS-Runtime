@@ -5,6 +5,9 @@ import "path/filepath"
 type layoutPaths struct {
 	repoDir              string
 	repoVersionFile      string
+	pythonVersionFile    string
+	pyProjectFile        string
+	uvLockFile           string
 	stateDir             string
 	backendStateFile     string
 	mutationStateFile    string
@@ -40,6 +43,9 @@ func newLayoutPaths(root string) layoutPaths {
 	return layoutPaths{
 		repoDir:              filepath.Join(root, "repo"),
 		repoVersionFile:      filepath.Join(root, "repo", "res", "version.json"),
+		pythonVersionFile:    filepath.Join(root, "repo", ".python-version"),
+		pyProjectFile:        filepath.Join(root, "repo", "pyproject.toml"),
+		uvLockFile:           filepath.Join(root, "repo", "uv.lock"),
 		stateDir:             stateDir,
 		backendStateFile:     filepath.Join(stateDir, "backend.json"),
 		mutationStateFile:    filepath.Join(stateDir, "mutation.json"),
@@ -70,6 +76,15 @@ func (l *Layout) RepoDir() string { return l.paths.repoDir }
 
 // RepoVersionFile 返回受管仓库版本文件路径。
 func (l *Layout) RepoVersionFile() string { return l.paths.repoVersionFile }
+
+// PythonVersionFile 返回受管仓库的精确 Python 版本文件路径。
+func (l *Layout) PythonVersionFile() string { return l.paths.pythonVersionFile }
+
+// PyProjectFile 返回受管仓库的项目元数据路径。
+func (l *Layout) PyProjectFile() string { return l.paths.pyProjectFile }
+
+// UVLockFile 返回受管仓库的锁文件路径。
+func (l *Layout) UVLockFile() string { return l.paths.uvLockFile }
 
 // StateDir 返回 Runtime 状态文件目录。
 func (l *Layout) StateDir() string { return l.paths.stateDir }

@@ -8,6 +8,16 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
+type workspaceControlContextKey struct{}
+
+func workspaceControlFromContext(ctx context.Context) *workspaceControl {
+	if ctx == nil {
+		return nil
+	}
+	control, _ := ctx.Value(workspaceControlContextKey{}).(*workspaceControl)
+	return control
+}
+
 // devRuntimeVersion 是 T7.1 正式注入前的稳定占位版本号。
 const devRuntimeVersion = "dev"
 
@@ -38,6 +48,31 @@ func runOperationWithCapabilities(
 	capabilities []string,
 	run func(context.Context, *protocol.Emitter) (sessionSuccess, error),
 ) int {
+	return runOperationSession(ctx, deps, command, stage, capabilities, false, run)
+}
+
+// runOperationWithStdinCancel 为需要接收 stdin cancel 的 M5 操作创建独立控制读取器。
+// workspace sync 保留自己的控制编排，因此不能把控制器嵌套到通用会话中。
+func runOperationWithStdinCancel(
+	ctx context.Context,
+	deps *deps,
+	command string,
+	stage protocol.Stage,
+	capabilities []string,
+	run func(context.Context, *protocol.Emitter) (sessionSuccess, error),
+) int {
+	return runOperationSession(ctx, deps, command, stage, capabilities, true, run)
+}
+
+func runOperationSession(
+	ctx context.Context,
+	deps *deps,
+	command string,
+	stage protocol.Stage,
+	capabilities []string,
+	withStdinCancel bool,
+	run func(context.Context, *protocol.Emitter) (sessionSuccess, error),
+) int {
 	output, err := newProcessOutput(deps)
 	if err != nil {
 		return sessionSetupFailure(deps, err)
@@ -55,7 +90,57 @@ func runOperationWithCapabilities(
 	if err := ctx.Err(); err != nil {
 		return emitFailure(deps, emitter, stage, err)
 	}
-	success, err := run(ctx, emitter)
+	operationContext := ctx
+	var cancelOperation context.CancelFunc
+	var control *workspaceControl
+	var controlReader *protocol.ControlReader
+	var controlDone chan error
+	if withStdinCancel {
+		operationContext, cancelOperation = context.WithCancel(ctx)
+		control = newWorkspaceControl(cancelOperation, stage)
+		controlReader, err = protocol.NewControlReader(
+			deps.io.In,
+			emitter,
+			control,
+			protocol.ControlCancel,
+		)
+		if err != nil {
+			cancelOperation()
+			return emitFailure(deps, emitter, stage, workspaceControlInfrastructureError(stage, err))
+		}
+		operationContext = context.WithValue(operationContext, workspaceControlContextKey{}, control)
+		controlDone = make(chan error, 1)
+		go func() {
+			readErr := controlReader.Run(operationContext)
+			if readErr != nil && !isWorkspaceControlContextCancellation(operationContext, readErr) {
+				control.SetReaderError(readErr)
+				cancelOperation()
+			}
+			controlDone <- readErr
+		}()
+	}
+	success, err := run(operationContext, emitter)
+	if controlReader != nil {
+		cancelOperation()
+		stopErr := stopWorkspaceControl(controlReader, deps.io.In, controlDone)
+		if stopErr != nil {
+			err = joinWorkspaceControlError(
+				err,
+				workspaceControlInfrastructureError(control.CurrentControlStage(), stopErr),
+			)
+		}
+		if controlErr := control.ReaderError(); controlErr != nil {
+			err = joinWorkspaceControlError(
+				err,
+				workspaceControlInfrastructureError(control.CurrentControlStage(), controlErr),
+			)
+		}
+		if err != nil {
+			err = addControlCommandID(err, control.CommandID())
+		} else if control.CommandID() != "" {
+			success.details = protocol.WithControlCommandID(success.details, control.CommandID())
+		}
+	}
 	if err != nil {
 		return emitFailure(deps, emitter, stage, err)
 	}

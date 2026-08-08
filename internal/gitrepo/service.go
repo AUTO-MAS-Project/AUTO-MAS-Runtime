@@ -55,6 +55,7 @@ type SyncRequest struct {
 	Policy           mirror.Policy
 	OperationID      string
 	PID              uint32
+	MutationLease    MutationLease
 	Emitter          WorkspaceEmitter
 	LoggerFactory    LoggerFactory
 	Auditor          filesystem.Auditor
@@ -89,7 +90,16 @@ type mutationLockSet interface {
 	Close() error
 }
 
-type mutationLease interface {
+// MutationLease 是跨 workspace 与环境编排共享的 mutation 锁租约。
+type MutationLease interface {
+	Close() error
+}
+
+type mutationLease = MutationLease
+
+// MutationCoordinator 提供一次受管 mutation 操作的锁生命周期。
+type MutationCoordinator interface {
+	AcquireMutation(context.Context) (MutationLease, error)
 	Close() error
 }
 
@@ -125,6 +135,11 @@ func NewService(layout *config.Layout) (*Service, error) {
 		newProductionRuntime,
 		buildProductionPlan,
 	)
+}
+
+// NewMutationCoordinator 创建可由上层编排持有的生产 mutation 锁协调器。
+func NewMutationCoordinator(ctx context.Context, layout *config.Layout) (MutationCoordinator, error) {
+	return newProductionLocks(ctx, layout)
 }
 
 func newServiceWithDependencies(
@@ -289,26 +304,31 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	}
 	var locks mutationLockSet
 	var lease mutationLease
+	leaseOwned := request.MutationLease == nil
 	var runtime syncRuntime
 	defer func() {
-		returnErr = joinServiceCloseError(returnErr, runtime, lease, locks, logger)
+		returnErr = joinServiceCloseError(returnErr, runtime, lease, locks, logger, leaseOwned)
 	}()
 
-	locks, err = s.newLocks(ctx, s.layout)
-	if err != nil || nilMutationLockSet(locks) {
-		if err == nil {
-			err = errInvalidService
+	if request.MutationLease != nil {
+		lease = request.MutationLease
+	} else {
+		locks, err = s.newLocks(ctx, s.layout)
+		if err != nil || nilMutationLockSet(locks) {
+			if err == nil {
+				err = errInvalidService
+			}
+			return SyncResult{}, mapMutexFailure(err)
 		}
-		return SyncResult{}, mapMutexFailure(err)
-	}
-	acquired, err := locks.AcquireMutation(ctx)
-	if err != nil || nilMutationLease(acquired) {
-		if err == nil {
-			err = errInvalidService
+		acquired, acquireErr := locks.AcquireMutation(ctx)
+		if acquireErr != nil || nilMutationLease(acquired) {
+			if acquireErr == nil {
+				acquireErr = errInvalidService
+			}
+			return SyncResult{}, mapMutexFailure(acquireErr)
 		}
-		return SyncResult{}, mapMutexFailure(err)
+		lease = acquired
 	}
-	lease = acquired
 
 	runtime, err = s.newRuntime(ctx, s.layout, request, logger)
 	if err != nil || nilSyncRuntime(runtime) {
@@ -701,7 +721,8 @@ func validateSyncRequest(request SyncRequest) error {
 	}
 	if request.OperationID == "" || request.PID == 0 ||
 		nilWorkspaceEmitter(request.Emitter) || request.LoggerFactory == nil ||
-		nilInterface(request.Auditor) {
+		nilInterface(request.Auditor) ||
+		(request.MutationLease != nil && nilMutationLease(request.MutationLease)) {
 		return serviceInternalError(protocol.StageWorkspaceClone, errInvalidServiceRequest)
 	}
 	return nil
@@ -1015,13 +1036,14 @@ func joinServiceCloseError(
 	lease mutationLease,
 	locks mutationLockSet,
 	logger OperationLogger,
+	closeLease bool,
 ) error {
 	if runtime != nil {
 		if err := runtime.Close(); err != nil {
 			current = joinPrimaryError(serviceStateWriteError(protocol.StageWorkspaceCleanup, err), current)
 		}
 	}
-	if lease != nil {
+	if lease != nil && closeLease {
 		if err := lease.Close(); err != nil {
 			current = joinPrimaryError(mapMutexFailure(err), current)
 		}

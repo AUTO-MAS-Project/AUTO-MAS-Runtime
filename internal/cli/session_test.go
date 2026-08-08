@@ -118,7 +118,7 @@ func TestExecute_CancelledWrappedErrorMapsToExit130(t *testing.T) {
 
 func TestExecute_ExitCodeFromResultCode(t *testing.T) {
 	t.Parallel()
-	result := runCLI(t, context.Background(), "--output", "ndjson", "bootstrap")
+	result := runCLI(t, context.Background(), "--output", "ndjson", "bootstrap", "--version", "v5.4.0")
 	if result.exitCode != protocol.ExitCodeInvalidArgument {
 		t.Fatalf("exit code = %d, want %d", result.exitCode, protocol.ExitCodeInvalidArgument)
 	}
@@ -147,6 +147,9 @@ func TestExecute_UnimplementedCommandStableError(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			t.Parallel()
 			args := append([]string{"--output", "ndjson"}, strings.Fields(command)...)
+			if command == "bootstrap" {
+				args = append(args, "--version", "v5.4.0")
+			}
 			result := runCLI(t, context.Background(), args...)
 			if result.exitCode != 2 {
 				t.Fatalf("exit code = %d, want 2", result.exitCode)

@@ -218,7 +218,8 @@ func validateBrokenEnvironment(
 
 func operationFailedStage(stage protocol.Stage) bool {
 	switch stage {
-	case protocol.StageWorkspaceCleanup, protocol.StagePythonCheck,
+	case protocol.StageWorkspaceCleanup, protocol.StageUVCheck,
+		protocol.StageUVDownload, protocol.StageUVVerify, protocol.StagePythonCheck,
 		protocol.StagePythonInstall, protocol.StageDependenciesCheck,
 		protocol.StageDependenciesSync, protocol.StageDependenciesRebuild:
 		return true

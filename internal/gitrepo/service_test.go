@@ -241,6 +241,37 @@ func TestService_SyncNoOpPreservesStableState(t *testing.T) {
 	}
 }
 
+func TestService_SyncUsesExternalMutationLeaseWithoutClosingIt(t *testing.T) {
+	root := t.TempDir()
+	layout := testServiceLayout(t, root)
+	if err := os.Mkdir(layout.RepoDir(), 0o755); err != nil {
+		t.Fatalf("Mkdir(repo) error = %v", err)
+	}
+	target := mustServiceTarget(t, "v1.0.0")
+	reader := &serviceTestReader{snapshot: testServiceSnapshot(target.Version())}
+	runtime := newServiceTestRuntime()
+	runtime.environment = state.EnvironmentState{
+		SchemaVersion:  state.SchemaVersion,
+		Status:         protocol.StateReadyToStart,
+		LastSuccessful: state.Revision{Version: target.Version(), Commit: strings.Repeat("d", 40)},
+	}
+	locks := &serviceTestLocks{}
+	externalLease := &serviceTestLease{}
+	request := testSyncRequest(target)
+	request.MutationLease = externalLease
+	service := newTestService(t, layout, reader, runtime, locks)
+
+	if _, err := service.Sync(context.Background(), request); err != nil {
+		t.Fatalf("Sync() error = %v, want nil", err)
+	}
+	if externalLease.closed {
+		t.Fatal("external mutation lease was closed by Service.Sync()")
+	}
+	if locks.closed {
+		t.Fatal("mutation coordinator was created or closed for external lease")
+	}
+}
+
 func TestService_SyncRejectsRunningBackend(t *testing.T) {
 	root := t.TempDir()
 	layout := testServiceLayout(t, root)

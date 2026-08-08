@@ -87,8 +87,9 @@ type Report struct {
 
 // Probes 是 doctor 需要注入替身的只读探测点。
 type Probes struct {
-	UVVersion func(ctx context.Context, exePath string) (string, error)
-	DiskFree  func(ctx context.Context, path string) (uint64, error)
+	UVVersion           func(ctx context.Context, exePath string) (string, error)
+	UVVersionWithLayout func(ctx context.Context, layout *config.Layout, exePath string) (string, error)
+	DiskFree            func(ctx context.Context, path string) (uint64, error)
 }
 
 // Service 组合布局与探针执行全部检查。
@@ -99,7 +100,7 @@ type Service struct {
 
 // New 创建只读诊断服务，layout 与两个探针都不可为空。
 func New(layout *config.Layout, probes Probes) (*Service, error) {
-	if layout == nil || probes.UVVersion == nil || probes.DiskFree == nil {
+	if layout == nil || (probes.UVVersion == nil && probes.UVVersionWithLayout == nil) || probes.DiskFree == nil {
 		return nil, errors.New("doctor service requires layout and probes")
 	}
 	return &Service{layout: layout, probes: probes}, nil
@@ -336,7 +337,13 @@ func (s *Service) checkUV(ctx context.Context) Check {
 	defer cancel()
 	var lastErr error
 	for _, exe := range executables {
-		version, err := s.probes.UVVersion(probeCtx, exe)
+		var version string
+		var err error
+		if s.probes.UVVersionWithLayout != nil {
+			version, err = s.probes.UVVersionWithLayout(probeCtx, s.layout, exe)
+		} else {
+			version, err = s.probes.UVVersion(probeCtx, exe)
+		}
 		if err != nil {
 			lastErr = err
 			if probeCtx.Err() != nil {

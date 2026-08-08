@@ -24,7 +24,7 @@ func doctorCommand(deps *deps) *cobra.Command {
 				func(ctx context.Context, emitter *protocol.Emitter) (sessionSuccess, error) {
 					service, err := deps.options.doctorFactory(
 						deps.global.layout,
-						doctor.ProductionProbes(),
+						doctor.ProductionProbesForLayout(deps.global.layout),
 					)
 					if err != nil {
 						return sessionSuccess{}, err

@@ -206,6 +206,65 @@ func TestDownloaderFailureKinds_AreValidOpenDiagnostics(t *testing.T) {
 	}
 }
 
+func TestDownloader_DoRequestBoundsNonCompliantTransport(t *testing.T) {
+	release := make(chan struct{})
+	transportFinished := make(chan struct{})
+	client := httpClientFunc(func(*http.Request) (*http.Response, error) {
+		<-release
+		close(transportFinished)
+		return nil, errors.New("transport released")
+	})
+	options, err := resolveDownloaderOptions([]DownloaderOption{
+		WithDownloaderTimeouts(10*time.Millisecond, time.Second),
+	})
+	if err != nil {
+		t.Fatalf("resolveDownloaderOptions() error = %v", err)
+	}
+	downloader, err := newDownloaderWithDependencies(
+		testLayout(t),
+		options,
+		downloaderDependencies{
+			sessions: &fakeSessionFactory{},
+			client:   client,
+			clock:    time.Now,
+			timers: func(delay time.Duration) timer {
+				return &runtimeTimer{timer: time.NewTimer(delay)}
+			},
+			cleanup: func(ctx context.Context) (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.WithoutCancel(ctx))
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("newDownloaderWithDependencies() error = %v", err)
+	}
+	target, err := url.Parse(validRequest().URL)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	done := make(chan *DownloadFailure, 1)
+	go func() {
+		_, failure := downloader.doRequest(t.Context(), target)
+		done <- failure
+	}()
+	var failure *DownloadFailure
+	select {
+	case failure = <-done:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("doRequest() did not return after transport timeout")
+	}
+	close(release)
+	select {
+	case <-transportFinished:
+	case <-time.After(time.Second):
+		t.Fatal("non-compliant transport goroutine did not finish after release")
+	}
+	if failure == nil || failure.Kind != FailureConnectTimeout {
+		t.Fatalf("doRequest() failure = %#v, want connect timeout", failure)
+	}
+}
+
 func TestDownloader_ExportedFailureDeclarationsHaveChineseComments(t *testing.T) {
 	targets := map[string]bool{
 		"FailureInvalidRequest":      false,
@@ -1180,6 +1239,78 @@ func TestDownloader_DownloadAcceptsMissingContentLength(t *testing.T) {
 	}
 	if result.Size != 3 {
 		t.Fatalf("result.Size = %d, want 3", result.Size)
+	}
+}
+
+func TestDownloader_DownloadResolvesUnknownExpectedSizeFromContentLength(t *testing.T) {
+	content := []byte("abc")
+	session := successfulRecordingSession()
+	client := responseClient(t, content, int64(len(content)), http.StatusOK)
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	request := requestForBytes(content)
+	request.ExpectedSize = 0
+	request.AllowUnknownSize = true
+	request.MaxSize = int64(len(content))
+
+	result, err := downloader.Download(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Download() error = %v, want nil", err)
+	}
+	if result.Size != int64(len(content)) {
+		t.Fatalf("result.Size = %d, want %d", result.Size, len(content))
+	}
+	written, _, abortCalls := session.snapshot()
+	if got := string(written); got != string(content) {
+		t.Fatalf("published content = %q, want %q", got, content)
+	}
+	if abortCalls != 0 {
+		t.Fatalf("session abort calls = %d, want 0", abortCalls)
+	}
+}
+
+func TestDownloader_DownloadRejectsUnknownExpectedSizeWithoutBoundedLength(t *testing.T) {
+	content := []byte("abc")
+	session := successfulRecordingSession()
+	client := responseClient(t, content, -1, http.StatusOK)
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	request := requestForBytes(content)
+	request.ExpectedSize = 0
+	request.AllowUnknownSize = true
+	request.MaxSize = 4
+
+	_, err := downloader.Download(t.Context(), request)
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("Download() error = %v, want *DownloadFailure", err)
+	}
+	if failure.Kind != FailureSizeMismatch {
+		t.Fatalf("failure.Kind = %q, want %q", failure.Kind, FailureSizeMismatch)
+	}
+	_, _, abortCalls := session.snapshot()
+	if abortCalls != 1 {
+		t.Fatalf("session abort calls = %d, want 1", abortCalls)
+	}
+}
+
+func TestDownloader_DownloadRejectsContentLengthAboveMaximum(t *testing.T) {
+	content := []byte("abc")
+	session := successfulRecordingSession()
+	client := responseClient(t, content, int64(len(content)), http.StatusOK)
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	request := requestForBytes(content)
+	request.MaxSize = 2
+
+	_, err := downloader.Download(t.Context(), request)
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("Download() error = %v, want *DownloadFailure", err)
+	}
+	if failure.Kind != FailureSizeMismatch {
+		t.Fatalf("failure.Kind = %q, want %q", failure.Kind, FailureSizeMismatch)
+	}
+	_, _, abortCalls := session.snapshot()
+	if abortCalls != 1 {
+		t.Fatalf("session abort calls = %d, want 1", abortCalls)
 	}
 }
 

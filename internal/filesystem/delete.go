@@ -96,6 +96,7 @@ type DeleteKind string
 
 const (
 	DeleteUVCache           DeleteKind = "uv_cache"
+	DeleteUVVersion         DeleteKind = "uv_version"
 	DeleteManagedVenv       DeleteKind = "managed_venv"
 	DeleteManagedPython     DeleteKind = "managed_python"
 	DeleteRepositoryUpdate  DeleteKind = "repository_update"
@@ -111,6 +112,7 @@ func (k DeleteKind) String() string { return string(k) }
 func (k DeleteKind) Valid() bool {
 	switch k {
 	case DeleteUVCache,
+		DeleteUVVersion,
 		DeleteManagedVenv,
 		DeleteManagedPython,
 		DeleteRepositoryUpdate,

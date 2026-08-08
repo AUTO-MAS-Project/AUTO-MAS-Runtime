@@ -34,6 +34,21 @@ type Revision struct {
 	sourceKey string
 }
 
+// NewRevision 构造一个经版本、分支、Commit 和来源校验的稳定 revision。
+// 应用层测试替身和跨包编排只能通过该构造器取得 Revision，不能伪造内部字段。
+func NewRevision(version, branch, commit, sourceKey string) (Revision, error) {
+	target, err := ParseTarget(version)
+	if err != nil || target.Branch() != branch || !validCommit(commit) || !validRevisionSourceKey(sourceKey) {
+		return Revision{}, errInvalidRevision
+	}
+	return Revision{
+		version:   version,
+		branch:    branch,
+		commit:    commit,
+		sourceKey: sourceKey,
+	}, nil
+}
+
 func newRevision(target Target, commit string, source mirror.Source) (Revision, error) {
 	if err := target.validate(); err != nil ||
 		!validCommit(commit) ||

@@ -14,6 +14,8 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
 
@@ -25,12 +27,15 @@ type IO struct {
 }
 
 type options struct {
-	cwd                    string
-	clock                  func() time.Time
-	versionSource          versionSourceFunc
-	doctorFactory          doctorFactory
-	workspaceFactory       workspaceFactory
-	workspaceLoggerFactory workspaceLoggerFactory
+	cwd                          string
+	clock                        func() time.Time
+	versionSource                versionSourceFunc
+	doctorFactory                doctorFactory
+	workspaceFactory             workspaceFactory
+	workspaceLoggerFactory       workspaceLoggerFactory
+	environmentFactory           environmentFactory
+	environmentStateStoreFactory environmentStateStoreFactory
+	mutationCoordinatorFactory   mutationCoordinatorFactory
 }
 
 // Option 配置 Execute 的可注入测试依赖。
@@ -85,6 +90,22 @@ func applyOptions(values ...Option) (options, error) {
 				operationID,
 				logging.WithClock(clock),
 			)
+		},
+		environmentFactory: func(layout *config.Layout) (environmentService, error) {
+			return uv.NewProductionEnvironment(layout)
+		},
+		environmentStateStoreFactory: func(
+			ctx context.Context,
+			layout *config.Layout,
+			clock func() time.Time,
+		) (environmentStateStore, error) {
+			return state.NewStore(ctx, layout, state.WithClock(clock))
+		},
+		mutationCoordinatorFactory: func(
+			ctx context.Context,
+			layout *config.Layout,
+		) (gitrepo.MutationCoordinator, error) {
+			return gitrepo.NewMutationCoordinator(ctx, layout)
 		},
 	}
 	for _, option := range values {

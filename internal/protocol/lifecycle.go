@@ -22,6 +22,7 @@ var lifecycleTransitions = []LifecycleTransition{
 	{From: StateReadyToStart, To: StateSyncingRepository},
 	{From: StatePreparingUV, To: StateSyncingRepository},
 	{From: StatePreparingUV, To: StatePreparingPython},
+	{From: StatePreparingUV, To: StateEnvironmentBroken},
 	{From: StateSyncingRepository, To: StatePreparingPython},
 	{From: StateSyncingRepository, To: StateEnvironmentBroken},
 	{From: StatePreparingPython, To: StateSyncingEnvironment},

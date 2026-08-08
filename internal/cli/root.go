@@ -59,7 +59,7 @@ func newRoot(deps *deps) *cobra.Command {
 		environmentGroup(deps),
 		dependenciesGroup(deps),
 		backendGroup(deps),
-		skeletonCommand(deps, "repair", "修复运行环境", protocol.StageRepair),
+		newM5RepairCommand(deps, "repair", "修复运行环境"),
 		cleanupCommand(deps),
 	)
 	// SetHelpCommand 只写 Command.helpCommand 字段，真正把它挂进子命令列表的是
@@ -136,37 +136,11 @@ func skeletonCommand(deps *deps, use, short string, stage protocol.Stage) *cobra
 	}
 }
 
-func bootstrapCommand(deps *deps) *cobra.Command {
-	command := skeletonCommand(deps, "bootstrap", "准备受管后端环境", protocol.StageBootstrap)
-	command.Flags().String("version", "", "目标版本（例如 v5.4.0-beta.1）")
-	return command
-}
-
 func workspaceGroup(deps *deps) *cobra.Command {
 	group := &cobra.Command{Use: "workspace", Short: "受管后端仓库操作"}
 	group.AddCommand(
 		workspaceCheckCommand(deps),
 		workspaceSyncCommand(deps),
-	)
-	return group
-}
-
-func environmentGroup(deps *deps) *cobra.Command {
-	group := &cobra.Command{Use: "environment", Short: "运行环境操作"}
-	group.AddCommand(
-		skeletonCommand(deps, "check", "只读检查 uv 与 Python 环境", protocol.StageUVCheck),
-		skeletonCommand(deps, "ensure", "准备固定版本 uv", protocol.StageUVCheck),
-		skeletonCommand(deps, "repair", "重新下载并校验 uv 与受管 Python", protocol.StageUVVerify),
-	)
-	return group
-}
-
-func dependenciesGroup(deps *deps) *cobra.Command {
-	group := &cobra.Command{Use: "dependencies", Short: "主项目依赖操作"}
-	group.AddCommand(
-		skeletonCommand(deps, "check", "只读检查依赖环境", protocol.StageDependenciesCheck),
-		skeletonCommand(deps, "sync", "按锁文件同步主项目依赖", protocol.StageDependenciesSync),
-		skeletonCommand(deps, "rebuild", "重建主项目环境", protocol.StageDependenciesRebuild),
 	)
 	return group
 }

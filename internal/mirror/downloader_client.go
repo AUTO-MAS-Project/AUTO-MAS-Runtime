@@ -6,9 +6,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
-const maxRedirects = 10
+const (
+	maxRedirects            = 10
+	transportCleanupTimeout = 250 * time.Millisecond
+)
 
 var (
 	errConnectionTimedOut        = errors.New("download connection timed out")
@@ -124,29 +128,29 @@ func (d *Downloader) doRequest(
 	case <-operationCtx.Done():
 		stopAndDrainTimer(connectTimer)
 		cancel()
-		result = <-results
+		result, _ = waitForDoResult(results)
 		kind = FailureCancelled
 		cause = errors.Join(
 			errRequestCancelled,
 			operationCtx.Err(),
-			sanitizeTransportError(result.err),
+			sanitizeDoResultError(result),
 		)
 	case <-connectTimer.C():
 		operationErr := operationCtx.Err()
 		cancel()
-		result = <-results
+		result, _ = waitForDoResult(results)
 		if operationErr != nil {
 			kind = FailureCancelled
 			cause = errors.Join(
 				errRequestCancelled,
 				operationErr,
-				sanitizeTransportError(result.err),
+				sanitizeDoResultError(result),
 			)
 		} else {
 			kind = FailureConnectTimeout
 			cause = errors.Join(
 				errConnectionTimedOut,
-				sanitizeTransportError(result.err),
+				sanitizeDoResultError(result),
 			)
 		}
 	}
@@ -178,6 +182,24 @@ func (d *Downloader) doRequest(
 		)
 	}
 	return &responseHandle{response: result.response, cancel: cancel}, nil
+}
+
+func waitForDoResult(results <-chan doResult) (doResult, bool) {
+	timer := time.NewTimer(transportCleanupTimeout)
+	defer timer.Stop()
+	select {
+	case result := <-results:
+		return result, true
+	case <-timer.C:
+		return doResult{err: errTransportCauseUnavailable}, false
+	}
+}
+
+func sanitizeDoResultError(result doResult) error {
+	if result.err == nil {
+		return errTransportCauseUnavailable
+	}
+	return sanitizeTransportError(result.err)
 }
 
 func classifyTransportFailure(err error) FailureKind {

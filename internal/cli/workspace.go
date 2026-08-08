@@ -153,6 +153,7 @@ func runWorkspaceSync(
 		ControlCommandID: control.CommandID,
 	}
 	result, syncErr := service.Sync(controlContext, request)
+	cancel()
 	stopErr := stopWorkspaceControl(reader, deps.io.In, controlDone)
 	if stopErr != nil {
 		syncErr = joinWorkspaceControlError(
@@ -187,13 +188,10 @@ func stopWorkspaceControl(
 	completed <-chan error,
 ) error {
 	reader.StopAccepting()
-	if file, isFile := input.(*os.File); isFile && file == os.Stdin {
-		return nil
-	}
 	var closeErr error
 	if closer, ok := input.(io.Closer); ok {
-		// 非真实 stdin 的 owner 必须保证 Close 在有限时间内返回；否则无法在
-		// 不泄漏不可回收 goroutine 的前提下结束控制读取。真实 os.Stdin 不走这里。
+		// Runtime 独占本次进程的 stdin；关闭它才能让真实控制读取在取消后
+		// 退出并完成 join。调用方传入的其他 reader 也必须支持有限时间 Close。
 		closeErr = closer.Close()
 	}
 	timer := time.NewTimer(workspaceControlJoinTimeout)

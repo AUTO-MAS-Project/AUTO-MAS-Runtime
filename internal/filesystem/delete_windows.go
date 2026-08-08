@@ -132,7 +132,7 @@ func (o *Operator) authorizeDeleteRequest(
 		validateAuditValue(request.Reason) != nil {
 		return authorizedDelete{}, ErrInvalidArgument
 	}
-	if request.Kind == DeleteUVStaging {
+	if request.Kind == DeleteUVStaging || request.Kind == DeleteUVVersion {
 		if request.Version == "" {
 			return authorizedDelete{}, ErrInvalidArgument
 		}
@@ -208,6 +208,9 @@ func (o *Operator) expectedDeletePath(
 	switch request.Kind {
 	case DeleteUVCache:
 		return o.layout.UVCacheDir(), true, nil
+	case DeleteUVVersion:
+		path, err := o.layout.UVVersionDir(request.Version)
+		return path, true, wrapLayoutArgument(err)
 	case DeleteManagedVenv:
 		return o.layout.VenvDir(), true, nil
 	case DeleteManagedPython:

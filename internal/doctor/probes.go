@@ -1,15 +1,18 @@
 package doctor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
 
 // probeUVTimeout 是单次 uv 版本探测的固定超时。
@@ -30,8 +33,17 @@ func ProductionProbes() Probes {
 	}
 }
 
+// ProductionProbesForLayout 返回使用真实 managed runtime 目录的生产探针。
+func ProductionProbesForLayout(layout *config.Layout) Probes {
+	return Probes{
+		UVVersionWithLayout: func(ctx context.Context, _ *config.Layout, exePath string) (string, error) {
+			return probeUVVersionWithLayout(ctx, layout, exePath, probeUVTimeout)
+		},
+		DiskFree: probeDiskFree,
+	}
+}
+
 // probeUVVersion 执行受管 uv.exe --version 并返回规范化输出。
-// T5.2 UVRunner 落地后，uv 子进程统一改由 internal/uv 的唯一执行器调用。
 func probeUVVersion(ctx context.Context, exePath string) (string, error) {
 	return probeUVVersionWithTimeout(ctx, exePath, probeUVTimeout)
 }
@@ -44,21 +56,50 @@ func probeUVVersionWithTimeout(
 	exePath string,
 	timeout time.Duration,
 ) (string, error) {
+	return probeUVVersionWithLayout(ctx, nil, exePath, timeout)
+}
+
+func probeUVVersionWithLayout(
+	ctx context.Context,
+	layout *config.Layout,
+	exePath string,
+	timeout time.Duration,
+) (string, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	command := exec.CommandContext(probeCtx, exePath, "--version")
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		// Windows 上 TerminateProcess 的退出码不携带 context 错误，
-		// 显式以探测上下文错误收口，保证错误链可被 errorKind 分类为 timeout。
+	base := filepath.Dir(exePath)
+	projectDir := base
+	pythonInstallDir := filepath.Join(base, "python")
+	projectEnvDir := filepath.Join(base, "venv")
+	cacheDir := filepath.Join(base, "cache")
+	if layout != nil {
+		// --version 不依赖后端仓库；doctor 需要能在首次安装的空 repo
+		// 上继续报告 uv 事实，因此使用已存在的受管 app-root 作为工作目录。
+		projectDir = layout.AppRoot()
+		pythonInstallDir = layout.PythonDir()
+		projectEnvDir = layout.VenvDir()
+		cacheDir = layout.UVCacheDir()
+	}
+	runner, err := uv.NewRunner(uv.RunnerConfig{
+		Executable:       exePath,
+		ProjectDir:       projectDir,
+		PythonInstallDir: pythonInstallDir,
+		ProjectEnvDir:    projectEnvDir,
+		CacheDir:         cacheDir,
+	})
+	if err != nil {
+		return "", err
+	}
+	result, err := runner.Run(probeCtx, []string{"--version"}, uv.RunOptions{
+		Stage: protocol.StageUVCheck,
+	})
+	if err != nil {
 		if probeCtx.Err() != nil {
 			return "", fmt.Errorf("run uv --version: %w", probeCtx.Err())
 		}
 		return "", fmt.Errorf("run uv --version: %w", err)
 	}
-	version := strings.TrimSpace(stdout.String())
+	version := strings.TrimSpace(result.Stdout)
 	if version == "" {
 		return "", errors.New("uv --version produced no output")
 	}

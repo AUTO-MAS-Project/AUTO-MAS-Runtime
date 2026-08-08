@@ -18,11 +18,11 @@ func documentedLifecycleTransitions(t *testing.T) []protocol.LifecycleTransition
 	preparation := docSection(t, content, "### 环境准备与恢复迁移", "### 后端监督迁移")
 	backend := docSection(t, content, "### 后端监督迁移", "### 迁移验证 API")
 
-	transitions := make([]protocol.LifecycleTransition, 0, 28)
-	transitions = append(transitions, parseLifecycleTransitionSection(t, preparation, 16)...)
+	transitions := make([]protocol.LifecycleTransition, 0, 29)
+	transitions = append(transitions, parseLifecycleTransitionSection(t, preparation, 17)...)
 	transitions = append(transitions, parseLifecycleTransitionSection(t, backend, 12)...)
-	if len(transitions) != 28 {
-		t.Fatalf("documented lifecycle transition count = %d, want 28", len(transitions))
+	if len(transitions) != 29 {
+		t.Fatalf("documented lifecycle transition count = %d, want 29", len(transitions))
 	}
 
 	seen := make(map[protocol.LifecycleTransition]struct{}, len(transitions))
@@ -112,8 +112,8 @@ func TestLifecycleTransitionsMatchSpecification(t *testing.T) {
 	if got := protocol.AllLifecycleTransitions(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("AllLifecycleTransitions() = %#v, documented %#v", got, want)
 	}
-	if got := len(protocol.AllLifecycleTransitions()); got != 28 {
-		t.Fatalf("len(AllLifecycleTransitions()) = %d, want 28", got)
+	if got := len(protocol.AllLifecycleTransitions()); got != 29 {
+		t.Fatalf("len(AllLifecycleTransitions()) = %d, want 29", got)
 	}
 
 	for _, transition := range want {

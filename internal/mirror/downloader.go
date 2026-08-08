@@ -55,11 +55,13 @@ const (
 
 // DownloadRequest 描述单次下载已冻结的 URL、文件身份和完整性预期。
 type DownloadRequest struct {
-	URL            string
-	FileName       string
-	ExpectedSize   int64
-	ExpectedSHA256 string
-	Progress       ProgressFunc
+	URL              string
+	FileName         string
+	ExpectedSize     int64
+	AllowUnknownSize bool
+	MaxSize          int64
+	ExpectedSHA256   string
+	Progress         ProgressFunc
 }
 
 // DownloadProgress 描述已确认完整写入并纳入摘要的字节进度。
@@ -340,12 +342,14 @@ func newDownloaderWithDependencies(
 }
 
 type validatedRequest struct {
-	url            *url.URL
-	fileName       string
-	expectedSize   int64
-	expectedSHA256 string
-	expectedDigest [32]byte
-	progress       ProgressFunc
+	url              *url.URL
+	fileName         string
+	expectedSize     int64
+	allowUnknownSize bool
+	maxSize          int64
+	expectedSHA256   string
+	expectedDigest   [32]byte
+	progress         ProgressFunc
 }
 
 func (d *Downloader) validateRequest(
@@ -369,7 +373,8 @@ func (d *Downloader) validateRequest(
 	if _, err := d.layout.DownloadPartFile(request.FileName); err != nil {
 		return validatedRequest{}, newDownloadFailure(FailureInvalidRequest, 0, err)
 	}
-	if request.ExpectedSize <= 0 {
+	if request.ExpectedSize < 0 || request.MaxSize < 0 ||
+		(request.ExpectedSize == 0 && !request.AllowUnknownSize) {
 		return validatedRequest{}, newDownloadFailure(
 			FailureInvalidRequest,
 			0,
@@ -387,12 +392,14 @@ func (d *Downloader) validateRequest(
 	var digest [32]byte
 	copy(digest[:], digestBytes)
 	return validatedRequest{
-		url:            parsed,
-		fileName:       request.FileName,
-		expectedSize:   request.ExpectedSize,
-		expectedSHA256: hex.EncodeToString(digestBytes),
-		expectedDigest: digest,
-		progress:       request.Progress,
+		url:              parsed,
+		fileName:         request.FileName,
+		expectedSize:     request.ExpectedSize,
+		allowUnknownSize: request.AllowUnknownSize,
+		maxSize:          request.MaxSize,
+		expectedSHA256:   hex.EncodeToString(digestBytes),
+		expectedDigest:   digest,
+		progress:         request.Progress,
 	}, nil
 }
 
@@ -409,23 +416,21 @@ func (d *Downloader) Download(
 	if err != nil {
 		return DownloadResult{}, newDownloadFailure(FailureFilesystem, 0, err)
 	}
-	result := DownloadResult{
-		Path:   session.Path(),
-		Size:   validated.expectedSize,
-		SHA256: validated.expectedSHA256,
-	}
-	reporter := newProgressReporter(
-		validated.progress,
-		validated.expectedSize,
-		d.progressInterval,
-		d.clock,
-	)
-	if err := reporter.report(0, true); err != nil {
-		return DownloadResult{}, d.abortFailure(
-			ctx,
-			session,
-			newDownloadFailure(FailureProgress, 0, err),
+	var reporter *progressReporter
+	if validated.expectedSize > 0 {
+		reporter = newProgressReporter(
+			validated.progress,
+			validated.expectedSize,
+			d.progressInterval,
+			d.clock,
 		)
+		if err := reporter.report(0, true); err != nil {
+			return DownloadResult{}, d.abortFailure(
+				ctx,
+				session,
+				newDownloadFailure(FailureProgress, 0, err),
+			)
+		}
 	}
 
 	handle, failure := d.doRequest(ctx, validated.url)
@@ -443,7 +448,7 @@ func (d *Downloader) Download(
 		return DownloadResult{}, d.abortFailure(ctx, session, failure)
 	}
 	if response.ContentLength >= 0 &&
-		response.ContentLength != validated.expectedSize {
+		validated.expectedSize > 0 && response.ContentLength != validated.expectedSize {
 		failure = newDownloadFailure(
 			FailureSizeMismatch,
 			0,
@@ -451,6 +456,47 @@ func (d *Downloader) Download(
 		)
 		failure.Err = errors.Join(failure.Err, closeResponseAndCancel(handle))
 		return DownloadResult{}, d.abortFailure(ctx, session, failure)
+	}
+	if validated.expectedSize == 0 {
+		if !validated.allowUnknownSize || response.ContentLength <= 0 {
+			failure = newDownloadFailure(
+				FailureSizeMismatch,
+				0,
+				errors.New("http content length is required for unknown download size"),
+			)
+			failure.Err = errors.Join(failure.Err, closeResponseAndCancel(handle))
+			return DownloadResult{}, d.abortFailure(ctx, session, failure)
+		}
+		validated.expectedSize = response.ContentLength
+	}
+	if validated.maxSize > 0 && validated.expectedSize > validated.maxSize {
+		failure = newDownloadFailure(
+			FailureSizeMismatch,
+			0,
+			errors.New("http content length exceeds maximum download size"),
+		)
+		failure.Err = errors.Join(failure.Err, closeResponseAndCancel(handle))
+		return DownloadResult{}, d.abortFailure(ctx, session, failure)
+	}
+	if reporter == nil {
+		reporter = newProgressReporter(
+			validated.progress,
+			validated.expectedSize,
+			d.progressInterval,
+			d.clock,
+		)
+		if err := reporter.report(0, true); err != nil {
+			return DownloadResult{}, d.abortFailure(
+				ctx,
+				session,
+				newDownloadFailure(FailureProgress, 0, err),
+			)
+		}
+	}
+	result := DownloadResult{
+		Path:   session.Path(),
+		Size:   validated.expectedSize,
+		SHA256: validated.expectedSHA256,
 	}
 
 	_, _, failure = d.readResponse(
@@ -658,6 +704,15 @@ func (d *Downloader) readResponse(
 				break
 			}
 			if len(chunk.data) > 0 {
+				if request.maxSize > 0 &&
+					(received > request.maxSize || int64(len(chunk.data)) > request.maxSize-received) {
+					failure = newDownloadFailure(
+						FailureSizeMismatch,
+						0,
+						errors.New("download exceeds maximum size"),
+					)
+					break
+				}
 				written, writeErr := writer.Write(chunk.data)
 				if writeErr == nil && written != len(chunk.data) {
 					writeErr = io.ErrShortWrite

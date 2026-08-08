@@ -23,6 +23,15 @@ func runCLI(t *testing.T, ctx context.Context, args ...string) runResult {
 	t.Helper()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+	options := []Option{
+		WithCWD(t.TempDir()),
+		WithClock(func() time.Time {
+			return time.Date(2026, 8, 2, 8, 0, 0, 0, time.UTC)
+		}),
+	}
+	if isM5CLICommand(args) {
+		options = append(options, legacyM5Options()...)
+	}
 	code := Execute(
 		ctx,
 		args,
@@ -31,12 +40,19 @@ func runCLI(t *testing.T, ctx context.Context, args ...string) runResult {
 			Out: &stdout,
 			Err: &stderr,
 		},
-		WithCWD(t.TempDir()),
-		WithClock(func() time.Time {
-			return time.Date(2026, 8, 2, 8, 0, 0, 0, time.UTC)
-		}),
+		options...,
 	)
 	return runResult{exitCode: code, stdout: stdout.String(), stderr: stderr.String()}
+}
+
+func isM5CLICommand(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "bootstrap", "environment", "dependencies", "repair":
+			return true
+		}
+	}
+	return false
 }
 
 // parsedEvent 是测试对 NDJSON 行的最小视图。
