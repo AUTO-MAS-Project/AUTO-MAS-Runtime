@@ -40,7 +40,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M3 CLI 框架与基础命令 | T3.1~T3.8 **已完成**（含三轮对抗性审查的修复与可维护性收敛） |
 | M4 工作区同步 | T4.0~T4.7 **已完成**（含三轮对抗性审查与组件矩阵） |
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
-| M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `eef6f4c`） |
+| M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `ea886f8`） |
 | M7、M9 | 未开始 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
