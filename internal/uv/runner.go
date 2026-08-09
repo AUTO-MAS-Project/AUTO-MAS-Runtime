@@ -26,6 +26,11 @@ const (
 	uvColorEnv            = "UV_COLOR"
 	uvNoProgressEnv       = "UV_NO_PROGRESS"
 	uvNoSystemConfigEnv   = "UV_NO_SYSTEM_CONFIG"
+	autoMASUVExecutable   = "AUTO_MAS_UV_EXE"
+	autoMASProtocol       = "AUTO_MAS_RUNTIME_PROTOCOL"
+	autoMASVersion        = "AUTO_MAS_EXPECTED_VERSION"
+	autoMASCommit         = "AUTO_MAS_EXPECTED_COMMIT"
+	autoMASSupervised     = "AUTO_MAS_SUPERVISED"
 	maxUVOutputLineBytes  = 1 << 20
 	maxUVOutputBytes      = 4 << 20
 	maxUVStreamBytes      = 16 << 20
@@ -48,7 +53,8 @@ type RunOptions struct {
 	PythonInstallDir string
 	ProjectEnvDir    string
 	CacheDir         string
-	// Environment 只接受非 UV 诊断变量，以及 network.go 明确允许的 UV 网络键。
+	// Environment 只接受非受控诊断变量，以及 network.go 明确允许的 UV 网络键；
+	// StartManaged 会清除并覆盖全部 AUTO_MAS 监督键。
 	Environment   map[string]string
 	PythonVersion string
 	Branch        string
@@ -408,6 +414,10 @@ func validateRunnerPaths(options resolvedRunOptions) error {
 }
 
 func buildEnvironment(options resolvedRunOptions) []string {
+	return buildEnvironmentWithSupervision(options, nil)
+}
+
+func buildEnvironmentWithSupervision(options resolvedRunOptions, supervision map[string]string) []string {
 	controlled := map[string]string{
 		uvPythonInstallDirEnv: options.PythonInstallDir,
 		uvCacheDirEnv:         options.CacheDir,
@@ -419,15 +429,25 @@ func buildEnvironment(options resolvedRunOptions) []string {
 		uvNoProgressEnv:       "1",
 		uvNoSystemConfigEnv:   "1",
 	}
+	for key, value := range supervision {
+		controlled[key] = value
+	}
 	reserved := make([]string, 0, len(controlled)+1)
 	for key := range controlled {
 		reserved = append(reserved, key)
 	}
 	overrides := make(map[string]string, len(options.Environment))
-	for key, value := range options.Environment {
+	optionKeys := make([]string, 0, len(options.Environment))
+	for key := range options.Environment {
+		optionKeys = append(optionKeys, key)
+	}
+	sort.Strings(optionKeys)
+	for _, key := range optionKeys {
+		value := options.Environment[key]
 		canonicalKey, allowedUV := canonicalUVOverrideKey(key)
+		_, supervisionKey := canonicalSupervisionEnvironmentKey(key)
 		if strings.EqualFold(key, "PATH") || containsEnvironmentKey(reserved, key) ||
-			(isUVEnvironmentKey(key) && !allowedUV) {
+			(isUVEnvironmentKey(key) && !allowedUV) || supervisionKey {
 			continue
 		}
 		if allowedUV {
@@ -439,7 +459,7 @@ func buildEnvironment(options resolvedRunOptions) []string {
 	for _, entry := range os.Environ() {
 		key, _, found := strings.Cut(entry, "=")
 		if found {
-			if isUVEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
+			if isUVEnvironmentKey(key) || isSupervisionEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
 				containsEnvironmentKeyMap(overrides, key) {
 				continue
 			}
@@ -462,6 +482,26 @@ func buildEnvironment(options resolvedRunOptions) []string {
 		values = append(values, key+"="+value)
 	}
 	return values
+}
+
+func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
+	for _, managed := range []string{
+		autoMASUVExecutable,
+		autoMASProtocol,
+		autoMASVersion,
+		autoMASCommit,
+		autoMASSupervised,
+	} {
+		if strings.EqualFold(key, managed) {
+			return managed, true
+		}
+	}
+	return "", false
+}
+
+func isSupervisionEnvironmentKey(key string) bool {
+	_, ok := canonicalSupervisionEnvironmentKey(key)
+	return ok
 }
 
 func isUVEnvironmentKey(key string) bool {
