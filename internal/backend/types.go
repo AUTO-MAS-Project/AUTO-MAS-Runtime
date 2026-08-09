@@ -15,29 +15,54 @@ import (
 type EventEmitter interface {
 	EmitState(protocol.StateEvent) error
 	EmitLog(protocol.LogEvent) error
+	EmitWarning(protocol.WarningEvent) error
 }
 
 // Request 描述一次受管后端监督请求。
 type Request struct {
-	OperationID string
-	RuntimePID  uint32
-	Emitter     EventEmitter
+	OperationID        string
+	RuntimePID         uint32
+	Emitter            EventEmitter
+	Control            ControlReceiver
+	BeforeShutdown     func(string)
+	BeforeControlClose func()
+}
+
+// ControlReceiver 为监督循环提供已由 ControlReader 校验并按 FIFO 排队的命令。
+type ControlReceiver interface {
+	Receive(context.Context) (protocol.ControlCommand, error)
 }
 
 // Dependencies 是 ManagedSupervisor 的消费侧依赖集合。
 type Dependencies struct {
-	Lock        LockSet
-	State       StateStore
-	Repository  RepositoryChecker
-	Entry       EntryChecker
-	UV          UVRunner
-	Health      HealthChecker
-	Logger      LoggerFactory
-	Clock       func() time.Time
-	UVPath      string
-	PythonPath  string
-	PythonPaths []string
-	PID         PIDProbe
+	Lock            LockSet
+	State           StateStore
+	Repository      RepositoryChecker
+	Entry           EntryChecker
+	UV              UVRunner
+	Health          HealthChecker
+	Logger          LoggerFactory
+	Clock           func() time.Time
+	UVPath          string
+	PythonPath      string
+	PythonPaths     []string
+	PID             PIDProbe
+	HTTP            HTTPCloser
+	ShutdownTimeout time.Duration
+	RestartDelay    time.Duration
+	Timer           func(time.Duration) <-chan time.Time
+	NewTimer        func(time.Duration) Timer
+}
+
+// Timer 是可停止的重启等待计时器，避免 timer channel 在收口后泄漏。
+type Timer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+// HTTPCloser 请求受管后端执行优雅关闭。
+type HTTPCloser interface {
+	Close(context.Context) error
 }
 
 // LockSet 提供后端 Mutex 的零等待租约。

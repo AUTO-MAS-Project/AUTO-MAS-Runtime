@@ -188,8 +188,13 @@ func stopWorkspaceControl(
 	completed <-chan error,
 ) error {
 	reader.StopAccepting()
+	if file, ok := input.(*os.File); ok && file == os.Stdin {
+		// 真实 stdin 由进程拥有，不能关闭；其阻塞读取由进程终止收口，
+		// 当前命令不为不可取消的系统句柄额外等待 join 超时。
+		return nil
+	}
 	var closeErr error
-	if closer, ok := input.(io.Closer); ok {
+	if closer, ok := ownedControlInput(input); ok {
 		// Runtime 独占本次进程的 stdin；关闭它才能让真实控制读取在取消后
 		// 退出并完成 join。调用方传入的其他 reader 也必须支持有限时间 Close。
 		closeErr = closer.Close()
@@ -211,6 +216,17 @@ func stopWorkspaceControl(
 		}
 		return errors.New("stdin control reader did not exit")
 	}
+}
+
+func ownedControlInput(input io.Reader) (io.Closer, bool) {
+	if input == nil {
+		return nil, false
+	}
+	if file, ok := input.(*os.File); ok && file == os.Stdin {
+		return nil, false
+	}
+	closer, ok := input.(io.Closer)
+	return closer, ok
 }
 
 func depsVersionValues(command *cobra.Command) ([]string, error) {
@@ -365,6 +381,10 @@ func isWorkspaceControlContextCancellation(controlContext context.Context, readE
 	}
 	// ControlReader 返回裸 sentinel 表示自身 context 已停止；带 read stdin control 包装的
 	// 同名错误来自底层 reader，必须保留为控制通道基础设施故障。
+	var expected expectedControlCancellation
+	if errors.As(readErr, &expected) {
+		return true
+	}
 	return readErr == context.Canceled || readErr == context.DeadlineExceeded
 }
 

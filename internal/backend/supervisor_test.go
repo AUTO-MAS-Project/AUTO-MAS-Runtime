@@ -492,19 +492,21 @@ func indexOfEvent(events []string, want string) int {
 }
 
 type backendFixture struct {
-	t          *testing.T
-	layout     *config.Layout
-	emitter    *fakeEmitter
-	lock       *fakeLock
-	state      *fakeState
-	repository *fakeRepository
-	entry      *fakeEntry
-	uv         *fakeUV
-	health     *fakeHealth
-	logger     *fakeLogger
-	loggerErr  error
-	proc       *fakeProcess
-	pid        *fakePID
+	t               *testing.T
+	layout          *config.Layout
+	emitter         *fakeEmitter
+	lock            *fakeLock
+	state           *fakeState
+	repository      *fakeRepository
+	entry           *fakeEntry
+	uv              *fakeUV
+	health          *fakeHealth
+	logger          *fakeLogger
+	loggerErr       error
+	proc            *fakeProcess
+	pid             *fakePID
+	depsHTTP        HTTPCloser
+	shutdownTimeout time.Duration
 }
 
 func newBackendFixture(t *testing.T) *backendFixture {
@@ -545,6 +547,7 @@ func (f *backendFixture) supervisor() *ManagedSupervisor {
 		UVPath:     "uv.exe",
 		PythonPath: "python.exe",
 		PID:        f.pid,
+		NewTimer:   func(time.Duration) Timer { return immediateTimer{} },
 	})
 	if err != nil {
 		f.t.Fatalf("NewManagedSupervisor() error = %v", err)
@@ -600,27 +603,48 @@ func equalStrings(left, right []string) bool {
 }
 
 type fakeEmitter struct {
-	mu      sync.Mutex
-	events  []string
-	state   []protocol.StateEvent
-	running chan struct{}
+	mu             sync.Mutex
+	events         []string
+	state          []protocol.StateEvent
+	stateErr       error
+	logErr         error
+	running        chan struct{}
+	runningOnce    sync.Once
+	runningRelease <-chan struct{}
 }
 
 func (e *fakeEmitter) EmitState(event protocol.StateEvent) error {
+	var release <-chan struct{}
 	e.mu.Lock()
 	e.events = append(e.events, "state:"+string(event.Status))
 	e.state = append(e.state, event)
 	if event.Status == protocol.StateRunning && e.running != nil {
-		close(e.running)
-		e.running = nil
+		e.runningOnce.Do(func() { close(e.running) })
+	}
+	if event.Status == protocol.StateRunning {
+		release = e.runningRelease
 	}
 	e.mu.Unlock()
-	return nil
+	if release != nil {
+		<-release
+	}
+	e.mu.Lock()
+	err := e.stateErr
+	e.mu.Unlock()
+	return err
 }
 
 func (e *fakeEmitter) EmitLog(event protocol.LogEvent) error {
 	e.mu.Lock()
 	e.events = append(e.events, "log:"+event.Message)
+	err := e.logErr
+	e.mu.Unlock()
+	return err
+}
+
+func (e *fakeEmitter) EmitWarning(event protocol.WarningEvent) error {
+	e.mu.Lock()
+	e.events = append(e.events, "warning:"+event.Code)
 	e.mu.Unlock()
 	return nil
 }
@@ -638,36 +662,63 @@ func (e *fakeEmitter) eventsSnapshot() []string {
 }
 
 type fakeLock struct {
-	acquireErr   error
-	acquireLease Lease
-	closeCalls   int
+	acquireErr     error
+	acquireLease   Lease
+	acquireStarted chan struct{}
+	acquireBlock   chan struct{}
+	closeCalls     int
+	closeErr       error
 }
 
-func (l *fakeLock) Acquire(context.Context) (Lease, error) {
+func (l *fakeLock) Acquire(ctx context.Context) (Lease, error) {
+	if l.acquireStarted != nil {
+		select {
+		case <-l.acquireStarted:
+		default:
+			close(l.acquireStarted)
+		}
+	}
+	if l.acquireBlock != nil {
+		select {
+		case <-l.acquireBlock:
+		case <-ctx.Done():
+			return l.acquireLease, ctx.Err()
+		}
+	}
 	if l.acquireErr != nil {
 		return l.acquireLease, l.acquireErr
 	}
 	return &fakeLease{}, nil
 }
-func (l *fakeLock) Close() error { l.closeCalls++; return nil }
+func (l *fakeLock) Close() error { l.closeCalls++; return l.closeErr }
 
-type fakeLease struct{ closed bool }
+type fakeLease struct {
+	closed   bool
+	closeErr error
+}
 
-func (l *fakeLease) Close() error { l.closed = true; return nil }
+func (l *fakeLease) Close() error { l.closed = true; return l.closeErr }
 
 type fakeState struct {
-	environment       state.EnvironmentState
-	environmentErr    error
-	onReadEnvironment func()
-	secondEnvironment *state.EnvironmentState
-	readCalls         int
-	closeCalls        int
-	transaction       *Transaction
-	updateErr         error
-	updateErrStage    protocol.Stage
-	beginHandle       TransactionHandle
-	beginErr          error
-	removeCalls       int
+	environment            state.EnvironmentState
+	environmentErr         error
+	onReadEnvironment      func()
+	secondEnvironment      *state.EnvironmentState
+	secondEnvironmentAfter int
+	readCalls              int
+	closeCalls             int
+	closeErr               error
+	transaction            *Transaction
+	updateErr              error
+	updateErrStage         protocol.Stage
+	updateStarted          chan struct{}
+	updateBlock            chan struct{}
+	updateCalls            int
+	beginHandle            TransactionHandle
+	beginErr               error
+	beginStarted           chan struct{}
+	beginBlock             chan struct{}
+	removeCalls            int
 }
 
 func (s *fakeState) ReadEnvironment(context.Context) (state.EnvironmentState, error) {
@@ -675,7 +726,11 @@ func (s *fakeState) ReadEnvironment(context.Context) (state.EnvironmentState, er
 	if s.onReadEnvironment != nil {
 		s.onReadEnvironment()
 	}
-	if s.secondEnvironment != nil && s.readCalls >= 2 {
+	threshold := s.secondEnvironmentAfter
+	if threshold <= 0 {
+		threshold = 2
+	}
+	if s.secondEnvironment != nil && s.readCalls >= threshold {
 		return *s.secondEnvironment, s.environmentErr
 	}
 	return s.environment, s.environmentErr
@@ -688,7 +743,21 @@ func (s *fakeState) ReadBackendTransaction(context.Context) (Transaction, error)
 	return Transaction{}, ErrTransactionNotFound
 }
 
-func (s *fakeState) BeginBackendTransaction(context.Context, TransactionInput) (TransactionHandle, error) {
+func (s *fakeState) BeginBackendTransaction(ctx context.Context, _ TransactionInput) (TransactionHandle, error) {
+	if s.beginStarted != nil {
+		select {
+		case <-s.beginStarted:
+		default:
+			close(s.beginStarted)
+		}
+	}
+	if s.beginBlock != nil {
+		select {
+		case <-s.beginBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.beginHandle != nil || s.beginErr != nil {
 		return s.beginHandle, s.beginErr
 	}
@@ -696,6 +765,17 @@ func (s *fakeState) BeginBackendTransaction(context.Context, TransactionInput) (
 }
 
 func (s *fakeState) UpdateBackendTransaction(_ context.Context, _ TransactionHandle, stage protocol.Stage) error {
+	s.updateCalls++
+	if s.updateStarted != nil && stage == s.updateErrStage {
+		select {
+		case <-s.updateStarted:
+		default:
+			close(s.updateStarted)
+		}
+	}
+	if s.updateBlock != nil && stage == s.updateErrStage {
+		<-s.updateBlock
+	}
 	if s.updateErrStage != "" && s.updateErrStage == stage {
 		return s.updateErr
 	}
@@ -708,20 +788,45 @@ func (s *fakeState) RemoveBackendTransaction(context.Context, TransactionHandle)
 }
 func (s *fakeState) Close() error {
 	s.closeCalls++
-	return nil
+	return s.closeErr
 }
 
 type fakeRepository struct {
-	Healthy   bool
-	Version   string
-	Commit    string
-	errOnCall int
-	err       error
-	checks    int
+	Healthy      bool
+	Version      string
+	Commit       string
+	errOnCall    int
+	err          error
+	checks       int
+	started      chan struct{}
+	block        chan struct{}
+	blockOnCall  int
+	blockStarted chan struct{}
 }
 
-func (r *fakeRepository) Check(context.Context) (RepositoryResult, error) {
+func (r *fakeRepository) Check(ctx context.Context) (RepositoryResult, error) {
 	r.checks++
+	if r.started != nil {
+		select {
+		case <-r.started:
+		default:
+			close(r.started)
+		}
+	}
+	if r.block != nil && (r.blockOnCall == 0 || r.checks == r.blockOnCall) {
+		if r.blockStarted != nil {
+			select {
+			case <-r.blockStarted:
+			default:
+				close(r.blockStarted)
+			}
+		}
+		select {
+		case <-r.block:
+		case <-ctx.Done():
+			return RepositoryResult{}, ctx.Err()
+		}
+	}
 	if r.errOnCall != 0 && r.checks == r.errOnCall {
 		return RepositoryResult{}, r.err
 	}
@@ -734,6 +839,7 @@ func (e *fakeEntry) Check(context.Context, string) error { return e.err }
 
 type fakeUV struct {
 	proc            ManagedProcess
+	procSequence    []ManagedProcess
 	args            []string
 	options         uv.ManagedOptions
 	startErr        error
@@ -752,27 +858,47 @@ func (u *fakeUV) StartManaged(_ context.Context, args []string, options uv.Manag
 	if u.onStart != nil {
 		u.onStart()
 	}
+	proc := u.proc
+	if index := u.startCalls - 1; index >= 0 && index < len(u.procSequence) {
+		proc = u.procSequence[index]
+	}
 	if u.startErr != nil {
 		if u.returnProcOnErr {
-			if process, ok := u.proc.(*fakeProcess); ok {
+			if process, ok := proc.(*fakeProcess); ok {
 				process.SetSink(sink)
 			}
-			return u.proc, u.startErr
+			return proc, u.startErr
 		}
 		return nil, u.startErr
 	}
-	if process, ok := u.proc.(*fakeProcess); ok {
+	if process, ok := proc.(*fakeProcess); ok {
 		process.SetSink(sink)
 	}
-	return u.proc, nil
+	return proc, nil
 }
 
 type fakeHealth struct {
 	err         error
 	observeExit bool
+	started     chan struct{}
+	block       <-chan struct{}
 }
 
 func (h *fakeHealth) Check(ctx context.Context, _ health.Expectation, probe health.Probe) error {
+	if h.started != nil {
+		select {
+		case <-h.started:
+		default:
+			close(h.started)
+		}
+	}
+	if h.block != nil {
+		select {
+		case <-h.block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if h.observeExit {
 		select {
 		case <-probe.Exited():
@@ -826,7 +952,12 @@ type fakeProcess struct {
 	startRecords    []process.StreamRecord
 	sinkOnTerminate bool
 	waitErr         error
+	waitErrs        []error
 	waitEmptyErr    error
+	waitEmptyErrs   []error
+	cleanupStarted  chan struct{}
+	cleanupRelease  chan struct{}
+	cleanupOnce     sync.Once
 	terminateErr    error
 	closeErr        error
 }
@@ -850,6 +981,17 @@ func (p *fakeProcess) SetSink(sink process.StreamSink) {
 	}
 	p.mu.Unlock()
 }
+
+func (p *fakeProcess) EmitRecord(ctx context.Context, record process.StreamRecord) error {
+	p.mu.Lock()
+	sink := p.sink
+	p.mu.Unlock()
+	if sink == nil {
+		return errors.New("fake process sink is nil")
+	}
+	return sink(ctx, record)
+}
+
 func (p *fakeProcess) PID() uint32 { return p.pid }
 func (p *fakeProcess) Exited() <-chan struct{} {
 	p.mu.Lock()
@@ -863,6 +1005,11 @@ func (p *fakeProcess) Snapshot() ([]process.Info, error) {
 	return []process.Info{{PID: p.pid, Executable: "uv.exe"}, {PID: p.pid + 1, ParentPID: p.pid, Executable: "python.exe"}}, nil
 }
 func (p *fakeProcess) Wait(context.Context) (process.ExitResult, error) {
+	if len(p.waitErrs) > 0 {
+		err := p.waitErrs[0]
+		p.waitErrs = p.waitErrs[1:]
+		return process.ExitResult{ExitCode: 0}, err
+	}
 	return process.ExitResult{ExitCode: 0}, p.waitErr
 }
 func (p *fakeProcess) Terminate(uint32) error {
@@ -883,8 +1030,32 @@ func (p *fakeProcess) Terminate(uint32) error {
 	p.mu.Unlock()
 	return p.terminateErr
 }
+
+func (p *fakeProcess) Exit() {
+	p.mu.Lock()
+	if p.exited == nil {
+		p.exited = make(chan struct{})
+	}
+	select {
+	case <-p.exited:
+	default:
+		close(p.exited)
+	}
+	p.mu.Unlock()
+}
 func (p *fakeProcess) WaitEmpty(context.Context) error {
+	if p.cleanupStarted != nil {
+		p.cleanupOnce.Do(func() { close(p.cleanupStarted) })
+	}
+	if p.cleanupRelease != nil {
+		<-p.cleanupRelease
+	}
 	p.waitedEmpty = true
+	if len(p.waitEmptyErrs) > 0 {
+		err := p.waitEmptyErrs[0]
+		p.waitEmptyErrs = p.waitEmptyErrs[1:]
+		return err
+	}
 	return p.waitEmptyErr
 }
 func (p *fakeProcess) Close() error {
@@ -897,6 +1068,16 @@ type fakePID struct{ alive bool }
 func (p *fakePID) Alive(context.Context, uint32) (bool, error) { return p.alive, nil }
 
 type fakeCodeError struct{ code protocol.Code }
+
+type immediateTimer struct{}
+
+func (immediateTimer) C() <-chan time.Time {
+	channel := make(chan time.Time)
+	close(channel)
+	return channel
+}
+
+func (immediateTimer) Stop() bool { return true }
 
 func (e *fakeCodeError) Error() string       { return string(e.code) }
 func (e *fakeCodeError) Code() protocol.Code { return e.code }

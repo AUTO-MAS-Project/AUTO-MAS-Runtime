@@ -36,6 +36,12 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	if deps.Clock == nil {
 		deps.Clock = time.Now
 	}
+	if deps.ShutdownTimeout <= 0 {
+		deps.ShutdownTimeout = defaultShutdownTimeout
+	}
+	if deps.RestartDelay <= 0 {
+		deps.RestartDelay = defaultRestartDelay
+	}
 	if deps.UVPath == "" {
 		deps.UVPath = deps.UV.Executable()
 	}
@@ -64,6 +70,9 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if request.Control != nil {
+		return s.superviseControlled(ctx, request)
 	}
 
 	locks, err := s.deps.Lock.Acquire(ctx)
@@ -438,6 +447,7 @@ type streamGate struct {
 	mu           sync.Mutex
 	open         bool
 	fault        error
+	faulted      chan struct{}
 	stage        protocol.Stage
 	pending      []protocol.LogEvent
 	pendingBytes int
@@ -460,6 +470,29 @@ func (g *streamGate) Fault() error {
 	return g.fault
 }
 
+func (g *streamGate) Faulted() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.faulted == nil {
+		g.faulted = make(chan struct{})
+		if g.fault != nil {
+			close(g.faulted)
+		}
+	}
+	return g.faulted
+}
+
+func (g *streamGate) setFaultLocked(err error) {
+	if err == nil || g.fault != nil {
+		return
+	}
+	g.fault = err
+	if g.faulted == nil {
+		g.faulted = make(chan struct{})
+	}
+	close(g.faulted)
+}
+
 func (g *streamGate) Emit(emitter EventEmitter, event protocol.LogEvent) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -468,7 +501,7 @@ func (g *streamGate) Emit(emitter EventEmitter, event protocol.LogEvent) error {
 	}
 	if !g.open {
 		if len(g.pending) >= maxPendingLogEvents || g.pendingBytes+len(event.Message) > maxPendingLogBytes {
-			g.fault = newError(protocol.CodeOutputWriteFailed, g.stage, "后端日志协议输出失败", map[string]any{"sink": "protocol_output", "reason": "pending_log_overflow"}, nil)
+			g.setFaultLocked(newError(protocol.CodeOutputWriteFailed, g.stage, "后端日志协议输出失败", map[string]any{"sink": "protocol_output", "reason": "pending_log_overflow"}, nil))
 			return g.fault
 		}
 		g.pending = append(g.pending, event)
@@ -476,7 +509,7 @@ func (g *streamGate) Emit(emitter EventEmitter, event protocol.LogEvent) error {
 		return nil
 	}
 	if err := emitter.EmitLog(event); err != nil {
-		g.fault = newError(protocol.CodeOutputWriteFailed, g.stage, "后端日志协议输出失败", map[string]any{"sink": "protocol_output"}, err)
+		g.setFaultLocked(newError(protocol.CodeOutputWriteFailed, g.stage, "后端日志协议输出失败", map[string]any{"sink": "protocol_output"}, err))
 		return g.fault
 	}
 	return nil
@@ -490,7 +523,7 @@ func (g *streamGate) Open(emitter EventEmitter) error {
 	}
 	for _, event := range g.pending {
 		if err := emitter.EmitLog(event); err != nil {
-			g.fault = newError(protocol.CodeOutputWriteFailed, g.stage, "后端日志协议输出失败", map[string]any{"sink": "protocol_output"}, err)
+			g.setFaultLocked(newError(protocol.CodeOutputWriteFailed, g.stage, "后端日志协议输出失败", map[string]any{"sink": "protocol_output"}, err))
 			return g.fault
 		}
 	}
@@ -505,9 +538,7 @@ func (g *streamGate) setFault(err error) {
 		return
 	}
 	g.mu.Lock()
-	if g.fault == nil {
-		g.fault = err
-	}
+	g.setFaultLocked(err)
 	g.mu.Unlock()
 }
 
@@ -620,6 +651,7 @@ func failureDetails(logger Logger, proc ManagedProcess, extra map[string]any) ma
 type processCleanup struct {
 	details map[string]any
 	err     error
+	forced  bool
 }
 
 func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProcess, tx TransactionHandle, logger Logger) processCleanup {
@@ -630,6 +662,9 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 	if proc == nil {
 		outcome.err = newCommittedError(protocol.CodeInternalError, protocol.StageBackendCleanup, "后端进程资源不可用", nil, errors.New("managed process is nil"))
 		return outcome
+	}
+	for key, value := range failureDetails(logger, proc, nil) {
+		outcome.details[key] = value
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
@@ -649,11 +684,38 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		}
 		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
 	}
-	resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", proc.WaitEmpty(cleanupCtx)), mapCleanupProcessError("close", proc.Close()))
+	waitEmptyErr := proc.WaitEmpty(cleanupCtx)
+	if waitEmptyErr != nil {
+		// 根进程可能已退出但后代仍占用 Job；先强制终止，再次 Wait/WaitEmpty，
+		// 只有第二次确认空树才允许后续成功收口。
+		forceCtx, forceCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		terminateErr := proc.Terminate(1)
+		exitResult, waitErr := proc.Wait(forceCtx)
+		if !errors.Is(waitErr, context.DeadlineExceeded) {
+			outcome.details["exitCode"] = exitResult.ExitCode
+		}
+		forceEmptyErr := proc.WaitEmpty(forceCtx)
+		forceCancel()
+		outcome.forced = forceEmptyErr == nil
+		// 首次收口因上下文预算触发强杀时属于可恢复事实；真实非上下文
+		// 错误仍须保留，避免强杀成功掩盖底层资源故障。
+		resultErr = withoutExpectedCancellation(resultErr, false)
+		if forceEmptyErr != nil {
+			resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", waitEmptyErr))
+		}
+		resultErr = errors.Join(resultErr, mapCleanupProcessError("terminate", terminateErr))
+		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, forceCtx.Err() != nil)))
+		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", forceEmptyErr))
+	} else {
+		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", waitEmptyErr))
+	}
+	resultErr = errors.Join(resultErr, mapCleanupProcessError("close", proc.Close()))
 	if tx != nil {
-		if err := s.deps.State.RemoveBackendTransaction(cleanupCtx, tx); err != nil {
+		resourceCtx, resourceCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		if err := s.deps.State.RemoveBackendTransaction(resourceCtx, tx); err != nil {
 			resultErr = errors.Join(resultErr, mapStateCleanupError(err))
 		}
+		resourceCancel()
 	}
 	if logger != nil {
 		if err := logger.Close(); err != nil {

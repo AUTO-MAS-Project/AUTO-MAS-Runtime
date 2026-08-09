@@ -53,6 +53,12 @@ type ControlHandler interface {
 	CurrentControlStage() Stage
 }
 
+// ControlShutdownPolicy 可选地决定 accepted shutdown 是否立即停止 reader。
+// 未实现该接口时保持默认行为：shutdown 先停止 reader，再执行 action。
+type ControlShutdownPolicy interface {
+	StopAfterShutdown(ControlCommand) bool
+}
+
 // ControlWarningEmitter 发射无效控制输入产生的 warning。
 // EmitWarning 在 ControlReader.mu 持有期间运行，因此不得回调当前 ControlReader 的 StopAccepting。
 type ControlWarningEmitter interface {
@@ -320,7 +326,13 @@ func (r *ControlReader) dispatch(command ControlCommand) error {
 		if action == nil {
 			return fmt.Errorf("prepare stdin control %q: accepted command returned nil action", command.Command)
 		}
+		stopAfterShutdown := true
 		if command.Command == ControlShutdown {
+			if policy, ok := r.handler.(ControlShutdownPolicy); ok {
+				stopAfterShutdown = policy.StopAfterShutdown(command)
+			}
+		}
+		if command.Command == ControlShutdown && stopAfterShutdown {
 			r.stopped = true
 		}
 		if err := action(); err != nil {
