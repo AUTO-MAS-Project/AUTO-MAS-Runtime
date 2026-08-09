@@ -235,7 +235,7 @@ func duplicatePinnedDirectory(
 			Err:       err,
 		})
 	}
-	if !sameObjectIdentity(identity, source.identity) {
+	if !sameDirectoryObjectIdentity(identity, source.identity) {
 		return closeOnFailure(&FileError{
 			Operation: "verify-duplicate",
 			Path:      source.path.String(),
@@ -274,6 +274,10 @@ func sameObjectIdentity(left, right objectIdentity) bool {
 		left.attributes == right.attributes &&
 		left.numberOfLinks == right.numberOfLinks &&
 		left.size == right.size
+}
+
+func sameDirectoryObjectIdentity(left, right objectIdentity) bool {
+	return (&left).Equal(&right)
 }
 
 func defaultStateGateWait(ctx context.Context, delay time.Duration) error {

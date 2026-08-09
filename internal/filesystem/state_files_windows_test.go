@@ -22,6 +22,38 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
+func TestStateFiles_FreshRootCreatesStateDirectory(t *testing.T) {
+	layout := newStateFilesTestLayout(t)
+	for _, relative := range []string{
+		"config",
+		"data",
+		"history",
+		"script",
+		"debug",
+		filepath.Join("plugins", "pypi", "site-packages"),
+	} {
+		if err := os.MkdirAll(filepath.Join(layout.AppRoot(), relative), 0o700); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", relative, err)
+		}
+	}
+	if _, err := os.Stat(layout.StateDir()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("StateDir() stat error = %v, want not exist", err)
+	}
+
+	files, err := NewStateFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("NewStateFiles() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := files.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	if info, err := os.Stat(layout.StateDir()); err != nil || !info.IsDir() {
+		t.Fatalf("StateDir() = %#v, %v, want directory", info, err)
+	}
+}
+
 func TestStateFiles_ReadMapsEveryKindThroughLayout(t *testing.T) {
 	layout := newStateFilesTestLayout(t)
 	if err := os.Mkdir(layout.StateDir(), 0o700); err != nil {
