@@ -33,6 +33,7 @@ type fakeBackendConfig struct {
 	ListenAddress            string           `json:"listenAddress"`
 	ListenDelayMS            int              `json:"listenDelayMs"`
 	ReadyFile                string           `json:"readyFile"`
+	PIDFile                  string           `json:"pidFile"`
 	GrandchildPIDFile        string           `json:"grandchildPidFile"`
 	SpawnGrandchild          bool             `json:"spawnGrandchild"`
 	GrandchildLifetimeMS     int              `json:"grandchildLifetimeMs"`
@@ -188,6 +189,12 @@ func runFakeBackend() int {
 	if err := emitConfiguredOutput(config); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 91
+	}
+	if config.PIDFile != "" {
+		if err := writeSignalFile(config.PIDFile, []byte(strconv.Itoa(os.Getpid())+"\n")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 98
+		}
 	}
 
 	grandchild, err := startGrandchild(config)

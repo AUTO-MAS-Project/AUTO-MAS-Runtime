@@ -684,21 +684,36 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
-	var resultErr error
+	// processErr 只记录 Job/进程资源收口事实；事务和日志错误不能使可恢复
+	// 的 Snapshot 竞态重新升级为进程清理失败。
+	var processErr error
+	var snapshotErr error
 	select {
 	case <-proc.Exited():
+		// Exited 只证明根进程已结束；Job 仍可能包含持有 stdout/stderr
+		// 管道的后代。先读取一次成员快照，确认有树后立即终止，避免
+		// proc.Wait 等待读者直到长预算耗尽。
+		members, err := proc.Snapshot()
+		snapshotErr = err
+		if err != nil {
+			outcome.forced = true
+			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
+		} else if len(members) > 0 {
+			outcome.forced = true
+			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
+		}
 		exitResult, waitErr := proc.Wait(cleanupCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
 			outcome.details["exitCode"] = exitResult.ExitCode
 		}
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
+		processErr = errors.Join(processErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
 	default:
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
+		processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		exitResult, waitErr := proc.Wait(cleanupCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
 			outcome.details["exitCode"] = exitResult.ExitCode
 		}
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
+		processErr = errors.Join(processErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
 	}
 	waitEmptyErr := proc.WaitEmpty(cleanupCtx)
 	if waitEmptyErr != nil {
@@ -715,17 +730,23 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		outcome.forced = forceEmptyErr == nil
 		// 首次收口因上下文预算触发强杀时属于可恢复事实；真实非上下文
 		// 错误仍须保留，避免强杀成功掩盖底层资源故障。
-		resultErr = withoutExpectedCancellation(resultErr, false)
+		processErr = withoutExpectedCancellation(processErr, false)
 		if forceEmptyErr != nil {
-			resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", waitEmptyErr))
+			processErr = errors.Join(processErr, mapCleanupProcessError("wait_empty", waitEmptyErr))
 		}
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("terminate", terminateErr))
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, forceCtx.Err() != nil)))
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", forceEmptyErr))
+		processErr = errors.Join(processErr, mapCleanupProcessError("terminate", terminateErr))
+		processErr = errors.Join(processErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, forceCtx.Err() != nil)))
+		processErr = errors.Join(processErr, mapCleanupProcessError("wait_empty", forceEmptyErr))
 	} else {
-		resultErr = errors.Join(resultErr, mapCleanupProcessError("wait_empty", waitEmptyErr))
+		processErr = errors.Join(processErr, mapCleanupProcessError("wait_empty", waitEmptyErr))
 	}
-	resultErr = errors.Join(resultErr, mapCleanupProcessError("close", proc.Close()))
+	// Close 也属于进程资源收口，必须先加入 processErr，再决定是否保留
+	// Snapshot 诊断。这样 OUTPUT_WRITE_FAILED 等真实主因位于错误链首位。
+	processErr = errors.Join(processErr, mapCleanupProcessError("close", proc.Close()))
+	if snapshotErr != nil && processErr != nil {
+		processErr = errors.Join(processErr, mapCleanupProcessError("snapshot", snapshotErr))
+	}
+	resultErr := processErr
 	if tx != nil {
 		resourceCtx, resourceCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		if err := s.deps.State.RemoveBackendTransaction(resourceCtx, tx); err != nil {

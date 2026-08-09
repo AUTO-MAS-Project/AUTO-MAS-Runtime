@@ -438,6 +438,95 @@ func TestBackendManaged_CleanupFailureOverridesHealthFailure(t *testing.T) {
 	}
 }
 
+func TestBackendManaged_ExitedTreeIsTerminatedBeforeWaitingStreams(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.snapshotSet = true
+	f.proc.snapshotMembers = []process.Info{{PID: f.proc.pid, Executable: "uv.exe"}, {PID: f.proc.pid + 1, ParentPID: f.proc.pid, Executable: "python.exe"}}
+	f.proc.Exit()
+
+	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, nil, nil)
+	if outcome.err != nil {
+		t.Fatalf("cleanupProcess() error = %v, want nil", outcome.err)
+	}
+	got := f.proc.orderSnapshot()
+	want := []string{"snapshot", "terminate", "wait", "wait_empty", "close"}
+	if !equalStrings(got, want) {
+		t.Fatalf("cleanup order = %#v, want %#v", got, want)
+	}
+}
+
+func TestBackendManaged_ExitedSnapshotRaceCanRecoverAfterForce(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.snapshotErr = errors.New("process entry is missing")
+	f.proc.Exit()
+
+	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, nil, nil)
+	if outcome.err != nil {
+		t.Fatalf("cleanupProcess() error = %v, want nil after forced empty tree", outcome.err)
+	}
+	if !outcome.forced {
+		t.Fatal("cleanupProcess() forced = false, want true")
+	}
+}
+
+func TestBackendManaged_ExitedSnapshotRacePreservesFinalCleanupFailure(t *testing.T) {
+	f := newBackendFixture(t)
+	snapshotErr := errors.New("process entry is missing")
+	f.proc.snapshotErr = snapshotErr
+	f.proc.waitEmptyErr = errors.New("job membership cannot be confirmed")
+	f.proc.Exit()
+
+	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, nil, nil)
+	assertBackendCode(t, outcome.err, protocol.CodeBackendShutdownFailed)
+	if !errors.Is(outcome.err, snapshotErr) {
+		t.Fatalf("cleanupProcess() error = %v, want snapshot cause", outcome.err)
+	}
+}
+
+func TestBackendManaged_ExitedSnapshotErrorIsRetainedWithProcessCloseFailure(t *testing.T) {
+	f := newBackendFixture(t)
+	snapshotErr := errors.New("process entry is missing")
+	closeErr := newError(protocol.CodeOutputWriteFailed, protocol.StageBackendCleanup, "日志管道关闭失败", map[string]any{"sink": "runtime_log"}, errors.New("close failed"))
+	f.proc.snapshotErr = snapshotErr
+	f.proc.closeErr = closeErr
+	f.proc.Exit()
+
+	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, nil, nil)
+	assertBackendCode(t, outcome.err, protocol.CodeOutputWriteFailed)
+	if !errors.Is(outcome.err, snapshotErr) {
+		t.Fatalf("cleanupProcess() error = %v, want snapshot cause", outcome.err)
+	}
+}
+
+func TestBackendManaged_ExitedSnapshotErrorKeepsOutputWaitFailurePrimary(t *testing.T) {
+	f := newBackendFixture(t)
+	snapshotErr := errors.New("process entry is missing")
+	waitErr := newError(protocol.CodeOutputWriteFailed, protocol.StageBackendCleanup, "日志等待失败", map[string]any{"sink": "runtime_log"}, errors.New("wait failed"))
+	f.proc.snapshotErr = snapshotErr
+	f.proc.waitErr = waitErr
+	f.proc.Exit()
+
+	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, nil, nil)
+	assertBackendCode(t, outcome.err, protocol.CodeOutputWriteFailed)
+	if !errors.Is(outcome.err, snapshotErr) {
+		t.Fatalf("cleanupProcess() error = %v, want snapshot cause", outcome.err)
+	}
+}
+
+func TestBackendManaged_ExitedSnapshotErrorIsNotRevivedByResourceErrors(t *testing.T) {
+	f := newBackendFixture(t)
+	snapshotErr := errors.New("process entry is missing")
+	f.proc.snapshotErr = snapshotErr
+	f.proc.Exit()
+	f.state.removeErr = errors.New("transaction remove failed")
+	f.logger.closeErr = errors.New("runtime log close failed")
+
+	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, &fakeTransaction{}, f.logger)
+	if errors.Is(outcome.err, snapshotErr) {
+		t.Fatalf("cleanupProcess() error = %v, snapshot error must not be revived by non-process errors", outcome.err)
+	}
+}
+
 func TestBackendManaged_HealthUpdateFailureCleansAndEmitsFailed(t *testing.T) {
 	f := newBackendFixture(t)
 	f.proc.keepAlive = true
@@ -720,6 +809,7 @@ type fakeState struct {
 	beginStarted           chan struct{}
 	beginBlock             chan struct{}
 	removeCalls            int
+	removeErr              error
 }
 
 func (s *fakeState) ReadEnvironment(context.Context) (state.EnvironmentState, error) {
@@ -786,7 +876,7 @@ func (s *fakeState) UpdateBackendTransaction(_ context.Context, _ TransactionHan
 
 func (s *fakeState) RemoveBackendTransaction(context.Context, TransactionHandle) error {
 	s.removeCalls++
-	return nil
+	return s.removeErr
 }
 func (s *fakeState) Close() error {
 	s.closeCalls++
@@ -926,6 +1016,7 @@ type fakeLogger struct {
 	path           string
 	records        []process.StreamRecord
 	closeCalls     int
+	closeErr       error
 	respectContext bool
 }
 
@@ -945,7 +1036,7 @@ func (l *fakeLogger) Close() error {
 	l.mu.Lock()
 	l.closeCalls++
 	l.mu.Unlock()
-	return nil
+	return l.closeErr
 }
 
 type fakeTransaction struct{}
@@ -971,6 +1062,10 @@ type fakeProcess struct {
 	cleanupOnce     sync.Once
 	terminateErr    error
 	closeErr        error
+	snapshotSet     bool
+	snapshotMembers []process.Info
+	snapshotErr     error
+	order           []string
 }
 
 func (p *fakeProcess) SetSink(sink process.StreamSink) {
@@ -1013,9 +1108,28 @@ func (p *fakeProcess) Exited() <-chan struct{} {
 	return p.exited
 }
 func (p *fakeProcess) Snapshot() ([]process.Info, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.order = append(p.order, "snapshot")
+	if p.snapshotErr != nil {
+		return nil, p.snapshotErr
+	}
+	if p.snapshotSet {
+		return append([]process.Info(nil), p.snapshotMembers...), nil
+	}
+	if p.exited != nil {
+		select {
+		case <-p.exited:
+			return []process.Info{}, nil
+		default:
+		}
+	}
 	return []process.Info{{PID: p.pid, Executable: "uv.exe"}, {PID: p.pid + 1, ParentPID: p.pid, Executable: "python.exe"}}, nil
 }
 func (p *fakeProcess) Wait(context.Context) (process.ExitResult, error) {
+	p.mu.Lock()
+	p.order = append(p.order, "wait")
+	p.mu.Unlock()
 	if len(p.waitErrs) > 0 {
 		err := p.waitErrs[0]
 		p.waitErrs = p.waitErrs[1:]
@@ -1025,6 +1139,7 @@ func (p *fakeProcess) Wait(context.Context) (process.ExitResult, error) {
 }
 func (p *fakeProcess) Terminate(uint32) error {
 	p.mu.Lock()
+	p.order = append(p.order, "terminate")
 	p.terminated = true
 	if p.sinkOnTerminate && p.sink != nil {
 		cancelled, cancel := context.WithCancel(context.Background())
@@ -1055,6 +1170,9 @@ func (p *fakeProcess) Exit() {
 	p.mu.Unlock()
 }
 func (p *fakeProcess) WaitEmpty(context.Context) error {
+	p.mu.Lock()
+	p.order = append(p.order, "wait_empty")
+	p.mu.Unlock()
 	if p.cleanupStarted != nil {
 		p.cleanupOnce.Do(func() { close(p.cleanupStarted) })
 	}
@@ -1070,8 +1188,17 @@ func (p *fakeProcess) WaitEmpty(context.Context) error {
 	return p.waitEmptyErr
 }
 func (p *fakeProcess) Close() error {
+	p.mu.Lock()
+	p.order = append(p.order, "close")
+	p.mu.Unlock()
 	p.closed = true
 	return p.closeErr
+}
+
+func (p *fakeProcess) orderSnapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.order...)
 }
 
 type fakePID struct{ alive bool }
