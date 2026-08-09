@@ -117,6 +117,46 @@ func TestFakeUV_RecordsArgumentsAndEnvironment(t *testing.T) {
 	}
 }
 
+func TestFakeUV_SelectsReplayRuleByArguments(t *testing.T) {
+	root := t.TempDir()
+	executable := buildFakeUV(t, root)
+	configPath := writeFakeUVConfig(t, root, map[string]any{
+		"exitCode": 99,
+		"rules": []map[string]any{
+			{
+				"argumentsPrefix": []string{"--version"},
+				"exitCode":        0,
+				"stdout":          []string{"uv 0.12.3"},
+			},
+			{
+				"argumentsPrefix": []string{"python", "list"},
+				"exitCode":        0,
+				"stdout":          []string{`[{"version":"3.12.10"}]`},
+			},
+		},
+	})
+
+	version := exec.Command(executable, "--version")
+	version.Env = append(os.Environ(), "FAKE_UV_CONFIG="+configPath)
+	versionOutput, err := version.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fake uv --version error = %v; output=%q", err, versionOutput)
+	}
+	if got, want := strings.TrimSpace(string(versionOutput)), "uv 0.12.3"; got != want {
+		t.Fatalf("fake uv --version output = %q, want %q", got, want)
+	}
+
+	list := exec.Command(executable, "python", "list", "--managed-python")
+	list.Env = append(os.Environ(), "FAKE_UV_CONFIG="+configPath)
+	listOutput, err := list.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fake uv python list error = %v; output=%q", err, listOutput)
+	}
+	if got, want := strings.TrimSpace(string(listOutput)), `[{"version":"3.12.10"}]`; got != want {
+		t.Fatalf("fake uv python list output = %q, want %q", got, want)
+	}
+}
+
 func buildFakeUV(t *testing.T, root string) string {
 	t.Helper()
 	workspace, err := os.Getwd()
@@ -133,7 +173,7 @@ func buildFakeUV(t *testing.T, root string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command("go", "build", "-o", output, fakePackage)
+	command := exec.Command("go", "build", "-buildvcs=false", "-o", output, fakePackage)
 	command.Dir = workspace
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build fake uv: %v\n%s", err, output)

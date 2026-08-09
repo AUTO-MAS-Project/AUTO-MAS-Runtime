@@ -8,11 +8,22 @@ import (
 )
 
 type replayConfig struct {
-	ExitCode int           `json:"exitCode"`
-	Stdout   []string      `json:"stdout"`
-	Stderr   []string      `json:"stderr"`
-	DelayMS  int           `json:"delayMs"`
-	Events   []replayEvent `json:"events"`
+	replayAction
+	Rules []replayRule `json:"rules"`
+}
+
+type replayRule struct {
+	replayAction
+	ArgumentsPrefix []string `json:"argumentsPrefix"`
+}
+
+type replayAction struct {
+	ExitCode          int           `json:"exitCode"`
+	Stdout            []string      `json:"stdout"`
+	Stderr            []string      `json:"stderr"`
+	DelayMS           int           `json:"delayMs"`
+	Events            []replayEvent `json:"events"`
+	CreateDirectories []string      `json:"createDirectories"`
 }
 
 type replayEvent struct {
@@ -39,6 +50,13 @@ func main() {
 			os.Exit(91)
 		}
 	}
+	action := config.replayAction
+	for _, rule := range config.Rules {
+		if hasArgumentsPrefix(os.Args[1:], rule.ArgumentsPrefix) {
+			action = rule.replayAction
+			break
+		}
+	}
 	if path := os.Getenv("FAKE_UV_RECORD"); path != "" {
 		environment := make(map[string]string)
 		for _, entry := range os.Environ() {
@@ -47,22 +65,30 @@ func main() {
 				environment[key] = value
 			}
 		}
-		record, err := json.Marshal(invocationRecord{
+		record := invocationRecord{
 			Arguments:   append([]string(nil), os.Args[1:]...),
 			Environment: environment,
-		})
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			os.Exit(92)
 		}
-		if err := os.WriteFile(path, record, 0o600); err != nil {
+		encodeErr := json.NewEncoder(file).Encode(record)
+		closeErr := file.Close()
+		if encodeErr != nil || closeErr != nil {
 			os.Exit(92)
 		}
 	}
-	if config.DelayMS > 0 {
-		time.Sleep(time.Duration(config.DelayMS) * time.Millisecond)
+	for _, path := range action.CreateDirectories {
+		if path == "" || os.MkdirAll(path, 0o700) != nil {
+			os.Exit(93)
+		}
 	}
-	if len(config.Events) > 0 {
-		for _, event := range config.Events {
+	if action.DelayMS > 0 {
+		time.Sleep(time.Duration(action.DelayMS) * time.Millisecond)
+	}
+	if len(action.Events) > 0 {
+		for _, event := range action.Events {
 			if event.DelayMS > 0 {
 				time.Sleep(time.Duration(event.DelayMS) * time.Millisecond)
 			}
@@ -74,14 +100,26 @@ func main() {
 			}
 		}
 	} else {
-		for _, line := range config.Stdout {
+		for _, line := range action.Stdout {
 			fmt.Fprintln(os.Stdout, line)
 		}
-		for _, line := range config.Stderr {
+		for _, line := range action.Stderr {
 			fmt.Fprintln(os.Stderr, line)
 		}
 	}
-	os.Exit(config.ExitCode)
+	os.Exit(action.ExitCode)
+}
+
+func hasArgumentsPrefix(arguments, prefix []string) bool {
+	if len(prefix) == 0 || len(arguments) < len(prefix) {
+		return false
+	}
+	for index := range prefix {
+		if arguments[index] != prefix[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func splitEnvironment(entry string) (string, string, bool) {
