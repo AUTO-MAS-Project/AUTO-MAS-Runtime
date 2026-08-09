@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
@@ -36,6 +37,7 @@ type options struct {
 	environmentFactory           environmentFactory
 	environmentStateStoreFactory environmentStateStoreFactory
 	mutationCoordinatorFactory   mutationCoordinatorFactory
+	backendFactory               backendFactory
 }
 
 // Option 配置 Execute 的可注入测试依赖。
@@ -106,6 +108,14 @@ func applyOptions(values ...Option) (options, error) {
 			layout *config.Layout,
 		) (gitrepo.MutationCoordinator, error) {
 			return gitrepo.NewMutationCoordinator(ctx, layout)
+		},
+		backendFactory: func(
+			ctx context.Context,
+			layout *config.Layout,
+			stderr io.Writer,
+			clock func() time.Time,
+		) (backendService, error) {
+			return backend.NewProductionManagedSupervisor(ctx, layout, stderr, clock)
 		},
 	}
 	for _, option := range values {

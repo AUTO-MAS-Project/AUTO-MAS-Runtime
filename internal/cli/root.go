@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"strconv"
 	"strings"
 
@@ -113,29 +112,6 @@ Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
 Use "{{.CommandPath}} [command] --help" for more information about a command.{{end}}
 `
 
-// skeletonCommand 注册已定界面但尚未实现的命令。
-// 所有骨架命令统一返回 UNSUPPORTED_MODE，并在 hello 后以 error+result 收口。
-func skeletonCommand(deps *deps, use, short string, stage protocol.Stage) *cobra.Command {
-	return &cobra.Command{
-		Use:   use,
-		Short: short,
-		// 叶子命令不接受位置参数，多余参数走参数错误路径（stderr + 退出码 2）。
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			deps.exitCode = runOperation(
-				deps.ctx,
-				deps,
-				commandPath(cmd),
-				stage,
-				func(context.Context, *protocol.Emitter) (sessionSuccess, error) {
-					return sessionSuccess{}, notImplementedError{stage: stage}
-				},
-			)
-			return nil
-		},
-	}
-}
-
 func workspaceGroup(deps *deps) *cobra.Command {
 	group := &cobra.Command{Use: "workspace", Short: "受管后端仓库操作"}
 	group.AddCommand(
@@ -147,9 +123,7 @@ func workspaceGroup(deps *deps) *cobra.Command {
 
 func backendGroup(deps *deps) *cobra.Command {
 	group := &cobra.Command{Use: "backend", Short: "后端进程操作"}
-	group.AddCommand(
-		skeletonCommand(deps, "supervise", "启动并监督后端进程", protocol.StageBackendSpawn),
-	)
+	group.AddCommand(backendSuperviseCommand(deps))
 	return group
 }
 

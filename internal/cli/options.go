@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -17,6 +18,29 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
+
+// backendService 是 CLI 消费的长驻后端监督窄接口。
+type backendService interface {
+	Supervise(context.Context, backend.Request) error
+}
+
+type backendFactory func(
+	context.Context,
+	*config.Layout,
+	io.Writer,
+	func() time.Time,
+) (backendService, error)
+
+// WithBackendFactory 注入后端监督器工厂，供命令契约测试隔离真实 Job 与端口。
+func WithBackendFactory(factory backendFactory) Option {
+	return func(values *options) error {
+		if factory == nil {
+			return errors.New("cli backend factory must not be nil")
+		}
+		values.backendFactory = factory
+		return nil
+	}
+}
 
 // versionSourceFunc 是 version 命令与 hello 版本字段的来源。
 type versionSourceFunc func(context.Context) (version.Info, error)

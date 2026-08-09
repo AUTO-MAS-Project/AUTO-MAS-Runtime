@@ -25,6 +25,7 @@ func TestLayout_FixedPathsMatchSpecification(t *testing.T) {
 		want string
 	}{
 		{name: "RepoDir", got: layout.RepoDir(), want: filepath.Join(root, "repo")},
+		{name: "BackendEntryFile", got: layout.BackendEntryFile(), want: filepath.Join(root, "repo", "main.py")},
 		{name: "RepoVersionFile", got: layout.RepoVersionFile(), want: filepath.Join(root, "repo", "res", "version.json")},
 		{name: "StateDir", got: layout.StateDir(), want: filepath.Join(root, "runtime-state")},
 		{name: "BackendStateFile", got: layout.BackendStateFile(), want: filepath.Join(root, "runtime-state", "backend.json")},
@@ -36,6 +37,7 @@ func TestLayout_FixedPathsMatchSpecification(t *testing.T) {
 		{name: "PythonDir", got: layout.PythonDir(), want: filepath.Join(root, "runtime", "environment", "python")},
 		{name: "PythonExecutable", got: layout.PythonExecutable(), want: filepath.Join(root, "runtime", "environment", "python", "python.exe")},
 		{name: "VenvDir", got: layout.VenvDir(), want: filepath.Join(root, "runtime", "environment", "venv")},
+		{name: "VenvPythonExecutable", got: layout.VenvPythonExecutable(), want: filepath.Join(root, "runtime", "environment", "venv", "Scripts", "python.exe")},
 		{name: "RuntimeCacheDir", got: layout.RuntimeCacheDir(), want: filepath.Join(root, "runtime", "cache")},
 		{name: "UVCacheDir", got: layout.UVCacheDir(), want: filepath.Join(root, "runtime", "cache", "uv")},
 		{name: "DownloadCacheDir", got: layout.DownloadCacheDir(), want: filepath.Join(root, "runtime", "cache", "downloads")},
@@ -165,6 +167,7 @@ type fixedPath struct {
 func fixedPaths(layout *config.Layout) []fixedPath {
 	return []fixedPath{
 		{name: "RepoDir", path: layout.RepoDir()},
+		{name: "BackendEntryFile", path: layout.BackendEntryFile()},
 		{name: "RepoVersionFile", path: layout.RepoVersionFile()},
 		{name: "StateDir", path: layout.StateDir()},
 		{name: "BackendStateFile", path: layout.BackendStateFile()},
@@ -176,6 +179,7 @@ func fixedPaths(layout *config.Layout) []fixedPath {
 		{name: "PythonDir", path: layout.PythonDir()},
 		{name: "PythonExecutable", path: layout.PythonExecutable()},
 		{name: "VenvDir", path: layout.VenvDir()},
+		{name: "VenvPythonExecutable", path: layout.VenvPythonExecutable()},
 		{name: "RuntimeCacheDir", path: layout.RuntimeCacheDir()},
 		{name: "UVCacheDir", path: layout.UVCacheDir()},
 		{name: "DownloadCacheDir", path: layout.DownloadCacheDir()},

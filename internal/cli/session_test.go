@@ -139,7 +139,6 @@ func TestExecute_UnimplementedCommandStableError(t *testing.T) {
 		"dependencies check",
 		"dependencies sync",
 		"dependencies rebuild",
-		"backend supervise",
 		"repair",
 	}
 	for _, command := range commands {
@@ -242,6 +241,16 @@ func TestClassifyFailure_FallbackCodes(t *testing.T) {
 			wantCode: protocol.CodeMutexOperationFailed,
 		},
 		{
+			name:     "backend cleanup fact wins over cancellation",
+			err:      errors.Join(context.Canceled, backendCleanupFactError{}),
+			wantCode: protocol.CodeBackendShutdownFailed,
+		},
+		{
+			name:     "backend cleanup fact wins over committed health failure",
+			err:      errors.Join(backendCommittedHealthError{}, backendCleanupFactError{}),
+			wantCode: protocol.CodeBackendShutdownFailed,
+		},
+		{
 			name:     "unmappable internal failure",
 			err:      errors.New("something broke inside the runtime"),
 			wantCode: protocol.CodeInternalError,
@@ -261,3 +270,31 @@ func TestClassifyFailure_FallbackCodes(t *testing.T) {
 		})
 	}
 }
+
+type backendCleanupFactError struct{}
+
+func (backendCleanupFactError) Error() string { return "backend cleanup failed" }
+
+func (backendCleanupFactError) Code() protocol.Code { return protocol.CodeBackendShutdownFailed }
+
+func (backendCleanupFactError) Stage() protocol.Stage { return protocol.StageBackendCleanup }
+
+func (backendCleanupFactError) Message() string { return "后端进程树清理失败" }
+
+func (backendCleanupFactError) Details() map[string]any { return map[string]any{} }
+
+func (backendCleanupFactError) Committed() bool { return true }
+
+type backendCommittedHealthError struct{}
+
+func (backendCommittedHealthError) Error() string { return "backend health failed" }
+
+func (backendCommittedHealthError) Code() protocol.Code { return protocol.CodeBackendHealthInvalid }
+
+func (backendCommittedHealthError) Stage() protocol.Stage { return protocol.StageBackendHealth }
+
+func (backendCommittedHealthError) Message() string { return "后端健康响应无效" }
+
+func (backendCommittedHealthError) Details() map[string]any { return map[string]any{} }
+
+func (backendCommittedHealthError) Committed() bool { return true }
