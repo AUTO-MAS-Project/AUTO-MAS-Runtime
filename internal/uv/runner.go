@@ -295,7 +295,7 @@ func (r *UVRunner) Run(
 	return result, nil
 }
 
-// CheckVersion 验证受管 uv 的 --version 输出是否与固定版本完全一致。
+// CheckVersion 验证受管 uv 的 --version 输出是否报告固定版本。
 func (r *UVRunner) CheckVersion(
 	ctx context.Context,
 	expected string,
@@ -306,7 +306,7 @@ func (r *UVRunner) CheckVersion(
 	if err != nil {
 		return err
 	}
-	if normalizeVersionOutput(result.Stdout) != "uv "+expected {
+	if !uvVersionOutputMatches(result.Stdout, expected) {
 		return newError(
 			protocol.CodeUVVersionMismatch,
 			stage,
@@ -318,6 +318,28 @@ func (r *UVRunner) CheckVersion(
 		)
 	}
 	return nil
+}
+
+func uvVersionOutputMatches(output, expected string) bool {
+	if expected == "" || strings.ContainsAny(expected, " \t\r\n") {
+		return false
+	}
+	normalized := normalizeVersionOutput(output)
+	if strings.ContainsAny(normalized, "\t\r\n") || !strings.HasPrefix(normalized, "uv ") {
+		return false
+	}
+	reported, metadata, hasMetadata := strings.Cut(strings.TrimPrefix(normalized, "uv "), " ")
+	if reported != expected {
+		return false
+	}
+	if !hasMetadata {
+		return true
+	}
+	if len(metadata) < 3 || metadata[0] != '(' || metadata[len(metadata)-1] != ')' {
+		return false
+	}
+	inner := metadata[1 : len(metadata)-1]
+	return inner != "" && strings.TrimSpace(inner) == inner && !strings.ContainsAny(inner, "()\r\n")
 }
 
 func normalizeVersionOutput(output string) string {

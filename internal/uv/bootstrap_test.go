@@ -169,7 +169,7 @@ func TestBootstrap_VersionSpoofIsRejected(t *testing.T) {
 	}
 }
 
-func TestBootstrap_RealZipExtractorPublishesOnlyUV(t *testing.T) {
+func TestBootstrap_OfficialZipLayoutPublishesOnlyUV(t *testing.T) {
 	layout := newUVTestLayout(t)
 	archiveBytes := makeUVArchive(t)
 	artifact := testArtifact(string(archiveBytes))
@@ -187,6 +187,13 @@ func TestBootstrap_RealZipExtractorPublishesOnlyUV(t *testing.T) {
 	}
 	if string(contents) != "fake uv" {
 		t.Fatalf("extracted uv.exe = %q, want fixture content", contents)
+	}
+	entries, err := os.ReadDir(publisher.request.Source)
+	if err != nil {
+		t.Fatalf("ReadDir(%q) error = %v", publisher.request.Source, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "uv.exe" {
+		t.Fatalf("published entries = %v, want only uv.exe", entries)
 	}
 }
 
@@ -214,6 +221,35 @@ func TestZipExtractor_RejectsUnsafeEntries(t *testing.T) {
 	err = (zipExtractor{}).Extract(t.Context(), archivePath, t.TempDir())
 	if err == nil {
 		t.Fatal("Extract() error = nil, want unsafe path rejection")
+	}
+}
+
+func TestZipExtractor_RejectsUnknownOfficialRootEntry(t *testing.T) {
+	archivePath := filepath.Join(t.TempDir(), "uv.zip")
+	file, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	writer := zip.NewWriter(file)
+	for _, name := range []string{"uv.exe", "uv-notes.txt"} {
+		entry, createErr := writer.Create(name)
+		if createErr != nil {
+			t.Fatalf("Create(%q) error = %v", name, createErr)
+		}
+		if _, writeErr := io.WriteString(entry, name); writeErr != nil {
+			t.Fatalf("Write(%q) error = %v", name, writeErr)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+
+	err = (zipExtractor{}).Extract(t.Context(), archivePath, t.TempDir())
+	if err == nil {
+		t.Fatal("Extract() error = nil, want unknown entry rejection")
 	}
 }
 
@@ -405,12 +441,22 @@ func makeUVArchive(t *testing.T) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
 	writer := zip.NewWriter(&buffer)
-	entry, err := writer.Create("uv.exe")
-	if err != nil {
-		t.Fatalf("zip Create() error = %v", err)
+	entries := []struct {
+		name    string
+		content string
+	}{
+		{name: "uv.exe", content: "fake uv"},
+		{name: "uvw.exe", content: "fake uvw"},
+		{name: "uvx.exe", content: "fake uvx"},
 	}
-	if _, err := io.WriteString(entry, "fake uv"); err != nil {
-		t.Fatalf("zip Write() error = %v", err)
+	for _, fixture := range entries {
+		entry, err := writer.Create(fixture.name)
+		if err != nil {
+			t.Fatalf("zip Create(%q) error = %v", fixture.name, err)
+		}
+		if _, err := io.WriteString(entry, fixture.content); err != nil {
+			t.Fatalf("zip Write(%q) error = %v", fixture.name, err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("zip Close() error = %v", err)

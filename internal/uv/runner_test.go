@@ -271,6 +271,35 @@ func TestNormalizeVersionOutput_AllowsOnlyOneLineEnding(t *testing.T) {
 	}
 }
 
+func TestUVVersionOutput_MatchesOfficialGrammar(t *testing.T) {
+	cases := []struct {
+		name     string
+		output   string
+		expected string
+		want     bool
+	}{
+		{name: "short", output: "uv 0.12.3\n", expected: "0.12.3", want: true},
+		{
+			name:     "official build metadata",
+			output:   "uv 0.12.3 (507230998 2026-08-07 x86_64-pc-windows-msvc)\r\n",
+			expected: "0.12.3",
+			want:     true,
+		},
+		{name: "wrong version", output: "uv 0.12.4 (build)", expected: "0.12.3", want: false},
+		{name: "unwrapped metadata", output: "uv 0.12.3 build", expected: "0.12.3", want: false},
+		{name: "empty metadata", output: "uv 0.12.3 ()", expected: "0.12.3", want: false},
+		{name: "extra line", output: "uv 0.12.3\nspoof", expected: "0.12.3", want: false},
+		{name: "trailing space", output: "uv 0.12.3 ", expected: "0.12.3", want: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := uvVersionOutputMatches(testCase.output, testCase.expected); got != testCase.want {
+				t.Fatalf("uvVersionOutputMatches(%q, %q) = %t, want %t", testCase.output, testCase.expected, got, testCase.want)
+			}
+		})
+	}
+}
+
 func newTestRunner(t *testing.T) *UVRunner {
 	t.Helper()
 	projectDir := t.TempDir()

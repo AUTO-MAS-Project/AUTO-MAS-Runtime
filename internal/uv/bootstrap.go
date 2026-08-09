@@ -904,6 +904,12 @@ func (zipExtractor) Extract(ctx context.Context, archivePath, stagingDir string)
 	if len(reader.File) > maxUVArchiveFiles {
 		return errors.New("uv archive contains too many files")
 	}
+	allowed := map[string]struct{}{
+		"uv.exe":  {},
+		"uvw.exe": {},
+		"uvx.exe": {},
+	}
+	seen := make(map[string]struct{}, len(allowed))
 	var found bool
 	var totalUncompressed uint64
 	for _, entry := range reader.File {
@@ -914,19 +920,26 @@ func (zipExtractor) Extract(ctx context.Context, archivePath, stagingDir string)
 			strings.Contains(entry.Name, "\\") || hasParentSegment(entry.Name) {
 			return errors.New("uv archive entry path is unsafe")
 		}
-		if entry.Name != "uv.exe" {
+		if _, ok := allowed[entry.Name]; !ok {
 			return errors.New("uv archive contains an unexpected entry")
 		}
+		if _, duplicate := seen[entry.Name]; duplicate {
+			return errors.New("uv archive contains a duplicate entry")
+		}
+		seen[entry.Name] = struct{}{}
 		fileInfo := entry.FileInfo()
-		if found || !fileInfo.Mode().IsRegular() ||
+		if !fileInfo.Mode().IsRegular() ||
 			fileInfo.Mode()&os.ModeSymlink != 0 ||
 			entry.UncompressedSize64 > maxUVArchiveBytes {
-			return errors.New("uv archive uv.exe entry is invalid")
+			return errors.New("uv archive executable entry is invalid")
 		}
 		if totalUncompressed > maxUVArchiveBytes-entry.UncompressedSize64 {
 			return errors.New("uv archive exceeds maximum uncompressed size")
 		}
 		totalUncompressed += entry.UncompressedSize64
+		if entry.Name != "uv.exe" {
+			continue
+		}
 		stagingInfo, err := os.Lstat(stagingDir)
 		if err != nil {
 			return err
