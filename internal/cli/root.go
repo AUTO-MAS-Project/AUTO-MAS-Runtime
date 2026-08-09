@@ -59,7 +59,7 @@ func newRoot(deps *deps) *cobra.Command {
 		environmentGroup(deps),
 		dependenciesGroup(deps),
 		backendGroup(deps),
-		newM5RepairCommand(deps, "repair", "修复运行环境"),
+		newM5RepairCommand(deps, "repair", "重验 uv、重装受管 Python，并重建 venv 与锁定依赖"),
 		cleanupCommand(deps),
 	)
 	// SetHelpCommand 只写 Command.helpCommand 字段，真正把它挂进子命令列表的是

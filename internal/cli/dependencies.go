@@ -31,7 +31,14 @@ func dependenciesSyncCommand(deps *deps) *cobra.Command {
 }
 
 func dependenciesRebuildCommand(deps *deps) *cobra.Command {
-	return newDependencyCommand(deps, "rebuild", "重建主项目环境", protocol.StageDependenciesRebuild, true, true)
+	return newDependencyCommand(
+		deps,
+		"rebuild",
+		"仅重建受管 venv 并同步锁定依赖，不修复 uv/Python",
+		protocol.StageDependenciesRebuild,
+		true,
+		true,
+	)
 }
 
 func newDependencyCommand(
@@ -41,6 +48,10 @@ func newDependencyCommand(
 	mutating bool,
 	rebuild bool,
 ) *cobra.Command {
+	capabilities := []string{string(protocol.CapabilityStdinCancel)}
+	if mutating {
+		capabilities = append(capabilities, string(protocol.CapabilityStateV1))
+	}
 	return &cobra.Command{
 		Use:   use,
 		Short: short,
@@ -51,7 +62,7 @@ func newDependencyCommand(
 				deps,
 				commandPath(cmd),
 				stage,
-				[]string{string(protocol.CapabilityStdinCancel), string(protocol.CapabilityStateV1)},
+				capabilities,
 				func(ctx context.Context, emitter *protocol.Emitter) (sessionSuccess, error) {
 					return runDependencyAction(ctx, deps, emitter, mutating, rebuild)
 				},
@@ -111,7 +122,12 @@ func runDependencyAction(
 	}
 	return sessionSuccess{
 		message: "依赖检查完成",
-		details: map[string]any{"version": check.Version, "commit": check.Commit, "lockfileChecked": result.LockfileChecked},
+		details: map[string]any{
+			"version":         check.Version,
+			"commit":          check.Commit,
+			"lockfileChecked": result.LockfileChecked,
+			"synchronized":    result.Synchronized,
+		},
 	}, nil
 }
 

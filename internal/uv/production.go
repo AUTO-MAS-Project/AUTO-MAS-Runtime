@@ -178,7 +178,7 @@ func (s *ProductionEnvironment) SyncDependencies(
 	return service.SyncDependencies(ctx, request)
 }
 
-// CheckDependencies 只检查锁文件与 lock 一致性。
+// CheckDependencies 只读检查锁文件与现有主项目环境是否同步。
 func (s *ProductionEnvironment) CheckDependencies(
 	ctx context.Context,
 	request DependenciesRequest,

@@ -21,6 +21,86 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
 
+func TestM5CommandCapabilitiesMatchStateOwnership(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantState bool
+	}{
+		{name: "bootstrap", args: []string{"bootstrap", "--version", "v5.4.0"}, wantState: true},
+		{name: "environment check", args: []string{"environment", "check"}},
+		{name: "environment ensure", args: []string{"environment", "ensure"}, wantState: true},
+		{name: "environment repair", args: []string{"environment", "repair"}, wantState: true},
+		{name: "dependencies check", args: []string{"dependencies", "check"}},
+		{name: "dependencies sync", args: []string{"dependencies", "sync"}, wantState: true},
+		{name: "dependencies rebuild", args: []string{"dependencies", "rebuild"}, wantState: true},
+		{name: "repair", args: []string{"repair"}, wantState: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			args := append([]string{"--output", "ndjson"}, test.args...)
+			result := runCLI(t, ctx, args...)
+			events := parseNDJSON(t, result.stdout)
+			if len(events) == 0 || eventType(events[0]) != string(protocol.TypeHello) {
+				t.Fatalf("first event = %#v, want hello", events)
+			}
+			capabilities, ok := events[0].object["capabilities"].([]any)
+			if !ok {
+				t.Fatalf("hello capabilities = %#v, want array", events[0].object["capabilities"])
+			}
+			if !containsCapability(capabilities, protocol.CapabilityStdinCancel) {
+				t.Fatal("hello capabilities do not advertise stdin.cancel")
+			}
+			if got := containsCapability(capabilities, protocol.CapabilityStateV1); got != test.wantState {
+				t.Fatalf("state.v1 capability = %t, want %t; capabilities=%#v", got, test.wantState, capabilities)
+			}
+		})
+	}
+}
+
+func TestM5HelpDefinesRepairScope(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			name: "top-level repair covers every managed tool layer",
+			args: []string{"repair", "--help"},
+			want: []string{"uv", "Python", "venv", "锁定依赖"},
+		},
+		{
+			name: "dependency rebuild excludes uv and Python repair",
+			args: []string{"dependencies", "rebuild", "--help"},
+			want: []string{"仅", "venv", "锁定依赖", "不修复 uv/Python"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := runCLI(t, context.Background(), test.args...)
+			if result.exitCode != protocol.ExitCodeSuccess {
+				t.Fatalf("help exit code = %d, want success; stderr=%q", result.exitCode, result.stderr)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(result.stdout, want) {
+					t.Errorf("help output does not contain %q: %s", want, result.stdout)
+				}
+			}
+		})
+	}
+}
+
+func containsCapability(values []any, want protocol.Capability) bool {
+	for _, value := range values {
+		if value == string(want) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	root := t.TempDir()
 	log := &m5TestLog{}
@@ -834,22 +914,23 @@ func stateStatusesFromEvents(t *testing.T, payload string) []string {
 }
 
 type m5TestEnvironment struct {
-	calls              *[]string
-	uvErr              error
-	dependencyErr      error
-	repairErr          error
-	pythonErr          error
-	rebuildErr         error
-	waitForCancel      bool
-	syncCalls          int
-	readyCalls         int
-	repairCalls        int
-	uvRepairCalls      int
-	pythonPrepareCalls int
-	rebuildCalls       int
-	uvPolicy           mirror.Policy
-	pythonRequest      uv.PythonRequest
-	dependencyRequest  uv.DependenciesRequest
+	calls                  *[]string
+	uvErr                  error
+	dependencyErr          error
+	repairErr              error
+	pythonErr              error
+	rebuildErr             error
+	dependencyCheckEnabled bool
+	waitForCancel          bool
+	syncCalls              int
+	readyCalls             int
+	repairCalls            int
+	uvRepairCalls          int
+	pythonPrepareCalls     int
+	rebuildCalls           int
+	uvPolicy               mirror.Policy
+	pythonRequest          uv.PythonRequest
+	dependencyRequest      uv.DependenciesRequest
 }
 
 func (s *m5TestEnvironment) Ensure(context.Context, uv.EnvironmentRequest) (uv.EnvironmentResult, error) {
@@ -939,7 +1020,10 @@ func (s *m5TestEnvironment) SyncDependencies(_ context.Context, request uv.Depen
 }
 
 func (s *m5TestEnvironment) CheckDependencies(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error) {
-	return uv.DependenciesResult{}, errors.New("not used")
+	if !s.dependencyCheckEnabled {
+		return uv.DependenciesResult{}, errors.New("not used")
+	}
+	return uv.DependenciesResult{LockfileChecked: true, Synchronized: true}, nil
 }
 
 func (s *m5TestEnvironment) RebuildDependencies(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error) {
