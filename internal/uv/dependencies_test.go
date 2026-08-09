@@ -52,6 +52,42 @@ func TestDependencies_LockfileContract(t *testing.T) {
 	}
 }
 
+func TestDependencies_CheckDetectsUnsynchronizedEnvironment(t *testing.T) {
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	writeLockfile(t, layout.UVLockFile())
+	runner := &fakeDependenciesRunner{responses: []fakeRunnerResponse{
+		{},
+		{result: UVResult{ExitCode: 1}, err: errors.New("environment is not synchronized")},
+	}}
+	service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
+	if err != nil {
+		t.Fatalf("NewDependenciesService() error = %v", err)
+	}
+
+	_, err = service.Check(t.Context(), dependencyTestRequest(layout))
+	assertPythonCode(t, err, protocol.CodeDependencySyncFailed)
+	if got, want := len(runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
+	}
+	want := []string{
+		"sync", "--project", layout.RepoDir(), "--python", "3.12.10", "--check",
+		"--locked", "--no-default-groups", "--no-install-workspace",
+	}
+	if got := runner.calls[1].args; !reflect.DeepEqual(got, want) {
+		t.Fatalf("check sync args = %#v, want %#v", got, want)
+	}
+	if got := runner.calls[1].options.Environment[uvOfflineEnv]; got != "1" {
+		t.Fatalf("check sync offline environment = %q, want 1", got)
+	}
+	if got, want := runner.calls[1].options.Stage, protocol.StageDependenciesCheck; got != want {
+		t.Fatalf("check sync stage = %q, want %q", got, want)
+	}
+}
+
 func TestDependencies_SyncArguments(t *testing.T) {
 	root := t.TempDir()
 	layout, err := config.NewLayout(root, filepath.Dir(root))
@@ -75,6 +111,9 @@ func TestDependencies_SyncArguments(t *testing.T) {
 	}
 	if !result.Synchronized || !result.LockfileChecked {
 		t.Fatalf("Sync() result = %#v, want checked and synchronized", result)
+	}
+	if got, want := len(runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 	want := []string{
 		"sync", "--project", layout.RepoDir(), "--python", "3.12.10",

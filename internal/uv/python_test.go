@@ -79,6 +79,54 @@ func TestPython_RequiresPythonCompatibility(t *testing.T) {
 	}
 }
 
+func TestPython_CompatibleReleaseSpecifiers(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   PythonVersion
+		requires  string
+		wantMatch bool
+	}{
+		{
+			name:      "two components retain the major prefix",
+			version:   PythonVersion{Major: 3, Minor: 99, Patch: 1},
+			requires:  "~=3.12",
+			wantMatch: true,
+		},
+		{
+			name:     "two components reject the next major",
+			version:  PythonVersion{Major: 4},
+			requires: "~=3.12",
+		},
+		{
+			name:      "three components retain the major minor prefix",
+			version:   PythonVersion{Major: 3, Minor: 12, Patch: 99},
+			requires:  "~=3.12.0",
+			wantMatch: true,
+		},
+		{
+			name:     "three components reject the next minor",
+			version:  PythonVersion{Major: 3, Minor: 13},
+			requires: "~=3.12.0",
+		},
+		{
+			name:     "one component is invalid",
+			version:  PythonVersion{Major: 3, Minor: 12, Patch: 10},
+			requires: "~=3",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := requirementMatches(test.version, test.requires)
+			if test.wantMatch && err != nil {
+				t.Fatalf("requirementMatches(%s, %q) error = %v", test.version.String(), test.requires, err)
+			}
+			if !test.wantMatch && err == nil {
+				t.Fatalf("requirementMatches(%s, %q) error = nil, want mismatch or invalid", test.version.String(), test.requires)
+			}
+		})
+	}
+}
+
 func TestPython_ReadRequiresPythonAcceptsTomlKeyForms(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -127,6 +175,44 @@ func TestPython_ReadRequiresPythonRejectsDuplicateTomlKeys(t *testing.T) {
 	}
 	_, err = service.ReadSpec(context.Background(), projectDir)
 	assertPythonCode(t, err, protocol.CodePythonVersionIncompatible)
+}
+
+func TestPython_ArrayTableIsNotProject(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "dotted key belongs to array table",
+			content: "[[tool.entries]]\nproject.requires-python = \">=3.12,<3.13\"\n",
+			wantErr: true,
+		},
+		{
+			name: "ordinary project table after array table",
+			content: "[[tool.entries]]\nname = \"example\"\n" +
+				"[project]\nrequires-python = \">=3.12,<3.13\"\n",
+			want: ">=3.12,<3.13",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseProjectRequiresPythonTOML(test.content)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parseProjectRequiresPythonTOML() = %q, nil, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseProjectRequiresPythonTOML() error = %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("parseProjectRequiresPythonTOML() = %q, want %q", got, test.want)
+			}
+		})
+	}
 }
 
 func TestPython_InstallArguments(t *testing.T) {

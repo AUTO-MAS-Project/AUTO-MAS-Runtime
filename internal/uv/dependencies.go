@@ -61,7 +61,7 @@ func NewDependenciesService(
 	return &DependenciesService{layout: layout, runner: runner, remover: remover, network: network}, nil
 }
 
-// Check 只读取 uv.lock，并用 uv 的退出码检查锁文件是否过期。
+// Check 离线检查 uv.lock 与现有主项目环境是否保持同步。
 func (s *DependenciesService) Check(
 	ctx context.Context,
 	request DependenciesRequest,
@@ -69,40 +69,27 @@ func (s *DependenciesService) Check(
 	if err := s.validateRequest(ctx, &request); err != nil {
 		return DependenciesResult{}, err
 	}
-	if err := requireRegularLockfile(s.lockfilePath(request.ProjectDir)); err != nil {
+	if err := s.checkLockfile(ctx, request); err != nil {
 		return DependenciesResult{}, err
 	}
 	result, err := s.runner.Run(ctx, []string{
-		"lock",
+		"sync",
 		"--project",
 		request.ProjectDir,
+		"--python",
+		request.PythonVersion,
 		"--check",
+		"--locked",
+		"--no-default-groups",
+		"--no-install-workspace",
 	}, withOfflineUV(s.runOptions(request, protocol.StageDependenciesCheck)))
-	if err != nil {
+	if err != nil || result.ExitCode != 0 {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return DependenciesResult{}, err
 		}
-		if result.ExitCode > 0 {
-			return DependenciesResult{}, newError(
-				protocol.CodeLockfileOutdated,
-				protocol.StageDependenciesCheck,
-				"项目锁文件已过期",
-				map[string]any{"exitCode": result.ExitCode},
-				err,
-			)
-		}
-		return DependenciesResult{}, err
+		return DependenciesResult{}, dependencyCheckError(result, err)
 	}
-	if result.ExitCode != 0 {
-		return DependenciesResult{}, newError(
-			protocol.CodeLockfileOutdated,
-			protocol.StageDependenciesCheck,
-			"项目锁文件已过期",
-			map[string]any{"exitCode": result.ExitCode},
-			nil,
-		)
-	}
-	return DependenciesResult{LockfileChecked: true}, nil
+	return DependenciesResult{LockfileChecked: true, Synchronized: true}, nil
 }
 
 // Sync 在只读锁文件检查通过后执行固定的锁定依赖同步。
@@ -113,7 +100,7 @@ func (s *DependenciesService) Sync(
 	if err := s.validateRequest(ctx, &request); err != nil {
 		return DependenciesResult{}, err
 	}
-	if _, err := s.Check(ctx, request); err != nil {
+	if err := s.checkLockfile(ctx, request); err != nil {
 		return DependenciesResult{}, err
 	}
 	lockDigest, err := lockfileDigest(ctx, s.lockfilePath(request.ProjectDir))
@@ -141,6 +128,43 @@ func (s *DependenciesService) Sync(
 		return DependenciesResult{}, dependencySyncError(result, err)
 	}
 	return DependenciesResult{LockfileChecked: true, Synchronized: true}, nil
+}
+
+func (s *DependenciesService) checkLockfile(ctx context.Context, request DependenciesRequest) error {
+	if err := requireRegularLockfile(s.lockfilePath(request.ProjectDir)); err != nil {
+		return err
+	}
+	result, err := s.runner.Run(ctx, []string{
+		"lock",
+		"--project",
+		request.ProjectDir,
+		"--check",
+	}, withOfflineUV(s.runOptions(request, protocol.StageDependenciesCheck)))
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if result.ExitCode > 0 {
+			return newError(
+				protocol.CodeLockfileOutdated,
+				protocol.StageDependenciesCheck,
+				"项目锁文件已过期",
+				map[string]any{"exitCode": result.ExitCode},
+				err,
+			)
+		}
+		return err
+	}
+	if result.ExitCode != 0 {
+		return newError(
+			protocol.CodeLockfileOutdated,
+			protocol.StageDependenciesCheck,
+			"项目锁文件已过期",
+			map[string]any{"exitCode": result.ExitCode},
+			nil,
+		)
+	}
+	return nil
 }
 
 func lockfileDigest(ctx context.Context, path string) (string, error) {
@@ -310,6 +334,19 @@ func dependencySyncError(result UVResult, cause error) error {
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesSync,
 		"Python 依赖同步失败",
+		map[string]any{"exitCode": result.ExitCode},
+		cause,
+	)
+}
+
+func dependencyCheckError(result UVResult, cause error) error {
+	if cause == nil {
+		cause = errors.New("uv sync check exited with a non-zero status")
+	}
+	return newError(
+		protocol.CodeDependencySyncFailed,
+		protocol.StageDependenciesCheck,
+		"主项目依赖环境未同步",
 		map[string]any{"exitCode": result.ExitCode},
 		cause,
 	)

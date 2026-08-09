@@ -458,6 +458,7 @@ func readRequiresPython(path string) (string, error) {
 func parseProjectRequiresPythonTOML(document string) (string, error) {
 	lines := strings.Split(strings.ReplaceAll(document, "\r\n", "\n"), "\n")
 	table := []string(nil)
+	arrayTable := false
 	found := false
 	var requiresPython string
 	for index := 0; index < len(lines); index++ {
@@ -466,7 +467,12 @@ func parseProjectRequiresPythonTOML(document string) (string, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "[[") {
-			table = nil
+			parsed, err := parseTomlArrayTableHeader(line)
+			if err != nil {
+				return "", err
+			}
+			table = parsed
+			arrayTable = true
 			continue
 		}
 		if strings.HasPrefix(line, "[") {
@@ -475,6 +481,7 @@ func parseProjectRequiresPythonTOML(document string) (string, error) {
 				return "", err
 			}
 			table = parsed
+			arrayTable = false
 			continue
 		}
 		keyText, valueText, ok := splitTomlAssignment(line)
@@ -485,9 +492,9 @@ func parseProjectRequiresPythonTOML(document string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		isTarget := (len(table) == 1 && table[0] == "project" &&
+		isTarget := !arrayTable && ((len(table) == 1 && table[0] == "project" &&
 			len(keys) == 1 && keys[0] == "requires-python") ||
-			(len(table) == 0 && len(keys) == 2 && keys[0] == "project" && keys[1] == "requires-python")
+			(len(table) == 0 && len(keys) == 2 && keys[0] == "project" && keys[1] == "requires-python"))
 		trimmedValue := strings.TrimSpace(valueText)
 		if strings.HasPrefix(trimmedValue, "\"\"\"") || strings.HasPrefix(trimmedValue, "'''") {
 			value, consumed, parseErr := parseTomlMultilineString(trimmedValue, lines[index+1:])
@@ -559,6 +566,44 @@ func parseTomlTableHeader(line string) ([]string, error) {
 		return nil, errors.New("TOML table header is invalid")
 	}
 	return parseTomlKeyPath(line[1:end])
+}
+
+func parseTomlArrayTableHeader(line string) ([]string, error) {
+	if !strings.HasPrefix(line, "[[") {
+		return nil, errors.New("TOML array table header is invalid")
+	}
+	quote := byte(0)
+	escaped := false
+	end := -1
+	for index := 2; index+1 < len(line); index++ {
+		character := line[index]
+		if quote != 0 {
+			if quote == '"' && escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && character == '\\' {
+				escaped = true
+				continue
+			}
+			if character == quote {
+				quote = 0
+			}
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			continue
+		}
+		if character == ']' && line[index+1] == ']' {
+			end = index
+			break
+		}
+	}
+	if end < 0 || strings.TrimSpace(tomlTrimCommentLine(line[end+2:])) != "" {
+		return nil, errors.New("TOML array table header is invalid")
+	}
+	return parseTomlKeyPath(line[2:end])
 }
 
 func parseTomlKeyPath(value string) ([]string, error) {
@@ -933,7 +978,9 @@ func parseSpecifier(value string) (versionSpecifier, error) {
 		value = strings.TrimSuffix(value, ".*")
 	}
 	versionParts := strings.Split(value, ".")
-	if len(versionParts) < 1 || len(versionParts) > 3 || (wildcard && operator != "==" && operator != "!=") {
+	if len(versionParts) < 1 || len(versionParts) > 3 ||
+		(wildcard && operator != "==" && operator != "!=") ||
+		(operator == "~=" && len(versionParts) < 2) {
 		return versionSpecifier{}, errors.New("requires-python version specifier is invalid")
 	}
 	var parsed [3]int
@@ -984,10 +1031,8 @@ func specifierMatches(version PythonVersion, specifier versionSpecifier) bool {
 	case "<=":
 		return comparison <= 0
 	case "~=":
-		upper := specifier.version
-		if specifier.parts <= 1 {
-			upper = [3]int{specifier.version[0] + 1, 0, 0}
-		} else {
+		upper := [3]int{specifier.version[0] + 1, 0, 0}
+		if specifier.parts == 3 {
 			upper = [3]int{specifier.version[0], specifier.version[1] + 1, 0}
 		}
 		return comparison >= 0 && compareVersion(value, upper) < 0
