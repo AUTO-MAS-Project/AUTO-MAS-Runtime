@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/spf13/cobra"
@@ -12,10 +14,14 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
-const backendModeManaged = "managed"
+const (
+	backendModeManaged     = "managed"
+	backendModeDevelopment = "development"
+)
 
 func backendSuperviseCommand(deps *deps) *cobra.Command {
 	var mode string
+	var repo string
 	command := &cobra.Command{
 		Use:   "supervise",
 		Short: "启动并监督后端进程",
@@ -36,13 +42,36 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 							cause:   errors.New("backend mode is required"),
 						}
 					}
-					if mode != backendModeManaged {
+					if mode != backendModeManaged && mode != backendModeDevelopment {
 						return sessionSuccess{}, &commandError{
 							code:    protocol.CodeUnsupportedMode,
 							stage:   protocol.StageBackendSpawn,
 							message: "当前后端运行模式尚不受支持",
 							details: map[string]any{"mode": mode},
 							cause:   errors.New("backend mode is unsupported"),
+						}
+					}
+					if mode == backendModeDevelopment {
+						if strings.TrimSpace(repo) == "" {
+							return sessionSuccess{}, &commandError{
+								code:    protocol.CodeInvalidArgument,
+								stage:   protocol.StageBackendSpawn,
+								message: "开发模式必须指定源码目录",
+								details: map[string]any{"field": "repo"},
+								cause:   errors.New("development repository is required"),
+							}
+						}
+						if !filepath.IsAbs(repo) {
+							repo = filepath.Join(deps.options.cwd, repo)
+						}
+						repo = filepath.Clean(repo)
+					} else if strings.TrimSpace(repo) != "" {
+						return sessionSuccess{}, &commandError{
+							code:    protocol.CodeInvalidArgument,
+							stage:   protocol.StageBackendSpawn,
+							message: "managed 模式不接受 --repo",
+							details: map[string]any{"field": "repo", "mode": mode},
+							cause:   errors.New("managed mode does not accept development repository"),
 						}
 					}
 					service, err := deps.options.backendFactory(
@@ -76,6 +105,8 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 					if err := service.Supervise(ctx, backend.Request{
 						OperationID:        emitter.OperationID(),
 						RuntimePID:         uint32(pid),
+						Mode:               backend.Mode(mode),
+						DevelopmentRepo:    repo,
 						Emitter:            &backendEventEmitter{emitter: emitter, control: control},
 						Control:            mailbox,
 						BeforeShutdown:     mailbox.BeforeShutdown,
@@ -94,6 +125,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&mode, "mode", "", "后端运行模式：managed 或 development")
+	command.Flags().StringVar(&repo, "repo", "", "development 模式源码目录")
 	return command
 }
 

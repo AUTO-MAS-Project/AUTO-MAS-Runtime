@@ -716,6 +716,7 @@ type fakeState struct {
 	updateCalls            int
 	beginHandle            TransactionHandle
 	beginErr               error
+	beginInput             TransactionInput
 	beginStarted           chan struct{}
 	beginBlock             chan struct{}
 	removeCalls            int
@@ -743,7 +744,8 @@ func (s *fakeState) ReadBackendTransaction(context.Context) (Transaction, error)
 	return Transaction{}, ErrTransactionNotFound
 }
 
-func (s *fakeState) BeginBackendTransaction(ctx context.Context, _ TransactionInput) (TransactionHandle, error) {
+func (s *fakeState) BeginBackendTransaction(ctx context.Context, input TransactionInput) (TransactionHandle, error) {
+	s.beginInput = input
 	if s.beginStarted != nil {
 		select {
 		case <-s.beginStarted:
@@ -847,12 +849,19 @@ type fakeUV struct {
 	startCalls      int
 	returnProcOnErr bool
 	onStart         func()
+	startNotify     chan struct{}
 }
 
 func (u *fakeUV) Check(context.Context) error { return u.checkErr }
 func (u *fakeUV) Executable() string          { return "uv.exe" }
 func (u *fakeUV) StartManaged(_ context.Context, args []string, options uv.ManagedOptions, sink process.StreamSink) (ManagedProcess, error) {
 	u.startCalls++
+	if u.startNotify != nil {
+		select {
+		case u.startNotify <- struct{}{}:
+		default:
+		}
+	}
 	u.args = append([]string(nil), args...)
 	u.options = options
 	if u.onStart != nil {
@@ -878,13 +887,15 @@ func (u *fakeUV) StartManaged(_ context.Context, args []string, options uv.Manag
 }
 
 type fakeHealth struct {
-	err         error
-	observeExit bool
-	started     chan struct{}
-	block       <-chan struct{}
+	err          error
+	observeExit  bool
+	started      chan struct{}
+	block        <-chan struct{}
+	expectations []health.Expectation
 }
 
-func (h *fakeHealth) Check(ctx context.Context, _ health.Expectation, probe health.Probe) error {
+func (h *fakeHealth) Check(ctx context.Context, expected health.Expectation, probe health.Probe) error {
+	h.expectations = append(h.expectations, expected)
 	if h.started != nil {
 		select {
 		case <-h.started:

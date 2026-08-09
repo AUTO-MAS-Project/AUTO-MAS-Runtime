@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +25,7 @@ func TestBackendSupervise_RequiresExplicitManagedMode(t *testing.T) {
 		wantCode protocol.Code
 	}{
 		{name: "missing", wantCode: protocol.CodeInvalidArgument},
-		{name: "development deferred", modeArgs: []string{"--mode", "development"}, wantCode: protocol.CodeUnsupportedMode},
+		{name: "development requires repo", modeArgs: []string{"--mode", "development"}, wantCode: protocol.CodeInvalidArgument},
 		{name: "unknown", modeArgs: []string{"--mode", "future"}, wantCode: protocol.CodeUnsupportedMode},
 	}
 	for _, test := range tests {
@@ -59,6 +60,33 @@ func TestBackendSupervise_RequiresExplicitManagedMode(t *testing.T) {
 				t.Fatalf("result code = %q, want %q", got, test.wantCode)
 			}
 		})
+	}
+}
+
+func TestBackendDevelopment_CLIResolvesExplicitRepoFromCWD(t *testing.T) {
+	cwd := t.TempDir()
+	var captured backend.Request
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "development", "--repo", "source"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(cwd),
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+			return backendServiceFunc(func(_ context.Context, request backend.Request) error {
+				captured = request
+				return nil
+			}), nil
+		}),
+	)
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if captured.Mode != backend.ModeDevelopment {
+		t.Fatalf("backend mode = %q, want development", captured.Mode)
+	}
+	if got, want := captured.DevelopmentRepo, filepath.Join(cwd, "source"); got != want {
+		t.Fatalf("development repo = %q, want %q", got, want)
 	}
 }
 

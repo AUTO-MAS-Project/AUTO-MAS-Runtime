@@ -956,7 +956,7 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 	}
 	done := make(chan result, 1)
 	go func() {
-		environment, revision, err := s.controlPreflight(phaseCtx)
+		environment, revision, err := s.controlPreflight(phaseCtx, request)
 		done <- result{environment: environment, revision: revision, err: err}
 	}()
 	for {
@@ -1032,9 +1032,20 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 	}
 }
 
-func (s *ManagedSupervisor) controlPreflight(ctx context.Context) (state.EnvironmentState, state.Revision, error) {
+func (s *ManagedSupervisor) controlPreflight(ctx context.Context, request Request) (state.EnvironmentState, state.Revision, error) {
+	if modeForRequest(request) == ModeDevelopment {
+		if _, err := s.normalizeDevelopmentRequest(ctx, request); err != nil {
+			return state.EnvironmentState{}, state.Revision{}, err
+		}
+	}
 	if err := s.recoverStaleTransaction(ctx); err != nil {
 		return state.EnvironmentState{}, state.Revision{}, err
+	}
+	if modeForRequest(request) == ModeDevelopment {
+		if err := s.deps.UV.Check(ctx); err != nil {
+			return state.EnvironmentState{}, state.Revision{}, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeUVExecFailed, "开发模式 uv 校验失败", err)
+		}
+		return state.EnvironmentState{}, state.Revision{}, nil
 	}
 	if err := s.checkEntry(ctx); err != nil {
 		return state.EnvironmentState{}, state.Revision{}, err
@@ -1201,6 +1212,18 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
+	mode := modeForRequest(request)
+	projectDir := s.layout.RepoDir()
+	projectEnvDir := ""
+	var identity *uv.SupervisionIdentity
+	pythonPaths := append([]string(nil), s.deps.PythonPaths...)
+	if mode == ModeDevelopment {
+		projectDir = request.DevelopmentRepo
+		projectEnvDir = developmentProjectEnv(projectDir)
+		pythonPaths = []string{developmentPythonPath(projectDir)}
+	} else {
+		identity = &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit}
+	}
 	logger, err := s.deps.Logger(ctx, request)
 	if err != nil || logger == nil {
 		if logger != nil {
@@ -1223,12 +1246,14 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		}
 		return nil, errors.Join(newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端事务写入失败", nil, err), cleanupErr)
 	}
-	if err := s.recheckRevision(ctx, environment, revision); err != nil {
-		cleanupErr := errors.Join(
-			s.removeBackendTransaction(ctx, tx),
-			mapLoggerCleanupError(logger.Close()),
-		)
-		return nil, errors.Join(err, cleanupErr)
+	if mode == ModeManaged {
+		if err := s.recheckRevision(ctx, environment, revision); err != nil {
+			cleanupErr := errors.Join(
+				s.removeBackendTransaction(ctx, tx),
+				mapLoggerCleanupError(logger.Close()),
+			)
+			return nil, errors.Join(err, cleanupErr)
+		}
 	}
 	gate := &streamGate{stage: protocol.StageBackendSpawn}
 	attempt := &controlAttempt{tx: tx, logger: logger, gate: gate, stage: protocol.StageBackendSpawn, results: results}
@@ -1262,9 +1287,9 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		)
 		return nil, errors.Join(ctxErr, cleanupErr)
 	}
-	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", s.layout.RepoDir(), "--no-sync", "main.py"}, uv.ManagedOptions{
-		RunOptions: uv.RunOptions{Stage: protocol.StageBackendSpawn, ProjectDir: s.layout.RepoDir()},
-		Identity:   &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit},
+	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", "main.py"}, uv.ManagedOptions{
+		RunOptions: uv.RunOptions{Stage: protocol.StageBackendSpawn, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
+		Identity:   identity,
 	}, s.streamSink(request, logger, gate))
 	if err != nil || proc == nil {
 		fault := gate.Fault()
@@ -1339,7 +1364,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		failure := withFailureDetailsExtra(newError(protocol.CodeStateWriteFailed, protocol.StageBackendHealth, "后端事务写入失败", nil, err), logger, proc, cleanup.details)
 		return nil, markCommitted(errors.Join(cleanup.err, failure))
 	}
-	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: append([]string(nil), s.deps.PythonPaths...)}
+	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: pythonPaths}
 	if restarting {
 		setControlStage(request.Control, protocol.StageBackendRestart)
 		snapshot.set(protocol.StageBackendRestart, protocol.StateRestarting, map[string]any{"pid": proc.PID(), "logPath": logger.LogPath()})
@@ -1462,9 +1487,15 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, probe health.Probe, gate *streamGate, snapshot *controlState, results <-chan controlResult) error {
 	healthCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	expectation := health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit}
+	if modeForRequest(request) == ModeDevelopment {
+		expectation.Mode = health.ModeDevelopment
+		expectation.Version = ""
+		expectation.Commit = ""
+	}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.deps.Health.Check(healthCtx, health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit}, probe)
+		done <- s.deps.Health.Check(healthCtx, expectation, probe)
 	}()
 	for {
 		if infraErr := controlInfrastructureError(request.Control); infraErr != nil {

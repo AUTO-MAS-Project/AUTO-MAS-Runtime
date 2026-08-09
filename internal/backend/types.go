@@ -22,11 +22,23 @@ type EventEmitter interface {
 type Request struct {
 	OperationID        string
 	RuntimePID         uint32
+	Mode               Mode
+	DevelopmentRepo    string
 	Emitter            EventEmitter
 	Control            ControlReceiver
 	BeforeShutdown     func(string)
 	BeforeControlClose func()
 }
+
+// Mode 选择后端源码与环境的监督策略。
+type Mode string
+
+const (
+	// ModeManaged 使用 Runtime 管理的仓库、环境和版本身份。
+	ModeManaged Mode = "managed"
+	// ModeDevelopment 只监督调用方显式指定的源码目录与既有 .venv。
+	ModeDevelopment Mode = "development"
+)
 
 // ControlReceiver 为监督循环提供已由 ControlReader 校验并按 FIFO 排队的命令。
 type ControlReceiver interface {

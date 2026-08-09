@@ -121,15 +121,35 @@ func TestManaged_CancellationUsesOperationCancelled(t *testing.T) {
 }
 
 func TestManaged_DevelopmentOmitsExpectedIdentity(t *testing.T) {
+	for _, key := range []string{
+		autoMASUVExecutable,
+		autoMASProtocol,
+		autoMASVersion,
+		autoMASCommit,
+		autoMASSupervised,
+	} {
+		t.Setenv(key, "host-stale")
+		t.Setenv(strings.ToLower(key), "host-stale-lower")
+	}
 	runner := newTestRunner(t)
 	recordPath := filepath.Join(t.TempDir(), "development-record.txt")
+	projectEnvDir := filepath.Join(t.TempDir(), "development-venv")
 	managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
 		RunOptions: RunOptions{
-			Stage: protocol.StageBackendSpawn,
+			Stage:         protocol.StageBackendSpawn,
+			ProjectEnvDir: projectEnvDir,
 			Environment: map[string]string{
-				"FAKE_UV_RECORD": recordPath,
-				autoMASVersion:   "malicious-version",
-				autoMASCommit:    strings.Repeat("b", 40),
+				"FAKE_UV_RECORD":                     recordPath,
+				autoMASUVExecutable:                  "option-stale-uv",
+				strings.ToLower(autoMASUVExecutable): "option-stale-uv-lower",
+				autoMASProtocol:                      "999",
+				strings.ToLower(autoMASProtocol):     "998",
+				autoMASVersion:                       "option-stale-version",
+				strings.ToLower(autoMASVersion):      "option-stale-version-lower",
+				autoMASCommit:                        strings.Repeat("b", 40),
+				strings.ToLower(autoMASCommit):       strings.Repeat("c", 40),
+				autoMASSupervised:                    "0",
+				strings.ToLower(autoMASSupervised):   "false",
 			},
 		},
 	}, nil)
@@ -149,8 +169,17 @@ func TestManaged_DevelopmentOmitsExpectedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := readTestRecord(t, recordPath)
-	if record[autoMASVersion] != "" || record[autoMASCommit] != "" {
-		t.Fatalf("development identity leaked: %#v", record)
+	for key, want := range map[string]string{
+		autoMASUVExecutable:  runner.Executable,
+		autoMASProtocol:      "1",
+		autoMASVersion:       "",
+		autoMASCommit:        "",
+		autoMASSupervised:    "1",
+		uvProjectEnvironment: projectEnvDir,
+	} {
+		if got := record[key]; got != want {
+			t.Errorf("environment[%q] = %q, want %q", key, got, want)
+		}
 	}
 }
 

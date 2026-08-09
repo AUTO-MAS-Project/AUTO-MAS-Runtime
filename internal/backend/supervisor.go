@@ -24,7 +24,7 @@ type ManagedSupervisor struct {
 	deps   Dependencies
 }
 
-// NewManagedSupervisor 创建仅支持 managed 模式的后端监督器。
+// NewManagedSupervisor 创建可按请求选择 managed 或 development 的后端监督器。
 func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSupervisor, error) {
 	if layout == nil {
 		return nil, errors.New("backend layout is nil")
@@ -57,7 +57,7 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	return &ManagedSupervisor{layout: layout, deps: deps}, nil
 }
 
-// Supervise 启动并长驻监督 managed 后端，直到调用方取消或 Job 根进程退出。
+// Supervise 启动并长驻监督指定模式的后端，直到调用方取消或 Job 根进程退出。
 func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (returnErr error) {
 	if ctx == nil {
 		return newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "后端监督上下文不可用", nil, errors.New("backend context is nil"))
@@ -68,8 +68,24 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if request.OperationID == "" || request.RuntimePID == 0 || request.Emitter == nil {
 		return newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "后端监督请求无效", nil, errors.New("backend request is invalid"))
 	}
+	mode := modeForRequest(request)
+	if mode != ModeManaged && mode != ModeDevelopment {
+		return newError(protocol.CodeUnsupportedMode, protocol.StageBackendSpawn, "后端运行模式不受支持", map[string]any{"mode": string(mode)}, errors.New("backend mode is unsupported"))
+	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if mode == ModeDevelopment {
+		var err error
+		request, err = s.normalizeDevelopmentRequest(ctx, request)
+		if err != nil {
+			return err
+		}
+		if request.Control == nil {
+			mailbox := NewControlMailbox(defaultControlMailboxCapacity)
+			request.Control = mailbox
+			defer mailbox.Close()
+		}
 	}
 	if request.Control != nil {
 		return s.superviseControlled(ctx, request)
