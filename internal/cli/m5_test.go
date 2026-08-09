@@ -55,7 +55,7 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	if code != protocol.ExitCodeSuccess {
 		t.Fatalf("Execute() exit code = %d, want %d; stderr=%q", code, protocol.ExitCodeSuccess, stderr.String())
 	}
-	if got, want := strings.Join(log.calls, ","), "acquire,uv,workspace,python,dependencies,ready,logger-close,lease-close,coordinator-close,store-close"; got != want {
+	if got, want := strings.Join(log.calls, ","), "acquire,uv,workspace,python-spec,python,dependencies,ready,logger-close,lease-close,coordinator-close,store-close"; got != want {
 		t.Fatalf("call order = %q, want %q", got, want)
 	}
 	events := parseNDJSON(t, stdout.String())
@@ -314,8 +314,8 @@ func TestEnvironmentRepair_PreservesStableState(t *testing.T) {
 	if code != protocol.ExitCodeSuccess {
 		t.Fatalf("Execute() exit code = %d, want success; stderr=%q", code, stderr.String())
 	}
-	if environment.repairCalls != 1 {
-		t.Fatalf("environment repair calls = %d, want 1", environment.repairCalls)
+	if environment.uvRepairCalls != 1 || environment.pythonPrepareCalls != 1 {
+		t.Fatalf("environment repair calls = uv %d Python %d, want 1/1", environment.uvRepairCalls, environment.pythonPrepareCalls)
 	}
 	if len(store.writes) != 0 {
 		t.Fatalf("environment writes = %#v, want no durable state change", store.writes)
@@ -368,7 +368,7 @@ func TestRecoverM5Transaction_FailsClosedForLiveAndRemovesStale(t *testing.T) {
 			if err := store.WriteTransaction(t.Context(), state.TransactionMutation, transaction); err != nil {
 				t.Fatalf("WriteTransaction() error = %v", err)
 			}
-			err = recoverM5Transaction(t.Context(), store)
+			err = recoverM5Transaction(t.Context(), store, layout)
 			if test.wantError != "" {
 				if findOperationErrorCode(err, test.wantError) == nil {
 					t.Fatalf("recoverM5Transaction() error = %v, want code %q", err, test.wantError)
@@ -382,6 +382,286 @@ func TestRecoverM5Transaction_FailsClosedForLiveAndRemovesStale(t *testing.T) {
 				t.Fatalf("ReadTransaction() error = %v, want ErrNotFound", err)
 			}
 		})
+	}
+}
+
+func TestRecoverM5Transaction_InvalidatesReadyState(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.MkdirAll(appRoot, 0o700); err != nil {
+		t.Fatalf("os.MkdirAll(app root) error = %v", err)
+	}
+	layout, err := config.NewLayout(appRoot, root)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	if err := os.MkdirAll(layout.RepoDir(), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll(repo) error = %v", err)
+	}
+	if err := os.WriteFile(layout.PythonVersionFile(), []byte("3.12.10\n"), 0o600); err != nil {
+		t.Fatalf("write .python-version error = %v", err)
+	}
+	if err := os.WriteFile(layout.PyProjectFile(), []byte("[project]\nrequires-python = \">=3.12,<3.13\"\n"), 0o600); err != nil {
+		t.Fatalf("write pyproject.toml error = %v", err)
+	}
+	store, err := state.NewStore(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("state.NewStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	ready, err := store.NewReadyEnvironment("v5.4.0", "0123456789abcdef0123456789abcdef01234567")
+	if err != nil {
+		t.Fatalf("NewReadyEnvironment() error = %v", err)
+	}
+	if err := store.WriteEnvironment(t.Context(), ready); err != nil {
+		t.Fatalf("WriteEnvironment() error = %v", err)
+	}
+	transaction, err := store.NewTransaction(state.TransactionMutation, state.TransactionInput{
+		OperationID:   "01J00000000000000000000002",
+		Command:       "dependencies sync",
+		PID:           ^uint32(0),
+		TargetVersion: "v5.4.0",
+		Stage:         protocol.StageDependenciesSync,
+	})
+	if err != nil {
+		t.Fatalf("NewTransaction() error = %v", err)
+	}
+	if err := store.WriteTransaction(t.Context(), state.TransactionMutation, transaction); err != nil {
+		t.Fatalf("WriteTransaction() error = %v", err)
+	}
+
+	if err := recoverM5Transaction(t.Context(), store, layout); err != nil {
+		t.Fatalf("recoverM5Transaction() error = %v", err)
+	}
+	got, err := store.ReadEnvironment(t.Context())
+	if err != nil {
+		t.Fatalf("ReadEnvironment() error = %v", err)
+	}
+	if got.Status != protocol.StateEnvironmentBroken || got.Broken == nil {
+		t.Fatalf("environment state = %#v, want environment_broken", got)
+	}
+	broken := got.Broken
+	if broken.Reason != state.ReasonOperationFailed ||
+		broken.Stage != protocol.StageDependenciesSync ||
+		broken.PythonVersion != "3.12.10" || broken.UVVersion != uv.FixedVersion {
+		t.Fatalf("broken facts = %#v, want stale dependency sync with exact tools", broken)
+	}
+	if got.LastSuccessful != ready.LastSuccessful {
+		t.Fatalf("lastSuccessful = %#v, want %#v", got.LastSuccessful, ready.LastSuccessful)
+	}
+	if _, err := store.ReadTransaction(t.Context(), state.TransactionMutation); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("ReadTransaction() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecoverM5Transaction_StateWriteFailureRetainsEvidence(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.MkdirAll(appRoot, 0o700); err != nil {
+		t.Fatalf("os.MkdirAll(app root) error = %v", err)
+	}
+	layout, err := config.NewLayout(appRoot, root)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	store, err := state.NewStore(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("state.NewStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	ready, err := store.NewReadyEnvironment("v5.4.0", "0123456789abcdef0123456789abcdef01234567")
+	if err != nil {
+		t.Fatalf("NewReadyEnvironment() error = %v", err)
+	}
+	if err := store.WriteEnvironment(t.Context(), ready); err != nil {
+		t.Fatalf("WriteEnvironment() error = %v", err)
+	}
+	transaction, err := store.NewTransaction(state.TransactionMutation, state.TransactionInput{
+		OperationID: "01J00000000000000000000003",
+		Command:     "environment repair",
+		PID:         ^uint32(0),
+		Stage:       protocol.StageUVDownload,
+	})
+	if err != nil {
+		t.Fatalf("NewTransaction() error = %v", err)
+	}
+	if err := store.WriteTransaction(t.Context(), state.TransactionMutation, transaction); err != nil {
+		t.Fatalf("WriteTransaction() error = %v", err)
+	}
+	failing := &failingEnvironmentWriteStore{Store: store, writeErr: errors.New("injected environment write failure")}
+
+	err = recoverM5Transaction(t.Context(), failing, layout)
+	if findOperationErrorCode(err, protocol.CodeStateWriteFailed) == nil {
+		t.Fatalf("recoverM5Transaction() error = %v, want STATE_WRITE_FAILED", err)
+	}
+	if _, err := store.ReadTransaction(t.Context(), state.TransactionMutation); err != nil {
+		t.Fatalf("ReadTransaction() error = %v, want retained transaction", err)
+	}
+	got, err := store.ReadEnvironment(t.Context())
+	if err != nil {
+		t.Fatalf("ReadEnvironment() error = %v", err)
+	}
+	if got.Status != protocol.StateReadyToStart {
+		t.Fatalf("environment status = %q, want original ready_to_start", got.Status)
+	}
+}
+
+func TestRecoverM5Transaction_PreservesWorkspaceOwnedEvidence(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.MkdirAll(appRoot, 0o700); err != nil {
+		t.Fatalf("os.MkdirAll(app root) error = %v", err)
+	}
+	layout, err := config.NewLayout(appRoot, root)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	store, err := state.NewStore(t.Context(), layout)
+	if err != nil {
+		t.Fatalf("state.NewStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	transaction, err := store.NewTransaction(state.TransactionMutation, state.TransactionInput{
+		OperationID:   "01J00000000000000000000004",
+		Command:       "workspace sync",
+		PID:           ^uint32(0),
+		TargetVersion: "v5.4.0",
+		Stage:         protocol.StageWorkspaceClone,
+	})
+	if err != nil {
+		t.Fatalf("NewTransaction() error = %v", err)
+	}
+	if err := store.WriteTransaction(t.Context(), state.TransactionMutation, transaction); err != nil {
+		t.Fatalf("WriteTransaction() error = %v", err)
+	}
+
+	err = recoverM5Transaction(t.Context(), store, layout)
+	if findOperationErrorCode(err, protocol.CodeUpdateStateAmbiguous) == nil {
+		t.Fatalf("recoverM5Transaction() error = %v, want UPDATE_STATE_AMBIGUOUS", err)
+	}
+	if _, err := store.ReadTransaction(t.Context(), state.TransactionMutation); err != nil {
+		t.Fatalf("ReadTransaction() error = %v, want workspace evidence retained", err)
+	}
+}
+
+func TestRepair_StagesFollowExecution(t *testing.T) {
+	root := t.TempDir()
+	log := &m5TestLog{}
+	store := &m5TestStateStore{
+		calls:              &log.calls,
+		recordTransactions: true,
+		initial: state.EnvironmentState{
+			Status: protocol.StateEnvironmentBroken,
+			LastSuccessful: state.Revision{
+				Version: "v5.3.0",
+				Commit:  "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+			},
+		},
+	}
+	environment := &m5TestEnvironment{calls: &log.calls}
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		t.Context(),
+		[]string{"--app-root", root, "--output", "ndjson", "repair"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(root),
+		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return &m5TestWorkspace{calls: &log.calls}, nil }),
+		WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+			return store, nil
+		}),
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return &m5TestCoordinator{calls: &log.calls}, nil
+		}),
+		WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+			return log, nil
+		}),
+	)
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("repair exit code = %d, want success; stderr=%q", code, stderr.String())
+	}
+	wantCalls := []string{
+		"acquire",
+		"transaction:repair",
+		"transaction:uv.download",
+		"uv-repair",
+		"transaction:uv.verify",
+		"transaction:python.check",
+		"python-spec",
+		"transaction:python.install",
+		"python",
+		"transaction:dependencies.rebuild",
+		"dependencies-rebuild",
+		"transaction:dependencies.sync",
+		"dependencies",
+		"ready",
+		"logger-close",
+		"lease-close",
+		"coordinator-close",
+		"store-close",
+	}
+	if !reflect.DeepEqual(log.calls, wantCalls) {
+		t.Fatalf("repair calls = %#v, want %#v", log.calls, wantCalls)
+	}
+	if !environment.pythonRequest.Reinstall {
+		t.Fatal("repair PythonRequest.Reinstall = false, want true")
+	}
+}
+
+func TestM5Failure_PersistsKnownToolVersions(t *testing.T) {
+	root := t.TempDir()
+	log := &m5TestLog{}
+	store := &m5TestStateStore{
+		calls: &log.calls,
+		initial: state.EnvironmentState{
+			Status: protocol.StateReadyToStart,
+			LastSuccessful: state.Revision{
+				Version: "v5.4.0",
+				Commit:  "0123456789abcdef0123456789abcdef01234567",
+			},
+		},
+	}
+	environment := &m5TestEnvironment{calls: &log.calls, pythonErr: errors.New("fake Python reinstall failure")}
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		t.Context(),
+		[]string{"--app-root", root, "--output", "ndjson", "environment", "repair"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(root),
+		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return &m5TestWorkspace{calls: &log.calls}, nil }),
+		WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+			return store, nil
+		}),
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return &m5TestCoordinator{calls: &log.calls}, nil
+		}),
+		WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+			return log, nil
+		}),
+	)
+	if code == protocol.ExitCodeSuccess {
+		t.Fatal("environment repair exit code = success, want Python failure")
+	}
+	if len(store.writes) != 1 || store.writes[0].Broken == nil {
+		t.Fatalf("environment writes = %#v, want one broken state", store.writes)
+	}
+	broken := store.writes[0].Broken
+	if broken.Stage != protocol.StagePythonInstall ||
+		broken.PythonVersion != "3.12.10" || broken.UVVersion != uv.FixedVersion {
+		t.Fatalf("broken facts = %#v, want exact Python and uv versions", broken)
 	}
 }
 
@@ -436,8 +716,17 @@ func TestRepair_DoesNotTouchProtectedInputs(t *testing.T) {
 	if code != protocol.ExitCodeSuccess {
 		t.Fatalf("repair exit code = %d, want success; stderr=%q", code, stderr.String())
 	}
-	if environment.repairCalls != 1 || len(store.writes) != 1 || store.writes[0].Status != protocol.StateReadyToStart {
-		t.Fatalf("repair calls=%d state writes=%#v, want one repair and ready state", environment.repairCalls, store.writes)
+	if environment.uvRepairCalls != 1 || environment.pythonPrepareCalls != 1 ||
+		environment.rebuildCalls != 1 || environment.syncCalls != 1 ||
+		len(store.writes) != 1 || store.writes[0].Status != protocol.StateReadyToStart {
+		t.Fatalf(
+			"repair calls=uv:%d Python:%d rebuild:%d sync:%d state writes=%#v, want one complete repair and ready state",
+			environment.uvRepairCalls,
+			environment.pythonPrepareCalls,
+			environment.rebuildCalls,
+			environment.syncCalls,
+			store.writes,
+		)
 	}
 	for relative, want := range protected {
 		path := filepath.Join(root, relative)
@@ -545,17 +834,22 @@ func stateStatusesFromEvents(t *testing.T, payload string) []string {
 }
 
 type m5TestEnvironment struct {
-	calls             *[]string
-	uvErr             error
-	dependencyErr     error
-	repairErr         error
-	waitForCancel     bool
-	syncCalls         int
-	readyCalls        int
-	repairCalls       int
-	uvPolicy          mirror.Policy
-	pythonRequest     uv.PythonRequest
-	dependencyRequest uv.DependenciesRequest
+	calls              *[]string
+	uvErr              error
+	dependencyErr      error
+	repairErr          error
+	pythonErr          error
+	rebuildErr         error
+	waitForCancel      bool
+	syncCalls          int
+	readyCalls         int
+	repairCalls        int
+	uvRepairCalls      int
+	pythonPrepareCalls int
+	rebuildCalls       int
+	uvPolicy           mirror.Policy
+	pythonRequest      uv.PythonRequest
+	dependencyRequest  uv.DependenciesRequest
 }
 
 func (s *m5TestEnvironment) Ensure(context.Context, uv.EnvironmentRequest) (uv.EnvironmentResult, error) {
@@ -604,16 +898,34 @@ func (s *m5TestEnvironment) EnsureUV(ctx context.Context, _ string, policy mirro
 	return "uv.exe", nil
 }
 
+func (s *m5TestEnvironment) RepairUV(context.Context, string, mirror.Policy) (string, error) {
+	s.uvRepairCalls++
+	*s.calls = append(*s.calls, "uv-repair")
+	if s.repairErr != nil {
+		return "", s.repairErr
+	}
+	return "uv.exe", nil
+}
+
 func (s *m5TestEnvironment) CheckUV(context.Context) (bool, error) { return true, nil }
 
+func (s *m5TestEnvironment) ReadPythonSpec(context.Context, string) (uv.PythonSpec, error) {
+	*s.calls = append(*s.calls, "python-spec")
+	return uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}, nil
+}
+
 func (s *m5TestEnvironment) PreparePython(_ context.Context, request uv.PythonRequest) (uv.PythonResult, error) {
+	s.pythonPrepareCalls++
 	s.pythonRequest = request
 	*s.calls = append(*s.calls, "python")
+	if s.pythonErr != nil {
+		return uv.PythonResult{}, s.pythonErr
+	}
 	return uv.PythonResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil
 }
 
 func (s *m5TestEnvironment) CheckPython(context.Context, uv.PythonRequest) (uv.PythonCheckResult, error) {
-	return uv.PythonCheckResult{}, errors.New("not used")
+	return uv.PythonCheckResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil
 }
 
 func (s *m5TestEnvironment) SyncDependencies(_ context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
@@ -631,7 +943,12 @@ func (s *m5TestEnvironment) CheckDependencies(context.Context, uv.DependenciesRe
 }
 
 func (s *m5TestEnvironment) RebuildDependencies(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error) {
-	return uv.DependenciesResult{}, errors.New("not used")
+	s.rebuildCalls++
+	*s.calls = append(*s.calls, "dependencies-rebuild")
+	if s.rebuildErr != nil {
+		return uv.DependenciesResult{}, s.rebuildErr
+	}
+	return uv.DependenciesResult{Rebuilt: true}, nil
 }
 
 type m5TestWorkspace struct {
@@ -683,11 +1000,21 @@ func (s *m5TestWorkspace) Sync(_ context.Context, request gitrepo.SyncRequest) (
 }
 
 type m5TestStateStore struct {
-	writes            []state.EnvironmentState
-	calls             *[]string
-	initial           state.EnvironmentState
-	transaction       state.TransactionState
-	transactionActive bool
+	writes             []state.EnvironmentState
+	calls              *[]string
+	initial            state.EnvironmentState
+	transaction        state.TransactionState
+	transactionActive  bool
+	recordTransactions bool
+}
+
+type failingEnvironmentWriteStore struct {
+	*state.Store
+	writeErr error
+}
+
+func (s *failingEnvironmentWriteStore) WriteEnvironment(context.Context, state.EnvironmentState) error {
+	return s.writeErr
 }
 
 func (s *m5TestStateStore) ReadEnvironment(context.Context) (state.EnvironmentState, error) {
@@ -730,6 +1057,9 @@ func (s *m5TestStateStore) NewTransaction(_ state.TransactionKind, input state.T
 func (s *m5TestStateStore) WriteTransaction(_ context.Context, _ state.TransactionKind, value state.TransactionState) error {
 	s.transaction = value
 	s.transactionActive = true
+	if s.recordTransactions {
+		*s.calls = append(*s.calls, "transaction:"+string(value.Stage))
+	}
 	return nil
 }
 
@@ -819,8 +1149,14 @@ func (m5UnsupportedEnvironment) RepairEnvironment(context.Context, uv.Environmen
 func (m5UnsupportedEnvironment) EnsureUV(context.Context, string, mirror.Policy) (string, error) {
 	return "", notImplementedError{stage: protocol.StageUVCheck}
 }
+func (m5UnsupportedEnvironment) RepairUV(context.Context, string, mirror.Policy) (string, error) {
+	return "", notImplementedError{stage: protocol.StageUVCheck}
+}
 func (m5UnsupportedEnvironment) CheckUV(context.Context) (bool, error) {
 	return false, notImplementedError{stage: protocol.StageUVCheck}
+}
+func (m5UnsupportedEnvironment) ReadPythonSpec(context.Context, string) (uv.PythonSpec, error) {
+	return uv.PythonSpec{}, notImplementedError{stage: protocol.StagePythonCheck}
 }
 func (m5UnsupportedEnvironment) PreparePython(context.Context, uv.PythonRequest) (uv.PythonResult, error) {
 	return uv.PythonResult{}, notImplementedError{stage: protocol.StagePythonCheck}

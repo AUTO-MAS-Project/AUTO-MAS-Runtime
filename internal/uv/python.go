@@ -50,6 +50,7 @@ type PythonRequest struct {
 	Branch           string
 	Commit           string
 	MirrorPolicy     mirror.Policy
+	Reinstall        bool
 	Line             LineFunc
 }
 
@@ -92,22 +93,30 @@ func (s *PythonService) ReadSpec(ctx context.Context, projectDir string) (Python
 	if ctx == nil || s == nil || s.layout == nil {
 		return PythonSpec{}, errors.New("python specification request is invalid")
 	}
+	return ReadPythonSpec(ctx, s.layout, projectDir)
+}
+
+// ReadPythonSpec 只从受管项目文件读取并校验精确 Python 契约。
+func ReadPythonSpec(ctx context.Context, layout *config.Layout, projectDir string) (PythonSpec, error) {
+	if ctx == nil || layout == nil {
+		return PythonSpec{}, errors.New("python specification request is invalid")
+	}
 	if err := ctx.Err(); err != nil {
 		return PythonSpec{}, err
 	}
 	if projectDir == "" {
-		projectDir = s.layout.RepoDir()
+		projectDir = layout.RepoDir()
 	}
-	versionPath := s.layout.PythonVersionFile()
-	if projectDir != s.layout.RepoDir() {
+	versionPath := layout.PythonVersionFile()
+	if projectDir != layout.RepoDir() {
 		versionPath = filepath.Join(projectDir, ".python-version")
 	}
 	version, err := readExactPythonVersion(versionPath)
 	if err != nil {
 		return PythonSpec{}, err
 	}
-	pyprojectPath := s.layout.PyProjectFile()
-	if projectDir != s.layout.RepoDir() {
+	pyprojectPath := layout.PyProjectFile()
+	if projectDir != layout.RepoDir() {
 		pyprojectPath = filepath.Join(projectDir, "pyproject.toml")
 	}
 	requiresPython, err := readRequiresPython(pyprojectPath)
@@ -174,7 +183,7 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 	if err != nil {
 		return PythonResult{}, fmt.Errorf("build Python mirror target: %w", err)
 	}
-	installResult, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPython, target, []string{
+	installArgs := []string{
 		"python",
 		"install",
 		spec.Version.String(),
@@ -183,7 +192,11 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 		request.PythonInstallDir,
 		"--no-bin",
 		"--no-registry",
-	}, RunOptions{
+	}
+	if request.Reinstall {
+		installArgs = append(installArgs, "--reinstall")
+	}
+	installResult, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPython, target, installArgs, RunOptions{
 		Stage:            protocol.StagePythonInstall,
 		ProjectDir:       request.ProjectDir,
 		PythonInstallDir: request.PythonInstallDir,

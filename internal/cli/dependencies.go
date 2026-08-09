@@ -140,7 +140,7 @@ func runMutatingDependencyAction(
 			returnErr = errors.Join(returnErr, mutationCloseError(closeErr))
 		}
 	}()
-	if err := recoverM5Transaction(ctx, store); err != nil {
+	if err := recoverM5Transaction(ctx, store, deps.global.layout); err != nil {
 		return sessionSuccess{}, err
 	}
 	initial, err := readEnvironmentOrUninitialized(ctx, store)
@@ -173,24 +173,20 @@ func runMutatingDependencyAction(
 			cause:   err,
 		}
 	}
-	transactionStage := protocol.StageDependenciesCheck
-	if rebuild {
-		transactionStage = protocol.StageDependenciesRebuild
-	}
 	transaction, err := beginM5Transaction(
 		ctx,
 		store,
 		emitter.OperationID(),
 		dependencyTransactionCommand(rebuild),
 		check.Version,
-		transactionStage,
+		protocol.StageDependenciesCheck,
 	)
 	if err != nil {
 		return sessionSuccess{}, err
 	}
 	transactionActive := true
 	defer func() {
-		if !transactionActive || retainM5TransactionOnFailure(returnErr) {
+		if !transactionActive || retainM5TransactionOnFailure(returnErr, transaction.Stage) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
@@ -212,34 +208,51 @@ func runMutatingDependencyAction(
 	if err != nil {
 		return sessionSuccess{}, err
 	}
-	if err := transitionM5State(emitter, machine, stage, protocol.StateSyncingEnvironment, "正在同步锁定依赖"); err != nil {
-		return sessionSuccess{}, err
-	}
-	if err := advanceM5Transaction(ctx, store, &transaction, stage); err != nil {
+	if err := transitionM5State(emitter, machine, stage, protocol.StateSyncingEnvironment, "正在检查并同步锁定依赖"); err != nil {
 		return sessionSuccess{}, err
 	}
 	if err := requireUVReady(ctx, service, uvLogLine(logger)); err != nil {
-		failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", uv.PythonSpec{}, logger, machine, stage, err)
+		failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", uv.PythonSpec{}, logger, machine, protocol.StageUVCheck, err)
+		return sessionSuccess{}, failure
+	}
+	pythonSpec, err := service.ReadPythonSpec(ctx, deps.global.layout.RepoDir())
+	if err != nil {
+		failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", uv.PythonSpec{}, logger, machine, protocol.StagePythonCheck, err)
 		return sessionSuccess{}, failure
 	}
 	pythonRequest := dependencyPythonRequest(deps, check)
 	pythonRequest.Line = uvLogLine(logger)
 	python, err := service.CheckPython(ctx, pythonRequest)
 	if err != nil {
-		failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", uv.PythonSpec{}, logger, machine, protocol.StagePythonCheck, err)
+		failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", pythonSpec, logger, machine, protocol.StagePythonCheck, err)
 		return sessionSuccess{}, failure
 	}
 	request := dependencyRequest(deps, emitter, check, python.Spec.Version.String(), uvLogLine(logger))
 	if rebuild {
+		if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesRebuild); err != nil {
+			return sessionSuccess{}, err
+		}
+		if err := emitM5Progress(emitter, protocol.StageDependenciesRebuild, protocol.ProgressRunning, "正在删除并重建受管 venv"); err != nil {
+			return sessionSuccess{}, err
+		}
 		if _, err := service.RebuildDependencies(ctx, request); err != nil {
 			failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", python.Spec, logger, machine, protocol.StageDependenciesRebuild, err)
 			return sessionSuccess{}, failure
 		}
 	}
+	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesSync); err != nil {
+		return sessionSuccess{}, err
+	}
+	if err := emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressRunning, "正在同步锁定依赖"); err != nil {
+		return sessionSuccess{}, err
+	}
 	result, err := service.SyncDependencies(ctx, request)
 	if err != nil {
 		failure := persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, "", python.Spec, logger, machine, protocol.StageDependenciesSync, err)
 		return sessionSuccess{}, failure
+	}
+	if err := emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressSucceeded, "锁定依赖已同步"); err != nil {
+		return sessionSuccess{}, err
 	}
 	ready, err := store.NewReadyEnvironment(check.Version, check.Commit)
 	if err != nil {

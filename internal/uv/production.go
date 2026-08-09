@@ -77,6 +77,37 @@ func (s *ProductionEnvironment) ensureUV(
 	return s.bootstrap.EnsureWithLine(ctx, operationID, policy, line)
 }
 
+// RepairUV 删除固定版本 uv 受管事实并重新下载校验。
+func (s *ProductionEnvironment) RepairUV(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+) (string, error) {
+	return s.repairUV(ctx, operationID, policy, nil)
+}
+
+// RepairUVWithLine 删除固定版本 uv 受管事实并重新下载校验，同时转发输出。
+func (s *ProductionEnvironment) RepairUVWithLine(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+) (string, error) {
+	return s.repairUV(ctx, operationID, policy, line)
+}
+
+func (s *ProductionEnvironment) repairUV(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+) (string, error) {
+	if s == nil || s.bootstrap == nil {
+		return "", errors.New("production environment is invalid")
+	}
+	return s.bootstrap.RepairWithLine(ctx, operationID, policy, line)
+}
+
 // CheckUV 只检查固定版本 uv，不触碰网络或创建目录。
 func (s *ProductionEnvironment) CheckUV(ctx context.Context) (bool, error) {
 	return s.checkUV(ctx, nil)
@@ -92,6 +123,14 @@ func (s *ProductionEnvironment) checkUV(ctx context.Context, line LineFunc) (boo
 		return false, errors.New("production environment is invalid")
 	}
 	return s.bootstrap.CheckWithLine(ctx, line)
+}
+
+// ReadPythonSpec 只读取并校验项目声明的精确 Python 契约。
+func (s *ProductionEnvironment) ReadPythonSpec(ctx context.Context, projectDir string) (PythonSpec, error) {
+	if s == nil || s.layout == nil {
+		return PythonSpec{}, errors.New("production environment is invalid")
+	}
+	return ReadPythonSpec(ctx, s.layout, projectDir)
 }
 
 // PreparePython 准备项目声明的精确受管 Python。

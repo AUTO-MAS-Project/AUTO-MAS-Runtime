@@ -175,6 +175,34 @@ func TestPython_InstallArguments(t *testing.T) {
 	}
 }
 
+func TestPython_ReinstallArguments(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	runner := &fakePythonRunner{
+		listOutput: `[{"version":"3.12.10"}]`,
+		findOutput: "C:/runtime/python/3.12.10/python.exe\n",
+	}
+	service, err := NewPythonService(layout, runner)
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	if _, err := service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir, Reinstall: true}); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	want := []string{
+		"python", "install", "3.12.10",
+		"--managed-python", "--install-dir", layout.PythonDir(), "--no-bin", "--no-registry", "--reinstall",
+	}
+	if got := runner.calls[1].args; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reinstall args = %#v, want %#v", got, want)
+	}
+}
+
 func TestPython_MirrorPolicyRotatesSources(t *testing.T) {
 	projectDir := t.TempDir()
 	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")

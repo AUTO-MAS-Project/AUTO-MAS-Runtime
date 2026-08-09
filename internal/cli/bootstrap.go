@@ -80,7 +80,7 @@ func runBootstrap(
 			returnErr = errors.Join(returnErr, mutationCloseError(closeErr))
 		}
 	}()
-	if err := recoverM5Transaction(ctx, store); err != nil {
+	if err := recoverM5Transaction(ctx, store, deps.global.layout); err != nil {
 		return sessionSuccess{}, err
 	}
 	initial, err := readEnvironmentOrUninitialized(ctx, store)
@@ -117,7 +117,7 @@ func runBootstrap(
 	}
 	uvTransactionActive := true
 	defer func() {
-		if !uvTransactionActive || retainM5TransactionOnFailure(returnErr) {
+		if !uvTransactionActive || retainM5TransactionOnFailure(returnErr, uvTransaction.Stage) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
@@ -131,6 +131,9 @@ func runBootstrap(
 		return sessionSuccess{}, err
 	}
 	if err := advanceM5Transaction(ctx, store, &uvTransaction, protocol.StageUVDownload); err != nil {
+		return sessionSuccess{}, err
+	}
+	if err := emitM5Progress(emitter, protocol.StageUVDownload, protocol.ProgressRunning, "正在准备固定版本 uv"); err != nil {
 		return sessionSuccess{}, err
 	}
 	uvExecutable, err := ensureM5UV(
@@ -153,10 +156,13 @@ func runBootstrap(
 			uv.PythonSpec{},
 			operationLogger,
 			machine,
-			protocol.StageUVCheck,
+			protocol.StageUVDownload,
 			err,
 		)
 		return sessionSuccess{}, failure
+	}
+	if err := advanceM5Transaction(ctx, store, &uvTransaction, protocol.StageUVVerify); err != nil {
+		return sessionSuccess{}, err
 	}
 	if err := emitM5Progress(emitter, protocol.StageUVVerify, protocol.ProgressSucceeded, "固定版本 uv 已校验"); err != nil {
 		return sessionSuccess{}, err
@@ -257,7 +263,7 @@ func runBootstrap(
 	}
 	transactionActive := true
 	defer func() {
-		if !transactionActive || retainM5TransactionOnFailure(returnErr) {
+		if !transactionActive || retainM5TransactionOnFailure(returnErr, transaction.Stage) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
@@ -266,6 +272,19 @@ func runBootstrap(
 			returnErr = errors.Join(returnErr, cleanupErr)
 		}
 	}()
+	if err := emitM5Progress(emitter, protocol.StagePythonCheck, protocol.ProgressRunning, "正在读取项目 Python 契约"); err != nil {
+		return sessionSuccess{}, err
+	}
+	pythonSpec, err := service.ReadPythonSpec(ctx, deps.global.layout.RepoDir())
+	if err != nil {
+		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, uv.PythonSpec{}, operationLogger, machine, protocol.StagePythonCheck, err)
+	}
+	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StagePythonInstall); err != nil {
+		return sessionSuccess{}, err
+	}
+	if err := emitM5Progress(emitter, protocol.StagePythonInstall, protocol.ProgressRunning, "正在准备受管 Python"); err != nil {
+		return sessionSuccess{}, err
+	}
 	pythonResult, err := service.PreparePython(ctx, uv.PythonRequest{
 		ProjectDir:       deps.global.layout.RepoDir(),
 		PythonInstallDir: deps.global.layout.PythonDir(),
@@ -277,7 +296,10 @@ func runBootstrap(
 		Line:             uvLogLine(operationLogger),
 	})
 	if err != nil {
-		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, uv.PythonSpec{}, operationLogger, machine, protocol.StagePythonCheck, err)
+		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonSpec, operationLogger, machine, protocol.StagePythonInstall, err)
+	}
+	if err := emitM5Progress(emitter, protocol.StagePythonInstall, protocol.ProgressSucceeded, "受管 Python 已就绪"); err != nil {
+		return sessionSuccess{}, err
 	}
 	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesCheck); err != nil {
 		return sessionSuccess{}, err

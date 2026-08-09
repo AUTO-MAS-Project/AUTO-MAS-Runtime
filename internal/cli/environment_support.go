@@ -76,10 +76,10 @@ func removeM5Transaction(ctx context.Context, store environmentStateStore) error
 }
 
 // recoverM5Transaction 在取得 mutation 租约后处理上次进程留下的单槽事务。
-// 只有 PID 已退出且 Mutex 已确认空闲时才允许条件删除；活动或无法分类的记录
-// 一律失败关闭，避免把另一个操作的崩溃现场当作可重试缓存覆盖。
-func recoverM5Transaction(ctx context.Context, store environmentStateStore) error {
-	if store == nil {
+// 只有 PID 已退出且 Mutex 已确认空闲时才允许恢复；危险阶段必须先把稳定状态
+// 失效为 environment_broken，再条件删除事务。M4 workspace 现场保留给其专用恢复器。
+func recoverM5Transaction(ctx context.Context, store environmentStateStore, layout *config.Layout) error {
+	if store == nil || layout == nil {
 		return stateStoreError(protocol.StageWorkspaceCleanup, errors.New("m5 state store is unavailable"))
 	}
 	snapshot, err := store.ReadTransaction(ctx, state.TransactionMutation)
@@ -104,6 +104,15 @@ func recoverM5Transaction(ctx context.Context, store environmentStateStore) erro
 	case state.ActivityStale:
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 		defer cancelCleanup()
+		owned, invalidatesEnvironment := classifyStaleM5Stage(transaction.Stage)
+		if !owned {
+			return staleM5TransactionOwnershipError(transaction)
+		}
+		if invalidatesEnvironment {
+			if err := persistStaleM5BrokenState(cleanupContext, store, layout, transaction); err != nil {
+				return err
+			}
+		}
 		if err := store.RemoveTransaction(cleanupContext, snapshot); err != nil {
 			return stateStoreError(protocol.StageWorkspaceCleanup, err)
 		}
@@ -121,6 +130,101 @@ func recoverM5Transaction(ctx context.Context, store environmentStateStore) erro
 	}
 }
 
+func classifyStaleM5Stage(stage protocol.Stage) (owned bool, invalidatesEnvironment bool) {
+	switch stage {
+	case protocol.StageBootstrap, protocol.StageRepair,
+		protocol.StageUVCheck, protocol.StagePythonCheck,
+		protocol.StageDependenciesCheck:
+		return true, false
+	case protocol.StageUVDownload, protocol.StageUVVerify,
+		protocol.StagePythonInstall, protocol.StageDependenciesSync,
+		protocol.StageDependenciesRebuild:
+		return true, true
+	default:
+		return false, false
+	}
+}
+
+func persistStaleM5BrokenState(
+	ctx context.Context,
+	store environmentStateStore,
+	layout *config.Layout,
+	transaction state.TransactionState,
+) error {
+	current, err := store.ReadEnvironment(ctx)
+	if errors.Is(err, state.ErrNotFound) {
+		// 首次安装还没有稳定 ready 声明，无需构造不存在的 active revision。
+		return nil
+	}
+	if err != nil {
+		return stateStoreError(transaction.Stage, err)
+	}
+	revision, ok := activeEnvironmentRevision(current)
+	if !ok {
+		return stateStoreError(transaction.Stage, errors.New("stale m5 transaction has no active revision"))
+	}
+	if staleM5ToolsRequired(transaction.Stage) &&
+		transaction.TargetVersion != "" && transaction.TargetVersion != revision.Version() {
+		return staleM5TransactionOwnershipError(transaction)
+	}
+
+	stage := transaction.Stage
+	python := uv.PythonSpec{}
+	uvExecutable := ""
+	if staleM5ToolsRequired(stage) {
+		uvExecutable, err = layout.UVExecutable(uv.FixedVersion)
+		if err != nil {
+			return stateStoreError(stage, err)
+		}
+		python, err = uv.ReadPythonSpec(ctx, layout, layout.RepoDir())
+		if err != nil {
+			// 进入工具修改阶段本应已经解析过项目契约；若现场文件已无法复核，
+			// 先以 python.check + unknown 工具事实失效旧 ready，绝不保留假就绪。
+			stage = protocol.StagePythonCheck
+			python = uv.PythonSpec{}
+		}
+	}
+	persisted, err := persistBrokenState(
+		ctx,
+		store,
+		layout,
+		current,
+		revision,
+		uvExecutable,
+		python,
+		nil,
+		stage,
+		map[string]any{"exitCode": 1},
+	)
+	if err != nil {
+		return err
+	}
+	if !persisted {
+		return stateStoreError(stage, errors.New("stale m5 transaction could not invalidate environment"))
+	}
+	return nil
+}
+
+func staleM5ToolsRequired(stage protocol.Stage) bool {
+	switch stage {
+	case protocol.StagePythonInstall, protocol.StageDependenciesSync,
+		protocol.StageDependenciesRebuild:
+		return true
+	default:
+		return false
+	}
+}
+
+func staleM5TransactionOwnershipError(transaction state.TransactionState) error {
+	return &commandError{
+		code:    protocol.CodeUpdateStateAmbiguous,
+		stage:   transaction.Stage,
+		message: "遗留变更事务需要专用恢复",
+		details: map[string]any{"command": transaction.Command},
+		cause:   errors.New("stale mutation transaction is outside m5 recovery ownership"),
+	}
+}
+
 type m5FreeMutexProbe struct{}
 
 func (m5FreeMutexProbe) Probe(ctx context.Context, kind state.MutexKind) (state.MutexProbeResult, error) {
@@ -135,8 +239,12 @@ func (m5FreeMutexProbe) Probe(ctx context.Context, kind state.MutexKind) (state.
 
 var _ state.MutexProbe = m5FreeMutexProbe{}
 
-func retainM5TransactionOnFailure(err error) bool {
-	return findOperationErrorCode(err, protocol.CodeStateWriteFailed) != nil
+func retainM5TransactionOnFailure(err error, stage protocol.Stage) bool {
+	if findOperationErrorCode(err, protocol.CodeStateWriteFailed) != nil {
+		return true
+	}
+	_, invalidatesEnvironment := classifyStaleM5Stage(stage)
+	return err != nil && invalidatesEnvironment
 }
 
 func m5TransactionCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -172,6 +280,21 @@ func ensureM5UV(
 		return withLine.EnsureUVWithLine(ctx, operationID, policy, line)
 	}
 	return service.EnsureUV(ctx, operationID, policy)
+}
+
+func repairM5UV(
+	ctx context.Context,
+	service environmentService,
+	operationID string,
+	policy mirror.Policy,
+	line uv.LineFunc,
+) (string, error) {
+	if withLine, ok := service.(interface {
+		RepairUVWithLine(context.Context, string, mirror.Policy, uv.LineFunc) (string, error)
+	}); ok {
+		return withLine.RepairUVWithLine(ctx, operationID, policy, line)
+	}
+	return service.RepairUV(ctx, operationID, policy)
 }
 
 func checkM5UV(
@@ -333,19 +456,22 @@ func persistM5FailureWithLifecycle(
 		return errors.Join(persistErr, cause)
 	}
 	if persisted {
+		var transitionErr error
 		if err := machine.Transition(protocol.StateEnvironmentBroken); err != nil {
-			return errors.Join(
-				&commandError{
-					code:    protocol.CodeInternalError,
-					stage:   stage,
-					message: "生命周期状态迁移失败",
-					details: map[string]any{},
-					cause:   err,
-				},
-				cause,
-			)
+			transitionErr = &commandError{
+				code:    protocol.CodeInternalError,
+				stage:   stage,
+				message: "生命周期状态迁移失败",
+				details: map[string]any{},
+				cause:   err,
+			}
 		}
-		return errors.Join(emitM5State(emitter, stage, protocol.StateEnvironmentBroken, "运行环境已损坏"), cause)
+		var emitErr error
+		if transitionErr == nil {
+			emitErr = emitM5State(emitter, stage, protocol.StateEnvironmentBroken, "运行环境已损坏")
+		}
+		removeErr := removeM5Transaction(persistContext, store)
+		return errors.Join(removeErr, transitionErr, emitErr, cause)
 	}
 	return errors.Join(rollbackM5Preparation(emitter, machine, stage, "运行环境保持原稳定状态"), cause)
 }

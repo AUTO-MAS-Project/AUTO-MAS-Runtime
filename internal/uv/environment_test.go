@@ -72,11 +72,30 @@ func TestEnvironmentCheck_IsReadOnly(t *testing.T) {
 	}
 }
 
+func TestRepair_ReinstallsPython(t *testing.T) {
+	steps := &environmentStepLog{}
+	service, err := NewEnvironmentService(
+		&fakeEnvironmentUV{steps: steps},
+		&fakeEnvironmentPython{steps: steps},
+		&fakeEnvironmentDependencies{steps: steps},
+	)
+	if err != nil {
+		t.Fatalf("NewEnvironmentService() error = %v", err)
+	}
+	if _, err := service.RepairEnvironment(t.Context(), EnvironmentRequest{OperationID: testOperationID}); err != nil {
+		t.Fatalf("RepairEnvironment() error = %v", err)
+	}
+	if !steps.pythonRequest.Reinstall {
+		t.Fatal("RepairEnvironment() PythonRequest.Reinstall = false, want true")
+	}
+}
+
 type environmentStepLog struct {
-	order        []string
-	ensureCalls  int
-	prepareCalls int
-	syncCalls    int
+	order         []string
+	ensureCalls   int
+	prepareCalls  int
+	syncCalls     int
+	pythonRequest PythonRequest
 }
 
 type fakeEnvironmentUV struct{ steps *environmentStepLog }
@@ -94,7 +113,12 @@ func (s *fakeEnvironmentUV) Check(context.Context) (bool, error) {
 
 type fakeEnvironmentPython struct{ steps *environmentStepLog }
 
-func (s *fakeEnvironmentPython) Prepare(context.Context, PythonRequest) (PythonResult, error) {
+func (s *fakeEnvironmentPython) ReadSpec(context.Context, string) (PythonSpec, error) {
+	return PythonSpec{Version: PythonVersion{Major: 3, Minor: 12, Patch: 10}}, nil
+}
+
+func (s *fakeEnvironmentPython) Prepare(_ context.Context, request PythonRequest) (PythonResult, error) {
+	s.steps.pythonRequest = request
 	s.steps.order = append(s.steps.order, "python.prepare")
 	s.steps.prepareCalls++
 	return PythonResult{Spec: PythonSpec{Version: PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil

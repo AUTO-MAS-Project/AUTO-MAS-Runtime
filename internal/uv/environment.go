@@ -13,12 +13,14 @@ type UVOperations interface {
 	Check(context.Context) (bool, error)
 }
 
+// UVRepairOperations 是显式 repair 消费的 uv 重下重验能力。
 type UVRepairOperations interface {
 	Repair(context.Context, string, mirror.Policy) (string, error)
 }
 
 // PythonOperations 是环境编排消费的 Python prepare/check 能力。
 type PythonOperations interface {
+	ReadSpec(context.Context, string) (PythonSpec, error)
 	Prepare(context.Context, PythonRequest) (PythonResult, error)
 	Check(context.Context, PythonRequest) (PythonCheckResult, error)
 }
@@ -207,6 +209,45 @@ func (s *EnvironmentService) ensureUV(
 	return s.uv.Ensure(ctx, operationID, policy)
 }
 
+// RepairUV 删除固定版本 uv 受管事实并重新下载校验。
+func (s *EnvironmentService) RepairUV(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+) (string, error) {
+	return s.repairUV(ctx, operationID, policy, nil)
+}
+
+// RepairUVWithLine 删除固定版本 uv 受管事实并重新下载校验，同时转发输出。
+func (s *EnvironmentService) RepairUVWithLine(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+) (string, error) {
+	return s.repairUV(ctx, operationID, policy, line)
+}
+
+func (s *EnvironmentService) repairUV(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+) (string, error) {
+	if ctx == nil || s == nil || s.uv == nil {
+		return "", errors.New("uv repair request is invalid")
+	}
+	if repair, ok := s.uv.(UVRepairOperations); ok {
+		if withLine, ok := s.uv.(interface {
+			RepairWithLine(context.Context, string, mirror.Policy, LineFunc) (string, error)
+		}); ok {
+			return withLine.RepairWithLine(ctx, operationID, policy, line)
+		}
+		return repair.Repair(ctx, operationID, policy)
+	}
+	return s.ensureUV(ctx, operationID, policy, line)
+}
+
 // CheckUV 只读取固定 uv 的可用性。
 func (s *EnvironmentService) CheckUV(ctx context.Context) (bool, error) {
 	return s.checkUV(ctx, nil)
@@ -227,6 +268,14 @@ func (s *EnvironmentService) checkUV(ctx context.Context, line LineFunc) (bool, 
 		return withLine.CheckWithLine(ctx, line)
 	}
 	return s.uv.Check(ctx)
+}
+
+// ReadPythonSpec 只读取并校验项目声明的精确 Python 契约。
+func (s *EnvironmentService) ReadPythonSpec(ctx context.Context, projectDir string) (PythonSpec, error) {
+	if ctx == nil || s == nil || s.python == nil {
+		return PythonSpec{}, errors.New("python specification request is invalid")
+	}
+	return s.python.ReadSpec(ctx, projectDir)
 }
 
 // PreparePython 读取项目契约并准备精确受管 Python。
@@ -307,6 +356,7 @@ func (s *EnvironmentService) Repair(
 		Branch:           request.Branch,
 		Commit:           request.Commit,
 		MirrorPolicy:     request.BootstrapPolicy,
+		Reinstall:        true,
 		Line:             request.Line,
 	})
 	if err != nil {
@@ -360,6 +410,7 @@ func (s *EnvironmentService) RepairEnvironment(
 		Branch:           request.Branch,
 		Commit:           request.Commit,
 		MirrorPolicy:     request.BootstrapPolicy,
+		Reinstall:        true,
 		Line:             request.Line,
 	})
 	if err != nil {
@@ -376,15 +427,7 @@ func (s *EnvironmentService) ensureUVForRepair(
 	ctx context.Context,
 	request EnvironmentRequest,
 ) (string, error) {
-	if repair, ok := s.uv.(UVRepairOperations); ok {
-		if withLine, ok := s.uv.(interface {
-			RepairWithLine(context.Context, string, mirror.Policy, LineFunc) (string, error)
-		}); ok {
-			return withLine.RepairWithLine(ctx, request.OperationID, request.BootstrapPolicy, request.Line)
-		}
-		return repair.Repair(ctx, request.OperationID, request.BootstrapPolicy)
-	}
-	return s.ensureUV(ctx, request.OperationID, request.BootstrapPolicy, request.Line)
+	return s.repairUV(ctx, request.OperationID, request.BootstrapPolicy, request.Line)
 }
 
 var _ UVOperations = (*Bootstrapper)(nil)
