@@ -15,6 +15,34 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
+func TestRunner_ScrubsUnmanagedUVEnvironment(t *testing.T) {
+	t.Setenv("UV_INSECURE_HOST", "unsafe.example")
+	t.Setenv("uv_no_sources", "1")
+	t.Setenv("UV_DEFAULT_INDEX", "https://unsafe.example/simple")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{
+		"UV_INSECURE_HOST":            "override.example",
+		"UV_NO_VERIFY_HASHES":         "1",
+		uvOfflineEnv:                  "1",
+		uvPythonInstallMirrorEnv:      "https://mirror.example/python",
+		"FAKE_UV_ALLOWED_FOR_TESTING": "1",
+	}})
+	for _, key := range []string{"UV_INSECURE_HOST", "UV_NO_SOURCES", "UV_DEFAULT_INDEX", "UV_NO_VERIFY_HASHES"} {
+		if containsEnvironmentKeyMap(environment, key) {
+			t.Fatalf("environment contains %q, want scrubbed", key)
+		}
+	}
+	for key, want := range map[string]string{
+		uvOfflineEnv:                  "1",
+		uvPythonInstallMirrorEnv:      "https://mirror.example/python",
+		"FAKE_UV_ALLOWED_FOR_TESTING": "1",
+	} {
+		if got := environment[key]; got != want {
+			t.Fatalf("environment[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestRunner_InjectsManagedEnvironment(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "fake-uv-record.txt")
 	runner := newTestRunner(t)

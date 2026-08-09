@@ -310,6 +310,7 @@ func dependencyPythonRequest(deps *deps, check gitrepo.CheckResult) uv.PythonReq
 		CacheDir:         deps.global.layout.UVCacheDir(),
 		Branch:           check.Branch,
 		Commit:           check.Commit,
+		MirrorPolicy:     deps.global.mirrorPolicy,
 	}
 }
 
@@ -327,6 +328,7 @@ func dependencyRequest(
 		OperationID:   emitter.OperationID(),
 		Branch:        check.Branch,
 		Commit:        check.Commit,
+		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          line,
 	}
 }

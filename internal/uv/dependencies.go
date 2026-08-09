@@ -2,6 +2,8 @@ package uv
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -23,6 +26,7 @@ type DependenciesRequest struct {
 	OperationID   string
 	Branch        string
 	Commit        string
+	MirrorPolicy  mirror.Policy
 	Line          LineFunc
 }
 
@@ -38,6 +42,7 @@ type DependenciesService struct {
 	layout  *config.Layout
 	runner  Runner
 	remover TreeRemover
+	network *networkExecutor
 }
 
 // NewDependenciesService 创建主项目依赖服务。
@@ -49,7 +54,11 @@ func NewDependenciesService(
 	if layout == nil || runner == nil || remover == nil {
 		return nil, errors.New("dependencies service dependencies are incomplete")
 	}
-	return &DependenciesService{layout: layout, runner: runner, remover: remover}, nil
+	network, err := newDefaultNetworkExecutor()
+	if err != nil {
+		return nil, err
+	}
+	return &DependenciesService{layout: layout, runner: runner, remover: remover, network: network}, nil
 }
 
 // Check 只读取 uv.lock，并用 uv 的退出码检查锁文件是否过期。
@@ -68,7 +77,7 @@ func (s *DependenciesService) Check(
 		"--project",
 		request.ProjectDir,
 		"--check",
-	}, s.runOptions(request, protocol.StageDependenciesCheck))
+	}, withOfflineUV(s.runOptions(request, protocol.StageDependenciesCheck)))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return DependenciesResult{}, err
@@ -107,7 +116,15 @@ func (s *DependenciesService) Sync(
 	if _, err := s.Check(ctx, request); err != nil {
 		return DependenciesResult{}, err
 	}
-	result, err := s.runner.Run(ctx, []string{
+	lockDigest, err := lockfileDigest(ctx, s.lockfilePath(request.ProjectDir))
+	if err != nil {
+		return DependenciesResult{}, err
+	}
+	target, err := mirror.NewTarget(mirror.TargetSpec{LockDigest: lockDigest})
+	if err != nil {
+		return DependenciesResult{}, fmt.Errorf("build package index mirror target: %w", err)
+	}
+	result, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPackageIndex, target, []string{
 		"sync",
 		"--project",
 		request.ProjectDir,
@@ -118,9 +135,42 @@ func (s *DependenciesService) Sync(
 		"--no-install-workspace",
 	}, s.runOptions(request, protocol.StageDependenciesSync))
 	if err != nil || result.ExitCode != 0 {
+		if isNetworkPolicyError(err) {
+			return DependenciesResult{}, err
+		}
 		return DependenciesResult{}, dependencySyncError(result, err)
 	}
 	return DependenciesResult{LockfileChecked: true, Synchronized: true}, nil
+}
+
+func lockfileDigest(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", newError(
+			protocol.CodeLockfileMissing,
+			protocol.StageDependenciesCheck,
+			"项目锁文件不可读取",
+			map[string]any{},
+			err,
+		)
+	}
+	if len(contents) > maxUVLockFileBytes {
+		return "", newError(
+			protocol.CodeLockfileMissing,
+			protocol.StageDependenciesCheck,
+			"项目锁文件过大",
+			map[string]any{"maxBytes": maxUVLockFileBytes},
+			errors.New("uv.lock is too large"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(contents)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // Rebuild 通过 T2.5 删除能力重建 managed venv，不触碰源码、锁文件和用户数据。

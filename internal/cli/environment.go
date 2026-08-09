@@ -61,6 +61,7 @@ func environmentCheckCommand(deps *deps) *cobra.Command {
 						PythonInstallDir: deps.global.layout.PythonDir(),
 						ProjectEnvDir:    deps.global.layout.VenvDir(),
 						CacheDir:         deps.global.layout.UVCacheDir(),
+						MirrorPolicy:     deps.global.mirrorPolicy,
 						Line:             uvLogLine(logger),
 					})
 					if err != nil {

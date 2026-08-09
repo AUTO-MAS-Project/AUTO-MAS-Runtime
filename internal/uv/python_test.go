@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -174,15 +175,85 @@ func TestPython_InstallArguments(t *testing.T) {
 	}
 }
 
+func TestPython_MirrorPolicyRotatesSources(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	runner := &fakePythonRunner{
+		listOutput:     `[{"version":"3.12.10"}]`,
+		findOutput:     "C:/runtime/python/3.12.10/python.exe\n",
+		installResults: []fakeRunnerResponse{{err: errors.New("first source failed")}, {}},
+	}
+	service, err := NewPythonService(layout, runner)
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	service.network = newTestNetworkExecutor(t)
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	if _, err := service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir, MirrorPolicy: policy}); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if got, want := len(runner.calls), 4; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
+	}
+	if got, want := runner.calls[1].options.Environment[uvPythonInstallMirrorEnv],
+		"https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"; got != want {
+		t.Fatalf("first Python mirror = %q, want %q", got, want)
+	}
+	if got, want := runner.calls[2].options.Environment[uvPythonInstallMirrorEnv],
+		"https://github.com/astral-sh/python-build-standalone/releases/download"; got != want {
+		t.Fatalf("second Python mirror = %q, want %q", got, want)
+	}
+}
+
+func TestPython_OfflineFailureMapsToNetworkUnavailable(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	runner := &fakePythonRunner{
+		listOutput:     `[{"version":"3.12.10"}]`,
+		installResults: []fakeRunnerResponse{{err: errors.New("cache miss")}},
+	}
+	service, err := NewPythonService(layout, runner)
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	service.network = newTestNetworkExecutor(t)
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}, Offline: true})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	_, err = service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir, MirrorPolicy: policy})
+	assertPythonCode(t, err, protocol.CodeNetworkUnavailable)
+	if got := runner.calls[1].options.Environment[uvOfflineEnv]; got != "1" {
+		t.Fatalf("offline environment = %q, want 1", got)
+	}
+	if got := runner.calls[1].options.Environment[uvPythonInstallMirrorEnv]; got != "" {
+		t.Fatalf("offline Python mirror = %q, want empty", got)
+	}
+}
+
 type fakePythonCall struct {
 	args    []string
 	options RunOptions
 }
 
 type fakePythonRunner struct {
-	listOutput string
-	findOutput string
-	calls      []fakePythonCall
+	listOutput     string
+	findOutput     string
+	installResults []fakeRunnerResponse
+	calls          []fakePythonCall
 }
 
 func (r *fakePythonRunner) Run(_ context.Context, args []string, options RunOptions) (UVResult, error) {
@@ -191,7 +262,12 @@ func (r *fakePythonRunner) Run(_ context.Context, args []string, options RunOpti
 	case "list":
 		return UVResult{Stdout: r.listOutput}, nil
 	case "install":
-		return UVResult{}, nil
+		if len(r.installResults) == 0 {
+			return UVResult{}, nil
+		}
+		response := r.installResults[0]
+		r.installResults = r.installResults[1:]
+		return response.result, response.err
 	case "find":
 		return UVResult{Stdout: r.findOutput}, nil
 	default:

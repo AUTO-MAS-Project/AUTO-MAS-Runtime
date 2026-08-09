@@ -93,6 +93,7 @@ func (s *EnvironmentService) Ensure(
 		CacheDir:         request.CacheDir,
 		Branch:           request.Branch,
 		Commit:           request.Commit,
+		MirrorPolicy:     request.BootstrapPolicy,
 		Line:             request.Line,
 	})
 	if err != nil {
@@ -105,6 +106,7 @@ func (s *EnvironmentService) Ensure(
 		OperationID:   request.OperationID,
 		Branch:        request.Branch,
 		Commit:        request.Commit,
+		MirrorPolicy:  request.BootstrapPolicy,
 		Line:          request.Line,
 	})
 	if err != nil {
@@ -143,6 +145,7 @@ func (s *EnvironmentService) Check(
 		CacheDir:         request.CacheDir,
 		Branch:           request.Branch,
 		Commit:           request.Commit,
+		MirrorPolicy:     request.BootstrapPolicy,
 		Line:             request.Line,
 	})
 	if err != nil {
@@ -155,6 +158,7 @@ func (s *EnvironmentService) Check(
 		OperationID:   request.OperationID,
 		Branch:        request.Branch,
 		Commit:        request.Commit,
+		MirrorPolicy:  request.BootstrapPolicy,
 		Line:          request.Line,
 	})
 	if err != nil {
@@ -302,6 +306,7 @@ func (s *EnvironmentService) Repair(
 		CacheDir:         request.CacheDir,
 		Branch:           request.Branch,
 		Commit:           request.Commit,
+		MirrorPolicy:     request.BootstrapPolicy,
 		Line:             request.Line,
 	})
 	if err != nil {
@@ -314,6 +319,7 @@ func (s *EnvironmentService) Repair(
 		OperationID:   request.OperationID,
 		Branch:        request.Branch,
 		Commit:        request.Commit,
+		MirrorPolicy:  request.BootstrapPolicy,
 		Line:          request.Line,
 	}
 	if _, err := s.RebuildDependencies(ctx, dependencyRequest); err != nil {
@@ -353,6 +359,7 @@ func (s *EnvironmentService) RepairEnvironment(
 		CacheDir:         request.CacheDir,
 		Branch:           request.Branch,
 		Commit:           request.Commit,
+		MirrorPolicy:     request.BootstrapPolicy,
 		Line:             request.Line,
 	})
 	if err != nil {

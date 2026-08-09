@@ -10,6 +10,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -78,10 +79,90 @@ func TestDependencies_SyncArguments(t *testing.T) {
 	want := []string{
 		"sync", "--project", layout.RepoDir(), "--python", "3.12.10",
 		"--locked", "--no-default-groups", "--no-install-workspace",
+		"--default-index", "https://mirrors.aliyun.com/pypi/simple/",
 	}
 	if got := runner.calls[1].args; !reflect.DeepEqual(got, want) {
 		t.Fatalf("sync args = %#v, want %#v", got, want)
 	}
+}
+
+func TestDependencies_PackageIndexPolicyRotatesSources(t *testing.T) {
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	writeLockfile(t, layout.UVLockFile())
+	runner := &fakeDependenciesRunner{responses: []fakeRunnerResponse{
+		{},
+		{err: errors.New("first index failed")},
+		{},
+	}}
+	service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
+	if err != nil {
+		t.Fatalf("NewDependenciesService() error = %v", err)
+	}
+	service.network = newTestNetworkExecutor(t)
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	request := dependencyTestRequest(layout)
+	request.MirrorPolicy = policy
+	if _, err := service.Sync(t.Context(), request); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if got, want := runner.calls[1].args[len(runner.calls[1].args)-2:],
+		[]string{"--default-index", "https://mirrors.aliyun.com/pypi/simple/"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("first index args = %#v, want %#v", got, want)
+	}
+	if got, want := runner.calls[2].args[len(runner.calls[2].args)-2:],
+		[]string{"--default-index", "https://pypi.tuna.tsinghua.edu.cn/simple/"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("second index args = %#v, want %#v", got, want)
+	}
+}
+
+func TestDependencies_OfflineFailureMapsToNetworkUnavailable(t *testing.T) {
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	writeLockfile(t, layout.UVLockFile())
+	runner := &fakeDependenciesRunner{responses: []fakeRunnerResponse{{}, {err: errors.New("cache miss")}}}
+	service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
+	if err != nil {
+		t.Fatalf("NewDependenciesService() error = %v", err)
+	}
+	service.network = newTestNetworkExecutor(t)
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}, Offline: true})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	request := dependencyTestRequest(layout)
+	request.MirrorPolicy = policy
+	_, err = service.Sync(t.Context(), request)
+	assertPythonCode(t, err, protocol.CodeNetworkUnavailable)
+	if got := runner.calls[1].options.Environment[uvOfflineEnv]; got != "1" {
+		t.Fatalf("offline environment = %q, want 1", got)
+	}
+}
+
+func newTestNetworkExecutor(t *testing.T) *networkExecutor {
+	t.Helper()
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		t.Fatalf("DefaultCatalog() error = %v", err)
+	}
+	rotator, err := mirror.NewRotator(mirror.WithMaxSourceAttempts(1))
+	if err != nil {
+		t.Fatalf("NewRotator() error = %v", err)
+	}
+	executor, err := newNetworkExecutor(catalog, rotator)
+	if err != nil {
+		t.Fatalf("newNetworkExecutor() error = %v", err)
+	}
+	return executor
 }
 
 func TestDependencies_RebuildUsesControlledDelete(t *testing.T) {

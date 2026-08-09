@@ -31,7 +31,13 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Execute(
 		context.Background(),
-		[]string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0"},
+		[]string{
+			"--app-root", root,
+			"--output", "ndjson",
+			"--mirror", "python=github",
+			"--mirror", "package-index=pypi",
+			"bootstrap", "--version", "v5.4.0",
+		},
 		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
 		WithCWD(root),
 		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
@@ -71,6 +77,15 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	}
 	if len(store.writes) != 1 || store.writes[0].Status != protocol.StateReadyToStart {
 		t.Fatalf("state writes = %#v, want one ready_to_start write", store.writes)
+	}
+	if got, ok := environment.uvPolicy.Preferred(mirror.KindPython); !ok || got != "github" {
+		t.Fatalf("uv policy Python preference = %q/%t, want github/true", got, ok)
+	}
+	if got, ok := environment.pythonRequest.MirrorPolicy.Preferred(mirror.KindPython); !ok || got != "github" {
+		t.Fatalf("Python request preference = %q/%t, want github/true", got, ok)
+	}
+	if got, ok := environment.dependencyRequest.MirrorPolicy.Preferred(mirror.KindPackageIndex); !ok || got != "pypi" {
+		t.Fatalf("dependency request preference = %q/%t, want pypi/true", got, ok)
 	}
 }
 
@@ -530,14 +545,17 @@ func stateStatusesFromEvents(t *testing.T, payload string) []string {
 }
 
 type m5TestEnvironment struct {
-	calls         *[]string
-	uvErr         error
-	dependencyErr error
-	repairErr     error
-	waitForCancel bool
-	syncCalls     int
-	readyCalls    int
-	repairCalls   int
+	calls             *[]string
+	uvErr             error
+	dependencyErr     error
+	repairErr         error
+	waitForCancel     bool
+	syncCalls         int
+	readyCalls        int
+	repairCalls       int
+	uvPolicy          mirror.Policy
+	pythonRequest     uv.PythonRequest
+	dependencyRequest uv.DependenciesRequest
 }
 
 func (s *m5TestEnvironment) Ensure(context.Context, uv.EnvironmentRequest) (uv.EnvironmentResult, error) {
@@ -573,7 +591,8 @@ func (s *m5TestEnvironment) RepairEnvironment(context.Context, uv.EnvironmentReq
 	}, nil
 }
 
-func (s *m5TestEnvironment) EnsureUV(ctx context.Context, _ string, _ mirror.Policy) (string, error) {
+func (s *m5TestEnvironment) EnsureUV(ctx context.Context, _ string, policy mirror.Policy) (string, error) {
+	s.uvPolicy = policy
 	if s.waitForCancel {
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -587,7 +606,8 @@ func (s *m5TestEnvironment) EnsureUV(ctx context.Context, _ string, _ mirror.Pol
 
 func (s *m5TestEnvironment) CheckUV(context.Context) (bool, error) { return true, nil }
 
-func (s *m5TestEnvironment) PreparePython(context.Context, uv.PythonRequest) (uv.PythonResult, error) {
+func (s *m5TestEnvironment) PreparePython(_ context.Context, request uv.PythonRequest) (uv.PythonResult, error) {
+	s.pythonRequest = request
 	*s.calls = append(*s.calls, "python")
 	return uv.PythonResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil
 }
@@ -596,7 +616,8 @@ func (s *m5TestEnvironment) CheckPython(context.Context, uv.PythonRequest) (uv.P
 	return uv.PythonCheckResult{}, errors.New("not used")
 }
 
-func (s *m5TestEnvironment) SyncDependencies(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error) {
+func (s *m5TestEnvironment) SyncDependencies(_ context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
+	s.dependencyRequest = request
 	s.syncCalls++
 	*s.calls = append(*s.calls, "dependencies")
 	if s.dependencyErr != nil {

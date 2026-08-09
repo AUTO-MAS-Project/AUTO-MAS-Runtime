@@ -273,6 +273,7 @@ func runBootstrap(
 		CacheDir:         deps.global.layout.UVCacheDir(),
 		Branch:           revision.Branch(),
 		Commit:           revision.Commit(),
+		MirrorPolicy:     deps.global.mirrorPolicy,
 		Line:             uvLogLine(operationLogger),
 	})
 	if err != nil {
@@ -294,6 +295,7 @@ func runBootstrap(
 		OperationID:   emitter.OperationID(),
 		Branch:        revision.Branch(),
 		Commit:        revision.Commit(),
+		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(operationLogger),
 	})
 	if err != nil {

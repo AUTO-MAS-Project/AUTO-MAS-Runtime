@@ -25,6 +25,7 @@ const (
 	uvPythonInstallBinEnv = "UV_PYTHON_INSTALL_BIN"
 	uvColorEnv            = "UV_COLOR"
 	uvNoProgressEnv       = "UV_NO_PROGRESS"
+	uvNoSystemConfigEnv   = "UV_NO_SYSTEM_CONFIG"
 	maxUVOutputLineBytes  = 1 << 20
 	maxUVOutputBytes      = 4 << 20
 	maxUVStreamBytes      = 16 << 20
@@ -47,11 +48,12 @@ type RunOptions struct {
 	PythonInstallDir string
 	ProjectEnvDir    string
 	CacheDir         string
-	Environment      map[string]string
-	PythonVersion    string
-	Branch           string
-	Commit           string
-	Line             LineFunc
+	// Environment 只接受非 UV 诊断变量，以及 network.go 明确允许的 UV 网络键。
+	Environment   map[string]string
+	PythonVersion string
+	Branch        string
+	Commit        string
+	Line          LineFunc
 }
 
 // LineFunc 接收 uv stdout/stderr 的逐行诊断。
@@ -415,6 +417,7 @@ func buildEnvironment(options resolvedRunOptions) []string {
 		uvPythonInstallBinEnv: "0",
 		uvColorEnv:            "never",
 		uvNoProgressEnv:       "1",
+		uvNoSystemConfigEnv:   "1",
 	}
 	reserved := make([]string, 0, len(controlled)+1)
 	for key := range controlled {
@@ -422,8 +425,13 @@ func buildEnvironment(options resolvedRunOptions) []string {
 	}
 	overrides := make(map[string]string, len(options.Environment))
 	for key, value := range options.Environment {
-		if strings.EqualFold(key, "PATH") || containsEnvironmentKey(reserved, key) {
+		canonicalKey, allowedUV := canonicalUVOverrideKey(key)
+		if strings.EqualFold(key, "PATH") || containsEnvironmentKey(reserved, key) ||
+			(isUVEnvironmentKey(key) && !allowedUV) {
 			continue
+		}
+		if allowedUV {
+			key = canonicalKey
 		}
 		overrides[key] = value
 	}
@@ -431,7 +439,8 @@ func buildEnvironment(options resolvedRunOptions) []string {
 	for _, entry := range os.Environ() {
 		key, _, found := strings.Cut(entry, "=")
 		if found {
-			if containsEnvironmentKey(reserved, key) || containsEnvironmentKeyMap(overrides, key) {
+			if isUVEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
+				containsEnvironmentKeyMap(overrides, key) {
 				continue
 			}
 		}
@@ -453,6 +462,21 @@ func buildEnvironment(options resolvedRunOptions) []string {
 		values = append(values, key+"="+value)
 	}
 	return values
+}
+
+func isUVEnvironmentKey(key string) bool {
+	return len(key) >= 3 && strings.EqualFold(key[:3], "UV_")
+}
+
+func canonicalUVOverrideKey(key string) (string, bool) {
+	switch {
+	case strings.EqualFold(key, uvOfflineEnv):
+		return uvOfflineEnv, true
+	case strings.EqualFold(key, uvPythonInstallMirrorEnv):
+		return uvPythonInstallMirrorEnv, true
+	default:
+		return "", false
+	}
 }
 
 func containsEnvironmentKey(keys []string, want string) bool {

@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -48,6 +49,7 @@ type PythonRequest struct {
 	CacheDir         string
 	Branch           string
 	Commit           string
+	MirrorPolicy     mirror.Policy
 	Line             LineFunc
 }
 
@@ -68,8 +70,9 @@ type Runner interface {
 
 // PythonService 负责读取项目 Python 契约并准备受管解释器。
 type PythonService struct {
-	layout *config.Layout
-	runner Runner
+	layout  *config.Layout
+	runner  Runner
+	network *networkExecutor
 }
 
 // NewPythonService 创建 Python 服务。
@@ -77,7 +80,11 @@ func NewPythonService(layout *config.Layout, runner Runner) (*PythonService, err
 	if layout == nil || runner == nil {
 		return nil, errors.New("python service dependencies are incomplete")
 	}
-	return &PythonService{layout: layout, runner: runner}, nil
+	network, err := newDefaultNetworkExecutor()
+	if err != nil {
+		return nil, err
+	}
+	return &PythonService{layout: layout, runner: runner, network: network}, nil
 }
 
 // ReadSpec 只读取项目的版本文件和 pyproject.toml，不启动任何进程。
@@ -163,7 +170,11 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 	if err := s.checkSupported(ctx, runOptions, spec.Version); err != nil {
 		return PythonResult{}, err
 	}
-	installResult, err := s.runner.Run(ctx, []string{
+	target, err := mirror.NewTarget(mirror.TargetSpec{PythonVersion: spec.Version.String()})
+	if err != nil {
+		return PythonResult{}, fmt.Errorf("build Python mirror target: %w", err)
+	}
+	installResult, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPython, target, []string{
 		"python",
 		"install",
 		spec.Version.String(),
@@ -184,6 +195,9 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 		Line:             request.Line,
 	})
 	if err != nil {
+		if isNetworkPolicyError(err) {
+			return PythonResult{}, err
+		}
 		return PythonResult{}, pythonError(
 			protocol.CodePythonInstallFailed,
 			protocol.StagePythonInstall,
@@ -270,6 +284,7 @@ func (s *PythonService) checkSupported(
 	options RunOptions,
 	version PythonVersion,
 ) error {
+	options = withOfflineUV(options)
 	result, err := s.runner.Run(ctx, []string{
 		"python",
 		"list",
@@ -303,6 +318,7 @@ func (s *PythonService) checkInstalled(
 	options RunOptions,
 	version PythonVersion,
 ) error {
+	options = withOfflineUV(options)
 	result, err := s.runner.Run(ctx, []string{
 		"python",
 		"find",
@@ -320,6 +336,12 @@ func (s *PythonService) checkInstalled(
 		)
 	}
 	return nil
+}
+
+func withOfflineUV(options RunOptions) RunOptions {
+	options = cloneRunOptions(options)
+	options.Environment[uvOfflineEnv] = "1"
+	return options
 }
 
 func pythonError(

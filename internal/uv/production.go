@@ -294,6 +294,7 @@ func (s *ProductionEnvironment) servicesForPython(
 		CacheDir:         request.CacheDir,
 		Branch:           request.Branch,
 		Commit:           request.Commit,
+		BootstrapPolicy:  request.MirrorPolicy,
 		Line:             request.Line,
 	})
 }
@@ -305,11 +306,12 @@ func (s *ProductionEnvironment) servicesForDependencies(
 		return nil, errors.New("production environment is invalid")
 	}
 	return s.services(s.uvExecutable(), EnvironmentRequest{
-		ProjectDir:    request.ProjectDir,
-		ProjectEnvDir: request.ProjectEnvDir,
-		Branch:        request.Branch,
-		Commit:        request.Commit,
-		Line:          request.Line,
+		ProjectDir:      request.ProjectDir,
+		ProjectEnvDir:   request.ProjectEnvDir,
+		Branch:          request.Branch,
+		Commit:          request.Commit,
+		BootstrapPolicy: request.MirrorPolicy,
+		Line:            request.Line,
 	})
 }
 
