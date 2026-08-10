@@ -36,7 +36,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | --- | --- |
 | M0 工程基础与最小 CI | T0.1~T0.4 **已完成** |
 | M1 协议层 `internal/protocol` | T1.0~T1.9 **已完成** |
-| M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | T2.1~T2.8 **已完成**（T2.8 为远端 CI 暴露的测试 8.3 短文件名假设，2026-08-04 修复） |
+| M2 基础设施（config/logging/state/lock/filesystem/mirror/下载器） | T2.1~T2.9 **已完成**（T2.9 收口 hosted Windows 的路径别名、Reparse 与 rename 占用语义） |
 | M3 CLI 框架与基础命令 | T3.1~T3.8 **已完成**（含三轮对抗性审查的修复与可维护性收敛） |
 | M4 工作区同步 | T4.0~T4.7 **已完成**（含三轮对抗性审查与组件矩阵） |
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
