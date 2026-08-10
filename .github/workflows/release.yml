@@ -354,6 +354,23 @@ jobs:
               if ([string]::IsNullOrWhiteSpace($line)) {
                 throw "version emitted an empty NDJSON line"
               }
+              $document = $null
+              $rootKind = $null
+              try {
+                $document = [System.Text.Json.JsonDocument]::Parse($line)
+                $rootKind = $document.RootElement.ValueKind
+              }
+              catch {
+                throw "version emitted a non-strict JSON line: $line"
+              }
+              finally {
+                if ($null -ne $document) {
+                  $document.Dispose()
+                }
+              }
+              if ($rootKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                throw "version emitted a JSON value that is not an object"
+              }
               $event = $null
               try {
                 $event = $line | ConvertFrom-Json -ErrorAction Stop -NoEnumerate
@@ -400,6 +417,23 @@ jobs:
             foreach ($line in (Get-Content -LiteralPath $stdout -Encoding utf8)) {
               if ([string]::IsNullOrWhiteSpace($line)) {
                 throw "doctor emitted an empty NDJSON line"
+              }
+              $document = $null
+              $rootKind = $null
+              try {
+                $document = [System.Text.Json.JsonDocument]::Parse($line)
+                $rootKind = $document.RootElement.ValueKind
+              }
+              catch {
+                throw "doctor emitted a non-strict JSON line: $line"
+              }
+              finally {
+                if ($null -ne $document) {
+                  $document.Dispose()
+                }
+              }
+              if ($rootKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                throw "doctor emitted a JSON value that is not an object"
               }
               $event = $null
               try {

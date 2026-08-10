@@ -98,6 +98,15 @@ func TestReleaseWorkflow_SmokeAndImmutabilityContract(t *testing.T) {
 	if got := strings.Count(source, "ConvertFrom-Json -ErrorAction Stop -NoEnumerate"); got != 2 {
 		t.Fatalf("strict NDJSON parser count = %d, want 2", got)
 	}
+	if got := strings.Count(source, "[System.Text.Json.JsonDocument]::Parse($line)"); got != 2 {
+		t.Fatalf("RFC JSON parser count = %d, want 2", got)
+	}
+	if got := strings.Count(source, "[System.Text.Json.JsonValueKind]::Object"); got != 2 {
+		t.Fatalf("JSON object kind guard count = %d, want 2", got)
+	}
+	if got := strings.Count(source, "$document.Dispose()"); got != 2 {
+		t.Fatalf("JSON document disposal count = %d, want 2", got)
+	}
 	if got := strings.Count(source, "$event.GetType() -ne [System.Management.Automation.PSCustomObject]"); got != 2 {
 		t.Fatalf("NDJSON object guard count = %d, want 2", got)
 	}
