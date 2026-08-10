@@ -37,15 +37,17 @@ commit，而不是依赖事件 SHA 的 tag-object 语义。发布前再通过 Gi
 push v* tag
     |
     v
-build (windows-latest)
-    |  test -> ldflags build -> package -> SHA256SUMS
-    +--------------------+
-    v                    v
-release               smoke
-softprops release     gh release download -> unzip -> version/doctor NDJSON
+package (windows-latest)
+    |  test -> ldflags build -> zip + SHA256SUMS
+    v
+publish (windows-latest)
+    |  softprops release
+    v
+smoke (windows-latest)
+       gh release download -> unzip -> version/doctor NDJSON
 ```
 
-`build` 只产生工作区资产；`release` 拥有最小的 `contents: write` 权限并上传 zip 与
+`package` 只产生工作区资产；`publish` 拥有最小的 `contents: write` 权限并上传 zip 与
 `SHA256SUMS.txt`；`smoke` 依赖发布 job，重新下载已发布 zip 后验证真实产物。构建脚本不接触
 token。强制移动 tag、无效 tag 和已存在 Release 直接失败，避免同一发布名被静默覆盖。
 
