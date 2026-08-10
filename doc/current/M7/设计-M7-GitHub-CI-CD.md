@@ -51,6 +51,11 @@ smoke (windows-latest)
 `SHA256SUMS.txt`；`smoke` 依赖发布 job，重新下载已发布 zip 后验证真实产物。构建脚本不接触
 token。强制移动 tag、无效 tag 和已存在 Release 直接失败，避免同一发布名被静默覆盖。
 
+JavaScript action 固定使用原生 Node.js 24 的稳定主版本：`actions/upload-artifact@v7`、
+`actions/download-artifact@v8` 和 `softprops/action-gh-release@v3`。发布 workflow 不依赖
+GitHub Runner 把已弃用的 Node.js 20 action 强制注入 Node.js 24；远端测试 tag 验收不得留下
+Node.js 20 弃用注释。
+
 ## 4. 资产布局与校验
 
 zip 根目录固定包含 `auto-mas-runtime.exe`、仓库 `LICENSE` 和简要 `README.md`。校验文件使用
