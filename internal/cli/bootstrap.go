@@ -117,13 +117,13 @@ func runBootstrap(
 	}
 	uvTransactionActive := true
 	defer func() {
-		if !uvTransactionActive || retainM5TransactionOnFailure(returnErr, uvTransaction.Stage) {
+		if !uvTransactionActive || retainM5TransactionOnFailure(returnErr) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 		defer cancelCleanup()
-		if cleanupErr := removeM5Transaction(cleanupContext, store); cleanupErr != nil {
-			returnErr = errors.Join(returnErr, cleanupErr)
+		if cleanupErr := removeM5Transaction(cleanupContext, store, uvTransaction); cleanupErr != nil {
+			returnErr = errors.Join(cleanupErr, returnErr)
 		}
 	}()
 
@@ -168,7 +168,7 @@ func runBootstrap(
 		return sessionSuccess{}, err
 	}
 	transactionCleanupContext, cancelTransactionCleanup := m5TransactionCleanupContext(ctx)
-	removeErr := removeM5Transaction(transactionCleanupContext, store)
+	removeErr := removeM5Transaction(transactionCleanupContext, store, uvTransaction)
 	cancelTransactionCleanup()
 	if removeErr != nil {
 		return sessionSuccess{}, removeErr
@@ -263,13 +263,13 @@ func runBootstrap(
 	}
 	transactionActive := true
 	defer func() {
-		if !transactionActive || retainM5TransactionOnFailure(returnErr, transaction.Stage) {
+		if !transactionActive || retainM5TransactionOnFailure(returnErr) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 		defer cancelCleanup()
-		if cleanupErr := removeM5Transaction(cleanupContext, store); cleanupErr != nil {
-			returnErr = errors.Join(returnErr, cleanupErr)
+		if cleanupErr := removeM5Transaction(cleanupContext, store, transaction); cleanupErr != nil {
+			returnErr = errors.Join(cleanupErr, returnErr)
 		}
 	}()
 	if err := emitM5Progress(emitter, protocol.StagePythonCheck, protocol.ProgressRunning, "正在读取项目 Python 契约"); err != nil {
@@ -331,7 +331,7 @@ func runBootstrap(
 		return sessionSuccess{}, stateStoreError(protocol.StageDependenciesSync, err)
 	}
 	transactionCleanupContext, cancelTransactionCleanup = m5TransactionCleanupContext(ctx)
-	removeErr = removeM5Transaction(transactionCleanupContext, store)
+	removeErr = removeM5Transaction(transactionCleanupContext, store, transaction)
 	cancelTransactionCleanup()
 	if removeErr != nil {
 		return sessionSuccess{}, removeErr

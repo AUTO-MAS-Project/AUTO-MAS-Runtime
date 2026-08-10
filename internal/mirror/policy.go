@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// ErrPolicyRejected 表示合法 Policy 与当前 Catalog 的选择约束冲突。
+// 调用方可把它映射为参数错误；Catalog 自身损坏不匹配此错误。
+var ErrPolicyRejected = errors.New("mirror policy selection is rejected")
+
 var (
 	errInvalidPolicy = errors.New("mirror policy is invalid")
 	errInvalidPlan   = errors.New("mirror plan is invalid")
@@ -90,7 +94,7 @@ func BuildPlan(
 	for preferredKind, key := range policy.preferred {
 		source, ok := catalog.Source(preferredKind, key)
 		if !ok || (policy.mirrorOnly && source.official) {
-			return Plan{}, fmt.Errorf("%w: preferred source", errInvalidPlan)
+			return Plan{}, fmt.Errorf("%w: preferred source", ErrPolicyRejected)
 		}
 	}
 
@@ -115,7 +119,7 @@ func BuildPlan(
 		}
 	}
 	if len(ordered) == 0 {
-		return Plan{}, fmt.Errorf("%w: online plan has no source", errInvalidPlan)
+		return Plan{}, fmt.Errorf("%w: online plan has no source", ErrPolicyRejected)
 	}
 	plan := Plan{
 		kind:    kind,

@@ -34,21 +34,12 @@ func environmentCheckCommand(deps *deps) *cobra.Command {
 				commandPath(cmd),
 				protocol.StageUVCheck,
 				[]string{string(protocol.CapabilityStdinCancel)},
-				func(ctx context.Context, emitter *protocol.Emitter) (success sessionSuccess, returnErr error) {
+				func(ctx context.Context, _ *protocol.Emitter) (sessionSuccess, error) {
 					service, err := deps.options.environmentFactory(deps.global.layout)
 					if err != nil {
 						return sessionSuccess{}, err
 					}
-					logger, err := openM5Logger(ctx, deps, "environment check", emitter.OperationID())
-					if err != nil {
-						return sessionSuccess{}, err
-					}
-					defer func() {
-						if closeErr := logger.Close(); closeErr != nil {
-							returnErr = errors.Join(returnErr, stateStoreError(protocol.StageWorkspaceCleanup, closeErr))
-						}
-					}()
-					ready, err := checkM5UV(ctx, service, uvLogLine(logger))
+					ready, err := checkM5UV(ctx, service, nil)
 					if err != nil {
 						return sessionSuccess{}, err
 					}
@@ -62,7 +53,7 @@ func environmentCheckCommand(deps *deps) *cobra.Command {
 						ProjectEnvDir:    deps.global.layout.VenvDir(),
 						CacheDir:         deps.global.layout.UVCacheDir(),
 						MirrorPolicy:     deps.global.mirrorPolicy,
-						Line:             uvLogLine(logger),
+						Line:             nil,
 					})
 					if err != nil {
 						return sessionSuccess{}, err
@@ -144,13 +135,13 @@ func environmentEnsureCommand(deps *deps) *cobra.Command {
 					}
 					transactionActive := true
 					defer func() {
-						if !transactionActive || retainM5TransactionOnFailure(returnErr, transaction.Stage) {
+						if !transactionActive || retainM5TransactionOnFailure(returnErr) {
 							return
 						}
 						cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 						defer cancelCleanup()
-						if cleanupErr := removeM5Transaction(cleanupContext, store); cleanupErr != nil {
-							returnErr = errors.Join(returnErr, cleanupErr)
+						if cleanupErr := removeM5Transaction(cleanupContext, store, transaction); cleanupErr != nil {
+							returnErr = errors.Join(cleanupErr, returnErr)
 						}
 					}()
 					if err := transitionM5State(emitter, machine, protocol.StageUVCheck, protocol.StatePreparingUV, "正在准备固定版本 uv"); err != nil {
@@ -193,7 +184,7 @@ func environmentEnsureCommand(deps *deps) *cobra.Command {
 						return sessionSuccess{}, err
 					}
 					cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
-					removeErr := removeM5Transaction(cleanupContext, store)
+					removeErr := removeM5Transaction(cleanupContext, store, transaction)
 					cancelCleanup()
 					if removeErr != nil {
 						return sessionSuccess{}, removeErr
@@ -302,13 +293,13 @@ func runEnvironmentRepair(
 	}
 	transactionActive := true
 	defer func() {
-		if !transactionActive || retainM5TransactionOnFailure(returnErr, transaction.Stage) {
+		if !transactionActive || retainM5TransactionOnFailure(returnErr) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 		defer cancelCleanup()
-		if cleanupErr := removeM5Transaction(cleanupContext, store); cleanupErr != nil {
-			returnErr = errors.Join(returnErr, cleanupErr)
+		if cleanupErr := removeM5Transaction(cleanupContext, store, transaction); cleanupErr != nil {
+			returnErr = errors.Join(cleanupErr, returnErr)
 		}
 	}()
 	logger, err := openM5Logger(ctx, deps, "environment repair", emitter.OperationID())
@@ -422,7 +413,7 @@ func runEnvironmentRepair(
 		return sessionSuccess{}, err
 	}
 	cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
-	removeErr := removeM5Transaction(cleanupContext, store)
+	removeErr := removeM5Transaction(cleanupContext, store, transaction)
 	cancelCleanup()
 	if removeErr != nil {
 		return sessionSuccess{}, removeErr

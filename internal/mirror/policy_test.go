@@ -1,6 +1,7 @@
 package mirror
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -220,10 +221,11 @@ func TestBuildPlan_PreferredKindsRemainIndependent(t *testing.T) {
 func TestBuildPlan_RejectsInvalidSelectionAndEmptyOnlinePlan(t *testing.T) {
 	catalog := mustDefaultCatalog(t)
 	tests := []struct {
-		name    string
-		catalog *Catalog
-		spec    PolicySpec
-		kind    Kind
+		name         string
+		catalog      *Catalog
+		spec         PolicySpec
+		kind         Kind
+		wantRejected bool
 	}{
 		{
 			name:    "nil catalog",
@@ -242,16 +244,18 @@ func TestBuildPlan_RejectsInvalidSelectionAndEmptyOnlinePlan(t *testing.T) {
 			kind:    Kind("unknown"),
 		},
 		{
-			name:    "missing preferred",
-			catalog: catalog,
+			name:         "missing preferred",
+			catalog:      catalog,
+			wantRejected: true,
 			spec: PolicySpec{
 				Preferred: map[Kind]string{KindGit: "missing"},
 			},
 			kind: KindGit,
 		},
 		{
-			name:    "official preferred in mirror-only",
-			catalog: catalog,
+			name:         "official preferred in mirror-only",
+			catalog:      catalog,
+			wantRejected: true,
 			spec: PolicySpec{
 				Preferred:  map[Kind]string{KindGit: "github"},
 				MirrorOnly: true,
@@ -259,10 +263,11 @@ func TestBuildPlan_RejectsInvalidSelectionAndEmptyOnlinePlan(t *testing.T) {
 			kind: KindGit,
 		},
 		{
-			name:    "official-only catalog in mirror-only",
-			catalog: officialOnlyGitCatalog(t),
-			spec:    PolicySpec{MirrorOnly: true},
-			kind:    KindGit,
+			name:         "official-only catalog in mirror-only",
+			catalog:      officialOnlyGitCatalog(t),
+			spec:         PolicySpec{MirrorOnly: true},
+			kind:         KindGit,
+			wantRejected: true,
 		},
 	}
 	for _, test := range tests {
@@ -275,8 +280,12 @@ func TestBuildPlan_RejectsInvalidSelectionAndEmptyOnlinePlan(t *testing.T) {
 					t.Fatalf("NewPolicy() error = %v", err)
 				}
 			}
-			if _, err := BuildPlan(test.catalog, policy, test.kind); err == nil {
+			_, err := BuildPlan(test.catalog, policy, test.kind)
+			if err == nil {
 				t.Fatal("BuildPlan() error = nil, want validation error")
+			}
+			if got := errors.Is(err, ErrPolicyRejected); got != test.wantRejected {
+				t.Fatalf("BuildPlan() ErrPolicyRejected = %t, want %t; error=%v", got, test.wantRejected, err)
 			}
 		})
 	}

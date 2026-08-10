@@ -202,13 +202,13 @@ func runMutatingDependencyAction(
 	}
 	transactionActive := true
 	defer func() {
-		if !transactionActive || retainM5TransactionOnFailure(returnErr, transaction.Stage) {
+		if !transactionActive || retainM5TransactionOnFailure(returnErr) {
 			return
 		}
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 		defer cancelCleanup()
-		if cleanupErr := removeM5Transaction(cleanupContext, store); cleanupErr != nil {
-			returnErr = errors.Join(returnErr, cleanupErr)
+		if cleanupErr := removeM5Transaction(cleanupContext, store, transaction); cleanupErr != nil {
+			returnErr = errors.Join(cleanupErr, returnErr)
 		}
 	}()
 	logger, err := openM5Logger(ctx, deps, dependencyTransactionCommand(rebuild), emitter.OperationID())
@@ -278,7 +278,7 @@ func runMutatingDependencyAction(
 		return sessionSuccess{}, stateStoreError(protocol.StageDependenciesSync, err)
 	}
 	cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
-	removeErr := removeM5Transaction(cleanupContext, store)
+	removeErr := removeM5Transaction(cleanupContext, store, transaction)
 	cancelCleanup()
 	if removeErr != nil {
 		return sessionSuccess{}, removeErr

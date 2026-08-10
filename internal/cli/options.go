@@ -124,6 +124,7 @@ type environmentStateStore interface {
 	WriteTransaction(context.Context, state.TransactionKind, state.TransactionState) error
 	ReadTransaction(context.Context, state.TransactionKind) (state.TransactionSnapshot, error)
 	RemoveTransaction(context.Context, state.TransactionSnapshot) error
+	RemoveOwnedTransaction(context.Context, state.TransactionKind, state.TransactionState) error
 	Close() error
 }
 

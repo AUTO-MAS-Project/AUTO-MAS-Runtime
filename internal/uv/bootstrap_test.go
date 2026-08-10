@@ -98,6 +98,9 @@ func TestBootstrap_AtomicPublish(t *testing.T) {
 		publisher.request.Destination != filepath.Dir(want) {
 		t.Fatalf("publish request = %#v, want versioned destination", publisher.request)
 	}
+	if publisher.request.ExpectedSourceIdentity == nil {
+		t.Fatal("publish request source identity = nil, want staging lease token")
+	}
 	if extractor.calls != 1 || checker.calls != 1 {
 		t.Fatalf("extractor/checker calls = %d/%d, want 1/1", extractor.calls, checker.calls)
 	}

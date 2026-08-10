@@ -290,6 +290,39 @@ func TestStore_RemoveTransactionRejectsRealReplacementAndRewrite(t *testing.T) {
 	})
 }
 
+func TestStore_RemoveOwnedTransactionRejectsDifferentOperation(t *testing.T) {
+	layout := newRealLayout(t)
+	store := newRealStore(t, layout)
+	current := validTransactionState(TransactionMutation)
+	if err := store.WriteTransaction(t.Context(), TransactionMutation, current); err != nil {
+		t.Fatalf("WriteTransaction() error = %v", err)
+	}
+	expected := current
+	expected.OperationID = "01J00000000000000000000009"
+
+	if err := store.RemoveOwnedTransaction(
+		t.Context(),
+		TransactionMutation,
+		expected,
+	); !errors.Is(err, ErrTransactionChanged) {
+		t.Fatalf("RemoveOwnedTransaction(other operation) error = %v, want ErrTransactionChanged", err)
+	}
+	snapshot, err := store.ReadTransaction(t.Context(), TransactionMutation)
+	if err != nil || snapshot.State() != current {
+		t.Fatalf("current transaction = %#v, %v, want retained %#v", snapshot.State(), err, current)
+	}
+	if err := store.RemoveOwnedTransaction(
+		t.Context(),
+		TransactionMutation,
+		current,
+	); err != nil {
+		t.Fatalf("RemoveOwnedTransaction(current) error = %v", err)
+	}
+	if _, err := store.ReadTransaction(t.Context(), TransactionMutation); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ReadTransaction() error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestStore_StateDirectoryReparsePointFailsClosed(t *testing.T) {
 	t.Parallel()
 

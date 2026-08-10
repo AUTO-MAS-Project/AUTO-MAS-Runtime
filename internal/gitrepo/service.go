@@ -294,6 +294,13 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		}
 		return SyncResult{}, serviceInvalidArgumentError(err)
 	}
+	plan, err := s.buildPlan(request.Policy)
+	if err != nil {
+		if errors.Is(err, mirror.ErrPolicyRejected) {
+			return SyncResult{}, servicePolicyArgumentError(err)
+		}
+		return SyncResult{}, serviceInternalError(protocol.StageWorkspaceClone, err)
+	}
 
 	logger, err := request.LoggerFactory(ctx, "workspace-sync", request.OperationID)
 	if err != nil || nilOperationLogger(logger) {
@@ -415,10 +422,6 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		}, nil
 	}
 
-	plan, err := s.buildPlan(request.Policy)
-	if err != nil {
-		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceInternalError(protocol.StageWorkspaceClone, err))
-	}
 	update, err := runtime.NewTransaction(state.TransactionUpdate, state.TransactionInput{
 		OperationID:   request.OperationID,
 		Command:       "workspace sync",
@@ -957,6 +960,10 @@ func serviceCheckReadError(cause error) *Error {
 
 func serviceInvalidArgumentError(cause error) *Error {
 	return newError(protocol.CodeInvalidArgument, protocol.StageWorkspaceClone, "应用根目录无效", map[string]any{}, cause)
+}
+
+func servicePolicyArgumentError(cause error) *Error {
+	return newError(protocol.CodeInvalidArgument, protocol.StageWorkspaceClone, "镜像策略参数无效", map[string]any{}, cause)
 }
 
 func serviceInvalidVersionError() *Error {

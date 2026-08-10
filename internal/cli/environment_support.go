@@ -61,15 +61,16 @@ func advanceM5Transaction(
 	return nil
 }
 
-func removeM5Transaction(ctx context.Context, store environmentStateStore) error {
-	snapshot, err := store.ReadTransaction(ctx, state.TransactionMutation)
+func removeM5Transaction(
+	ctx context.Context,
+	store environmentStateStore,
+	expected state.TransactionState,
+) error {
+	err := store.RemoveOwnedTransaction(ctx, state.TransactionMutation, expected)
 	if errors.Is(err, state.ErrNotFound) {
 		return nil
 	}
 	if err != nil {
-		return stateStoreError(protocol.StageWorkspaceCleanup, err)
-	}
-	if err := store.RemoveTransaction(ctx, snapshot); err != nil {
 		return stateStoreError(protocol.StageWorkspaceCleanup, err)
 	}
 	return nil
@@ -239,12 +240,9 @@ func (m5FreeMutexProbe) Probe(ctx context.Context, kind state.MutexKind) (state.
 
 var _ state.MutexProbe = m5FreeMutexProbe{}
 
-func retainM5TransactionOnFailure(err error, stage protocol.Stage) bool {
-	if findOperationErrorCode(err, protocol.CodeStateWriteFailed) != nil {
-		return true
-	}
-	_, invalidatesEnvironment := classifyStaleM5Stage(stage)
-	return err != nil && invalidatesEnvironment
+func retainM5TransactionOnFailure(err error) bool {
+	return findOperationErrorCode(err, protocol.CodeStateWriteFailed) != nil ||
+		findOperationErrorCode(err, protocol.CodeUpdateStateAmbiguous) != nil
 }
 
 func m5TransactionCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -470,8 +468,7 @@ func persistM5FailureWithLifecycle(
 		if transitionErr == nil {
 			emitErr = emitM5State(emitter, stage, protocol.StateEnvironmentBroken, "运行环境已损坏")
 		}
-		removeErr := removeM5Transaction(persistContext, store)
-		return errors.Join(removeErr, transitionErr, emitErr, cause)
+		return errors.Join(transitionErr, emitErr, cause)
 	}
 	return errors.Join(rollbackM5Preparation(emitter, machine, stage, "运行环境保持原稳定状态"), cause)
 }

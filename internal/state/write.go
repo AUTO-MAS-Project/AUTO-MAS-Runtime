@@ -141,6 +141,36 @@ func (s *Store) RemoveTransaction(
 	return classifyRemoveResult(file, result, err)
 }
 
+// RemoveOwnedTransaction 仅在当前事务仍与调用方持有的完整业务 snapshot 一致时条件删除。
+// 读取后的物理文件 token 仍由 RemoveTransaction 交给 StateFiles 复验，避免删除后来操作的事务。
+func (s *Store) RemoveOwnedTransaction(
+	ctx context.Context,
+	kind TransactionKind,
+	expected TransactionState,
+) error {
+	if err := ValidateTransaction(kind, expected); err != nil {
+		return err
+	}
+	snapshot, err := s.ReadTransaction(ctx, kind)
+	if err != nil {
+		return err
+	}
+	if !sameTransactionState(snapshot.State(), expected) {
+		return &transactionChangedError{}
+	}
+	return s.RemoveTransaction(ctx, snapshot)
+}
+
+func sameTransactionState(left, right TransactionState) bool {
+	return left.SchemaVersion == right.SchemaVersion &&
+		left.OperationID == right.OperationID &&
+		left.Command == right.Command &&
+		left.PID == right.PID &&
+		left.StartedAt.Equal(right.StartedAt) &&
+		left.TargetVersion == right.TargetVersion &&
+		left.Stage == right.Stage
+}
+
 func (s *Store) encodeStateLocked(file string, value any) ([]byte, error) {
 	encoded, err := s.marshalIndent(value, "", "  ")
 	if err != nil {

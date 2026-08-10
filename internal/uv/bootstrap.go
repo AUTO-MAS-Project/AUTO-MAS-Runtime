@@ -52,6 +52,8 @@ type PublishRequest struct {
 	Destination string
 	OperationID string
 	Version     string
+	// ExpectedSourceIdentity 把 staging lease 的关闭前身份交给受控 rename 复验。
+	ExpectedSourceIdentity *filesystem.DirectoryIdentity
 }
 
 // PublishResult 报告目录 rename 是否已经产生副作用。
@@ -315,8 +317,10 @@ func (b *Bootstrapper) ensure(
 		return "", wrapBootstrapError(protocol.StageUVVerify, err)
 	}
 	defer func() {
-		if closeErr := archiveLease.Close(); closeErr != nil {
-			returnErr = errors.Join(returnErr, wrapBootstrapError(protocol.StageUVVerify, closeErr))
+		if archiveLease != nil {
+			if closeErr := archiveLease.Close(); closeErr != nil {
+				returnErr = errors.Join(returnErr, wrapBootstrapError(protocol.StageUVVerify, closeErr))
+			}
 		}
 	}()
 	if err := verifySHA256(ctx, archivePath, spec.SHA256); err != nil {
@@ -348,41 +352,50 @@ func (b *Bootstrapper) ensure(
 	if err != nil {
 		return "", wrapBootstrapError(protocol.StageUVDownload, err)
 	}
-	published := false
 	defer func() {
-		if closeErr := stagingLease.Close(); closeErr != nil {
-			closeError := newError(
-				protocol.CodeUVDownloadFailed,
-				protocol.StageUVDownload,
-				"uv 暂存目录收口失败",
-				map[string]any{"committed": published},
-				closeErr,
-			)
-			if published {
-				closeError = newCommittedError(
+		if stagingLease != nil {
+			if closeErr := stagingLease.Close(); closeErr != nil {
+				closeError := newError(
 					protocol.CodeUVDownloadFailed,
 					protocol.StageUVDownload,
 					"uv 暂存目录收口失败",
-					map[string]any{"committed": true},
+					map[string]any{"committed": false},
 					closeErr,
 				)
+				returnErr = errors.Join(returnErr, closeError)
 			}
-			returnErr = errors.Join(returnErr, closeError)
 		}
 	}()
 	if err := b.extractor.Extract(ctx, archivePath, staging); err != nil {
+		return "", wrapBootstrapError(protocol.StageUVDownload, err)
+	}
+	sourceIdentity := stagingLease.Identity()
+	if sourceIdentity == nil {
+		return "", wrapBootstrapError(
+			protocol.StageUVDownload,
+			errors.New("uv staging directory identity is unavailable"),
+		)
+	}
+	archiveToClose := archiveLease
+	archiveLease = nil
+	if err := archiveToClose.Close(); err != nil {
+		return "", wrapBootstrapError(protocol.StageUVVerify, err)
+	}
+	stagingToClose := stagingLease
+	stagingLease = nil
+	if err := stagingToClose.Close(); err != nil {
 		return "", wrapBootstrapError(protocol.StageUVDownload, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	result, err := b.publisher.Publish(ctx, PublishRequest{
-		Source:      staging,
-		Destination: versionDir,
-		OperationID: operationID,
-		Version:     spec.Version,
+		Source:                 staging,
+		Destination:            versionDir,
+		OperationID:            operationID,
+		Version:                spec.Version,
+		ExpectedSourceIdentity: sourceIdentity,
 	})
-	published = result.MutationApplied
 	if err != nil {
 		if result.MutationApplied {
 			return "", newCommittedError(
@@ -418,11 +431,22 @@ func (b *Bootstrapper) check(ctx context.Context, line LineFunc) (bool, error) {
 	if err := requireUVPlatform(protocol.StageUVCheck); err != nil {
 		return false, err
 	}
+	root, err := filesystem.InspectManagedDirectory(ctx, b.layout, b.layout.AppRoot())
+	if err != nil {
+		return false, wrapBootstrapError(protocol.StageUVCheck, err)
+	}
+	if !root.Exists {
+		return false, nil
+	}
 	path, err := b.layout.UVExecutable(b.artifact.Version)
 	if err != nil {
 		return false, err
 	}
-	if !regularFile(path) {
+	inspection, err := filesystem.InspectManagedFile(ctx, b.layout, path)
+	if err != nil {
+		return false, wrapBootstrapError(protocol.StageUVCheck, err)
+	}
+	if !inspection.Exists {
 		return false, nil
 	}
 	if err := b.checkExecutableVersion(ctx, path, line); err != nil {
@@ -554,6 +578,16 @@ func (b *Bootstrapper) download(
 				protocol.StageUVVerify,
 				"uv 校验和不匹配",
 				map[string]any{"expectedSHA256": spec.SHA256},
+				rotationErr,
+			)
+		}
+		var coded interface{ Code() protocol.Code }
+		if errors.As(rotationErr, &coded) && coded.Code() == protocol.CodeNetworkUnavailable {
+			return mirror.DownloadResult{}, newError(
+				protocol.CodeNetworkUnavailable,
+				protocol.StageUVDownload,
+				"离线模式下没有可用的 uv 缓存",
+				map[string]any{},
 				rotationErr,
 			)
 		}
@@ -892,7 +926,7 @@ func bootstrapErrorCode(err error) protocol.Code {
 
 type zipExtractor struct{}
 
-func (zipExtractor) Extract(ctx context.Context, archivePath, stagingDir string) error {
+func (zipExtractor) Extract(ctx context.Context, archivePath, stagingDir string) (returnErr error) {
 	if ctx == nil || archivePath == "" || stagingDir == "" {
 		return errors.New("uv archive extraction request is invalid")
 	}
@@ -900,7 +934,9 @@ func (zipExtractor) Extract(ctx context.Context, archivePath, stagingDir string)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = reader.Close() }()
+	defer func() {
+		returnErr = errors.Join(returnErr, reader.Close())
+	}()
 	if len(reader.File) > maxUVArchiveFiles {
 		return errors.New("uv archive contains too many files")
 	}
@@ -952,21 +988,21 @@ func (zipExtractor) Extract(ctx context.Context, archivePath, stagingDir string)
 		if err != nil {
 			return err
 		}
-		input, err := entry.Open()
-		if err == nil {
-			written, copyErr := io.Copy(file, io.LimitReader(contextReader{ctx: ctx, reader: input}, maxUVArchiveBytes+1))
-			err = copyErr
-			if err == nil && written > maxUVArchiveBytes {
-				err = errors.New("uv archive uv.exe is too large")
+		input, inputErr := entry.Open()
+		var copyErr error
+		if inputErr == nil {
+			var written int64
+			written, copyErr = io.Copy(file, io.LimitReader(contextReader{ctx: ctx, reader: input}, maxUVArchiveBytes+1))
+			if copyErr == nil && written > maxUVArchiveBytes {
+				copyErr = errors.New("uv archive uv.exe is too large")
 			}
 		}
+		var inputCloseErr error
 		if input != nil {
-			_ = input.Close()
+			inputCloseErr = input.Close()
 		}
-		closeErr := file.Close()
-		if err == nil {
-			err = closeErr
-		}
+		fileCloseErr := file.Close()
+		err = errors.Join(inputErr, copyErr, inputCloseErr, fileCloseErr)
 		if err != nil {
 			removeErr := os.Remove(destination)
 			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -1056,12 +1092,13 @@ func (p filesystemPublisher) Publish(
 		return PublishResult{}, errors.Join(err, logger.Close())
 	}
 	result, err := operator.AtomicRename(ctx, filesystem.RenameRequest{
-		Kind:        filesystem.RenameUVStagingToVersion,
-		Source:      request.Source,
-		Destination: request.Destination,
-		OperationID: request.OperationID,
-		Version:     request.Version,
-		Reason:      "uv bootstrap publish",
+		Kind:                   filesystem.RenameUVStagingToVersion,
+		Source:                 request.Source,
+		Destination:            request.Destination,
+		OperationID:            request.OperationID,
+		Version:                request.Version,
+		Reason:                 "uv bootstrap publish",
+		ExpectedSourceIdentity: request.ExpectedSourceIdentity,
 	})
 	return PublishResult{MutationApplied: result.MutationApplied}, errors.Join(err, logger.Close())
 }

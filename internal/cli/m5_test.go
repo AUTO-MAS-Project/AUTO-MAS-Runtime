@@ -1090,6 +1090,9 @@ type m5TestStateStore struct {
 	transaction        state.TransactionState
 	transactionActive  bool
 	recordTransactions bool
+	removeCalls        int
+	removeContextErr   error
+	removeErr          error
 }
 
 type failingEnvironmentWriteStore struct {
@@ -1154,7 +1157,32 @@ func (s *m5TestStateStore) ReadTransaction(context.Context, state.TransactionKin
 	return state.TransactionSnapshot{}, nil
 }
 
-func (s *m5TestStateStore) RemoveTransaction(context.Context, state.TransactionSnapshot) error {
+func (s *m5TestStateStore) RemoveTransaction(ctx context.Context, _ state.TransactionSnapshot) error {
+	s.removeCalls++
+	s.removeContextErr = ctx.Err()
+	if s.removeErr != nil {
+		return s.removeErr
+	}
+	s.transactionActive = false
+	return nil
+}
+
+func (s *m5TestStateStore) RemoveOwnedTransaction(
+	ctx context.Context,
+	_ state.TransactionKind,
+	expected state.TransactionState,
+) error {
+	s.removeCalls++
+	s.removeContextErr = ctx.Err()
+	if !s.transactionActive {
+		return state.ErrNotFound
+	}
+	if s.transaction != expected {
+		return state.ErrTransactionChanged
+	}
+	if s.removeErr != nil {
+		return s.removeErr
+	}
 	s.transactionActive = false
 	return nil
 }
