@@ -1122,8 +1122,14 @@ func TestRotator_FailureKindDoesNotAffectTransitions(t *testing.T) {
 		terminal       bool
 	}
 	fullTraversal := map[Kind][]string{
-		KindGit:          {"cnb", "github"},
-		KindUV:           {"gh-proxy", "github"},
+		KindGit: {"cnb", "github"},
+		KindUV: {
+			"agentsmirror",
+			"gh-proxy",
+			"cdn-gh-proxy",
+			"edgeone-gh-proxy",
+			"github",
+		},
 		KindPython:       {"gh-proxy", "github"},
 		KindPackageIndex: {"aliyun", "tsinghua", "ustc", "pypi"},
 	}
@@ -1451,7 +1457,13 @@ func TestRotator_SucceededOutcomeForEveryKind(t *testing.T) {
 		},
 		{
 			kind: KindUV,
-			keys: []string{"gh-proxy", "github"},
+			keys: []string{
+				"agentsmirror",
+				"gh-proxy",
+				"cdn-gh-proxy",
+				"edgeone-gh-proxy",
+				"github",
+			},
 		},
 		{
 			kind: KindPython,

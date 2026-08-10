@@ -175,8 +175,20 @@ func TestDefaultCatalog_ExactSourcesAndOrder(t *testing.T) {
 				official bool
 			}{
 				{
+					key:     "agentsmirror",
+					baseURL: "https://uv.agentsmirror.com/github/astral-sh/uv/releases/download",
+				},
+				{
 					key:     "gh-proxy",
 					baseURL: "https://gh-proxy.com/https://github.com/astral-sh/uv/releases/download",
+				},
+				{
+					key:     "cdn-gh-proxy",
+					baseURL: "https://cdn.gh-proxy.com/https://github.com/astral-sh/uv/releases/download",
+				},
+				{
+					key:     "edgeone-gh-proxy",
+					baseURL: "https://edgeone.gh-proxy.com/https://github.com/astral-sh/uv/releases/download",
 				},
 				{
 					key:      "github",

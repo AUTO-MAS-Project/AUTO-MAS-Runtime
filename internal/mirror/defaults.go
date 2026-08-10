@@ -23,8 +23,23 @@ func DefaultCatalog() (*Catalog, error) {
 		},
 		{
 			kind:    KindUV,
+			key:     "agentsmirror",
+			baseURL: "https://uv.agentsmirror.com/github/astral-sh/uv/releases/download",
+		},
+		{
+			kind:    KindUV,
 			key:     "gh-proxy",
 			baseURL: "https://gh-proxy.com/https://github.com/astral-sh/uv/releases/download",
+		},
+		{
+			kind:    KindUV,
+			key:     "cdn-gh-proxy",
+			baseURL: "https://cdn.gh-proxy.com/https://github.com/astral-sh/uv/releases/download",
+		},
+		{
+			kind:    KindUV,
+			key:     "edgeone-gh-proxy",
+			baseURL: "https://edgeone.gh-proxy.com/https://github.com/astral-sh/uv/releases/download",
 		},
 		{
 			kind:     KindUV,

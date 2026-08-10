@@ -174,7 +174,16 @@ func TestBuildPlan_PreferredKindsRemainIndependent(t *testing.T) {
 		want []string
 	}{
 		{kind: KindGit, want: []string{"github", "cnb"}},
-		{kind: KindUV, want: []string{"github", "gh-proxy"}},
+		{
+			kind: KindUV,
+			want: []string{
+				"github",
+				"agentsmirror",
+				"gh-proxy",
+				"cdn-gh-proxy",
+				"edgeone-gh-proxy",
+			},
+		},
 		{kind: KindPython, want: []string{"github", "gh-proxy"}},
 		{
 			kind: KindPackageIndex,
