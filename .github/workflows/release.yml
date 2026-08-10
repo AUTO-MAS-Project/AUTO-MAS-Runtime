@@ -158,7 +158,7 @@ jobs:
           }
 
       - name: Upload release assets for publishing
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: runtime-release-assets
           path: |
@@ -180,7 +180,7 @@ jobs:
 
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: runtime-release-assets
           path: release-assets
@@ -274,7 +274,7 @@ jobs:
           }
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.package.outputs.tag }}
           name: AUTO-MAS Runtime ${{ needs.package.outputs.tag }}

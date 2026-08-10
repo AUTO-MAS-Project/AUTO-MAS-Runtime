@@ -36,7 +36,9 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "license guard", snippet: "LICENSE is required for release packaging"},
 		{name: "archive entries", snippet: "Compress-Archive -Path @(\"auto-mas-runtime.exe\", \"LICENSE\", \"README.md\")"},
 		{name: "SHA256 sums", snippet: "Get-FileHash -LiteralPath $archive -Algorithm SHA256"},
-		{name: "release action", snippet: "uses: softprops/action-gh-release@v2"},
+		{name: "upload action", snippet: "uses: actions/upload-artifact@v7"},
+		{name: "download action", snippet: "uses: actions/download-artifact@v8"},
+		{name: "release action", snippet: "uses: softprops/action-gh-release@v3"},
 		{name: "unmatched asset guard", snippet: "fail_on_unmatched_files: true"},
 		{name: "generated notes", snippet: "generate_release_notes: true"},
 		{name: "unsigned policy", snippet: "The executable is intentionally unsigned"},
@@ -56,6 +58,15 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 	}
 	if strings.Contains(source, "overwrite_files:") {
 		t.Fatal("release workflow relies on an undeclared action input for immutability")
+	}
+	for _, legacy := range []string{
+		"uses: actions/upload-artifact@v4",
+		"uses: actions/download-artifact@v4",
+		"uses: softprops/action-gh-release@v2",
+	} {
+		if strings.Contains(source, legacy) {
+			t.Errorf("release workflow still uses legacy action %q", legacy)
+		}
 	}
 }
 
