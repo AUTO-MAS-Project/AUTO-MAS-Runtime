@@ -6,7 +6,8 @@
 M2 T2.10 uv 镜像源扩充、M4 工作区同步、M5 T5.9 Windows 黑盒回归修复与 M6 后端监督均已
 完成；设计和审查记录分别归档到 [`../archive/M2/`](../archive/M2/)、
 [`../archive/M4/`](../archive/M4/)、[`../archive/M5/`](../archive/M5/) 与
-[`../archive/M6/`](../archive/M6/)。当前没有进行中的设计或实施计划。
+[`../archive/M6/`](../archive/M6/)。M7 发布实现已完成本地验证，远端测试 tag/Release 冒烟
+仍待单独外发授权；当前设计与计划见 [`M7/`](./M7/)。
 
 任务完成后的处理规则：
 

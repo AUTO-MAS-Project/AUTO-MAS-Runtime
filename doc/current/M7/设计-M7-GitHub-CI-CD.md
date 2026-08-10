@@ -7,6 +7,9 @@ M7 为 Runtime 建立可重复的 Windows x64 发布流水线。受保护的 `v*
 注入 `internal/version`，生成未签名的 `auto-mas-runtime.exe`，再发布带校验和的 zip 资产。
 
 Runtime 本身不执行自更新、不签名、不上传用户数据，也不把 GitHub Actions 逻辑迁入 Runtime。
+本仓库 workflow 只发布 `auto-mas-runtime.exe`；AUTO-MAS 后端仓库的
+`release/<version>` 分支与同名 tag 创建、锁定和 `uv lock --check` 属于 AUTO-MAS 侧
+`TODO-CI-2/3`，不由本仓库 M7 创建或校验。
 SignPath 接入继续遵守决策 D3，留在 T7.5；CNB 镜像同步在没有目标仓库和凭据前不启用。
 
 ## 2. 版本与构建事实
@@ -23,6 +26,10 @@ github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.BuildDate
 
 未经过 linker 注入的本地开发构建继续显示 `dev`，空提交和构建时间；`version` 命令与
 `hello.runtimeVersion` 仍消费同一个 `version.Load` 来源。
+
+构建 Commit 从 checkout 后的 `HEAD^{commit}` 解析，轻量 tag 和 annotated tag 均得到实际
+commit，而不是依赖事件 SHA 的 tag-object 语义。发布前再通过 GitHub API 递归解析当前 tag，
+只有它仍指向同一 commit 时才允许创建 Release。
 
 ## 3. Workflow 拓扑
 

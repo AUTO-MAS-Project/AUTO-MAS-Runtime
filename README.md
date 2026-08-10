@@ -48,11 +48,32 @@ if ($LASTEXITCODE -ne 0) { throw "build failed" }
 if ($LASTEXITCODE -ne 0) { throw "run failed" }
 ```
 
-The current scaffold prints a development version placeholder:
+Local builds without release linker flags keep the stable development placeholders:
 
 ```text
 auto-mas-runtime dev
 ```
+
+Build a release-style Windows x64 executable with PowerShell 7:
+
+```powershell
+$releaseTag = "v0.1.0-beta.1"
+$releaseCommit = (& git rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw "unable to resolve release commit" }
+$releaseDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$releaseLdflags = "-s -w -X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Version=$releaseTag -X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Commit=$releaseCommit -X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.BuildDate=$releaseDate"
+$env:GOOS = "windows"
+$env:GOARCH = "amd64"
+$releaseDist = Join-Path (Get-Location) "dist"
+New-Item -ItemType Directory -Path $releaseDist -Force -ErrorAction Stop | Out-Null
+$releaseExecutable = Join-Path $releaseDist "auto-mas-runtime.exe"
+& go build -trimpath -buildvcs=false -ldflags $releaseLdflags -o $releaseExecutable ./cmd/auto-mas-runtime
+if ($LASTEXITCODE -ne 0) { throw "release-style build failed" }
+```
+
+The `version --output ndjson` result details report the injected tag, commit, and build date;
+the protocol `hello.runtimeVersion` reports the same injected tag. The project is distributed under
+AGPL-3.0-or-later; see [LICENSE](LICENSE).
 
 ## Test and lint
 
