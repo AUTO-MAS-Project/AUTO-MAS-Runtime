@@ -5,8 +5,8 @@
 
 M4 工作区同步、M5 uv/Python/依赖与 M6 后端监督均已完成；设计和审查记录分别归档到
 [`../archive/M4/`](../archive/M4/)、[`../archive/M5/`](../archive/M5/) 与
-[`../archive/M6/`](../archive/M6/)。当前没有尚未完成的里程碑设计或实施计划；新阶段开工时
-按本目录规则新增独立子目录。
+[`../archive/M6/`](../archive/M6/)。当前进行中的工作是
+[`M2/T2.9 hosted Windows 路径语义修复`](./M2/设计-T2.9-hosted-Windows路径语义修复.md)。
 
 任务完成后的处理规则：
 
