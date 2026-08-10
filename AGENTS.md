@@ -30,7 +30,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-08-09）
+## 2. 当前状态（截至 2026-08-10）
 
 | 里程碑 | 状态 |
 | --- | --- |
@@ -40,7 +40,8 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M3 CLI 框架与基础命令 | T3.1~T3.8 **已完成**（含三轮对抗性审查的修复与可维护性收敛） |
 | M4 工作区同步 | T4.0~T4.7 **已完成**（含三轮对抗性审查与组件矩阵） |
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
-| M6~M7、M9 | 未开始 |
+| M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `ea886f8`） |
+| M7、M9 | 未开始 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
 | M12 PostHog 遥测 | 规划中（决策 D8，2026-08-04 立项）；待 D-open-9 定稿，禁止提前实现 |
@@ -50,10 +51,11 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 - `internal/protocol`、`config`、`filesystem`、`logging`、`state`、`lock`、`mirror`、
   `cli`、`doctor`、`cleanup`、`version` 已实现；
 - `gitrepo` 已实现版本映射、go-git 浅克隆、仓库校验、原子替换、中断恢复和 workspace 服务；
-  `uv` 已实现固定工具 bootstrap、受管 Python、锁定依赖、恢复和 repair；`backend`、`health`、
-  `process` 仍只有占位；
+  `uv` 已实现固定工具 bootstrap、受管 Python、锁定依赖、恢复和 repair；`process`、`health`、
+  `backend` 已实现 Windows Job 进程树、固定健康检查、managed/development 监督、控制关闭与一次重启；
 - `internal/cli` 已按架构命令树注册全部命令，`version`/`doctor`/`cleanup`、workspace 和
-  M5 environment/bootstrap/dependencies/repair 为真实实现；后续里程碑命令仍返回 `UNSUPPORTED_MODE`；
+  M5 environment/bootstrap/dependencies/repair 以及 M6 `backend supervise` 为真实实现；尚未实现的
+  模式仍失败关闭并返回 `UNSUPPORTED_MODE`；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
 
 Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`。

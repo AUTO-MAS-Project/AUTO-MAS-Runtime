@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -24,6 +27,11 @@ type replayAction struct {
 	DelayMS           int           `json:"delayMs"`
 	Events            []replayEvent `json:"events"`
 	CreateDirectories []string      `json:"createDirectories"`
+	Exec              string        `json:"exec"`
+	ExecArgs          []string      `json:"execArgs"`
+	PIDFile           string        `json:"pidFile"`
+	ExecReadyFile     string        `json:"execReadyFile"`
+	ExecReleaseFile   string        `json:"execReleaseFile"`
 }
 
 type replayEvent struct {
@@ -84,6 +92,41 @@ func main() {
 			os.Exit(93)
 		}
 	}
+	if action.PIDFile != "" {
+		if err := writeSignalFile(action.PIDFile, []byte(fmt.Sprintf("%d\n", os.Getpid()))); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(94)
+		}
+	}
+	if action.Exec != "" {
+		command := exec.Command(action.Exec, action.ExecArgs...)
+		command.Stdin = os.Stdin
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		command.Env = os.Environ()
+		runErr := command.Run()
+		if action.ExecReadyFile != "" {
+			if err := writeSignalFile(action.ExecReadyFile, []byte("ready\n")); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(95)
+			}
+		}
+		if action.ExecReleaseFile != "" {
+			if err := waitForSignalFile(action.ExecReleaseFile); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(95)
+			}
+		}
+		if runErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(runErr, &exitErr) {
+				os.Exit(exitErr.ExitCode())
+			}
+			fmt.Fprintln(os.Stderr, runErr)
+			os.Exit(94)
+		}
+		os.Exit(0)
+	}
 	if action.DelayMS > 0 {
 		time.Sleep(time.Duration(action.DelayMS) * time.Millisecond)
 	}
@@ -129,4 +172,51 @@ func splitEnvironment(entry string) (string, string, bool) {
 		}
 	}
 	return "", "", false
+}
+
+func writeSignalFile(path string, payload []byte) (resultErr error) {
+	if path == "" {
+		return errors.New("signal file path is empty")
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".fakeuv-signal-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			resultErr = errors.Join(resultErr, os.Remove(temporaryPath))
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return errors.Join(err, temporary.Close())
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		return errors.Join(err, temporary.Close())
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	removeTemporary = false
+	return nil
+}
+
+func waitForSignalFile(path string) error {
+	if path == "" {
+		return errors.New("release file path is empty")
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		<-ticker.C
+	}
 }

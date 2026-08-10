@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -237,6 +238,12 @@ func TestWorkspaceSyncCommand_JoinsClosableControlReader(t *testing.T) {
 	case <-input.readDone:
 	default:
 		t.Fatal("control reader goroutine remains after Execute returned")
+	}
+}
+
+func TestWorkspaceControlInput_DoesNotCloseProcessStdin(t *testing.T) {
+	if closer, owned := ownedControlInput(os.Stdin); closer != nil || owned {
+		t.Fatalf("ownedControlInput(os.Stdin) = (%v, %t), want (nil, false)", closer, owned)
 	}
 }
 

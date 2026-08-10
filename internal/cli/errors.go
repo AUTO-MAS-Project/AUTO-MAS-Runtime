@@ -16,6 +16,13 @@ type operationError interface {
 	Details() map[string]any
 }
 
+// terminalStatusError 允许长驻应用服务为 failure result 提供稳定生命周期终态。
+// 未实现该接口的命令继续使用通用 failed/cancelled 状态。
+type terminalStatusError interface {
+	error
+	TerminalStatus() string
+}
+
 // committedOperationError 标记已经跨过不可逆提交点的应用服务错误。
 type committedOperationError interface {
 	operationError

@@ -4,6 +4,7 @@ import "path/filepath"
 
 type layoutPaths struct {
 	repoDir              string
+	backendEntryFile     string
 	repoVersionFile      string
 	pythonVersionFile    string
 	pyProjectFile        string
@@ -18,6 +19,7 @@ type layoutPaths struct {
 	pythonDir            string
 	pythonExecutable     string
 	venvDir              string
+	venvPythonExecutable string
 	runtimeCacheDir      string
 	uvCacheDir           string
 	downloadCacheDir     string
@@ -42,6 +44,7 @@ func newLayoutPaths(root string) layoutPaths {
 
 	return layoutPaths{
 		repoDir:              filepath.Join(root, "repo"),
+		backendEntryFile:     filepath.Join(root, "repo", "main.py"),
 		repoVersionFile:      filepath.Join(root, "repo", "res", "version.json"),
 		pythonVersionFile:    filepath.Join(root, "repo", ".python-version"),
 		pyProjectFile:        filepath.Join(root, "repo", "pyproject.toml"),
@@ -56,6 +59,7 @@ func newLayoutPaths(root string) layoutPaths {
 		pythonDir:            pythonDir,
 		pythonExecutable:     filepath.Join(pythonDir, "python.exe"),
 		venvDir:              filepath.Join(environmentDir, "venv"),
+		venvPythonExecutable: filepath.Join(environmentDir, "venv", "Scripts", "python.exe"),
 		runtimeCacheDir:      cacheDir,
 		uvCacheDir:           filepath.Join(cacheDir, "uv"),
 		downloadCacheDir:     filepath.Join(cacheDir, "downloads"),
@@ -73,6 +77,9 @@ func newLayoutPaths(root string) layoutPaths {
 
 // RepoDir 返回受管后端仓库目录。
 func (l *Layout) RepoDir() string { return l.paths.repoDir }
+
+// BackendEntryFile 返回受管后端入口文件路径。
+func (l *Layout) BackendEntryFile() string { return l.paths.backendEntryFile }
 
 // RepoVersionFile 返回受管仓库版本文件路径。
 func (l *Layout) RepoVersionFile() string { return l.paths.repoVersionFile }
@@ -116,6 +123,9 @@ func (l *Layout) PythonExecutable() string { return l.paths.pythonExecutable }
 
 // VenvDir 返回受管 Python 虚拟环境目录。
 func (l *Layout) VenvDir() string { return l.paths.venvDir }
+
+// VenvPythonExecutable 返回受管项目虚拟环境的 Python 解释器路径。
+func (l *Layout) VenvPythonExecutable() string { return l.paths.venvPythonExecutable }
 
 // RuntimeCacheDir 返回 Runtime 缓存根目录。
 func (l *Layout) RuntimeCacheDir() string { return l.paths.runtimeCacheDir }

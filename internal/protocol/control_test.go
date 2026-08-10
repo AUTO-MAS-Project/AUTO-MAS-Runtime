@@ -1167,6 +1167,43 @@ func TestControlReader_StopAcceptingOnShutdownSkipsBufferedCommands(t *testing.T
 	}
 }
 
+type keepReaderOnShutdownHandler struct {
+	controlContractHandler
+}
+
+func (*keepReaderOnShutdownHandler) StopAfterShutdown(ControlCommand) bool { return false }
+
+func TestControlReader_ShutdownPolicyCanKeepReaderForPriorCancel(t *testing.T) {
+	handler := &keepReaderOnShutdownHandler{controlContractHandler: controlContractHandler{disposition: ControlAccepted}}
+	reader, err := NewControlReader(
+		strings.NewReader(
+			controlTestLine(ControlCancel, controlTestID(1))+"\n"+
+				controlTestLine(ControlShutdown, controlTestID(2))+"\n"+
+				controlTestLine(ControlStatus, controlTestID(3))+"\n",
+		),
+		&controlContractWarningEmitter{},
+		handler,
+		ControlCancel,
+		ControlShutdown,
+		ControlStatus,
+	)
+	if err != nil {
+		t.Fatalf("NewControlReader() error = %v", err)
+	}
+	if err := reader.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := len(handler.prepared); got != 3 {
+		t.Fatalf("prepared commands = %d, want 3", got)
+	}
+	reader.mu.Lock()
+	stopped := reader.stopped
+	reader.mu.Unlock()
+	if stopped {
+		t.Fatal("reader stopped after policy declined shutdown stop")
+	}
+}
+
 func TestControlReader_StatusSnapshotKeepsLifecycleAndCorrelatesEvents(t *testing.T) {
 	machine, err := NewLifecycleMachine(StateReadyToStart)
 	if err != nil {

@@ -415,6 +415,11 @@ func TestFakeUVProcess(t *testing.T) {
 			uvColorEnv,
 			uvNoProgressEnv,
 			"PATH",
+			autoMASUVExecutable,
+			autoMASProtocol,
+			autoMASVersion,
+			autoMASCommit,
+			autoMASSupervised,
 		} {
 			lines = append(lines, key+"="+os.Getenv(key))
 		}

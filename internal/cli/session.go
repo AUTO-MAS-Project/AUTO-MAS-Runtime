@@ -199,22 +199,30 @@ func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, su
 
 func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) int {
 	code, stage, message, details := classifyFailure(err, fallbackStage)
-	errorEvent, err := protocol.NewErrorEvent(code, stage, message, details)
-	if err != nil {
-		writeDiagnostic(deps.io, err)
+	errorEvent, eventErr := protocol.NewErrorEvent(code, stage, message, details)
+	if eventErr != nil {
+		writeDiagnostic(deps.io, eventErr)
 		return exitCodeFor(code)
 	}
-	if err := emitter.EmitError(errorEvent); err != nil {
-		writeDiagnostic(deps.io, err)
+	if emitErr := emitter.EmitError(errorEvent); emitErr != nil {
+		writeDiagnostic(deps.io, emitErr)
 		return exitCodeFor(code)
 	}
 	status := "failed"
 	if code == protocol.CodeOperationCancelled {
 		status = "cancelled"
+	} else {
+		var terminal terminalStatusError
+		if errors.As(err, &terminal) {
+			candidate := protocol.StateStatus(terminal.TerminalStatus())
+			if protocol.IsKnownStateStatus(candidate) {
+				status = string(candidate)
+			}
+		}
 	}
 	result := protocol.NewFailureResult(errorEvent, status, message, details)
-	if err := emitter.EmitResult(result); err != nil {
-		writeDiagnostic(deps.io, err)
+	if emitErr := emitter.EmitResult(result); emitErr != nil {
+		writeDiagnostic(deps.io, emitErr)
 		return exitCodeFor(code)
 	}
 	return exitCodeFor(code)
@@ -283,21 +291,34 @@ func findCommittedOperationError(err error) operationError {
 	if err == nil {
 		return nil
 	}
-	if committedErr, ok := err.(committedOperationError); ok && committedErr.Committed() {
-		return committedErr
+	var selected operationError
+	var committedErr committedOperationError
+	if errors.As(err, &committedErr) && committedErr.Committed() {
+		selected = committedErr
 	}
 	if multi, ok := err.(interface{ Unwrap() []error }); ok {
 		for _, child := range multi.Unwrap() {
-			if found := findCommittedOperationError(child); found != nil {
-				return found
-			}
+			selected = selectCommittedOperationError(selected, findCommittedOperationError(child))
 		}
-		return nil
+		return selected
 	}
 	if single, ok := err.(interface{ Unwrap() error }); ok {
-		return findCommittedOperationError(single.Unwrap())
+		selected = selectCommittedOperationError(selected, findCommittedOperationError(single.Unwrap()))
 	}
-	return nil
+	return selected
+}
+
+func selectCommittedOperationError(current, candidate operationError) operationError {
+	if current == nil {
+		return candidate
+	}
+	if candidate == nil {
+		return current
+	}
+	if current.Stage() != protocol.StageBackendCleanup && candidate.Stage() == protocol.StageBackendCleanup {
+		return candidate
+	}
+	return current
 }
 
 func findControlInfrastructureError(err error) operationError {
