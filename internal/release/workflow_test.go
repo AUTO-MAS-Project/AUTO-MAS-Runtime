@@ -31,6 +31,8 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "version ldflag", snippet: "internal/version.Version=$($env:RELEASE_TAG)"},
 		{name: "commit ldflag", snippet: "internal/version.Commit=$($env:SOURCE_COMMIT)"},
 		{name: "build date ldflag", snippet: "internal/version.BuildDate=$($env:BUILD_DATE)"},
+		{name: "peeled source commit", snippet: "git rev-parse --verify \"HEAD^{commit}\""},
+		{name: "source commit output", snippet: "source_commit=$sourceCommit"},
 		{name: "license guard", snippet: "LICENSE is required for release packaging"},
 		{name: "archive entries", snippet: "Compress-Archive -Path @(\"auto-mas-runtime.exe\", \"LICENSE\", \"README.md\")"},
 		{name: "SHA256 sums", snippet: "Get-FileHash -LiteralPath $archive -Algorithm SHA256"},
@@ -77,8 +79,12 @@ func TestReleaseWorkflow_SmokeAndImmutabilityContract(t *testing.T) {
 		{name: "existing release rejection", snippet: "already exists; refusing to overwrite it"},
 		{name: "release archive download", snippet: "gh release download $env:RELEASE_TAG"},
 		{name: "version NDJSON", snippet: "version --output ndjson"},
+		{name: "version empty line rejection", snippet: "version emitted an empty NDJSON line"},
+		{name: "version object rejection", snippet: "version emitted a JSON value that is not an object"},
 		{name: "version tag identity", snippet: "runtimeVersion -ne $env:RELEASE_TAG"},
 		{name: "doctor NDJSON", snippet: "doctor --output ndjson --app-root $smokeRoot"},
+		{name: "doctor empty line rejection", snippet: "doctor emitted an empty NDJSON line"},
+		{name: "doctor object rejection", snippet: "doctor emitted a JSON value that is not an object"},
 		{name: "hello assertion", snippet: "did not start with a hello event"},
 		{name: "terminal result assertion", snippet: "did not emit exactly one final result event"},
 	}
@@ -88,6 +94,12 @@ func TestReleaseWorkflow_SmokeAndImmutabilityContract(t *testing.T) {
 				t.Fatalf("release workflow missing %s snippet %q", test.name, test.snippet)
 			}
 		})
+	}
+	if got := strings.Count(source, "ConvertFrom-Json -ErrorAction Stop -NoEnumerate"); got != 2 {
+		t.Fatalf("strict NDJSON parser count = %d, want 2", got)
+	}
+	if got := strings.Count(source, "$event.GetType() -ne [System.Management.Automation.PSCustomObject]"); got != 2 {
+		t.Fatalf("NDJSON object guard count = %d, want 2", got)
 	}
 }
 

@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       tag: ${{ steps.metadata.outputs.tag }}
+      source_commit: ${{ steps.metadata.outputs.source_commit }}
       archive_name: ${{ steps.metadata.outputs.archive_name }}
       prerelease: ${{ steps.metadata.outputs.prerelease }}
     defaults:
@@ -44,7 +45,6 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
-          SOURCE_COMMIT: ${{ github.sha }}
           FORCED_PUSH: ${{ github.event.forced }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -64,8 +64,9 @@ jobs:
               $env:RELEASE_TAG.EndsWith(".lock")) {
             throw "release tag contains a forbidden git ref pattern"
           }
-          if ($env:SOURCE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
-            throw "github.sha is not a full commit id"
+          $sourceCommit = (& git rev-parse --verify "HEAD^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+            throw "checked out source is not a full commit id"
           }
 
           $isPrerelease = $env:RELEASE_TAG -imatch '-(?:beta|rc|alpha)'
@@ -74,6 +75,7 @@ jobs:
 
           @(
             "tag=$($env:RELEASE_TAG)"
+            "source_commit=$sourceCommit"
             "archive_name=$archiveName"
             "prerelease=$($isPrerelease.ToString().ToLowerInvariant())"
             "build_date=$buildDate"
@@ -91,7 +93,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
-          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ steps.metadata.outputs.source_commit }}
         run: |
           $ErrorActionPreference = "Stop"
           $env:GOOS = "windows"
@@ -187,7 +189,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.package.outputs.tag }}
-          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ needs.package.outputs.source_commit }}
           REPOSITORY: ${{ github.repository }}
           API_URL: ${{ github.api_url }}
         run: |
@@ -350,14 +352,20 @@ jobs:
           $events = @(
             foreach ($line in (Get-Content -LiteralPath $stdout -Encoding utf8)) {
               if ([string]::IsNullOrWhiteSpace($line)) {
-                continue
+                throw "version emitted an empty NDJSON line"
               }
+              $event = $null
               try {
-                $line | ConvertFrom-Json -ErrorAction Stop
+                $event = $line | ConvertFrom-Json -ErrorAction Stop -NoEnumerate
               }
               catch {
                 throw "version emitted a non-JSON line: $line"
               }
+              if ($null -eq $event -or
+                  $event.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+                throw "version emitted a JSON value that is not an object"
+              }
+              $event
             }
           )
           if ($events.Count -lt 2 -or $events[0].type -ne "hello") {
@@ -391,14 +399,20 @@ jobs:
           $events = @(
             foreach ($line in (Get-Content -LiteralPath $stdout -Encoding utf8)) {
               if ([string]::IsNullOrWhiteSpace($line)) {
-                continue
+                throw "doctor emitted an empty NDJSON line"
               }
+              $event = $null
               try {
-                $line | ConvertFrom-Json -ErrorAction Stop
+                $event = $line | ConvertFrom-Json -ErrorAction Stop -NoEnumerate
               }
               catch {
                 throw "doctor emitted a non-JSON line: $line"
               }
+              if ($null -eq $event -or
+                  $event.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+                throw "doctor emitted a JSON value that is not an object"
+              }
+              $event
             }
           )
           if ($events.Count -lt 2) {
