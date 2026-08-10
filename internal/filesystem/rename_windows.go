@@ -20,6 +20,19 @@ type renameAttempt struct {
 	destination CanonicalPath
 }
 
+// renamePinRetryError 表示已经在规范 source 身份上确认的可重试叶子占用。
+type renamePinRetryError struct {
+	err error
+}
+
+func (e *renamePinRetryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *renamePinRetryError) Unwrap() error {
+	return e.err
+}
+
 // AtomicRename 按受控用途执行 no-replace 的句柄相对原子重命名。
 func (o *Operator) AtomicRename(
 	ctx context.Context,
@@ -31,7 +44,8 @@ func (o *Operator) AtomicRename(
 	for attemptIndex := 0; ; attemptIndex++ {
 		attempt, err := o.pinRenameAttempt(ctx, request)
 		if err != nil {
-			if !isTransientRenamePinError(err, request.Source) {
+			var retryErr *renamePinRetryError
+			if !errors.As(err, &retryErr) {
 				return RenameResult{}, err
 			}
 			if attemptIndex >= len(o.delays) {
@@ -200,6 +214,9 @@ func (o *Operator) pinRenameAttempt(
 		o.api,
 	)
 	if err != nil {
+		if isTransientRenamePinError(err, source.String()) {
+			return nil, &renamePinRetryError{err: err}
+		}
 		return nil, err
 	}
 	sourceObject := &sourceChain.objects[len(sourceChain.objects)-1]

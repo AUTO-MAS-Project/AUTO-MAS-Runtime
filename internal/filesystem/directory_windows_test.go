@@ -24,23 +24,29 @@ func TestPrepareManagedDirectory_CreatesAndPinsExactTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareManagedDirectory() error = %v", err)
 	}
-	if lease.Path() != target {
-		t.Fatalf("lease.Path() = %q, want %q", lease.Path(), target)
+	t.Cleanup(func() {
+		if err := lease.Close(); err != nil {
+			t.Errorf("cleanup lease.Close() error = %v", err)
+		}
+	})
+	wantPath := mustCanonicalize(t, target).String()
+	if lease.Path() != wantPath {
+		t.Fatalf("lease.Path() = %q, want %q", lease.Path(), wantPath)
 	}
-	info, err := os.Lstat(target)
+	info, err := os.Lstat(lease.Path())
 	if err != nil {
 		t.Fatalf("Lstat(target) error = %v", err)
 	}
 	if !info.IsDir() {
 		t.Fatalf("target mode = %v, want directory", info.Mode())
 	}
-	if err := os.Remove(target); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+	if err := os.Remove(lease.Path()); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 		t.Fatalf("Remove(target) error = %v, want sharing violation while lease is open", err)
 	}
 	if err := lease.Close(); err != nil {
 		t.Fatalf("lease.Close() error = %v", err)
 	}
-	if err := os.Remove(target); err != nil {
+	if err := os.Remove(lease.Path()); err != nil {
 		t.Fatalf("Remove(target) after close error = %v", err)
 	}
 	if err := lease.Close(); err != nil {

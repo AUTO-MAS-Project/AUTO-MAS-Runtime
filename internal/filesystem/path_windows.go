@@ -125,6 +125,9 @@ func inspectManagedDirectoryWith(
 	if err := ctx.Err(); err != nil {
 		return DirectoryInspection{}, err
 	}
+	if err := rejectRawReparseChain(ctx, path, api); err != nil {
+		return DirectoryInspection{}, err
+	}
 	target, err := canonicalizeContextWith(ctx, path, api)
 	if err != nil {
 		return DirectoryInspection{}, err
@@ -217,30 +220,15 @@ func rejectMissingReparseChain(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var probeErr error
-		for _, directory := range []bool{true, false} {
-			handle, err := api.openPath(nativeWindowsPath(current), reparseProbeSpec(directory))
-			if err != nil {
-				if !isWindowsNotFound(err) {
-					probeErr = err
-				}
-				continue
-			}
-			identity, identityErr := api.identity(handle)
-			closeErr := api.closeHandle(handle)
-			if identityErr != nil || closeErr != nil {
-				return errors.Join(
-					wrapFileError("identify-reparse-probe", current, identityErr),
-					wrapFileError("close-reparse-probe", current, closeErr),
-				)
-			}
-			if identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		exists, reparse, err := probeRawReparsePoint(current, api)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if reparse {
 				return unsafeReparseError(current)
 			}
 			return nil
-		}
-		if probeErr != nil {
-			return &FileError{Operation: "probe-reparse", Path: current, Err: probeErr}
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
@@ -248,6 +236,79 @@ func rejectMissingReparseChain(
 		}
 		current = parent
 	}
+}
+
+// rejectRawReparseChain 在规范化可能解析祖先路径前检查调用方提供的原始组件链。
+func rejectRawReparseChain(ctx context.Context, path string, api pathAPI) error {
+	if ctx == nil || path == "" || !api.valid() {
+		return fmt.Errorf("%w: invalid raw reparse input", ErrInvalidArgument)
+	}
+	cleaned, err := cleanAbsoluteWindowsPath(path)
+	if err != nil {
+		return err
+	}
+	volume := filepath.VolumeName(cleaned)
+	current := cleaned
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attributes, attributesErr := api.attributes(nativeWindowsPath(current))
+		switch {
+		case attributesErr == nil:
+			if attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+				return unsafeReparseError(current)
+			}
+		case !isWindowsNotFound(attributesErr):
+			return &FileError{Operation: "attributes", Path: current, Err: attributesErr}
+		default:
+			exists, reparse, probeErr := probeRawReparsePoint(current, api)
+			if probeErr != nil {
+				return probeErr
+			}
+			if exists {
+				if reparse {
+					return unsafeReparseError(current)
+				}
+				return &FileError{Operation: "probe-reparse", Path: current, Err: ErrIdentityChanged}
+			}
+		}
+		if isWindowsVolumeRoot(current, volume) {
+			return nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+// probeRawReparsePoint 不跟随最终对象，补足属性查询无法识别悬空链接的情况。
+func probeRawReparsePoint(path string, api pathAPI) (bool, bool, error) {
+	var probeErr error
+	for _, directory := range []bool{true, false} {
+		handle, err := api.openPath(nativeWindowsPath(path), reparseProbeSpec(directory))
+		if err != nil {
+			if !isWindowsNotFound(err) {
+				probeErr = err
+			}
+			continue
+		}
+		identity, identityErr := api.identity(handle)
+		closeErr := api.closeHandle(handle)
+		if identityErr != nil || closeErr != nil {
+			return true, false, errors.Join(
+				wrapFileError("identify-reparse-probe", path, identityErr),
+				wrapFileError("close-reparse-probe", path, closeErr),
+			)
+		}
+		return true, identity.attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0, nil
+	}
+	if probeErr != nil {
+		return false, false, &FileError{Operation: "probe-reparse", Path: path, Err: probeErr}
+	}
+	return false, false, nil
 }
 
 func reparseProbeSpec(directory bool) openSpec {

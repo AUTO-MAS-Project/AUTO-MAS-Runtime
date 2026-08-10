@@ -297,6 +297,66 @@ func TestAtomicRename_RetriesPinSharingViolationBeforeRename(t *testing.T) {
 	}
 }
 
+func TestAtomicRename_RetriesPinSharingViolationAcrossEquivalentPathSpellings(t *testing.T) {
+	tests := []struct {
+		name      string
+		transform func(*testing.T, string) string
+	}{
+		{
+			name: "extended path",
+			transform: func(_ *testing.T, path string) string {
+				return extendedPathForTest(path)
+			},
+		},
+		{
+			name: "short path",
+			transform: func(t *testing.T, path string) string {
+				short, ok := shortPathForTest(t, path)
+				if !ok {
+					t.Skip("volume does not expose an 8.3 short path for the fixture")
+				}
+				return short
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
+			request.Source = test.transform(t, request.Source)
+			operator.delays = []time.Duration{10 * time.Millisecond}
+			openRelative := operator.api.openRelative
+			pinCalls := 0
+			operator.api.openRelative = func(
+				parent windows.Handle,
+				name string,
+				spec openSpec,
+			) (windows.Handle, error) {
+				if name == filepath.Base(request.Source) && spec == renameSourceSpec() {
+					pinCalls++
+					if pinCalls == 1 {
+						return windows.InvalidHandle, windows.ERROR_SHARING_VIOLATION
+					}
+				}
+				return openRelative(parent, name, spec)
+			}
+			waitCalls := 0
+			operator.wait = func(context.Context, time.Duration) error {
+				waitCalls++
+				return nil
+			}
+
+			result, err := operator.AtomicRename(t.Context(), request)
+			if err != nil || !result.MutationApplied {
+				t.Fatalf("AtomicRename() = %#v, %v, want retry success", result, err)
+			}
+			if pinCalls != 2 || waitCalls != 1 {
+				t.Fatalf("pin calls/waits = %d/%d, want 2/1", pinCalls, waitCalls)
+			}
+		})
+	}
+}
+
 func TestAtomicRename_DoesNotRetryParentAccessDeniedAsOccupied(t *testing.T) {
 	operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
 	openRelative := operator.api.openRelative
@@ -352,6 +412,11 @@ func TestTransientRenamePinError_RejectsCloseFailure(t *testing.T) {
 
 func TestAtomicRename_MapsPinSharingViolationAfterRetryExhaustion(t *testing.T) {
 	operator, _, request := newRenameFixture(t, RenameRepositoryToRetired)
+	if short, ok := shortPathForTest(t, request.Source); ok {
+		request.Source = short
+	} else {
+		request.Source = extendedPathForTest(request.Source)
+	}
 	operator.delays = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
 	openRelative := operator.api.openRelative
 	pinCalls := 0
@@ -476,6 +541,7 @@ func TestAtomicRename_CancellationAfterPinStopsBeforeMutation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	caseSensitive := operator.api.caseSensitive
 	finalPath := operator.api.finalPath
+	appRoot := mustCanonicalize(t, layout.AppRoot()).String()
 	parentChecks := 0
 	operator.api.caseSensitive = func(handle windows.Handle) (bool, error) {
 		value, err := caseSensitive(handle)
@@ -485,7 +551,7 @@ func TestAtomicRename_CancellationAfterPinStopsBeforeMutation(t *testing.T) {
 		path, pathErr := finalPath(handle)
 		if pathErr == nil {
 			display, displayErr := displayWindowsPath(path)
-			if displayErr == nil && sameRenamePath(display, layout.AppRoot()) {
+			if displayErr == nil && sameRenamePath(display, appRoot) {
 				parentChecks++
 				if parentChecks == 2 {
 					cancel()

@@ -140,6 +140,72 @@ func TestInspectManagedDirectory_RejectsDanglingReparsePoints(t *testing.T) {
 	})
 }
 
+func TestInspectManagedDirectory_RejectsRawReparseBeforeCanonicalization(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func(*testing.T, string) (*config.Layout, string)
+		marker func(*config.Layout, string) string
+	}{
+		{
+			name: "direct dangling",
+			setup: func(t *testing.T, root string) (*config.Layout, string) {
+				appRoot := filepath.Join(root, "direct-app")
+				if err := os.MkdirAll(appRoot, 0o700); err != nil {
+					t.Fatalf("MkdirAll(app-root) error = %v", err)
+				}
+				layout := inspectTestLayout(t, appRoot, root)
+				return layout, layout.RepoDir()
+			},
+			marker: func(_ *config.Layout, target string) string { return target },
+		},
+		{
+			name: "ancestor",
+			setup: func(t *testing.T, root string) (*config.Layout, string) {
+				appRoot := filepath.Join(root, "raw-ancestor", "app")
+				if err := os.MkdirAll(appRoot, 0o700); err != nil {
+					t.Fatalf("MkdirAll(app-root) error = %v", err)
+				}
+				layout := inspectTestLayout(t, appRoot, root)
+				return layout, layout.AppRoot()
+			},
+			marker: func(layout *config.Layout, _ string) string {
+				return filepath.Dir(layout.AppRoot())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			layout, target := test.setup(t, root)
+			markedPath := test.marker(layout, target)
+			api := newProductionPathAPI()
+			attributes := api.attributes
+			openPath := api.openPath
+			api.attributes = func(path string) (uint32, error) {
+				display, err := displayWindowsPath(path)
+				if err == nil && sameRenamePath(display, markedPath) {
+					return windows.FILE_ATTRIBUTE_REPARSE_POINT, nil
+				}
+				return attributes(path)
+			}
+			api.openPath = func(path string, spec openSpec) (windows.Handle, error) {
+				display, err := displayWindowsPath(path)
+				if err == nil && sameRenamePath(display, markedPath) {
+					t.Fatalf("opened raw reparse component %q before rejection", display)
+				}
+				return openPath(path, spec)
+			}
+
+			inspection, err := inspectManagedDirectoryWith(t.Context(), layout, target, api)
+			if inspection != (DirectoryInspection{}) {
+				t.Fatalf("inspection = %#v, want zero", inspection)
+			}
+			assertFilesystemCode(t, err, protocol.CodeUnsafeReparsePoint)
+		})
+	}
+}
+
 func TestInspectManagedDirectory_PermissionAndCancellationFailBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	layout := inspectTestLayout(t, filepath.Join(root, "app"), root)
