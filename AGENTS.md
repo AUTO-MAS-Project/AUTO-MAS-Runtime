@@ -30,7 +30,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-08-10）
+## 2. 当前状态（截至 2026-08-11）
 
 | 里程碑 | 状态 |
 | --- | --- |
@@ -41,7 +41,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M4 工作区同步 | T4.0~T4.7 **已完成**（含三轮对抗性审查与组件矩阵） |
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
 | M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `ea886f8`） |
-| M7 GitHub CI/CD 发布 | T7.1 已完成；T7.2/T7.3 实现与本地验收已完成，远端测试 tag 验收待授权；T7.4 明确跳过；T7.5 按 D3 延后 |
+| M7 GitHub CI/CD 发布 | T7.1~T7.4 **已完成**（beta.2 Release run `31407585577`、三 job 全绿、独立资产/NDJSON 验收通过）；T7.5 按 D3 延后 |
 | M9 联调与首版验收 | 未开始 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
@@ -58,7 +58,8 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
   M5 environment/bootstrap/dependencies/repair 以及 M6 `backend supervise` 为真实实现；尚未实现的
   模式仍失败关闭并返回 `UNSUPPORTED_MODE`；
 - `.github/workflows/release.yml` 已实现 Windows x64 测试、版本注入、未签名 zip/SHA-256 发布与
-  Release 资产冒烟验证；真实测试 tag 仍需单独授权后执行；
+  Release 资产冒烟验证，并使用原生 Node.js 24 的 upload v7/download v8/release v3 action；
+  beta.2 测试 Release 已完成远端验收；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
 
 Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`。
