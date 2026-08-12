@@ -75,6 +75,17 @@ The `version --output ndjson` result details report the injected tag, commit, an
 the protocol `hello.runtimeVersion` reports the same injected tag. The project is distributed under
 AGPL-3.0-or-later; see [LICENSE](LICENSE).
 
+## Error observation
+
+Official release builds can enable Sentry error observation with the optional GitHub Actions
+repository secret `AUTO_MAS_SENTRY_DSN`. The value is injected into the executable at build time;
+it must be a Sentry project DSN, not a Sentry auth token. If the secret is absent, telemetry remains
+a no-op. The release workflow does not use PostHog or Umami credentials.
+
+For a one-off local run, set `AUTO_MAS_SENTRY_DSN` in the current PowerShell 7 process. Set
+`AUTO_MAS_TELEMETRY=disabled` to disable Sentry before the SDK is initialized. Runtime reports only
+sanitized `INTERNAL_ERROR` and unexpected panic events; it does not enable tracing or log forwarding.
+
 ## Test and lint
 
 ```powershell

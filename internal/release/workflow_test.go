@@ -31,6 +31,9 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "version ldflag", snippet: "internal/version.Version=$($env:RELEASE_TAG)"},
 		{name: "commit ldflag", snippet: "internal/version.Commit=$($env:SOURCE_COMMIT)"},
 		{name: "build date ldflag", snippet: "internal/version.BuildDate=$($env:BUILD_DATE)"},
+		{name: "telemetry disabled during release tests", snippet: "AUTO_MAS_TELEMETRY: disabled"},
+		{name: "optional Sentry secret", snippet: "AUTO_MAS_SENTRY_DSN: ${{ secrets.AUTO_MAS_SENTRY_DSN }}"},
+		{name: "Sentry DSN ldflag", snippet: "internal/telemetry.BuildSentryDSN=$($env:AUTO_MAS_SENTRY_DSN)"},
 		{name: "peeled source commit", snippet: "git rev-parse --verify \"HEAD^{commit}\""},
 		{name: "source commit output", snippet: "source_commit=$sourceCommit"},
 		{name: "license guard", snippet: "LICENSE is required for release packaging"},
@@ -58,6 +61,11 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 	}
 	if strings.Contains(source, "overwrite_files:") {
 		t.Fatal("release workflow relies on an undeclared action input for immutability")
+	}
+	for _, forbidden := range []string{"AUTO_MAS_POSTHOG", "AUTO_MAS_UMAMI", "SENTRY_AUTH_TOKEN"} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("release workflow contains cancelled or unnecessary secret %q", forbidden)
+		}
 	}
 	for _, legacy := range []string{
 		"uses: actions/upload-artifact@v4",

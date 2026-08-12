@@ -18,6 +18,8 @@ jobs:
     name: Build release package
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      AUTO_MAS_TELEMETRY: disabled
     outputs:
       tag: ${{ steps.metadata.outputs.tag }}
       source_commit: ${{ steps.metadata.outputs.source_commit }}
@@ -94,6 +96,7 @@ jobs:
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
           SOURCE_COMMIT: ${{ steps.metadata.outputs.source_commit }}
+          AUTO_MAS_SENTRY_DSN: ${{ secrets.AUTO_MAS_SENTRY_DSN }}
         run: |
           $ErrorActionPreference = "Stop"
           $env:GOOS = "windows"
@@ -101,7 +104,17 @@ jobs:
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
           $binary = Join-Path $dist "auto-mas-runtime.exe"
-          $ldflags = "-s -w -X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Version=$($env:RELEASE_TAG) -X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Commit=$($env:SOURCE_COMMIT) -X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.BuildDate=$($env:BUILD_DATE)"
+          $ldflagValues = @(
+            "-s"
+            "-w"
+            "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Version=$($env:RELEASE_TAG)"
+            "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Commit=$($env:SOURCE_COMMIT)"
+            "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.BuildDate=$($env:BUILD_DATE)"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:AUTO_MAS_SENTRY_DSN)) {
+            $ldflagValues += "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry.BuildSentryDSN=$($env:AUTO_MAS_SENTRY_DSN)"
+          }
+          $ldflags = $ldflagValues -join " "
           & go build -trimpath -buildvcs=false -ldflags $ldflags -o $binary ./cmd/auto-mas-runtime
           if ($LASTEXITCODE -ne 0) {
             throw "Windows x64 build failed"
@@ -298,6 +311,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    env:
+      AUTO_MAS_TELEMETRY: disabled
     defaults:
       run:
         shell: pwsh
