@@ -58,7 +58,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 - `internal/cli` 已按架构命令树注册全部命令，`version`/`doctor`/`cleanup`、workspace 和
   M5 environment/bootstrap/dependencies/repair 以及 M6 `backend supervise` 为真实实现；尚未实现的
   模式仍失败关闭并返回 `UNSUPPORTED_MODE`；
-- `.github/workflows/release.yml` 已实现 Windows x64 测试、版本注入、未签名 zip/SHA-256 发布与
+- `.github/workflows/release.yml` 已实现 Windows x64 测试、版本注入、未签名 EXE/SHA-256 直接发布与
   Release 资产冒烟验证，并使用原生 Node.js 24 的 upload v7/download v8/release v3 action；
   beta.2 测试 Release 已完成远端验收；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。

@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   package:
-    name: Build release package
+    name: Build release executable
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -23,7 +23,7 @@ jobs:
     outputs:
       tag: ${{ steps.metadata.outputs.tag }}
       source_commit: ${{ steps.metadata.outputs.source_commit }}
-      archive_name: ${{ steps.metadata.outputs.archive_name }}
+      binary_name: ${{ steps.metadata.outputs.binary_name }}
       prerelease: ${{ steps.metadata.outputs.prerelease }}
     defaults:
       run:
@@ -73,12 +73,12 @@ jobs:
 
           $isPrerelease = $env:RELEASE_TAG -imatch '-(?:beta|rc|alpha)'
           $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $archiveName = "auto-mas-runtime-$($env:RELEASE_TAG)-windows-x64.zip"
+          $binaryName = "auto-mas-runtime.exe"
 
           @(
             "tag=$($env:RELEASE_TAG)"
             "source_commit=$sourceCommit"
-            "archive_name=$archiveName"
+            "binary_name=$binaryName"
             "prerelease=$($isPrerelease.ToString().ToLowerInvariant())"
             "build_date=$buildDate"
           ) | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8NoBOM
@@ -123,51 +123,22 @@ jobs:
             throw "Windows x64 build did not produce auto-mas-runtime.exe"
           }
 
-      - name: Assemble archive and checksums
+      - name: Assemble executable and checksums
         env:
-          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
-          ARCHIVE_NAME: ${{ steps.metadata.outputs.archive_name }}
+          BINARY_NAME: ${{ steps.metadata.outputs.binary_name }}
         run: |
           $ErrorActionPreference = "Stop"
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
-          $package = Join-Path $dist "package"
-          $binary = Join-Path $dist "auto-mas-runtime.exe"
-          $license = Join-Path $env:GITHUB_WORKSPACE "LICENSE"
-          if (-not (Test-Path -LiteralPath $license -PathType Leaf)) {
-            throw "LICENSE is required for release packaging; add the approved repository license before tagging a release"
+          $binary = Join-Path $dist $env:BINARY_NAME
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "release executable was not created"
           }
 
-          New-Item -ItemType Directory -Path $package -Force | Out-Null
-          Copy-Item -LiteralPath $binary -Destination (Join-Path $package "auto-mas-runtime.exe") -Force
-          Copy-Item -LiteralPath $license -Destination (Join-Path $package "LICENSE") -Force
-          $readme = @'
-          AUTO-MAS Runtime {0}
-          Windows x64 release artifact.
-
-          Run auto-mas-runtime.exe version to inspect the build.
-          Run auto-mas-runtime.exe doctor --output ndjson for a machine-readable diagnostic.
-
-          Source: https://github.com/AUTO-MAS-Project/AUTO-MAS-Runtime
-          '@ -f $env:RELEASE_TAG
-          $readme | Set-Content -LiteralPath (Join-Path $package "README.md") -Encoding utf8NoBOM
-
-          $archive = Join-Path $dist $env:ARCHIVE_NAME
-          Push-Location -LiteralPath $package
-          try {
-            Compress-Archive -Path @("auto-mas-runtime.exe", "LICENSE", "README.md") -DestinationPath $archive -CompressionLevel Optimal -Force
-          }
-          finally {
-            Pop-Location
-          }
-          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
-            throw "release archive was not created"
-          }
-
-          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $($env:ARCHIVE_NAME)" | Set-Content -LiteralPath (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
-          $archives = @(Get-ChildItem -LiteralPath $dist -Filter "*.zip" -File)
-          if ($archives.Count -ne 1 -or $archives[0].Name -ne $env:ARCHIVE_NAME) {
-            throw "release output contains an unexpected archive set"
+          $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($env:BINARY_NAME)" | Set-Content -LiteralPath (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+          $binaries = @(Get-ChildItem -LiteralPath $dist -Filter "*.exe" -File)
+          if ($binaries.Count -ne 1 -or $binaries[0].Name -ne $env:BINARY_NAME) {
+            throw "release output contains an unexpected executable set"
           }
 
       - name: Upload release assets for publishing
@@ -175,7 +146,7 @@ jobs:
         with:
           name: runtime-release-assets
           path: |
-            dist/*.zip
+            dist/auto-mas-runtime.exe
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 7
@@ -292,7 +263,7 @@ jobs:
           tag_name: ${{ needs.package.outputs.tag }}
           name: AUTO-MAS Runtime ${{ needs.package.outputs.tag }}
           files: |
-            release-assets/*.zip
+            release-assets/auto-mas-runtime.exe
             release-assets/SHA256SUMS.txt
           fail_on_unmatched_files: true
           prerelease: ${{ needs.package.outputs.prerelease }}
@@ -318,48 +289,34 @@ jobs:
         shell: pwsh
 
     steps:
-      - name: Download published archive
+      - name: Download published executable
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.package.outputs.tag }}
-          ARCHIVE_NAME: ${{ needs.package.outputs.archive_name }}
+          BINARY_NAME: ${{ needs.package.outputs.binary_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
           $downloadDir = Join-Path $env:RUNNER_TEMP "runtime-release-download"
           New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-          & gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --pattern $env:ARCHIVE_NAME --dir $downloadDir --clobber
+          & gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --pattern $env:BINARY_NAME --dir $downloadDir --clobber
           if ($LASTEXITCODE -ne 0) {
-            throw "unable to download published release archive"
+            throw "unable to download published release executable"
           }
-          $archives = @(Get-ChildItem -LiteralPath $downloadDir -Filter "*.zip" -File)
-          if ($archives.Count -ne 1 -or $archives[0].Name -ne $env:ARCHIVE_NAME) {
-            throw "published release archive set is unexpected"
+          $binaries = @(Get-ChildItem -LiteralPath $downloadDir -Filter "*.exe" -File)
+          if ($binaries.Count -ne 1 -or $binaries[0].Name -ne $env:BINARY_NAME) {
+            throw "published release executable set is unexpected"
           }
-          "ARCHIVE_PATH=$($archives[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM
-
-      - name: Extract archive
-        run: |
-          $ErrorActionPreference = "Stop"
-          $extractDir = Join-Path $env:RUNNER_TEMP "runtime-release-extracted"
-          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-          Expand-Archive -LiteralPath $env:ARCHIVE_PATH -DestinationPath $extractDir -Force
-          foreach ($required in @("auto-mas-runtime.exe", "LICENSE", "README.md")) {
-            if (-not (Test-Path -LiteralPath (Join-Path $extractDir $required) -PathType Leaf)) {
-              throw "release archive is missing $required"
-            }
-          }
-          "EXTRACT_DIR=$extractDir" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM
+          "BINARY_PATH=$($binaries[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM
 
       - name: Run version command
         env:
           RELEASE_TAG: ${{ needs.package.outputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
-          $binary = Join-Path $env:EXTRACT_DIR "auto-mas-runtime.exe"
           $stdout = Join-Path $env:RUNNER_TEMP "runtime-version.stdout"
           $stderr = Join-Path $env:RUNNER_TEMP "runtime-version.stderr"
-          & $binary version --output ndjson 1> $stdout 2> $stderr
+          & $env:BINARY_PATH version --output ndjson 1> $stdout 2> $stderr
           if ($LASTEXITCODE -ne 0) {
             $diagnostic = Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue
             throw "version command failed: $diagnostic"
@@ -417,12 +374,11 @@ jobs:
       - name: Run NDJSON doctor command
         run: |
           $ErrorActionPreference = "Stop"
-          $binary = Join-Path $env:EXTRACT_DIR "auto-mas-runtime.exe"
           $smokeRoot = Join-Path $env:RUNNER_TEMP "runtime-smoke-root"
           New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
           $stdout = Join-Path $env:RUNNER_TEMP "runtime-doctor.stdout"
           $stderr = Join-Path $env:RUNNER_TEMP "runtime-doctor.stderr"
-          & $binary doctor --output ndjson --app-root $smokeRoot 1> $stdout 2> $stderr
+          & $env:BINARY_PATH doctor --output ndjson --app-root $smokeRoot 1> $stdout 2> $stderr
           if ($LASTEXITCODE -ne 0) {
             $diagnostic = Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue
             throw "doctor command failed: $diagnostic"

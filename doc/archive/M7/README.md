@@ -2,7 +2,7 @@
 
 M7 建立了 Windows x64 的 GitHub Release 流水线：受保护的 `v*` tag 触发
 `package → publish → smoke` 三个 job，构建期注入版本、Commit 和 UTC 构建时间，发布未签名
-zip 与 SHA-256 校验资产，并从真实 Release 下载产物执行严格 NDJSON 冒烟。
+`auto-mas-runtime.exe` 与 SHA-256 校验资产，并从真实 Release 直接下载 EXE 执行严格 NDJSON 冒烟。
 
 ## 文档索引
 

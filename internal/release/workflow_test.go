@@ -2,9 +2,6 @@
 package release
 
 import (
-	"archive/zip"
-	"bytes"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,9 +33,10 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "Sentry DSN ldflag", snippet: "internal/telemetry.BuildSentryDSN=$($env:AUTO_MAS_SENTRY_DSN)"},
 		{name: "peeled source commit", snippet: "git rev-parse --verify \"HEAD^{commit}\""},
 		{name: "source commit output", snippet: "source_commit=$sourceCommit"},
-		{name: "license guard", snippet: "LICENSE is required for release packaging"},
-		{name: "archive entries", snippet: "Compress-Archive -Path @(\"auto-mas-runtime.exe\", \"LICENSE\", \"README.md\")"},
-		{name: "SHA256 sums", snippet: "Get-FileHash -LiteralPath $archive -Algorithm SHA256"},
+		{name: "direct executable name", snippet: "$binaryName = \"auto-mas-runtime.exe\""},
+		{name: "direct executable checksum", snippet: "Get-FileHash -LiteralPath $binary -Algorithm SHA256"},
+		{name: "direct executable upload", snippet: "dist/auto-mas-runtime.exe"},
+		{name: "direct executable release", snippet: "release-assets/auto-mas-runtime.exe"},
 		{name: "upload action", snippet: "uses: actions/upload-artifact@v7"},
 		{name: "download action", snippet: "uses: actions/download-artifact@v8"},
 		{name: "release action", snippet: "uses: softprops/action-gh-release@v3"},
@@ -65,6 +63,11 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 	for _, forbidden := range []string{"AUTO_MAS_POSTHOG", "AUTO_MAS_UMAMI", "SENTRY_AUTH_TOKEN"} {
 		if strings.Contains(source, forbidden) {
 			t.Fatalf("release workflow contains cancelled or unnecessary secret %q", forbidden)
+		}
+	}
+	for _, archiveSnippet := range []string{"Compress-Archive", "Expand-Archive", "*.zip", ".zip\""} {
+		if strings.Contains(source, archiveSnippet) {
+			t.Fatalf("release workflow still packages a zip via %q", archiveSnippet)
 		}
 	}
 	for _, legacy := range []string{
@@ -96,7 +99,8 @@ func TestReleaseWorkflow_SmokeAndImmutabilityContract(t *testing.T) {
 		{name: "commit identity check", snippet: "$resolvedCommit -cne $env:SOURCE_COMMIT"},
 		{name: "existing release endpoint", snippet: "/releases/tags/$tagPath"},
 		{name: "existing release rejection", snippet: "already exists; refusing to overwrite it"},
-		{name: "release archive download", snippet: "gh release download $env:RELEASE_TAG"},
+		{name: "release executable download", snippet: "gh release download $env:RELEASE_TAG"},
+		{name: "published executable path", snippet: "BINARY_PATH=$($binaries[0].FullName)"},
 		{name: "version NDJSON", snippet: "version --output ndjson"},
 		{name: "version empty line rejection", snippet: "version emitted an empty NDJSON line"},
 		{name: "version object rejection", snippet: "version emitted a JSON value that is not an object"},
@@ -131,76 +135,19 @@ func TestReleaseWorkflow_SmokeAndImmutabilityContract(t *testing.T) {
 	}
 }
 
-func TestReleaseWorkflow_ReadmeArchiveContract(t *testing.T) {
+func TestReleaseWorkflow_DirectExecutableContract(t *testing.T) {
 	source := releaseWorkflowSource(t)
-	template := releaseReadmeTemplate(t, source)
-	if strings.Contains(template, "`") {
-		t.Fatal("release README template contains a PowerShell escape character")
-	}
-	readme := strings.ReplaceAll(template, "{0}", "v5.2.0-withplugin.0.0.1")
 	for _, want := range []string{
-		"AUTO-MAS Runtime v5.2.0-withplugin.0.0.1",
-		"auto-mas-runtime.exe version",
-		"auto-mas-runtime.exe doctor --output ndjson",
+		"$binaryName = \"auto-mas-runtime.exe\"",
+		"$hash  $($env:BINARY_NAME)",
+		"--pattern $env:BINARY_NAME",
+		"& $env:BINARY_PATH version --output ndjson",
+		"& $env:BINARY_PATH doctor --output ndjson --app-root $smokeRoot",
 	} {
-		if !strings.Contains(readme, want) {
-			t.Fatalf("release README = %q, want text %q", readme, want)
+		if !strings.Contains(source, want) {
+			t.Fatalf("release workflow missing direct executable behavior %q", want)
 		}
 	}
-	for _, character := range readme {
-		if character < 0x20 && character != '\n' && character != '\r' && character != '\t' {
-			t.Fatalf("release README contains C0 control U+%04X", character)
-		}
-	}
-
-	var archive bytes.Buffer
-	writer := zip.NewWriter(&archive)
-	for _, file := range []struct {
-		name     string
-		contents string
-	}{
-		{name: "auto-mas-runtime.exe", contents: "binary"},
-		{name: "LICENSE", contents: "license"},
-		{name: "README.md", contents: readme},
-	} {
-		entry, err := writer.Create(file.name)
-		if err != nil {
-			t.Fatalf("Create(%q) error = %v", file.name, err)
-		}
-		if _, err := io.WriteString(entry, file.contents); err != nil {
-			t.Fatalf("WriteString(%q) error = %v", file.name, err)
-		}
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatalf("zip Writer.Close() error = %v", err)
-	}
-
-	reader, err := zip.NewReader(bytes.NewReader(archive.Bytes()), int64(archive.Len()))
-	if err != nil {
-		t.Fatalf("zip.NewReader() error = %v", err)
-	}
-	if len(reader.File) != 3 {
-		t.Fatalf("archive entries = %d, want 3", len(reader.File))
-	}
-	for _, file := range reader.File {
-		if file.Name != "README.md" {
-			continue
-		}
-		opened, err := file.Open()
-		if err != nil {
-			t.Fatalf("README Open() error = %v", err)
-		}
-		contents, readErr := io.ReadAll(opened)
-		closeErr := opened.Close()
-		if readErr != nil || closeErr != nil {
-			t.Fatalf("README read error = %v, close error = %v", readErr, closeErr)
-		}
-		if got := string(contents); got != readme {
-			t.Fatalf("archived README = %q, want %q", got, readme)
-		}
-		return
-	}
-	t.Fatal("archive does not contain README.md")
 }
 
 func releaseWorkflowSource(t *testing.T) string {
@@ -215,24 +162,4 @@ func releaseWorkflowSource(t *testing.T) string {
 		t.Fatalf("ReadFile(%q) error = %v", path, err)
 	}
 	return strings.ReplaceAll(string(data), "\r\n", "\n")
-}
-
-func releaseReadmeTemplate(t *testing.T, source string) string {
-	t.Helper()
-	const startMarker = "$readme = @'\n"
-	const endMarker = "\n          '@ -f $env:RELEASE_TAG"
-	start := strings.Index(source, startMarker)
-	if start < 0 {
-		t.Fatalf("release workflow missing README start marker %q", startMarker)
-	}
-	start += len(startMarker)
-	end := strings.Index(source[start:], endMarker)
-	if end < 0 {
-		t.Fatalf("release workflow missing README end marker %q", endMarker)
-	}
-	lines := strings.Split(source[start:start+end], "\n")
-	for index, line := range lines {
-		lines[index] = strings.TrimPrefix(line, "          ")
-	}
-	return strings.Join(lines, "\n")
 }
