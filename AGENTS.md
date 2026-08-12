@@ -18,15 +18,16 @@ Vue 仍直接访问 Python 后端的 HTTP/WebSocket 业务接口。Runtime 只�
 **不代理任何业务流量**。
 
 **Runtime 负责：** 本机环境检测与部署、受管后端 Git 仓库更新、uv/Python/依赖同步、
-后端进程启动与监督、健康检查、诊断、修复、清理、进程树回收。
+后端进程启动与监督、健康检查、诊断、修复、清理、进程树回收；M12 完成后还负责
+白名单化的运行质量遥测与内部错误观测。
 
 **Runtime 不负责：** 业务 HTTP/WebSocket 代理、Python 插件依赖管理、自身自动更新、
 Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
-首版正式发布**仅支持 Windows**。2026-08-04 起登记两项**规划中**扩展（决策 D7/D8，
-均不改变既有 Windows 契约）：跨平台适配（Linux 少数发行版 + macOS，Windows 仍为
-首要平台，M11）与 PostHog 遥测（计划阶段，M12）；详见 `doc/架构设计.md`
-「平台支持策略」「遥测策略」两节。
+首版正式发布**仅支持 Windows**。2026-08-04 起登记跨平台与遥测扩展（决策 D7/D8）；
+2026-08-12 按当前决策将 M12 收敛为 Sentry-only 错误观测；D10 的自建 Umami 方案已取消，
+仅保留历史追溯。以上均不改变既有 Windows 协议契约；详见 `doc/架构设计.md`
+「平台支持策略」「遥测与错误观测策略」两节。
 
 ---
 
@@ -45,7 +46,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M9 联调与首版验收 | 未开始 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
-| M12 PostHog 遥测 | 规划中（决策 D8，2026-08-04 立项）；待 D-open-9 定稿，禁止提前实现 |
+| M12 遥测与错误观测（Sentry-only） | Sentry 方案进行中；T12.1、T12.2、T12.4~T12.6 尚未完成，T12.3/Umami 已取消 |
 
 代码现状：
 
@@ -366,9 +367,12 @@ func NewProcessOutput(output io.Writer) (*ProcessOutput, error) { ... }
 - 时间用 `time.Duration`，不用裸 `int` 秒；含单位的字段名带单位（`timeoutSeconds` 只在 JSON 契约里出现）；
 - 长函数禁止裸返回（naked return）；
 - 枚举用具名类型 + 常量组 + `String()`，并提供合法性校验（现有 stage / status 即此模式）；
-- 不引入非必要依赖：当前生产依赖只有 `golang.org/x/sys/windows`；新增依赖需在任务文档中说明理由。
-  已批准方向：CLI 使用 Cobra、Git 使用 go-git、Windows 系统调用继续使用固定版本 `x/sys/windows`；
-  `google/go-cmp` 仅可用于测试结构比较。具体边界见 `doc/maintenance/现成库替换评估.md`。
+- 不引入非必要依赖；新增依赖需在任务文档中说明理由并固定版本。已批准方向：CLI 使用 Cobra、
+  Git 使用 go-git、Windows 系统调用继续使用固定版本 `x/sys/windows`；`google/go-cmp` 仅可用于
+  测试结构比较。M12 仅允许 Sentry SDK 由 `internal/telemetry` adapter 直接导入；Umami
+  已取消，不得新增 Umami SDK 或 HTTP adapter。业务包、`protocol` 和 `logging` 禁止依赖观测实现；
+  Sentry SDK 的默认 PII、日志与 tracing 能力必须按架构白名单关闭。具体边界见
+  `doc/maintenance/现成库替换评估.md` 和 `doc/current/M12/设计-T12.1-遥测与错误观测.md`。
 
 ### 8.9 stdout 所有权（最容易违反，务必逐条对照 `doc/代码审查清单.md`）
 
