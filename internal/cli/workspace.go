@@ -112,7 +112,7 @@ func runWorkspaceSync(
 	}
 	controlDone := make(chan error, 1)
 	go func() {
-		readErr := reader.Run(controlContext)
+		readErr := runControlReaderSafely(controlContext, reader)
 		if readErr != nil {
 			contextStopped := isWorkspaceControlContextCancellation(controlContext, readErr)
 			if !contextStopped {

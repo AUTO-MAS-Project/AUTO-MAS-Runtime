@@ -72,13 +72,29 @@ func runOperationSession(
 	capabilities []string,
 	withStdinCancel bool,
 	run func(context.Context, *protocol.Emitter) (sessionSuccess, error),
-) int {
+) (exitCode int) {
+	runtimeVersion, versionPanicked, versionPanicFrames := helloRuntimeVersionSafely(ctx, deps.options.versionSource)
+	telemetryState := newSessionTelemetryState(deps, command, stage, runtimeVersion, versionPanicked, versionPanicFrames)
+	var emitter *protocol.Emitter
+	defer func() {
+		if recover() != nil {
+			failure := unexpectedPanicError(stage)
+			telemetryState.addPanic(failure, capturePanicFrames())
+			if emitter == nil {
+				writeDiagnostic(deps.io, errors.New("unexpected panic"))
+				exitCode = protocol.ExitCodePreconditionFailed
+			} else {
+				exitCode, telemetryState.terminalWritten = safeEmitPanicFailure(deps, emitter, stage, failure)
+			}
+		}
+		telemetryState.finish()
+	}()
+
 	output, err := newProcessOutput(deps)
 	if err != nil {
 		return sessionSetupFailure(deps, err)
 	}
-	runtimeVersion := helloRuntimeVersion(ctx, deps.options.versionSource)
-	emitter, err := output.NewEmitter(
+	emitter, err = output.NewEmitter(
 		runtimeVersion,
 		command,
 		capabilities,
@@ -87,8 +103,11 @@ func runOperationSession(
 	if err != nil {
 		return sessionSetupFailure(deps, err)
 	}
+	telemetryState.sessionStarted = true
 	if err := ctx.Err(); err != nil {
-		return emitFailure(deps, emitter, stage, err)
+		telemetryState.operationErr = err
+		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
+		return exitCode
 	}
 	operationContext := ctx
 	var cancelOperation context.CancelFunc
@@ -106,12 +125,15 @@ func runOperationSession(
 		)
 		if err != nil {
 			cancelOperation()
-			return emitFailure(deps, emitter, stage, workspaceControlInfrastructureError(stage, err))
+			failure := workspaceControlInfrastructureError(stage, err)
+			telemetryState.operationErr = failure
+			exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, failure)
+			return exitCode
 		}
 		operationContext = context.WithValue(operationContext, workspaceControlContextKey{}, control)
 		controlDone = make(chan error, 1)
 		go func() {
-			readErr := controlReader.Run(operationContext)
+			readErr := runControlReaderSafely(operationContext, controlReader)
 			if readErr != nil && !isWorkspaceControlContextCancellation(operationContext, readErr) {
 				control.SetReaderError(readErr)
 				cancelOperation()
@@ -119,7 +141,9 @@ func runOperationSession(
 			controlDone <- readErr
 		}()
 	}
-	success, err := run(operationContext, emitter)
+	success, err, panicked, panicFrames := invokeSessionRun(stage, func() (sessionSuccess, error) {
+		return run(operationContext, emitter)
+	})
 	if controlReader != nil {
 		cancelOperation()
 		stopErr := stopWorkspaceControl(controlReader, deps.io.In, controlDone)
@@ -142,9 +166,18 @@ func runOperationSession(
 		}
 	}
 	if err != nil {
-		return emitFailure(deps, emitter, stage, err)
+		telemetryState.operationErr = err
+		if panicked {
+			telemetryState.addPanic(err, panicFrames)
+		}
+		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
+		return exitCode
 	}
-	return emitSuccess(deps, emitter, stage, success)
+	exitCode, telemetryState.terminalWritten = emitSuccess(deps, emitter, stage, success)
+	if exitCode != protocol.ExitCodeSuccess {
+		telemetryState.operationErr = telemetryOutputFailure(stage)
+	}
+	return exitCode
 }
 
 // helloRuntimeVersion 读取版本来源填充 hello.runtimeVersion；
@@ -184,7 +217,7 @@ func sessionSetupFailure(deps *deps, err error) int {
 	return protocol.ExitCodePreconditionFailed
 }
 
-func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, success sessionSuccess) int {
+func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, success sessionSuccess) (int, bool) {
 	status := success.status
 	if status == "" {
 		status = "succeeded"
@@ -192,21 +225,21 @@ func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, su
 	result := protocol.NewSuccessResult(stage, status, success.message, success.details)
 	if err := emitter.EmitResult(result); err != nil {
 		writeDiagnostic(deps.io, err)
-		return protocol.ExitCodePreconditionFailed
+		return protocol.ExitCodePreconditionFailed, false
 	}
-	return protocol.ExitCodeSuccess
+	return protocol.ExitCodeSuccess, true
 }
 
-func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) int {
+func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) (int, bool) {
 	code, stage, message, details := classifyFailure(err, fallbackStage)
 	errorEvent, eventErr := protocol.NewErrorEvent(code, stage, message, details)
 	if eventErr != nil {
 		writeDiagnostic(deps.io, eventErr)
-		return exitCodeFor(code)
+		return exitCodeFor(code), false
 	}
 	if emitErr := emitter.EmitError(errorEvent); emitErr != nil {
 		writeDiagnostic(deps.io, emitErr)
-		return exitCodeFor(code)
+		return exitCodeFor(code), false
 	}
 	status := "failed"
 	if code == protocol.CodeOperationCancelled {
@@ -223,9 +256,9 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 	result := protocol.NewFailureResult(errorEvent, status, message, details)
 	if emitErr := emitter.EmitResult(result); emitErr != nil {
 		writeDiagnostic(deps.io, emitErr)
-		return exitCodeFor(code)
+		return exitCodeFor(code), false
 	}
-	return exitCodeFor(code)
+	return exitCodeFor(code), true
 }
 
 // classifyFailure 把命令错误映射为冻结错误码与中文 message。

@@ -135,13 +135,29 @@ func runBackendSuperviseSession(
 	command string,
 	stage protocol.Stage,
 	run func(context.Context, *protocol.Emitter, *backend.ControlMailbox, *backendControl) (sessionSuccess, error),
-) int {
+) (exitCode int) {
+	runtimeVersion, versionPanicked, versionPanicFrames := helloRuntimeVersionSafely(ctx, deps.options.versionSource)
+	telemetryState := newSessionTelemetryState(deps, command, stage, runtimeVersion, versionPanicked, versionPanicFrames)
+	var emitter *protocol.Emitter
+	defer func() {
+		if recover() != nil {
+			failure := unexpectedPanicError(stage)
+			telemetryState.addPanic(failure, capturePanicFrames())
+			if emitter == nil {
+				writeDiagnostic(deps.io, errors.New("unexpected panic"))
+				exitCode = protocol.ExitCodePreconditionFailed
+			} else {
+				exitCode, telemetryState.terminalWritten = safeEmitPanicFailure(deps, emitter, stage, failure)
+			}
+		}
+		telemetryState.finish()
+	}()
+
 	output, err := newProcessOutput(deps)
 	if err != nil {
 		return sessionSetupFailure(deps, err)
 	}
-	runtimeVersion := helloRuntimeVersion(ctx, deps.options.versionSource)
-	emitter, err := output.NewEmitter(
+	emitter, err = output.NewEmitter(
 		runtimeVersion,
 		command,
 		[]string{string(protocol.CapabilityStdinCancel), string(protocol.CapabilityStateV1), string(protocol.CapabilityLogStream)},
@@ -150,8 +166,11 @@ func runBackendSuperviseSession(
 	if err != nil {
 		return sessionSetupFailure(deps, err)
 	}
+	telemetryState.sessionStarted = true
 	if err := ctx.Err(); err != nil {
-		return emitFailure(deps, emitter, stage, err)
+		telemetryState.operationErr = err
+		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
+		return exitCode
 	}
 	operationContext, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -171,7 +190,10 @@ func runBackendSuperviseSession(
 		protocol.ControlStatus,
 	)
 	if err != nil {
-		return emitFailure(deps, emitter, stage, backendControlInfrastructureError(stage, err))
+		failure := backendControlInfrastructureError(stage, err)
+		telemetryState.operationErr = failure
+		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, failure)
+		return exitCode
 	}
 	mailbox.SetBeforeShutdown(func(string) {
 		cancelReader()
@@ -185,13 +207,15 @@ func runBackendSuperviseSession(
 	})
 	controlDone := make(chan error, 1)
 	go func() {
-		readErr := reader.Run(readerContext)
+		readErr := runControlReaderSafely(readerContext, reader)
 		if readErr != nil && !isWorkspaceControlContextCancellation(readerContext, readErr) {
 			control.SetReaderError(readErr)
 		}
 		controlDone <- readErr
 	}()
-	success, runErr := run(operationContext, emitter, mailbox, control)
+	success, runErr, panicked, panicFrames := invokeSessionRun(stage, func() (sessionSuccess, error) {
+		return run(operationContext, emitter, mailbox, control)
+	})
 	cancelReader()
 	reader.StopAccepting()
 	mailbox.StopAccepting()
@@ -212,9 +236,18 @@ func runBackendSuperviseSession(
 		}
 	}
 	if runErr != nil {
-		return emitFailure(deps, emitter, stage, runErr)
+		telemetryState.operationErr = runErr
+		if panicked {
+			telemetryState.addPanic(runErr, panicFrames)
+		}
+		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, runErr)
+		return exitCode
 	}
-	return emitSuccess(deps, emitter, stage, success)
+	exitCode, telemetryState.terminalWritten = emitSuccess(deps, emitter, stage, success)
+	if exitCode != protocol.ExitCodeSuccess {
+		telemetryState.operationErr = telemetryOutputFailure(stage)
+	}
+	return exitCode
 }
 
 type backendControl struct {

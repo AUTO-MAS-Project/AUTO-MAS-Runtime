@@ -16,6 +16,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
@@ -38,6 +39,7 @@ type options struct {
 	environmentStateStoreFactory environmentStateStoreFactory
 	mutationCoordinatorFactory   mutationCoordinatorFactory
 	backendFactory               backendFactory
+	telemetryFactory             telemetryFactory
 }
 
 // Option 配置 Execute 的可注入测试依赖。
@@ -117,6 +119,7 @@ func applyOptions(values ...Option) (options, error) {
 		) (backendService, error) {
 			return backend.NewProductionManagedSupervisor(ctx, layout, stderr, clock)
 		},
+		telemetryFactory: telemetry.New,
 	}
 	for _, option := range values {
 		if option == nil {
