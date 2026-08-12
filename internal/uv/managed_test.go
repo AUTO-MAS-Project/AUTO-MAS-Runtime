@@ -193,3 +193,26 @@ func TestManaged_RejectsInvalidManagedIdentityBeforeSpawn(t *testing.T) {
 		t.Fatalf("StartManaged() = %#v, %v, want validation error", managed, err)
 	}
 }
+
+func TestManaged_StartFailureIncludesStableDiagnostics(t *testing.T) {
+	runner := newTestRunner(t)
+	runner.Executable = filepath.Join(t.TempDir(), "missing-uv.exe")
+	managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
+	}, nil)
+	if managed != nil {
+		t.Fatalf("StartManaged() process = %#v, want nil", managed)
+	}
+	var operationErr *Error
+	if !errors.As(err, &operationErr) {
+		t.Fatalf("StartManaged() error = %T %v, want uv Error", err, err)
+	}
+	details := operationErr.Details()
+	if details["operation"] != "start" || details["projectDir"] != runner.ProjectDir ||
+		details["projectEnvDir"] != runner.ProjectEnvDir {
+		t.Fatalf("StartManaged() details = %#v, want stable start diagnostics", details)
+	}
+	if _, ok := details["windowsError"]; !ok {
+		t.Fatalf("StartManaged() details = %#v, want windowsError", details)
+	}
+}

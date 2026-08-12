@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
@@ -176,7 +177,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			startFailureDetails(resolved, err),
 			err,
 		)
 	}
@@ -310,14 +311,19 @@ func (r *UVRunner) CheckVersion(
 	stage protocol.Stage,
 	line LineFunc,
 ) error {
-	result, err := r.Run(ctx, []string{"--version"}, RunOptions{Stage: stage, Line: line})
+	return r.CheckVersionWithOptions(ctx, expected, RunOptions{Stage: stage, Line: line})
+}
+
+// CheckVersionWithOptions 使用调用方显式提供的路径上下文验证受管 uv 版本。
+func (r *UVRunner) CheckVersionWithOptions(ctx context.Context, expected string, options RunOptions) error {
+	result, err := r.Run(ctx, []string{"--version"}, options)
 	if err != nil {
 		return err
 	}
 	if !uvVersionOutputMatches(result.Stdout, expected) {
 		return newError(
 			protocol.CodeUVVersionMismatch,
-			stage,
+			options.Stage,
 			"uv 版本校验失败",
 			map[string]any{
 				"expectedVersion": expected,
@@ -652,6 +658,21 @@ func runnerDetails(result UVResult, options resolvedRunOptions) map[string]any {
 		"branch":        options.Branch,
 		"commit":        options.Commit,
 	}
+}
+
+func startFailureDetails(options resolvedRunOptions, err error) map[string]any {
+	details := map[string]any{
+		"operation":        "start",
+		"projectDir":       filepath.Clean(options.ProjectDir),
+		"projectEnvDir":    filepath.Clean(options.ProjectEnvDir),
+		"pythonInstallDir": filepath.Clean(options.PythonInstallDir),
+		"cacheDir":         filepath.Clean(options.CacheDir),
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		details["windowsError"] = uint64(errno)
+	}
+	return details
 }
 
 func mergeDetails(left, right map[string]any) map[string]any {

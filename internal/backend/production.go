@@ -9,7 +9,6 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
-	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
 
@@ -51,8 +50,8 @@ type productionUV struct {
 	expected string
 }
 
-func (r productionUV) Check(ctx context.Context) error {
-	return r.runner.CheckVersion(ctx, r.expected, protocol.StageBackendSpawn, nil)
+func (r productionUV) Check(ctx context.Context, options uv.RunOptions) error {
+	return r.runner.CheckVersionWithOptions(ctx, r.expected, options)
 }
 
 func (r productionUV) Executable() string { return r.runner.Executable }

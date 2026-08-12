@@ -149,7 +149,7 @@ type EntryChecker interface {
 
 // UVRunner 是长驻受管 uv 的唯一启动入口。
 type UVRunner interface {
-	Check(context.Context) error
+	Check(context.Context, uv.RunOptions) error
 	Executable() string
 	StartManaged(context.Context, []string, uv.ManagedOptions, process.StreamSink) (ManagedProcess, error)
 }

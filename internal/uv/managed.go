@@ -92,7 +92,7 @@ func (r *UVRunner) StartManaged(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 受管进程启动失败",
-			map[string]any{},
+			startFailureDetails(resolved, err),
 			err,
 		)
 	}

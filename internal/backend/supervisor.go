@@ -140,7 +140,11 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if err != nil {
 		return preferCancellation(ctx, err)
 	}
-	if err := s.deps.UV.Check(ctx); err != nil {
+	if err := s.deps.UV.Check(ctx, uv.RunOptions{
+		Stage:         protocol.StageBackendSpawn,
+		ProjectDir:    s.layout.RepoDir(),
+		ProjectEnvDir: s.layout.VenvDir(),
+	}); err != nil {
 		return preferCancellation(ctx, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeUVExecFailed, "受管 uv 校验失败", err))
 	}
 

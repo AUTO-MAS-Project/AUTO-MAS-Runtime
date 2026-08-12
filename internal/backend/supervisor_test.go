@@ -113,6 +113,12 @@ func TestBackendManaged_UsesExactUVArgsAndEnvironment(t *testing.T) {
 	if got, want := f.uv.args, []string{"run", "--project", f.layout.RepoDir(), "--no-sync", "main.py"}; !equalStrings(got, want) {
 		t.Fatalf("uv args = %#v, want %#v", got, want)
 	}
+	if got, want := f.uv.checkOptions.ProjectDir, f.layout.RepoDir(); got != want {
+		t.Fatalf("managed uv preflight ProjectDir = %q, want %q", got, want)
+	}
+	if got, want := f.uv.checkOptions.ProjectEnvDir, f.layout.VenvDir(); got != want {
+		t.Fatalf("managed uv preflight ProjectEnvDir = %q, want %q", got, want)
+	}
 	if f.uv.options.Identity == nil {
 		t.Fatal("managed identity is nil")
 	}
@@ -936,14 +942,18 @@ type fakeUV struct {
 	options         uv.ManagedOptions
 	startErr        error
 	checkErr        error
+	checkOptions    uv.RunOptions
 	startCalls      int
 	returnProcOnErr bool
 	onStart         func()
 	startNotify     chan struct{}
 }
 
-func (u *fakeUV) Check(context.Context) error { return u.checkErr }
-func (u *fakeUV) Executable() string          { return "uv.exe" }
+func (u *fakeUV) Check(_ context.Context, options uv.RunOptions) error {
+	u.checkOptions = options
+	return u.checkErr
+}
+func (u *fakeUV) Executable() string { return "uv.exe" }
 func (u *fakeUV) StartManaged(_ context.Context, args []string, options uv.ManagedOptions, sink process.StreamSink) (ManagedProcess, error) {
 	u.startCalls++
 	if u.startNotify != nil {

@@ -1042,7 +1042,11 @@ func (s *ManagedSupervisor) controlPreflight(ctx context.Context, request Reques
 		return state.EnvironmentState{}, state.Revision{}, err
 	}
 	if modeForRequest(request) == ModeDevelopment {
-		if err := s.deps.UV.Check(ctx); err != nil {
+		if err := s.deps.UV.Check(ctx, uv.RunOptions{
+			Stage:         protocol.StageBackendSpawn,
+			ProjectDir:    request.DevelopmentRepo,
+			ProjectEnvDir: developmentProjectEnv(request.DevelopmentRepo),
+		}); err != nil {
 			return state.EnvironmentState{}, state.Revision{}, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeUVExecFailed, "开发模式 uv 校验失败", err)
 		}
 		return state.EnvironmentState{}, state.Revision{}, nil
@@ -1061,7 +1065,11 @@ func (s *ManagedSupervisor) controlPreflight(ctx context.Context, request Reques
 	if err != nil {
 		return state.EnvironmentState{}, state.Revision{}, err
 	}
-	if err := s.deps.UV.Check(ctx); err != nil {
+	if err := s.deps.UV.Check(ctx, uv.RunOptions{
+		Stage:         protocol.StageBackendSpawn,
+		ProjectDir:    s.layout.RepoDir(),
+		ProjectEnvDir: s.layout.VenvDir(),
+	}); err != nil {
 		return state.EnvironmentState{}, state.Revision{}, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeEnvironmentBroken, "受管 uv 校验失败", err)
 	}
 	return environment, revision, nil

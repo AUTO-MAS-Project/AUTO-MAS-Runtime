@@ -241,6 +241,7 @@ type backendE2EFixture struct {
 	grandchildPID string
 	uvExecReady   string
 	uvExecRelease string
+	uvRecord      string
 	layout        *config.Layout
 	emitter       *backendE2EEmitter
 	mailbox       *ControlMailbox
@@ -354,11 +355,6 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	if err != nil {
 		t.Fatalf("NewLayout() error = %v", err)
 	}
-	// 即使 development 前置检查也会使用生产 runner 的默认受管项目目录；
-	// 仅保留这个诊断工作目录，不把开发文件写入 runtime-root。
-	if err := os.MkdirAll(layout.RepoDir(), 0o700); err != nil {
-		t.Fatalf("MkdirAll(managed repo cwd) error = %v", err)
-	}
 	uvPath, err := layout.UVExecutable(uv.FixedVersion)
 	if err != nil {
 		t.Fatalf("UVExecutable() error = %v", err)
@@ -396,8 +392,14 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	writeE2EConfig(t, backendConfigPath, configValue)
 	uvConfigPath := filepath.Join(root, "uv-config.json")
 	writeE2EUVConfig(t, uvConfigPath, developmentPythonPath, rootPIDPath, uvExecReadyPath, uvExecReleasePath)
+	uvRecordPath := filepath.Join(root, "uv-record.ndjson")
 	t.Setenv(e2eFakeBackendEnv, backendConfigPath)
 	t.Setenv(e2eFakeUVConfigEnv, uvConfigPath)
+	t.Setenv("FAKE_UV_RECORD", uvRecordPath)
+	t.Setenv("UV_INSECURE_HOST", "must-not-leak.example")
+	t.Setenv("UV_DEFAULT_INDEX", "https://must-not-leak.example/simple")
+	t.Setenv("AUTO_MAS_EXPECTED_VERSION", "stale-version")
+	t.Setenv("AUTO_MAS_EXPECTED_COMMIT", "stale-commit")
 	if err := waitE2EPortClosed(t.Context()); err != nil {
 		t.Fatalf("port 36163 is occupied before fixture: %v", err)
 	}
@@ -435,6 +437,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		grandchildPID: configValue.GrandchildPIDFile,
 		uvExecReady:   uvExecReadyPath,
 		uvExecRelease: uvExecReleasePath,
+		uvRecord:      uvRecordPath,
 		layout:        layout,
 		emitter:       emitter,
 		mailbox:       mailbox,
@@ -521,6 +524,7 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 		GrandchildLifetimeMS: 60_000,
 		Events:               e2EOutputEvents("lifecycle"),
 	})
+	repositorySnapshot := snapshotDevelopmentTree(t, fixture.repo)
 	done := fixture.supervise(t.Context())
 	running := fixture.emitter.waitState(t, protocol.StateRunning, 1)
 	if running.Details["pid"] == nil || running.Details["logPath"] == nil {
@@ -542,6 +546,10 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	}
 	fixture.emitter.waitState(t, protocol.StateStopped, 1)
 	fixture.assertResourcesReleased(t, &generation)
+	if got := snapshotDevelopmentTree(t, fixture.repo); !equalStrings(got, repositorySnapshot) {
+		t.Fatalf("development tree changed: got %#v, want %#v", got, repositorySnapshot)
+	}
+	assertE2EDevelopmentUVEnvironment(t, fixture)
 	assertE2EStateSequence(t, fixture.emitter.statesSnapshot(), protocol.StateStartingBackend, protocol.StateRunning, protocol.StateStoppingBackend, protocol.StateStopped)
 	assertE2EPersistentLog(t, running, "lifecycle")
 	assertE2ETimelineBefore(t, fixture.emitter, "state:"+string(protocol.StateStartingBackend), "log:lifecycle ")
@@ -567,6 +575,54 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	}
 	if !strings.Contains(string(payload), "lifecycle stdout") || !strings.Contains(string(payload), "lifecycle stderr") {
 		t.Fatalf("runtime log = %q, want both stream messages", string(payload))
+	}
+}
+
+func assertE2EDevelopmentUVEnvironment(t *testing.T, fixture *backendE2EFixture) {
+	t.Helper()
+	payload, err := os.ReadFile(fixture.uvRecord)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", fixture.uvRecord, err)
+	}
+	type invocation struct {
+		Arguments   []string          `json:"arguments"`
+		Environment map[string]string `json:"environment"`
+	}
+	var records []invocation
+	for _, line := range strings.Split(strings.TrimSpace(string(payload)), "\n") {
+		var record invocation
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode uv record %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	if len(records) < 2 {
+		t.Fatalf("uv records = %#v, want version check and managed run", records)
+	}
+	record := records[len(records)-1]
+	wantArgs := []string{"run", "--project", fixture.repo, "--no-sync", "main.py"}
+	if !equalStrings(record.Arguments, wantArgs) {
+		t.Fatalf("uv arguments = %#v, want %#v", record.Arguments, wantArgs)
+	}
+	wantControlled := map[string]string{
+		"UV_PROJECT_ENVIRONMENT":    filepath.Join(fixture.repo, ".venv"),
+		"AUTO_MAS_SUPERVISED":       "1",
+		"AUTO_MAS_RUNTIME_PROTOCOL": "1",
+	}
+	for key, want := range wantControlled {
+		if got := record.Environment[key]; got != want {
+			t.Fatalf("uv environment[%q] = %q, want %q", key, got, want)
+		}
+	}
+	for _, forbidden := range []string{
+		"UV_INSECURE_HOST",
+		"UV_DEFAULT_INDEX",
+		"AUTO_MAS_EXPECTED_VERSION",
+		"AUTO_MAS_EXPECTED_COMMIT",
+	} {
+		if _, ok := record.Environment[forbidden]; ok {
+			t.Fatalf("uv environment contains forbidden host value %q: %#v", forbidden, record.Environment)
+		}
 	}
 }
 

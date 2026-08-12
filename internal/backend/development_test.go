@@ -71,6 +71,27 @@ func TestBackendDevelopment_UsesExistingVenvWithoutSync(t *testing.T) {
 	}
 }
 
+func TestBackendDevelopment_UVPreflightUsesExplicitRepo(t *testing.T) {
+	f := newBackendFixture(t)
+	repo := newDevelopmentRepo(t)
+	f.proc.keepAlive = true
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, developmentRequest(f.request(), repo)) }()
+	waitFor(t, f.emitter.running)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
+	}
+	if got, want := f.uv.checkOptions.ProjectDir, repo; got != want {
+		t.Fatalf("uv preflight ProjectDir = %q, want %q", got, want)
+	}
+	if got, want := f.uv.checkOptions.ProjectEnvDir, filepath.Join(repo, ".venv"); got != want {
+		t.Fatalf("uv preflight ProjectEnvDir = %q, want %q", got, want)
+	}
+}
+
 func TestBackendDevelopment_InjectsOnlyRequiredEnv(t *testing.T) {
 	f := newBackendFixture(t)
 	repo := newDevelopmentRepo(t)

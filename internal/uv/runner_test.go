@@ -328,6 +328,28 @@ func TestUVVersionOutput_MatchesOfficialGrammar(t *testing.T) {
 	}
 }
 
+func TestUVRunner_StartFailureIncludesStableDiagnostics(t *testing.T) {
+	runner := newTestRunner(t)
+	missing := filepath.Join(t.TempDir(), "missing-project")
+	_, err := runner.Run(t.Context(), []string{"--version"}, RunOptions{
+		Stage:         protocol.StageBackendSpawn,
+		ProjectDir:    missing,
+		ProjectEnvDir: filepath.Join(missing, ".venv"),
+	})
+	var operationErr *Error
+	if !errors.As(err, &operationErr) {
+		t.Fatalf("Run() error = %T %v, want uv Error", err, err)
+	}
+	details := operationErr.Details()
+	if details["operation"] != "start" || details["projectDir"] != missing ||
+		details["projectEnvDir"] != filepath.Join(missing, ".venv") {
+		t.Fatalf("Run() details = %#v, want stable start diagnostics", details)
+	}
+	if _, ok := details["windowsError"]; !ok {
+		t.Fatalf("Run() details = %#v, want windowsError", details)
+	}
+}
+
 func newTestRunner(t *testing.T) *UVRunner {
 	t.Helper()
 	projectDir := t.TempDir()
