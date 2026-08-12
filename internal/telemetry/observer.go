@@ -77,7 +77,7 @@ type Observer struct {
 
 // New 根据配置构造遥测观察器；禁用、离线或缺少凭据时不会创建 SDK client。
 func New(config Config) Recorder {
-	return newObserverWithFactory(config, nil)
+	return newObserverWithFactory(config, newSentryProvider)
 }
 
 func newObserverWithFactory(config Config, sentryFactory providerFactory) *Observer {
