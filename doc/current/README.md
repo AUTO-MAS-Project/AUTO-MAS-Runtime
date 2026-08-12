@@ -11,10 +11,6 @@ M7 GitHub CI/CD 发布均已完成；设计和审查记录分别归档到
 
 当前工作：
 
-- [M9 T9.5 beta.4 development 黑盒回归修复设计](./M9/设计-T9.5-beta4-development-黑盒回归.md)：
-  beta.4 纯 development app root 的 uv 预检路径回归、稳定诊断与真实 Windows 验收边界；
-- [M9 T9.5 实施计划](./M9/计划-T9.5-beta4-development-黑盒回归.md)：TDD、官方 uv/真实
-  Python 集成、源码不变与进程清理验证；
 - [M12 遥测与错误观测设计](./M12/设计-T12.1-遥测与错误观测.md)：Sentry-only，
   DSN 配置边界、错误白名单和失败静默契约；历史 Umami 迁移已取消；
 - [M12 实施计划](./M12/计划-T12.1-遥测与错误观测.md)：T12.1~T12.6 的 TDD 步骤、
