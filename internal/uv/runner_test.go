@@ -15,6 +15,15 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
+func telemetryEnvironmentKeysForTest() []string {
+	return []string{
+		"AUTO_MAS_TELEMETRY",
+		"AUTO_MAS_SENTRY_DSN",
+		"AUTO_MAS_SENTRY_ENVIRONMENT",
+		"AUTO_MAS_SENTRY_RELEASE",
+	}
+}
+
 func TestRunner_ScrubsUnmanagedUVEnvironment(t *testing.T) {
 	t.Setenv("UV_INSECURE_HOST", "unsafe.example")
 	t.Setenv("uv_no_sources", "1")
@@ -40,6 +49,50 @@ func TestRunner_ScrubsUnmanagedUVEnvironment(t *testing.T) {
 		if got := environment[key]; got != want {
 			t.Fatalf("environment[%q] = %q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestRunner_ScrubsTelemetryEnvironment(t *testing.T) {
+	for _, key := range telemetryEnvironmentKeysForTest() {
+		t.Setenv(key, "host-value")
+	}
+	t.Setenv("AUTO_MAS_TEST_HOST_PASSTHROUGH", "host-value")
+	recordPath := filepath.Join(t.TempDir(), "telemetry-environment-record.txt")
+	runner := newTestRunner(t)
+	environment := map[string]string{
+		"FAKE_UV_RECORD":                   recordPath,
+		"AUTO_MAS_TEST_OPTION_PASSTHROUGH": "option-value",
+		uvOfflineEnv:                       "1",
+	}
+	for _, key := range telemetryEnvironmentKeysForTest() {
+		environment[strings.ToLower(key)] = "option-value"
+	}
+	result, err := runner.Run(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, RunOptions{
+		Stage:       protocol.StageUVCheck,
+		Environment: environment,
+	})
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Run() = %#v, %v, want exit 0", result, err)
+	}
+	record := readTestRecord(t, recordPath)
+	assertTelemetryEnvironmentAbsent(t, record)
+	for key, want := range map[string]string{
+		"AUTO_MAS_TEST_HOST_PASSTHROUGH":   "host-value",
+		"AUTO_MAS_TEST_OPTION_PASSTHROUGH": "option-value",
+		uvOfflineEnv:                       "1",
+		uvManagedPythonEnv:                 "1",
+		uvNoModifyPathEnv:                  "1",
+		uvPythonInstallBinEnv:              "0",
+		uvPythonInstallDirEnv:              runner.PythonInstallDir,
+		uvProjectEnvironment:               runner.ProjectEnvDir,
+		uvCacheDirEnv:                      runner.CacheDir,
+	} {
+		if got := record[key]; got != want {
+			t.Errorf("environment[%q] = %q, want %q", key, got, want)
+		}
+	}
+	if got := record["PATH"]; got == "" {
+		t.Fatal("environment[PATH] is empty, want inherited PATH")
 	}
 }
 
@@ -391,6 +444,15 @@ func readTestRecord(t *testing.T, path string) map[string]string {
 	return result
 }
 
+func assertTelemetryEnvironmentAbsent(t *testing.T, environment map[string]string) {
+	t.Helper()
+	for _, key := range telemetryEnvironmentKeysForTest() {
+		if containsEnvironmentKeyMap(environment, key) {
+			t.Errorf("child environment contains Runtime-only telemetry key %q", key)
+		}
+	}
+}
+
 func waitForTestFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.NewTimer(5 * time.Second)
@@ -423,10 +485,11 @@ func TestFakeUVProcess(t *testing.T) {
 		}
 	}
 	if path := os.Getenv("FAKE_UV_RECORD"); path != "" {
-		lines := make([]string, 0, len(os.Environ())+len(os.Args))
+		lines := make([]string, 0, len(os.Environ())+len(os.Args)+16)
 		for index, argument := range os.Args {
 			lines = append(lines, fmt.Sprintf("arg%d=%s", index, argument))
 		}
+		lines = append(lines, os.Environ()...)
 		for _, key := range []string{
 			uvPythonInstallDirEnv,
 			uvCacheDirEnv,
@@ -443,7 +506,9 @@ func TestFakeUVProcess(t *testing.T) {
 			autoMASCommit,
 			autoMASSupervised,
 		} {
-			lines = append(lines, key+"="+os.Getenv(key))
+			if value, ok := os.LookupEnv(key); ok {
+				lines = append(lines, key+"="+value)
+			}
 		}
 		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
 			t.Fatal(err)

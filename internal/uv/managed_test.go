@@ -104,6 +104,107 @@ func TestManaged_ScrubsHostSupervisionEnvironment(t *testing.T) {
 	}
 }
 
+func TestManagedRunner_ScrubsTelemetryEnvironment(t *testing.T) {
+	testCases := []struct {
+		name     string
+		identity *SupervisionIdentity
+		mode     string
+		offline  bool
+	}{
+		{name: "managed enabled", identity: &SupervisionIdentity{Version: "v6.0.0-test", Commit: strings.Repeat("a", 40)}, mode: "enabled"},
+		{name: "managed disabled", identity: &SupervisionIdentity{Version: "v6.0.0-test", Commit: strings.Repeat("a", 40)}, mode: "disabled"},
+		{name: "managed offline", identity: &SupervisionIdentity{Version: "v6.0.0-test", Commit: strings.Repeat("a", 40)}, mode: "enabled", offline: true},
+		{name: "development enabled", mode: "enabled"},
+		{name: "development disabled", mode: "disabled"},
+		{name: "development offline", mode: "enabled", offline: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			for _, key := range telemetryEnvironmentKeysForTest() {
+				t.Setenv(key, "host-value")
+			}
+			t.Setenv("AUTO_MAS_TELEMETRY", testCase.mode)
+			t.Setenv("AUTO_MAS_TEST_HOST_PASSTHROUGH", "host-value")
+			runner := newTestRunner(t)
+			recordPath := filepath.Join(t.TempDir(), "managed-telemetry-environment-record.txt")
+			environment := map[string]string{
+				"FAKE_UV_RECORD":                   recordPath,
+				"AUTO_MAS_TEST_OPTION_PASSTHROUGH": "option-value",
+			}
+			for _, key := range telemetryEnvironmentKeysForTest() {
+				environment[strings.ToLower(key)] = "option-value"
+			}
+			if testCase.offline {
+				environment[strings.ToLower(uvOfflineEnv)] = "1"
+			}
+			managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+				RunOptions: RunOptions{
+					Stage:       protocol.StageBackendSpawn,
+					Environment: environment,
+				},
+				Identity: testCase.identity,
+			}, nil)
+			if err != nil {
+				t.Fatalf("StartManaged() error = %v", err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			result, err := managed.Wait(ctx)
+			if err != nil || result.ExitCode != 0 {
+				t.Fatalf("Wait() = %#v, %v, want exit 0", result, err)
+			}
+			if err := managed.WaitEmpty(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := managed.Close(); err != nil {
+				t.Fatal(err)
+			}
+			record := readTestRecord(t, recordPath)
+			assertTelemetryEnvironmentAbsent(t, record)
+			for key, want := range map[string]string{
+				"AUTO_MAS_TEST_HOST_PASSTHROUGH":   "host-value",
+				"AUTO_MAS_TEST_OPTION_PASSTHROUGH": "option-value",
+				autoMASUVExecutable:                runner.Executable,
+				autoMASProtocol:                    "1",
+				autoMASSupervised:                  "1",
+				uvManagedPythonEnv:                 "1",
+				uvNoModifyPathEnv:                  "1",
+				uvPythonInstallBinEnv:              "0",
+			} {
+				if got := record[key]; got != want {
+					t.Errorf("environment[%q] = %q, want %q", key, got, want)
+				}
+			}
+			if got := record["PATH"]; got == "" {
+				t.Fatal("environment[PATH] is empty, want inherited PATH")
+			}
+			if testCase.offline {
+				if got := record[uvOfflineEnv]; got != "1" {
+					t.Errorf("environment[%q] = %q, want 1", uvOfflineEnv, got)
+				}
+			} else if containsEnvironmentKeyMap(record, uvOfflineEnv) {
+				t.Errorf("environment contains %q, want absent", uvOfflineEnv)
+			}
+			if testCase.identity == nil {
+				for _, key := range []string{autoMASVersion, autoMASCommit} {
+					if containsEnvironmentKeyMap(record, key) {
+						t.Errorf("development environment contains %q, want absent", key)
+					}
+				}
+			} else {
+				for key, want := range map[string]string{
+					autoMASVersion: testCase.identity.Version,
+					autoMASCommit:  testCase.identity.Commit,
+				} {
+					if got := record[key]; got != want {
+						t.Errorf("environment[%q] = %q, want %q", key, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestManaged_CancellationUsesOperationCancelled(t *testing.T) {
 	runner := newTestRunner(t)
 	ctx, cancel := context.WithCancel(t.Context())
