@@ -32,6 +32,10 @@ const (
 	autoMASVersion        = "AUTO_MAS_EXPECTED_VERSION"
 	autoMASCommit         = "AUTO_MAS_EXPECTED_COMMIT"
 	autoMASSupervised     = "AUTO_MAS_SUPERVISED"
+	autoMASTelemetry      = "AUTO_MAS_TELEMETRY"
+	autoMASSentryDSN      = "AUTO_MAS_SENTRY_DSN"
+	autoMASSentryEnv      = "AUTO_MAS_SENTRY_ENVIRONMENT"
+	autoMASSentryRelease  = "AUTO_MAS_SENTRY_RELEASE"
 	maxUVOutputLineBytes  = 1 << 20
 	maxUVOutputBytes      = 4 << 20
 	maxUVStreamBytes      = 16 << 20
@@ -55,7 +59,7 @@ type RunOptions struct {
 	ProjectEnvDir    string
 	CacheDir         string
 	// Environment 只接受非受控诊断变量，以及 network.go 明确允许的 UV 网络键；
-	// StartManaged 会清除并覆盖全部 AUTO_MAS 监督键。
+	// Runtime-only 遥测键会被拒绝，StartManaged 会清除并覆盖全部 AUTO_MAS 监督键。
 	Environment   map[string]string
 	PythonVersion string
 	Branch        string
@@ -452,7 +456,7 @@ func buildEnvironmentWithSupervision(options resolvedRunOptions, supervision map
 		value := options.Environment[key]
 		canonicalKey, allowedUV := canonicalUVOverrideKey(key)
 		_, supervisionKey := canonicalSupervisionEnvironmentKey(key)
-		if strings.EqualFold(key, "PATH") || containsEnvironmentKey(reserved, key) ||
+		if strings.EqualFold(key, "PATH") || isRuntimeOnlyEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
 			(isUVEnvironmentKey(key) && !allowedUV) || supervisionKey {
 			continue
 		}
@@ -465,7 +469,7 @@ func buildEnvironmentWithSupervision(options resolvedRunOptions, supervision map
 	for _, entry := range os.Environ() {
 		key, _, found := strings.Cut(entry, "=")
 		if found {
-			if isUVEnvironmentKey(key) || isSupervisionEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
+			if isRuntimeOnlyEnvironmentKey(key) || isUVEnvironmentKey(key) || isSupervisionEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
 				containsEnvironmentKeyMap(overrides, key) {
 				continue
 			}
@@ -508,6 +512,14 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 func isSupervisionEnvironmentKey(key string) bool {
 	_, ok := canonicalSupervisionEnvironmentKey(key)
 	return ok
+}
+
+// isRuntimeOnlyEnvironmentKey 阻止仅供 Runtime 配置的观测键跨越 uv/Python 进程边界。
+func isRuntimeOnlyEnvironmentKey(key string) bool {
+	return strings.EqualFold(key, autoMASTelemetry) ||
+		strings.EqualFold(key, autoMASSentryDSN) ||
+		strings.EqualFold(key, autoMASSentryEnv) ||
+		strings.EqualFold(key, autoMASSentryRelease)
 }
 
 func isUVEnvironmentKey(key string) bool {
