@@ -141,18 +141,8 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 		"--check",
 	}
 	options := s.runOptions(request, protocol.StageDependenciesCheck)
-	plan, err := s.network.plan(request.MirrorPolicy, mirror.KindPackageIndex)
-	if err != nil {
-		return err
-	}
-	if plan.Offline() {
+	if request.MirrorPolicy.Offline() {
 		options = withOfflineUV(options)
-	} else {
-		sources := plan.Sources()
-		if len(sources) == 0 {
-			return errors.New("package index mirror plan is empty")
-		}
-		args = append(args, "--default-index", sources[0].BaseURL())
 	}
 	result, err := s.runner.Run(ctx, args, options)
 	if err != nil {
