@@ -118,7 +118,6 @@ func TestDependencies_SyncArguments(t *testing.T) {
 	want := []string{
 		"sync", "--project", layout.RepoDir(), "--python", "3.12.10",
 		"--locked", "--no-default-groups", "--no-install-workspace",
-		"--default-index", "https://mirrors.aliyun.com/pypi/simple/",
 	}
 	if got := runner.calls[1].args; !reflect.DeepEqual(got, want) {
 		t.Fatalf("sync args = %#v, want %#v", got, want)
@@ -127,22 +126,13 @@ func TestDependencies_SyncArguments(t *testing.T) {
 
 func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 	tests := []struct {
-		name          string
-		policySpec    mirror.PolicySpec
-		wantSyncIndex string
-		wantOffline   bool
+		name        string
+		policySpec  mirror.PolicySpec
+		wantOffline bool
 	}{
 		{
-			name:          "default online",
-			policySpec:    mirror.PolicySpec{Preferred: map[mirror.Kind]string{}},
-			wantSyncIndex: "https://mirrors.aliyun.com/pypi/simple/",
-		},
-		{
-			name: "preferred online",
-			policySpec: mirror.PolicySpec{Preferred: map[mirror.Kind]string{
-				mirror.KindPackageIndex: "tsinghua",
-			}},
-			wantSyncIndex: "https://pypi.tuna.tsinghua.edu.cn/simple/",
+			name:       "default online",
+			policySpec: mirror.PolicySpec{Preferred: map[mirror.Kind]string{}},
 		},
 		{
 			name:        "offline",
@@ -163,7 +153,6 @@ func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDependenciesService() error = %v", err)
 			}
-			service.network = newTestNetworkExecutor(t)
 			policy, err := mirror.NewPolicy(test.policySpec)
 			if err != nil {
 				t.Fatalf("NewPolicy() error = %v", err)
@@ -196,9 +185,6 @@ func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 				"sync", "--project", layout.RepoDir(), "--python", "3.12.10",
 				"--locked", "--no-default-groups", "--no-install-workspace",
 			}
-			if test.wantSyncIndex != "" {
-				wantSyncArgs = append(wantSyncArgs, "--default-index", test.wantSyncIndex)
-			}
 			if got := syncCall.args; !reflect.DeepEqual(got, wantSyncArgs) {
 				t.Fatalf("sync args = %#v, want %#v", got, wantSyncArgs)
 			}
@@ -214,7 +200,46 @@ func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 	}
 }
 
-func TestDependencies_PackageIndexPolicyRotatesSources(t *testing.T) {
+func TestDependencies_PackageIndexOverrideRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "mirror", key: "tsinghua"},
+		{name: "official", key: "pypi"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			layout, err := config.NewLayout(root, filepath.Dir(root))
+			if err != nil {
+				t.Fatalf("NewLayout() error = %v", err)
+			}
+			writeLockfile(t, layout.UVLockFile())
+			runner := &fakeDependenciesRunner{}
+			service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
+			if err != nil {
+				t.Fatalf("NewDependenciesService() error = %v", err)
+			}
+			policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{
+				mirror.KindPackageIndex: test.key,
+			}})
+			if err != nil {
+				t.Fatalf("NewPolicy() error = %v", err)
+			}
+			request := dependencyTestRequest(layout)
+			request.MirrorPolicy = policy
+
+			_, err = service.Sync(t.Context(), request)
+			assertPythonCode(t, err, protocol.CodeInvalidArgument)
+			if got := len(runner.calls); got != 0 {
+				t.Fatalf("runner calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestDependencies_OnlineSyncFailureMapsToDependencySyncFailed(t *testing.T) {
 	root := t.TempDir()
 	layout, err := config.NewLayout(root, filepath.Dir(root))
 	if err != nil {
@@ -223,30 +248,17 @@ func TestDependencies_PackageIndexPolicyRotatesSources(t *testing.T) {
 	writeLockfile(t, layout.UVLockFile())
 	runner := &fakeDependenciesRunner{responses: []fakeRunnerResponse{
 		{},
-		{err: errors.New("first index failed")},
-		{},
+		{result: UVResult{ExitCode: 1}, err: errors.New("download failed")},
 	}}
 	service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
 	if err != nil {
 		t.Fatalf("NewDependenciesService() error = %v", err)
 	}
-	service.network = newTestNetworkExecutor(t)
-	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
-	if err != nil {
-		t.Fatalf("NewPolicy() error = %v", err)
-	}
-	request := dependencyTestRequest(layout)
-	request.MirrorPolicy = policy
-	if _, err := service.Sync(t.Context(), request); err != nil {
-		t.Fatalf("Sync() error = %v", err)
-	}
-	if got, want := runner.calls[1].args[len(runner.calls[1].args)-2:],
-		[]string{"--default-index", "https://mirrors.aliyun.com/pypi/simple/"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("first index args = %#v, want %#v", got, want)
-	}
-	if got, want := runner.calls[2].args[len(runner.calls[2].args)-2:],
-		[]string{"--default-index", "https://pypi.tuna.tsinghua.edu.cn/simple/"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("second index args = %#v, want %#v", got, want)
+
+	_, err = service.Sync(t.Context(), dependencyTestRequest(layout))
+	assertPythonCode(t, err, protocol.CodeDependencySyncFailed)
+	if got, want := len(runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 }
 
@@ -262,7 +274,6 @@ func TestDependencies_OfflineFailureMapsToNetworkUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDependenciesService() error = %v", err)
 	}
-	service.network = newTestNetworkExecutor(t)
 	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}, Offline: true})
 	if err != nil {
 		t.Fatalf("NewPolicy() error = %v", err)
