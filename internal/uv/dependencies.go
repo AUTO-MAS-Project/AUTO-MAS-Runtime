@@ -61,7 +61,7 @@ func NewDependenciesService(
 	return &DependenciesService{layout: layout, runner: runner, remover: remover, network: network}, nil
 }
 
-// Check 离线检查 uv.lock 与现有主项目环境是否保持同步。
+// Check 只读检查 uv.lock 与现有主项目环境是否保持同步。
 func (s *DependenciesService) Check(
 	ctx context.Context,
 	request DependenciesRequest,
@@ -134,12 +134,27 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 	if err := requireRegularLockfile(s.lockfilePath(request.ProjectDir)); err != nil {
 		return err
 	}
-	result, err := s.runner.Run(ctx, []string{
+	args := []string{
 		"lock",
 		"--project",
 		request.ProjectDir,
 		"--check",
-	}, withOfflineUV(s.runOptions(request, protocol.StageDependenciesCheck)))
+	}
+	options := s.runOptions(request, protocol.StageDependenciesCheck)
+	plan, err := s.network.plan(request.MirrorPolicy, mirror.KindPackageIndex)
+	if err != nil {
+		return err
+	}
+	if plan.Offline() {
+		options = withOfflineUV(options)
+	} else {
+		sources := plan.Sources()
+		if len(sources) == 0 {
+			return errors.New("package index mirror plan is empty")
+		}
+		args = append(args, "--default-index", sources[0].BaseURL())
+	}
+	result, err := s.runner.Run(ctx, args, options)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
