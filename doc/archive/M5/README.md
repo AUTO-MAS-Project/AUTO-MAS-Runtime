@@ -17,7 +17,9 @@ M5 实现 `internal/uv` 的 uv bootstrap、统一执行器、受管 Python、锁
 - [`设计-T5.9-Windows-uv发布回归.md`](./设计-T5.9-Windows-uv发布回归.md)：真实打包 EXE
   暴露的 Windows uv 发布、失败收口与只读检查回归的修复设计；
 - [`审查-T5.9-Windows-uv发布回归.md`](./审查-T5.9-Windows-uv发布回归.md)：T5.9 红绿灯、
-  官方资产、race、最终 EXE 黑盒与独立审查证据。
+  官方资产、race、最终 EXE 黑盒与独立审查证据；
+- [`设计-T5.10-锁文件检查网络策略.md`](./设计-T5.10-锁文件检查网络策略.md)：修复
+  `uv lock --check` 无条件离线，恢复在线 package-index 策略与显式离线边界。
 
 ## 本轮冻结决策
 
