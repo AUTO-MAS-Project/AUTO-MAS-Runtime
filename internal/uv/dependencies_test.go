@@ -125,24 +125,24 @@ func TestDependencies_SyncArguments(t *testing.T) {
 	}
 }
 
-func TestDependencies_LockfileCheckFollowsMirrorPolicy(t *testing.T) {
+func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 	tests := []struct {
-		name        string
-		policySpec  mirror.PolicySpec
-		wantIndex   string
-		wantOffline bool
+		name          string
+		policySpec    mirror.PolicySpec
+		wantSyncIndex string
+		wantOffline   bool
 	}{
 		{
-			name:       "default online",
-			policySpec: mirror.PolicySpec{Preferred: map[mirror.Kind]string{}},
-			wantIndex:  "https://mirrors.aliyun.com/pypi/simple/",
+			name:          "default online",
+			policySpec:    mirror.PolicySpec{Preferred: map[mirror.Kind]string{}},
+			wantSyncIndex: "https://mirrors.aliyun.com/pypi/simple/",
 		},
 		{
 			name: "preferred online",
 			policySpec: mirror.PolicySpec{Preferred: map[mirror.Kind]string{
 				mirror.KindPackageIndex: "tsinghua",
 			}},
-			wantIndex: "https://pypi.tuna.tsinghua.edu.cn/simple/",
+			wantSyncIndex: "https://pypi.tuna.tsinghua.edu.cn/simple/",
 		},
 		{
 			name:        "offline",
@@ -179,9 +179,6 @@ func TestDependencies_LockfileCheckFollowsMirrorPolicy(t *testing.T) {
 			}
 			lockCall := runner.calls[0]
 			wantArgs := []string{"lock", "--project", layout.RepoDir(), "--check"}
-			if test.wantIndex != "" {
-				wantArgs = append(wantArgs, "--default-index", test.wantIndex)
-			}
 			if got := lockCall.args; !reflect.DeepEqual(got, wantArgs) {
 				t.Fatalf("lock check args = %#v, want %#v", got, wantArgs)
 			}
@@ -192,6 +189,26 @@ func TestDependencies_LockfileCheckFollowsMirrorPolicy(t *testing.T) {
 				}
 			} else if offlineSet {
 				t.Fatalf("lock check offline environment = %q, true, want unset", offlineValue)
+			}
+
+			syncCall := runner.calls[1]
+			wantSyncArgs := []string{
+				"sync", "--project", layout.RepoDir(), "--python", "3.12.10",
+				"--locked", "--no-default-groups", "--no-install-workspace",
+			}
+			if test.wantSyncIndex != "" {
+				wantSyncArgs = append(wantSyncArgs, "--default-index", test.wantSyncIndex)
+			}
+			if got := syncCall.args; !reflect.DeepEqual(got, wantSyncArgs) {
+				t.Fatalf("sync args = %#v, want %#v", got, wantSyncArgs)
+			}
+			syncOfflineValue, syncOfflineSet := syncCall.options.Environment[uvOfflineEnv]
+			if test.wantOffline {
+				if !syncOfflineSet || syncOfflineValue != "1" {
+					t.Fatalf("sync offline environment = %q, %t, want 1, true", syncOfflineValue, syncOfflineSet)
+				}
+			} else if syncOfflineSet {
+				t.Fatalf("sync offline environment = %q, true, want unset", syncOfflineValue)
 			}
 		})
 	}
