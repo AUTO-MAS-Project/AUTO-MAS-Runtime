@@ -125,6 +125,78 @@ func TestDependencies_SyncArguments(t *testing.T) {
 	}
 }
 
+func TestDependencies_LockfileCheckFollowsMirrorPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		policySpec  mirror.PolicySpec
+		wantIndex   string
+		wantOffline bool
+	}{
+		{
+			name:       "default online",
+			policySpec: mirror.PolicySpec{Preferred: map[mirror.Kind]string{}},
+			wantIndex:  "https://mirrors.aliyun.com/pypi/simple/",
+		},
+		{
+			name: "preferred online",
+			policySpec: mirror.PolicySpec{Preferred: map[mirror.Kind]string{
+				mirror.KindPackageIndex: "tsinghua",
+			}},
+			wantIndex: "https://pypi.tuna.tsinghua.edu.cn/simple/",
+		},
+		{
+			name:        "offline",
+			policySpec:  mirror.PolicySpec{Preferred: map[mirror.Kind]string{}, Offline: true},
+			wantOffline: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			layout, err := config.NewLayout(root, filepath.Dir(root))
+			if err != nil {
+				t.Fatalf("NewLayout() error = %v", err)
+			}
+			writeLockfile(t, layout.UVLockFile())
+			runner := &fakeDependenciesRunner{}
+			service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
+			if err != nil {
+				t.Fatalf("NewDependenciesService() error = %v", err)
+			}
+			service.network = newTestNetworkExecutor(t)
+			policy, err := mirror.NewPolicy(test.policySpec)
+			if err != nil {
+				t.Fatalf("NewPolicy() error = %v", err)
+			}
+			request := dependencyTestRequest(layout)
+			request.MirrorPolicy = policy
+
+			if _, err := service.Sync(t.Context(), request); err != nil {
+				t.Fatalf("Sync() error = %v", err)
+			}
+			if got, want := len(runner.calls), 2; got != want {
+				t.Fatalf("runner calls = %d, want %d", got, want)
+			}
+			lockCall := runner.calls[0]
+			wantArgs := []string{"lock", "--project", layout.RepoDir(), "--check"}
+			if test.wantIndex != "" {
+				wantArgs = append(wantArgs, "--default-index", test.wantIndex)
+			}
+			if got := lockCall.args; !reflect.DeepEqual(got, wantArgs) {
+				t.Fatalf("lock check args = %#v, want %#v", got, wantArgs)
+			}
+			offlineValue, offlineSet := lockCall.options.Environment[uvOfflineEnv]
+			if test.wantOffline {
+				if !offlineSet || offlineValue != "1" {
+					t.Fatalf("lock check offline environment = %q, %t, want 1, true", offlineValue, offlineSet)
+				}
+			} else if offlineSet {
+				t.Fatalf("lock check offline environment = %q, true, want unset", offlineValue)
+			}
+		})
+	}
+}
+
 func TestDependencies_PackageIndexPolicyRotatesSources(t *testing.T) {
 	root := t.TempDir()
 	layout, err := config.NewLayout(root, filepath.Dir(root))
