@@ -2,8 +2,6 @@ package uv
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -42,7 +40,6 @@ type DependenciesService struct {
 	layout  *config.Layout
 	runner  Runner
 	remover TreeRemover
-	network *networkExecutor
 }
 
 // NewDependenciesService 创建主项目依赖服务。
@@ -54,11 +51,7 @@ func NewDependenciesService(
 	if layout == nil || runner == nil || remover == nil {
 		return nil, errors.New("dependencies service dependencies are incomplete")
 	}
-	network, err := newDefaultNetworkExecutor()
-	if err != nil {
-		return nil, err
-	}
-	return &DependenciesService{layout: layout, runner: runner, remover: remover, network: network}, nil
+	return &DependenciesService{layout: layout, runner: runner, remover: remover}, nil
 }
 
 // Check 只读检查 uv.lock 与现有主项目环境是否保持同步。
@@ -103,15 +96,11 @@ func (s *DependenciesService) Sync(
 	if err := s.checkLockfile(ctx, request); err != nil {
 		return DependenciesResult{}, err
 	}
-	lockDigest, err := lockfileDigest(ctx, s.lockfilePath(request.ProjectDir))
-	if err != nil {
-		return DependenciesResult{}, err
+	options := s.runOptions(request, protocol.StageDependenciesSync)
+	if request.MirrorPolicy.Offline() {
+		options = withOfflineUV(options)
 	}
-	target, err := mirror.NewTarget(mirror.TargetSpec{LockDigest: lockDigest})
-	if err != nil {
-		return DependenciesResult{}, fmt.Errorf("build package index mirror target: %w", err)
-	}
-	result, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPackageIndex, target, []string{
+	result, err := s.runner.Run(ctx, []string{
 		"sync",
 		"--project",
 		request.ProjectDir,
@@ -120,10 +109,19 @@ func (s *DependenciesService) Sync(
 		"--locked",
 		"--no-default-groups",
 		"--no-install-workspace",
-	}, s.runOptions(request, protocol.StageDependenciesSync))
+	}, options)
 	if err != nil || result.ExitCode != 0 {
-		if isNetworkPolicyError(err) {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return DependenciesResult{}, err
+		}
+		if request.MirrorPolicy.Offline() {
+			return DependenciesResult{}, newError(
+				protocol.CodeNetworkUnavailable,
+				protocol.StageDependenciesSync,
+				"离线缓存不足，操作需要网络",
+				map[string]any{"sourceKind": mirror.KindPackageIndex.String(), "exitCode": result.ExitCode},
+				nonNilRunError(err),
+			)
 		}
 		return DependenciesResult{}, dependencySyncError(result, err)
 	}
@@ -170,36 +168,6 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 		)
 	}
 	return nil
-}
-
-func lockfileDigest(ctx context.Context, path string) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return "", newError(
-			protocol.CodeLockfileMissing,
-			protocol.StageDependenciesCheck,
-			"项目锁文件不可读取",
-			map[string]any{},
-			err,
-		)
-	}
-	if len(contents) > maxUVLockFileBytes {
-		return "", newError(
-			protocol.CodeLockfileMissing,
-			protocol.StageDependenciesCheck,
-			"项目锁文件过大",
-			map[string]any{"maxBytes": maxUVLockFileBytes},
-			errors.New("uv.lock is too large"),
-		)
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(contents)
-	return hex.EncodeToString(digest[:]), nil
 }
 
 // Rebuild 通过 T2.5 删除能力重建 managed venv，不触碰源码、锁文件和用户数据。
@@ -262,6 +230,15 @@ func (s *DependenciesService) validateRequest(
 		if value == "" || containsNUL(value) {
 			return fmt.Errorf("%s is invalid", name)
 		}
+	}
+	if source, ok := request.MirrorPolicy.Preferred(mirror.KindPackageIndex); ok {
+		return newError(
+			protocol.CodeInvalidArgument,
+			protocol.StageDependenciesCheck,
+			"锁定依赖不支持覆盖包索引",
+			map[string]any{"sourceKind": mirror.KindPackageIndex.String(), "source": source},
+			errors.New("package index override conflicts with locked sources"),
+		)
 	}
 	return nil
 }
