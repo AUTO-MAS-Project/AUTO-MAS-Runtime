@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,7 @@ const gitFixtureTimeout = 10 * time.Second
 type gitFixtureCommit struct {
 	label   string
 	version string
+	files   map[string]string
 }
 
 type gitFixtureRepository struct {
@@ -84,7 +86,23 @@ func newGitFixtureRepository(
 		); err != nil {
 			t.Fatalf("WriteFile(marker) error = %v", err)
 		}
-		for _, path := range []string{"res/version.json", "fixture-marker.txt"} {
+		paths := []string{"res/version.json", "fixture-marker.txt"}
+		fixturePaths := make([]string, 0, len(commit.files))
+		for path := range commit.files {
+			fixturePaths = append(fixturePaths, path)
+		}
+		sort.Strings(fixturePaths)
+		for _, path := range fixturePaths {
+			filePath := filepath.Join(seedPath, filepath.FromSlash(path))
+			if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+				t.Fatalf("MkdirAll(%q) error = %v", path, err)
+			}
+			if err := os.WriteFile(filePath, []byte(commit.files[path]), 0o600); err != nil {
+				t.Fatalf("WriteFile(%q) error = %v", path, err)
+			}
+			paths = append(paths, path)
+		}
+		for _, path := range paths {
 			if _, err := worktree.Add(path); err != nil {
 				t.Fatalf("Add(%q) error = %v", path, err)
 			}

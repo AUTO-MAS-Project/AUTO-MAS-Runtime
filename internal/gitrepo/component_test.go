@@ -53,7 +53,12 @@ func TestComponent_GitAcquisitionMatrix(t *testing.T) {
 	t.Run("preferred source succeeds with shallow single branch and no tags", func(t *testing.T) {
 		repository := newGitFixtureRepository(t,
 			gitFixtureCommit{label: "base", version: "v0.9.0"},
-			gitFixtureCommit{label: "target", version: "v1.0.0"},
+			gitFixtureCommit{label: "target", version: "v1.0.0", files: map[string]string{
+				".debug":               "local debug marker",
+				"app/kept.txt":         "backend content",
+				"frontend/ignored.txt": "frontend content",
+				"frontend-tools/kept":  "similarly named root remains",
+			}},
 		)
 		repository.setBranch(t, "v1.0.0", "target")
 		repository.addTag(t, "v1.0.0", "target")
@@ -87,6 +92,10 @@ func TestComponent_GitAcquisitionMatrix(t *testing.T) {
 			t.Fatalf("Fetch() revision = %#v, want target/origin", result.Revision)
 		}
 		assertFetchedRepositoryShape(t, result.RepositoryPath, target, source, result.Revision.Commit())
+		assertSparseCheckoutPath(t, result.RepositoryPath, ".debug", false, "")
+		assertSparseCheckoutPath(t, result.RepositoryPath, "frontend", false, "")
+		assertSparseCheckoutPath(t, result.RepositoryPath, "app/kept.txt", true, "backend content")
+		assertSparseCheckoutPath(t, result.RepositoryPath, "frontend-tools/kept", true, "similarly named root remains")
 		assertCommitObjectAbsent(t, result.RepositoryPath, repository.hash(t, "base"))
 		stats := server.snapshotStats("origin")
 		if stats.discoveries != 2 || stats.packs != 1 ||
@@ -1145,6 +1154,40 @@ func assertFetchedRepositoryShape(
 	branches.Close()
 	if len(branchNames) != 1 || branchNames[0] != plumbing.NewBranchReferenceName(target.Branch()).String() {
 		t.Fatalf("local branches = %v, want only target branch", branchNames)
+	}
+	worktree, err := repository.Worktree()
+	if err != nil {
+		t.Fatalf("Worktree() error = %v", err)
+	}
+	status, err := worktree.Status()
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if !status.IsClean() {
+		t.Fatalf("Status() = %s, want clean sparse worktree", status)
+	}
+}
+
+func assertSparseCheckoutPath(
+	t *testing.T,
+	repositoryPath string,
+	path string,
+	wantPresent bool,
+	wantContent string,
+) {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(repositoryPath, filepath.FromSlash(path)))
+	if !wantPresent {
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("ReadFile(%q) error = %v, want not exist", path, err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	if string(content) != wantContent {
+		t.Fatalf("ReadFile(%q) = %q, want %q", path, content, wantContent)
 	}
 }
 
