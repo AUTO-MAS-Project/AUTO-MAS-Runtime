@@ -79,6 +79,9 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 			if !options.SingleBranch || options.Depth != 1 || options.Tags != git.NoTags {
 				t.Fatalf("clone shape = single:%t depth:%d tags:%d, want true/1/NoTags", options.SingleBranch, options.Depth, options.Tags)
 			}
+			if !options.NoCheckout {
+				t.Fatal("CloneOptions.NoCheckout = false, want true")
+			}
 			if options.RemoteName != "origin" || options.RecurseSubmodules != git.NoRecurseSubmodules {
 				t.Fatalf("clone remote/submodules = %q/%d, want origin/disabled", options.RemoteName, options.RecurseSubmodules)
 			}
