@@ -171,6 +171,13 @@ func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, err
 	if dependencies.cleanupContext == nil {
 		dependencies.cleanupContext = newCloneCleanupContext
 	}
+	if client, ok := dependencies.git.(goGitClient); ok && !client.policy.valid() {
+		policy, err := newCheckoutPolicy(repositoryCheckoutExclusions())
+		if err != nil {
+			return nil, fmt.Errorf("%w: checkout policy: %v", ErrInvalidFetcher, err)
+		}
+		dependencies.git = goGitClient{policy: policy}
+	}
 	if dependencies.layout == nil ||
 		nilDependency(dependencies.rotator) ||
 		nilDependency(dependencies.git) ||
@@ -409,6 +416,7 @@ func (f *Fetcher) fetchAttempt(
 		RemoteName:        "origin",
 		ReferenceName:     plumbing.NewBranchReferenceName(request.Target.Branch()),
 		SingleBranch:      true,
+		NoCheckout:        true,
 		Depth:             1,
 		RecurseSubmodules: git.NoRecurseSubmodules,
 		Progress:          progress,
@@ -1069,7 +1077,9 @@ func (w *cloneProgressWriter) Err() error {
 	return w.lastErr
 }
 
-type goGitClient struct{}
+type goGitClient struct {
+	policy checkoutPolicy
+}
 
 // cloneStorage 只暴露 go-git 必需的 Storer 方法，避免触发有截断 pack 句柄缺陷的快捷写入路径。
 type cloneStorage struct {
@@ -1096,11 +1106,14 @@ func (goGitClient) ListReferences(
 	})
 }
 
-func (goGitClient) Clone(
+func (c goGitClient) Clone(
 	ctx context.Context,
 	path string,
 	options git.CloneOptions,
 ) error {
+	if !c.policy.valid() || !options.NoCheckout {
+		return errInvalidCheckoutPolicy
+	}
 	worktree := osfs.New(path)
 	gitDirectory, err := worktree.Chroot(git.GitDirName)
 	if err != nil {
@@ -1111,8 +1124,40 @@ func (goGitClient) Clone(
 		Storer: diskStore,
 		init:   diskStore.Init,
 	}
-	_, err = git.CloneContext(ctx, store, worktree, &options)
-	return err
+	repository, err := git.CloneContext(ctx, store, worktree, &options)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	head, err := repository.Head()
+	if err != nil {
+		return fmt.Errorf("read cloned HEAD: %w", err)
+	}
+	commit, err := repository.CommitObject(head.Hash())
+	if err != nil {
+		return fmt.Errorf("read cloned commit: %w", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return fmt.Errorf("read cloned tree: %w", err)
+	}
+	patterns, err := c.policy.patterns(tree)
+	if err != nil {
+		return fmt.Errorf("build sparse checkout: %w", err)
+	}
+	clonedWorktree, err := repository.Worktree()
+	if err != nil {
+		return fmt.Errorf("open cloned worktree: %w", err)
+	}
+	if err := clonedWorktree.ResetSparsely(&git.ResetOptions{
+		Mode:   git.HardReset,
+		Commit: head.Hash(),
+	}, patterns); err != nil {
+		return fmt.Errorf("sparse checkout repository: %w", err)
+	}
+	return ctx.Err()
 }
 
 var _ gitClient = goGitClient{}

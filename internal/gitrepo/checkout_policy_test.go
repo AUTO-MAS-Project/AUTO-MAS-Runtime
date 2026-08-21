@@ -28,6 +28,8 @@ func TestCheckoutPolicy_RejectsInvalidExclusions(t *testing.T) {
 		{name: "git directory", exclusions: []string{".git"}},
 		{name: "nested slash", exclusions: []string{"frontend/cache"}},
 		{name: "nested backslash", exclusions: []string{`frontend\cache`}},
+		{name: "wildcard", exclusions: []string{"front*"}},
+		{name: "windows absolute", exclusions: []string{`C:\frontend`}},
 		{name: "duplicate", exclusions: []string{"frontend", "frontend"}},
 		{name: "required file", exclusions: []string{"main.py"}},
 		{name: "required directory", exclusions: []string{"app"}},
