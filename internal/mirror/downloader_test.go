@@ -1785,6 +1785,100 @@ func TestDownloader_BodyClosedExactlyOnceAcrossResponsePaths(t *testing.T) {
 	}
 }
 
+// zeroProgressReader 始终返回 (0, nil)。io.Reader 契约允许这种返回，
+// 真实来源可以是非阻塞 socket、被中断的 TLS 记录读取，或行为不规范的 transport。
+type zeroProgressReader struct {
+	reads atomic.Int64
+}
+
+func (r *zeroProgressReader) Read([]byte) (int, error) {
+	r.reads.Add(1)
+	return 0, nil
+}
+
+// TestPumpBody_ZeroReadRespectsCancellation 锁定 L-2 的修复。
+//
+// (0, nil) 分支 continue 回循环顶部，走不到底下带 ctx.Done() 的 select，
+// 因此修复前这条路径完全不可取消：goroutine 以 100% CPU 忙转，
+// 且随 Download 一起泄漏——下载超时和用户取消都拿它没办法。
+func TestPumpBody_ZeroReadRespectsCancellation(t *testing.T) {
+	reader := &zeroProgressReader{}
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks := make(chan bodyChunk)
+	done := make(chan struct{})
+	go pumpBody(ctx, reader, chunks, done)
+
+	// 先确认它真的在转（否则这个用例可能因为根本没进入循环而假通过）。
+	deadline := time.Now().Add(2 * time.Second)
+	for reader.reads.Load() == 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("pumpBody never issued a read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pumpBody did not return after cancellation on the (0, nil) path")
+	}
+	select {
+	case chunk := <-chunks:
+		t.Fatalf("pumpBody emitted a chunk %#v, want none for zero-length reads", chunk)
+	default:
+	}
+}
+
+// TestDownloader_UnknownSizeProgressProbeFailureClosesBody 锁定 M-2 的修复。
+//
+// Download 有两处初始进度探测：expectedSize > 0 时在取得 HTTP 句柄**之前**探测
+// （失败时没有句柄可泄漏），以及 expectedSize == 0 时从 Content-Length 解析出
+// 尺寸后、在**已持有句柄**的情况下探测。修复前只有后者忘了收口：abortFailure
+// 只回滚文件系统 session，不碰 HTTP 句柄，于是响应体不关、派生 context 不取消，
+// 连接不归还连接池。镜像轮换会对每个候选源重复调用，泄漏按候选数累积。
+//
+// 已有的 TestDownloader_BodyClosedExactlyOnceAcrossResponsePaths「progress error」
+// 用例在 Received == Total 时失败，走的是终态报告路径，覆盖不到这一处。
+func TestDownloader_UnknownSizeProgressProbeFailureClosesBody(t *testing.T) {
+	content := []byte("abc")
+	body := &closeCountingBody{reader: bytes.NewReader(content)}
+	client := responseWithBodyClient(t, body, int64(len(content)), http.StatusOK)
+	session := successfulRecordingSession()
+	downloader := downloaderForTransactionTest(t, session, client, nil)
+	request := requestForBytes(content)
+	request.ExpectedSize = 0
+	request.AllowUnknownSize = true
+	request.MaxSize = int64(len(content))
+	probeCalls := 0
+	request.Progress = func(progress DownloadProgress) error {
+		probeCalls++
+		// 只在首次（Received == 0 的探测）失败，确保命中的是探测分支而非终态报告。
+		if progress.Received == 0 {
+			return errTestSecret
+		}
+		return nil
+	}
+
+	_, err := downloader.Download(t.Context(), request)
+	var failure *DownloadFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("Download() error = %v, want *DownloadFailure", err)
+	}
+	if failure.Kind != FailureProgress {
+		t.Fatalf("failure kind = %v, want %v", failure.Kind, FailureProgress)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("progress calls = %d, want exactly the initial probe", probeCalls)
+	}
+	if got := body.count.Load(); got != 1 {
+		t.Fatalf("Body.Close count = %d, want 1 (response body leaked)", got)
+	}
+	if _, _, abortCalls := session.snapshot(); abortCalls != 1 {
+		t.Fatalf("session abort calls = %d, want 1", abortCalls)
+	}
+}
+
 func TestDownloader_BodyCloseFailureMatrix(t *testing.T) {
 	content := []byte("abc")
 	closeCause := errors.New("close-cause-secret")

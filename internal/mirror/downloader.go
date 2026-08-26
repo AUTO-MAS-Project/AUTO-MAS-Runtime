@@ -486,11 +486,12 @@ func (d *Downloader) Download(
 			d.clock,
 		)
 		if err := reporter.report(0, true); err != nil {
-			return DownloadResult{}, d.abortFailure(
-				ctx,
-				session,
-				newDownloadFailure(FailureProgress, 0, err),
-			)
+			failure = newDownloadFailure(FailureProgress, 0, err)
+			// abortFailure 只回滚文件系统 session，不碰 HTTP 句柄；这里与上面各
+			// 失败分支保持一致地关闭响应体并取消派生 context，否则连接不归还
+			// 连接池，镜像轮换反复调用时会累积泄漏。
+			failure.Err = errors.Join(failure.Err, closeResponseAndCancel(handle))
+			return DownloadResult{}, d.abortFailure(ctx, session, failure)
 		}
 	}
 	result := DownloadResult{
@@ -654,6 +655,12 @@ func pumpBody(
 	for {
 		n, err := body.Read(buffer)
 		if n == 0 && err == nil {
+			// io.Reader 允许返回 (0, nil)，调用方应当忽略。但这条分支走不到下面的
+			// select，因此必须在此检查取消，否则一个持续返回 (0, nil) 的 reader
+			// 会让本 goroutine 无限忙转且无法被取消。
+			if ctx.Err() != nil {
+				return
+			}
 			continue
 		}
 		chunk := bodyChunk{err: err}
