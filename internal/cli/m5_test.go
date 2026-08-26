@@ -115,7 +115,7 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 			"--app-root", root,
 			"--output", "ndjson",
 			"--mirror", "python=github",
-			"--mirror", "package-index=pypi",
+			"--mirror", "git=cnb",
 			"bootstrap", "--version", "v5.4.0",
 		},
 		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
@@ -164,8 +164,96 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	if got, ok := environment.pythonRequest.MirrorPolicy.Preferred(mirror.KindPython); !ok || got != "github" {
 		t.Fatalf("Python request preference = %q/%t, want github/true", got, ok)
 	}
-	if got, ok := environment.dependencyRequest.MirrorPolicy.Preferred(mirror.KindPackageIndex); !ok || got != "pypi" {
-		t.Fatalf("dependency request preference = %q/%t, want pypi/true", got, ok)
+	// 原本这里用 package-index=pypi 断言镜像策略透传，但架构设计要求 bootstrap
+	// 对显式 package-index 首选直接返回 INVALID_ARGUMENT，该用例只是因为依赖服务
+	// 被替换成假实现才没撞上。改用 git 首选验证同一条透传路径，
+	// 拒绝行为由 TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects 覆盖。
+	if got, ok := environment.dependencyRequest.MirrorPolicy.Preferred(mirror.KindGit); !ok || got != "cnb" {
+		t.Fatalf("dependency request preference = %q/%t, want cnb/true", got, ok)
+	}
+}
+
+// TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects 锁定架构设计的要求：
+// bootstrap 与顶层 repair 对显式 --mirror package-index=<键> 返回 INVALID_ARGUMENT，
+// 且必须在调用 uv 之前失败关闭。断言重点是「一次副作用都没发生」——
+// 既没抢 mutation 锁，也没开状态库、没下载 uv、没同步仓库。
+// 修复前该拒绝发生在 uv/仓库/Python 全部落盘之后的依赖同步阶段。
+func TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "bootstrap", args: []string{"bootstrap", "--version", "v5.4.0"}},
+		{name: "repair", args: []string{"repair"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log := &m5TestLog{}
+			environment := &m5TestEnvironment{calls: &log.calls}
+			workspace := &m5TestWorkspace{calls: &log.calls}
+			store := &m5TestStateStore{calls: &log.calls}
+			coordinator := &m5TestCoordinator{calls: &log.calls}
+			var stdout, stderr bytes.Buffer
+			args := append(
+				[]string{
+					"--app-root", root,
+					"--output", "ndjson",
+					"--mirror", "package-index=pypi",
+				},
+				test.args...,
+			)
+			code := Execute(
+				context.Background(),
+				args,
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithCWD(root),
+				WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+				WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
+				WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+					return store, nil
+				}),
+				WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+					return coordinator, nil
+				}),
+				WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+					return log, nil
+				}),
+			)
+			if code != int(protocol.ExitCodeInvalidArgument) {
+				t.Fatalf("exit code = %d, want %d; stderr=%q", code, protocol.ExitCodeInvalidArgument, stderr.String())
+			}
+			if len(log.calls) != 0 {
+				t.Fatalf("calls = %#v, want no side effect before rejection", log.calls)
+			}
+			if len(store.writes) != 0 {
+				t.Fatalf("state writes = %#v, want none", store.writes)
+			}
+			if environment.uvRepairCalls != 0 || environment.pythonPrepareCalls != 0 || environment.syncCalls != 0 {
+				t.Fatalf(
+					"environment calls = uvRepair %d python %d sync %d, want all zero",
+					environment.uvRepairCalls,
+					environment.pythonPrepareCalls,
+					environment.syncCalls,
+				)
+			}
+			events := parseNDJSON(t, stdout.String())
+			var errorEvent, resultEvent parsedEvent
+			for _, event := range events {
+				switch eventType(event) {
+				case string(protocol.TypeError):
+					errorEvent = event
+				case string(protocol.TypeResult):
+					resultEvent = event
+				}
+			}
+			if got := eventString(errorEvent, "code"); got != string(protocol.CodeInvalidArgument) {
+				t.Errorf("error code = %q, want INVALID_ARGUMENT", got)
+			}
+			if got := eventString(resultEvent, "code"); got != string(protocol.CodeInvalidArgument) {
+				t.Errorf("result code = %q, want INVALID_ARGUMENT", got)
+			}
+		})
 	}
 }
 

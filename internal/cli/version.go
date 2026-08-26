@@ -39,15 +39,18 @@ func runVersion(
 ) (sessionSuccess, error) {
 	info, err := source(ctx)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		// 取消与超时都交给会话层的取消分支，映射为 OPERATION_CANCELLED。
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return sessionSuccess{}, err
 		}
 		var operationErr operationError
 		if errors.As(err, &operationErr) {
 			return sessionSuccess{}, err
 		}
+		// 这里失败的是版本信息查询，尚未向协议通道写入任何内容；
+		// 按架构设计「任何命令都不得把内部故障伪装成输出写失败」，用 INTERNAL_ERROR。
 		return sessionSuccess{}, &commandError{
-			code:    protocol.CodeOutputWriteFailed,
+			code:    protocol.CodeInternalError,
 			stage:   protocol.StageRuntimeHandshake,
 			message: "无法获取版本信息",
 			details: map[string]any{},

@@ -117,7 +117,10 @@ func TestVersionCommand_InjectedValues(t *testing.T) {
 	}
 }
 
-func TestVersionCommand_SourceErrorMapsToOutputWriteFailed(t *testing.T) {
+// 版本源失败是内部故障，不是协议输出失败。架构设计要求「任何命令都不得把内部
+// 故障伪装成输出写失败」，因此这里断言 INTERNAL_ERROR。
+// 本用例此前断言 OUTPUT_WRITE_FAILED，是固化了缺陷行为，已随修复一并纠正。
+func TestVersionCommand_SourceErrorMapsToInternalError(t *testing.T) {
 	t.Parallel()
 	var stdout strings.Builder
 	var stderr strings.Builder
@@ -147,14 +150,48 @@ func TestVersionCommand_SourceErrorMapsToOutputWriteFailed(t *testing.T) {
 			resultEvent = event
 		}
 	}
-	if got := eventString(errorEvent, "code"); got != string(protocol.CodeOutputWriteFailed) {
-		t.Errorf("error code = %q, want OUTPUT_WRITE_FAILED", got)
+	if got := eventString(errorEvent, "code"); got != string(protocol.CodeInternalError) {
+		t.Errorf("error code = %q, want INTERNAL_ERROR", got)
 	}
 	if got := eventString(errorEvent, "message"); got != "无法获取版本信息" {
 		t.Errorf("error message = %q, want 无法获取版本信息", got)
 	}
-	if got := eventString(resultEvent, "code"); got != string(protocol.CodeOutputWriteFailed) {
-		t.Errorf("result code = %q, want OUTPUT_WRITE_FAILED", got)
+	if got := eventString(resultEvent, "code"); got != string(protocol.CodeInternalError) {
+		t.Errorf("result code = %q, want INTERNAL_ERROR", got)
+	}
+}
+
+// 版本源返回 DeadlineExceeded 时同样要落到取消语义，而不是 INTERNAL_ERROR，
+// 否则超时会被当成内部故障并触发遥测上报。
+func TestVersionCommand_DeadlineExceededSourceMapsToOperationCancelled(t *testing.T) {
+	t.Parallel()
+	var stdout strings.Builder
+	var stderr strings.Builder
+	code := Execute(
+		context.Background(),
+		[]string{"--output", "ndjson", "version"},
+		IO{
+			In:  strings.NewReader(""),
+			Out: &stdout,
+			Err: &stderr,
+		},
+		WithCWD(t.TempDir()),
+		WithVersionSource(func(context.Context) (version.Info, error) {
+			return version.Info{}, context.DeadlineExceeded
+		}),
+	)
+	if code != 130 {
+		t.Fatalf("exit code = %d, want 130", code)
+	}
+	events := parseNDJSON(t, stdout.String())
+	var resultEvent parsedEvent
+	for _, event := range events {
+		if eventType(event) == string(protocol.TypeResult) {
+			resultEvent = event
+		}
+	}
+	if got := eventString(resultEvent, "code"); got != string(protocol.CodeOperationCancelled) {
+		t.Errorf("result code = %q, want OPERATION_CANCELLED", got)
 	}
 }
 
