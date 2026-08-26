@@ -140,33 +140,28 @@ Runtime 只接收版本号，不接收任意 Git 分支或 Commit。版本必须
 
 ## 全局选项
 
-这些选项可以和支持它们的命令一起使用：
+最常用的三个：`--app-root <目录>` 指定 Runtime 受管目录根（默认当前工作目录，
+建议显式传绝对路径），`--output human|ndjson` 选择输出格式，`--protocol 1`
+声明协议版本。
 
-| 选项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--app-root <目录>` | 当前工作目录 | Runtime 受管目录根；建议显式传入绝对路径 |
-| `--output <模式>` | `human` | 取值为 `human` 或 `ndjson` |
-| `--protocol <版本>` | `1` | Runtime 协议版本；当前只支持 `1` |
-| `--offline` | 关闭 | 禁止所有网络访问 |
-| `--mirror <类型>=<键>` | 无 | 指定镜像源，可重复使用；类型为 `git`、`uv`、`python`、`package-index` |
-| `--mirror-only` | 关闭 | 只使用配置的镜像源，不回退官方源 |
-
-`--offline` 不能和 `--mirror` 或 `--mirror-only` 同时使用。网络相关操作在
-离线模式下无法完成时会返回 `NETWORK_UNAVAILABLE`。
+网络行为由 `--offline`、`--mirror <类型>=<键>`（可重复）和 `--mirror-only`
+控制，三者有互斥规则：`--offline` 不能与 `--mirror` 或 `--mirror-only` 同时
+使用，离线下无法完成的网络操作返回 `NETWORK_UNAVAILABLE`。完整取值、默认值和
+各命令接受哪些镜像类型见
+[架构设计](doc/架构设计.md)。
 
 ## 错误观测
 
-正式发布可以通过可选的 GitHub Actions secret `AUTO_MAS_SENTRY_DSN` 启用 Sentry
-错误观测。它必须是 Sentry 项目 DSN，不是 auth token；没有该 secret 时，观测保持
-no-op。Runtime 只上报已清理的 `INTERNAL_ERROR` 和未预期的 panic，不启用 tracing
-或日志转发，也不使用 PostHog/Umami。
+发布构建可通过可选的 GitHub Actions secret `AUTO_MAS_SENTRY_DSN` 启用 Sentry；
+缺少该 secret 时观测保持 no-op。Runtime 只上报已净化的 `INTERNAL_ERROR` 和未预期
+panic，不启用 tracing 或日志转发。禁用观测：
 
-临时本地运行可以在当前 PowerShell 7 会话设置相关环境变量；不要把 DSN 写入仓库、
-脚本或提交历史。需要禁用观测时：
-
-`powershell
+```powershell
 $env:AUTO_MAS_TELEMETRY = 'disabled'
-`
+```
+
+DSN 不要写入仓库、脚本或提交历史。净化白名单和零网络门禁的具体要求见
+[代码审查清单](doc/代码审查清单.md)。
 
 ## 给 Electron 或其他程序调用
 
@@ -232,14 +227,14 @@ child.stderr.on('data', (chunk) => {
 
 ```json
 {"protocol":1,"command":"cancel","commandId":"01J..."}
-{"protocol":1,"command":"status","commandId":"01J..."}
 {"protocol":1,"command":"shutdown","commandId":"01J..."}
 ```
 
-支持 stdin 控制的耗时一次性命令支持 `cancel`；`backend supervise` 另外支持
-`status` 和 `shutdown`。具体能力以首个 `hello.capabilities` 为准。`commandId`
-由调用方生成并保持唯一。关闭监督进程时，向其 stdin 发送 `shutdown`，不要直接
-按进程名终止 Python。
+耗时一次性命令支持 `cancel`；`backend supervise` 另外支持 `status` 和
+`shutdown`。实际可用命令以首个 `hello.capabilities` 为准，`commandId` 由调用方
+生成并保持唯一。**关闭监督进程时向其 stdin 发送 `shutdown`，不要按进程名终止
+Python。** 各命令的完整语义、回显规则和无效命令的处理方式见
+[架构设计](doc/架构设计.md)。
 
 ## 输出与退出码
 
@@ -270,20 +265,12 @@ $exitCode = $LASTEXITCODE
 
 ### 退出码
 
-退出码是粗粒度分类；精确原因应读取 NDJSON `result.code`。
+`0` 成功、`2` 参数错误、`130` 用户取消，其余非零值按失败领域分类
+（协议、前置条件、网络、Git、依赖、后端、锁冲突）。
 
-| 退出码 | 含义 |
-| ---: | --- |
-| `0` | 成功 |
-| `2` | 参数错误 |
-| `10` | 协议不兼容 |
-| `20` | 前置条件不满足 |
-| `30` | 网络或下载失败 |
-| `40` | Git、仓库或目录替换失败 |
-| `50` | uv、Python 或项目依赖失败 |
-| `60` | 后端启动或运行失败 |
-| `70` | 操作冲突或目录被锁定 |
-| `130` | 用户取消 |
+**退出码只提供粗粒度分类，精确原因必须读取 NDJSON `result.code`**，不要用退出码
+反推具体错误。完整退出码表和每个错误码的含义见
+[架构设计](doc/架构设计.md)。
 
 ## 开发与验证
 
@@ -298,38 +285,16 @@ $exitCode = $LASTEXITCODE
 ### 标准验证
 
 ```powershell
-$env:GOCACHE = Join-Path $env:TEMP 'auto-mas-runtime-verify'
-
-$unformatted = & gofmt -l .
-if ($LASTEXITCODE -ne 0) { throw 'gofmt failed' }
-if ($unformatted) {
-    $unformatted
-    throw 'gofmt found unformatted files'
-}
-
+& gofmt -l .                     # 输出为空才算通过
 & go vet ./...
-if ($LASTEXITCODE -ne 0) { throw 'go vet failed' }
-
 & go build -buildvcs=false ./...
-if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-
 & go test ./... -count=1
-if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
-
-& git diff --check
-if ($LASTEXITCODE -ne 0) { throw 'diff check failed' }
 ```
 
-执行 race detector 前，先把 GCC 所在目录放到当前 PowerShell 会话的 PATH 首位：
-
-```powershell
-$gccBin = Split-Path -Parent (Get-Command gcc -ErrorAction Stop).Source
-$env:PATH = "$gccBin;$env:PATH"
-$env:GOCACHE = Join-Path $env:TEMP 'auto-mas-runtime-race'
-
-& go test -race ./... -count=1
-if ($LASTEXITCODE -ne 0) { throw 'race tests failed' }
-```
+**每条原生命令后都要检查 `$LASTEXITCODE`**：PowerShell 不会因原生命令失败而中断
+脚本，漏检会导致「测试没跑却宣称通过」。并发相关改动需要追加 race detector 和重复
+执行。带 `$LASTEXITCODE` 检查的完整验证门、race detector 的 PATH 前置条件和已知
+限制见 [AGENTS.md](AGENTS.md) 第 5 节。
 
 ## 进一步阅读
 
