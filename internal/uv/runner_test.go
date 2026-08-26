@@ -1,6 +1,7 @@
 package uv
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -332,6 +333,95 @@ func TestRunner_RejectsExcessiveStreamOutput(t *testing.T) {
 	}
 }
 
+// TestRunner_CapturesFullOutputOfFastExitingProcess 锁定 H-1 的修复。
+//
+// 修复前 Run() 用 command.StdoutPipe()/StderrPipe() 取读端，而那两个读端归 exec
+// 所有：command.Wait() 一返回就把它们关掉。读取 goroutine 与 Wait 是并发的，
+// 于是「子进程写完大于管道缓冲区的数据后立刻退出」这一形状会让仍在进行或尚未被
+// 调度的读取拿到 os.ErrClosed，被 recordFirstError 记成 streamErr，
+// 最终把一次**成功**的 uv 运行报成 UV_EXEC_FAILED「uv 输出读取失败」，
+// 并且丢掉已经写出的输出。
+//
+// 修复后读端由 Run() 自己持有（os.Pipe()），Wait 无法提前关闭它，
+// EOF 只取决于子进程树是否还持有写端。断言因此是「成功且输出完整」。
+// 这个竞态是概率性的，所以重复若干轮以提高命中率；单轮通过不足以证明无竞态。
+func TestRunner_CapturesFullOutputOfFastExitingProcess(t *testing.T) {
+	const (
+		lines     = 2000
+		lineBytes = 200
+	)
+	for round := 0; round < 20; round++ {
+		runner := newTestRunner(t)
+		result, err := runner.Run(t.Context(), []string{
+			"-test.run=^TestFakeUVProcess$",
+		}, RunOptions{
+			Stage: protocol.StageUVCheck,
+			Environment: map[string]string{
+				"FAKE_UV_LINES":      strconv.Itoa(lines),
+				"FAKE_UV_LINE_BYTES": strconv.Itoa(lineBytes),
+			},
+		})
+		if err != nil {
+			t.Fatalf("round %d: Run() error = %v, want success", round, err)
+		}
+		if result.ExitCode != 0 {
+			t.Fatalf("round %d: exit code = %d, want 0", round, result.ExitCode)
+		}
+		if got := strings.Count(result.Stdout, "\n"); got != lines {
+			t.Fatalf("round %d: captured %d lines, want %d", round, got, lines)
+		}
+		if !strings.Contains(result.Stdout, uvCaptureTruncatedNotice) {
+			continue
+		}
+		t.Fatalf("round %d: output unexpectedly truncated below the capture budget", round)
+	}
+}
+
+// TestRunner_TruncatesOversizedCaptureWithoutFailing 锁定 M-1 的修复。
+//
+// maxUVOutputBytes 是诊断快照上限，不是流上限（流上限是 maxUVStreamBytes）。
+// 修复前触到快照上限会 recordFirstError，于是「输出足够多但完全正常」的
+// uv sync 会确定性地失败在 UV_EXEC_FAILED，且重试无效——依赖越多越必然。
+// 修复后只截断并追加说明标记，运行本身仍然成功。
+func TestRunner_TruncatesOversizedCaptureWithoutFailing(t *testing.T) {
+	// 每行 100 KiB 远低于 1 MiB 行上限；64 行合计约 6.4 MiB，
+	// 超过 4 MiB 快照上限但远低于 16 MiB 流上限。
+	const (
+		lines     = 64
+		lineBytes = 100 * 1024
+	)
+	runner := newTestRunner(t)
+	result, err := runner.Run(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, RunOptions{
+		Stage: protocol.StageUVCheck,
+		Environment: map[string]string{
+			"FAKE_UV_LINES":      strconv.Itoa(lines),
+			"FAKE_UV_LINE_BYTES": strconv.Itoa(lineBytes),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want success despite capture truncation", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("exit code = %d, want 0", result.ExitCode)
+	}
+	if !strings.HasSuffix(result.Stdout, uvCaptureTruncatedNotice) {
+		t.Fatalf("captured stdout does not end with the truncation notice; tail=%q", tailForTest(result.Stdout, 80))
+	}
+	// 含标记的总长仍不得超过快照上限，否则截断标记本身就成了新的越界来源。
+	if len(result.Stdout) > maxUVOutputBytes {
+		t.Fatalf("captured stdout bytes = %d, want <= %d", len(result.Stdout), maxUVOutputBytes)
+	}
+}
+
+func tailForTest(value string, size int) string {
+	if len(value) <= size {
+		return value
+	}
+	return value[len(value)-size:]
+}
+
 func TestNormalizeVersionOutput_AllowsOnlyOneLineEnding(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -476,7 +566,7 @@ func TestFakeUVProcess(t *testing.T) {
 	if os.Getenv("FAKE_UV_RECORD") == "" && os.Getenv("FAKE_UV_STARTED") == "" &&
 		os.Getenv("FAKE_UV_STDOUT") == "" && os.Getenv("FAKE_UV_STDERR") == "" &&
 		os.Getenv("FAKE_UV_EXIT") == "" && os.Getenv("FAKE_UV_DELAY") == "" &&
-		os.Getenv("FAKE_UV_LARGE") == "" {
+		os.Getenv("FAKE_UV_LARGE") == "" && os.Getenv("FAKE_UV_LINES") == "" {
 		return
 	}
 	if path := os.Getenv("FAKE_UV_STARTED"); path != "" {
@@ -529,6 +619,32 @@ func TestFakeUVProcess(t *testing.T) {
 			_, _ = fmt.Fprint(os.Stdout, strings.Repeat("x", size))
 		} else {
 			_, _ = fmt.Fprintln(os.Stdout, strings.Repeat("x", size))
+		}
+	}
+	// FAKE_UV_LINES/FAKE_UV_LINE_BYTES 产生多条「每条都不超行上限」的输出。
+	// FAKE_UV_LARGE 只能产生单行，一旦超过 1 MiB 行上限就走失败路径，
+	// 无法用来构造「总量很大但每行合法」的成功场景。
+	if value := os.Getenv("FAKE_UV_LINES"); value != "" {
+		lines, err := strconv.Atoi(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lineBytes := 200
+		if raw := os.Getenv("FAKE_UV_LINE_BYTES"); raw != "" {
+			lineBytes, err = strconv.Atoi(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		payload := strings.Repeat("y", lineBytes)
+		writer := bufio.NewWriter(os.Stdout)
+		for index := 0; index < lines; index++ {
+			if _, err := fmt.Fprintf(writer, "%d %s\n", index, payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if value := os.Getenv("FAKE_UV_DELAY"); value != "" {

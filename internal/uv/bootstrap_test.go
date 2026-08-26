@@ -106,6 +106,52 @@ func TestBootstrap_AtomicPublish(t *testing.T) {
 	}
 }
 
+// TestBootstrap_PublishedDownloadFailureIsTreatedAsSuccess 锁定 M-3 的修复。
+//
+// 真实下载器在「校验通过、成品已 rename 到最终位置」之后失败时，会同时返回
+// 已填充的 DownloadResult 和 Published=true 的 DownloadFailure。修复前轮换回调
+// 只看 downloadErr == nil，于是把这种失败当成源不可用并切换到下一个镜像；
+// 下一个镜像的下载会撞上 ErrDestinationExists（成品已经在那里了），
+// 一路耗尽后以 MIRROR_EXHAUSTED 收场——而磁盘上正躺着一个字节精确、
+// 校验通过的归档。断言 downloader.calls == 1 就是在证明没有发生这次轮换。
+func TestBootstrap_PublishedDownloadFailureIsTreatedAsSuccess(t *testing.T) {
+	layout := newUVTestLayout(t)
+	archiveBytes := makeUVArchive(t)
+	artifact := testArtifact(string(archiveBytes))
+	downloader := &fakeDownloader{
+		payload: archiveBytes,
+		failAfterWrite: &mirror.DownloadFailure{
+			Kind:      mirror.FailureFilesystem,
+			Published: true,
+			Err:       errors.New("fake post-publish tail failure"),
+		},
+	}
+	extractor := &fakeExtractor{}
+	publisher := &fakePublisher{}
+	bootstrapper := newTestBootstrapper(t, layout, artifact, downloader, &fakeVersionChecker{}, extractor, publisher)
+
+	got, err := bootstrapper.Ensure(t.Context(), testOperationID, testMirrorPolicy(t))
+	if err != nil {
+		t.Fatalf("Ensure() error = %v, want published artifact to be accepted", err)
+	}
+	want, err := layout.UVExecutable(artifact.Version)
+	if err != nil {
+		t.Fatalf("UVExecutable() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("Ensure() path = %q, want %q", got, want)
+	}
+	if downloader.calls != 1 {
+		t.Fatalf("downloads = %d, want 1 (published artifact must not trigger rotation)", downloader.calls)
+	}
+	if extractor.calls != 1 {
+		t.Fatalf("extractor calls = %d, want 1 (published archive must still be extracted)", extractor.calls)
+	}
+	if !publisher.result.MutationApplied {
+		t.Fatal("publisher did not report the atomic mutation")
+	}
+}
+
 func TestBootstrap_PostPublishVersionFailureIsCommitted(t *testing.T) {
 	layout := newUVTestLayout(t)
 	archiveBytes := makeUVArchive(t)
@@ -324,9 +370,13 @@ func newTestBootstrapper(
 type fakeDownloader struct {
 	payload []byte
 	err     error
-	calls   int
-	request mirror.DownloadRequest
-	path    string
+	// failAfterWrite 在制品已经写到最终位置之后才返回，用来复现真实下载器的
+	// Published 失败：downloader.go 在 PublishNoReplace 之后失败时同时返回
+	// 已填充的 DownloadResult 和 Published=true 的失败，此处必须保持一致。
+	failAfterWrite error
+	calls          int
+	request        mirror.DownloadRequest
+	path           string
 }
 
 func (f *fakeDownloader) Download(
@@ -349,6 +399,9 @@ func (f *fakeDownloader) Download(
 	}
 	if err := os.WriteFile(f.path, f.payload, 0o600); err != nil {
 		return mirror.DownloadResult{}, err
+	}
+	if f.failAfterWrite != nil {
+		return mirror.DownloadResult{Path: f.path}, f.failAfterWrite
 	}
 	return mirror.DownloadResult{Path: f.path}, nil
 }

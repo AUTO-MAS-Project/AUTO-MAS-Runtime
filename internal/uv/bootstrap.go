@@ -558,6 +558,14 @@ func (b *Bootstrapper) download(
 			downloadedPath = downloadResult.Path
 			return mirror.AttemptOutcome{Kind: mirror.OutcomeSucceeded}
 		}
+		// 校验通过、成品已 rename 到最终位置之后才失败的情况（Published=true），
+		// 产物是有效的，只是收尾步骤失败。此时必须视为成功：继续轮换会让下一个
+		// 镜像撞上 ErrDestinationExists，最终以 MIRROR_EXHAUSTED 收场，
+		// 而磁盘上躺着一个字节精确、校验通过的归档。
+		if isDownloadPublished(downloadErr) {
+			downloadedPath = downloadResult.Path
+			return mirror.AttemptOutcome{Kind: mirror.OutcomeSucceeded}
+		}
 		if isDownloadIntegrityFailure(downloadErr) {
 			return mirror.AttemptOutcome{
 				Kind:        mirror.OutcomeIntegrityFailure,
@@ -739,6 +747,13 @@ func committedBootstrapError(err error) error {
 func isDownloadIntegrityFailure(err error) bool {
 	var failure *mirror.DownloadFailure
 	return errors.As(err, &failure) && failure.Kind == mirror.FailureChecksumMismatch
+}
+
+// isDownloadPublished 报告失败是否发生在成品已发布到最终位置之后。
+// 这类失败的产物已通过校验且可直接使用，不应触发镜像轮换重试。
+func isDownloadPublished(err error) bool {
+	var failure *mirror.DownloadFailure
+	return errors.As(err, &failure) && failure.Published
 }
 
 var errChecksumMismatch = errors.New("uv checksum mismatch")

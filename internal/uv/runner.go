@@ -38,7 +38,9 @@ const (
 	autoMASSentryRelease  = "AUTO_MAS_SENTRY_RELEASE"
 	maxUVOutputLineBytes  = 1 << 20
 	maxUVOutputBytes      = 4 << 20
-	maxUVStreamBytes      = 16 << 20
+	// uvCaptureTruncatedNotice 追加在诊断快照末尾，说明输出被截断而非 uv 失败。
+	uvCaptureTruncatedNotice = "\n[uv 输出已截断：超过诊断保留上限]\n"
+	maxUVStreamBytes         = 16 << 20
 )
 
 // RunnerConfig 描述一个受管 uv 执行器的固定目录上下文。
@@ -151,7 +153,13 @@ func (r *UVRunner) Run(
 	command := exec.CommandContext(runContext, r.Executable, args...)
 	command.Dir = resolved.ProjectDir
 	command.Env = buildEnvironment(resolved)
-	stdout, err := command.StdoutPipe()
+	// 不使用 command.StdoutPipe/StderrPipe：那两者返回的读端归 exec 所有，
+	// command.Wait() 会在子进程退出后立即关闭它们，导致仍在进行或尚未被调度的
+	// 读取拿到 os.ErrClosed，进而把成功的 uv 运行误判为「输出读取失败」，
+	// 并可能丢掉全部输出（例如 uv --version 的版本号）。
+	// 这里自己持有读端，Wait 便无法提前关闭；写端在 Start 之后立刻关闭，
+	// 于是 EOF 只取决于子进程树是否还持有写端句柄。
+	stdout, stdoutWrite, err := os.Pipe()
 	if err != nil {
 		return UVResult{}, newError(
 			protocol.CodeUVExecFailed,
@@ -161,8 +169,10 @@ func (r *UVRunner) Run(
 			err,
 		)
 	}
-	stderr, err := command.StderrPipe()
+	defer func() { _ = stdout.Close() }()
+	stderr, stderrWrite, err := os.Pipe()
 	if err != nil {
+		_ = stdoutWrite.Close()
 		return UVResult{}, newError(
 			protocol.CodeUVExecFailed,
 			options.Stage,
@@ -171,18 +181,35 @@ func (r *UVRunner) Run(
 			err,
 		)
 	}
+	defer func() { _ = stderr.Close() }()
+	command.Stdout = stdoutWrite
+	command.Stderr = stderrWrite
 	clock := r.Clock
 	if clock == nil {
 		clock = time.Now
 	}
 	started := clock()
-	if err := command.Start(); err != nil {
+	startErr := command.Start()
+	// 子进程已持有写端的副本，父进程这一份必须立刻关闭，否则永远读不到 EOF。
+	closeWriteErr := errors.Join(stdoutWrite.Close(), stderrWrite.Close())
+	if startErr != nil {
 		return UVResult{}, newError(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			startFailureDetails(resolved, err),
-			err,
+			startFailureDetails(resolved, startErr),
+			errors.Join(startErr, closeWriteErr),
+		)
+	}
+	if closeWriteErr != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return UVResult{}, newError(
+			protocol.CodeUVExecFailed,
+			options.Stage,
+			"uv 执行失败",
+			map[string]any{},
+			closeWriteErr,
 		)
 	}
 	job, jobErr := process.NewJob()
@@ -574,20 +601,35 @@ func readUVStream(
 	var streamErr error
 	var consumed int64
 	overflowed := false
+	captureTruncated := false
+	// maxUVOutputBytes 是「留多少输出用于诊断」的快照上限，不是流上限；
+	// 流上限是 maxUVStreamBytes，超出它才会 overflow() 杀掉 uv。
+	// 因此达到快照上限只截断并标记，不能记为错误——否则依赖数量足够多的
+	// uv sync 会因为「日志太长」而确定性失败，且重试无效。
+	// 截断标记要占用配额，故正文预算为 maxUVOutputBytes 减去标记长度，
+	// 保证含标记的快照总长仍不超过 maxUVOutputBytes。
+	captureBudget := maxUVOutputBytes - len(uvCaptureTruncatedNotice)
+	markCaptureTruncated := func() {
+		if captureTruncated {
+			return
+		}
+		captureTruncated = true
+		_, _ = builder.WriteString(uvCaptureTruncatedNotice)
+	}
 	processLine := func(value []byte, hasNewline bool) {
 		if len(value) == 0 && !hasNewline {
 			return
 		}
-		if builder.Len() < maxUVOutputBytes {
-			remaining := maxUVOutputBytes - builder.Len()
+		if builder.Len() < captureBudget {
+			remaining := captureBudget - builder.Len()
 			if len(value) > remaining {
 				_, _ = builder.Write(value[:remaining])
-				recordFirstError(&streamErr, errors.New("uv output exceeds capture limit"))
+				markCaptureTruncated()
 			} else {
 				_, _ = builder.Write(value)
 			}
 		} else {
-			recordFirstError(&streamErr, errors.New("uv output exceeds capture limit"))
+			markCaptureTruncated()
 		}
 		if consumed > maxUVStreamBytes && !overflowed {
 			overflowed = true
