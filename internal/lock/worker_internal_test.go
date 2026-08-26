@@ -630,6 +630,45 @@ func TestSet_FinishThreadRetriesUntilSignaled(t *testing.T) {
 	}
 }
 
+// TestSet_FinishThreadStopsRetryingOnPermanentFailure 锁定 M-4 的修复。
+//
+// threadWait 是 INFINITE，所以一次 wait 返回错误说明句柄本身有问题（重复 Close、
+// 句柄被外部关闭），后续每次 wait 都会立即返回同一个永久错误。修复前这个重试
+// 没有上界：Close() 永不返回、忙转占满一个核心、errors.Join 的错误链无限增长，
+// 并且命名 Mutex 永不释放——后续所有需要该锁的操作都撞 LOCK_HELD。
+//
+// 修复只加上界，不改错误语义：TestSet_FinishThreadRetriesUntilSignaled 要求
+// wait 期间出现的异常即使最终成功也必须上报，所以累积保持不变，
+// 由上界保证累积有限。断言 wait 次数恰好等于 maxThreadWaitAttempts。
+func TestSet_FinishThreadStopsRetryingOnPermanentFailure(t *testing.T) {
+	api := newTestWindowsAPI()
+	injectedErr := errors.New("injected permanent thread wait failure")
+	api.threadWaitResult = func(apiCall) (uint32, error) {
+		return waitResultFailed, injectedErr
+	}
+	set := &Set{thread: testThreadHandle, api: api}
+
+	result := make(chan error, 1)
+	go func() { result <- set.finishThread(workerExit{waitForThread: true}) }()
+
+	err := waitValue(t, result, "finishThread with a permanently failing wait")
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("finishThread() error = %v, want injected error", err)
+	}
+	if got := api.count("wait"); got != maxThreadWaitAttempts {
+		t.Fatalf("thread Wait calls = %d, want %d", got, maxThreadWaitAttempts)
+	}
+	// 达到上界后仍然要继续关闭线程句柄，否则句柄本身也泄漏了。
+	closeCalls := api.callsFor("close")
+	if len(closeCalls) != 1 || closeCalls[0].Handle != testThreadHandle {
+		t.Fatalf("thread Close calls = %#v, want one final close", closeCalls)
+	}
+	// 累积语义保持不变，但必须由上界封顶：无上界时这个计数会无限增长。
+	if got := strings.Count(err.Error(), "wait-worker-thread"); got != maxThreadWaitAttempts {
+		t.Fatalf("wait error occurrences = %d, want %d (accumulation must be bounded)", got, maxThreadWaitAttempts)
+	}
+}
+
 func testWorkerOperationErrors(t *testing.T) {
 	t.Helper()
 	injectedErr := errors.New("injected worker failure")

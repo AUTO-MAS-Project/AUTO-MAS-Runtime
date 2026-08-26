@@ -24,6 +24,10 @@ const (
 	requestClose
 )
 
+// maxThreadWaitAttempts 限制等待 worker 线程退出的重试次数。
+// 正常路径首次 wait 即成功；设置上界只为让句柄失效等永久错误也能让 Close() 返回。
+const maxThreadWaitAttempts = 64
+
 type workerRequest struct {
 	operation  requestKind
 	ctx        context.Context
@@ -274,7 +278,13 @@ func (s *Set) Close() error {
 func (s *Set) finishThread(exit workerExit) error {
 	var waitErr error
 	if exit.waitForThread {
-		for {
+		// 等待有上界：threadWait 是 INFINITE，若句柄已失效（重复 Close、
+		// 句柄被外部关闭）则每次 wait 都立即返回同一个永久错误。无上界的重试
+		// 会让 Close() 永不返回、占满一个核心，并且错误链无限增长直到 OOM，
+		// 同时命名 Mutex 永不释放，后续所有需要该锁的操作都撞 LOCK_HELD。
+		// 达到上界后带着已累积的错误跳出并继续关闭句柄，保证 Close() 一定返回。
+		// 错误仍然逐次累积（wait 期间出过怪事即使最终成功也要上报），上界让累积有限。
+		for attempt := 0; attempt < maxThreadWaitAttempts; attempt++ {
 			result, err := s.api.waitForSingleObject(s.thread, threadWait)
 			if err != nil {
 				waitErr = errors.Join(waitErr, &OperationError{
