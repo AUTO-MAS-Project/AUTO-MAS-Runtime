@@ -1836,6 +1836,17 @@ func (s *ManagedSupervisor) finishControlCancel(ctx context.Context, request Req
 		stoppedErr := s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
 		return errors.Join(stateErr, stoppedErr, primary)
 	}
+	// cleanupDone 是 buffered(1) 且只投递一次，因此 cleanupFinished 一定能到位；
+	// 但 controlEnded 只能由 attempt.results 上的一次投递翻转。若转发 goroutine
+	// 已经因管道错误永久退出，就没有任何投递会到来，此处便会永久阻塞：
+	// cancel 之后既不退出也不发 result，Electron 永久等待终态。
+	// 因此在「清理已完成、只差控制通道收口」这唯一的无界等待上加时限，
+	// 与 closeControlAndDrain / drainUntilTerminal 使用同一个 controlDrainTimeout。
+	// nil channel 在 select 中永久阻塞，所以计时器只在清理完成后才被装上。
+	controlTimer := time.NewTimer(controlDrainTimeout)
+	controlTimer.Stop()
+	defer controlTimer.Stop()
+	var controlDeadline <-chan time.Time
 	for {
 		select {
 		case cleanup := <-cleanupDone:
@@ -1845,6 +1856,14 @@ func (s *ManagedSupervisor) finishControlCancel(ctx context.Context, request Req
 				return finalize(cleanup)
 			}
 			closeControl()
+			controlTimer.Reset(controlDrainTimeout)
+			controlDeadline = controlTimer.C
+		case <-controlDeadline:
+			// 控制通道没有失败，只是不再报告结果；不把它记成 controlErr，
+			// 否则一次正常的 cancel 会退化成 INTERNAL_ERROR 失败。
+			controlEnded = true
+			closeControl()
+			return finalize(*cleanupResult)
 		case result := <-attempt.results:
 			if result.err != nil {
 				controlEnded = true

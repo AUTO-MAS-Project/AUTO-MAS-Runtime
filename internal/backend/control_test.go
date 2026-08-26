@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1175,6 +1176,56 @@ func TestBackend_CancelCleanupFailureDoesNotRedrainControl(t *testing.T) {
 		assertBackendCode(t, err, protocol.CodeBackendShutdownFailed)
 	case <-timer.C:
 		t.Fatal("cancel cleanup failure did not finish within bound")
+	}
+}
+
+// TestBackend_CancelFinishesWhenControlForwarderStoppedSilently 锁定 M-5 的修复。
+//
+// 转发 goroutine 在「forwarderCtx 已取消 + Receive 返回取消错误 + 没有基础设施
+// 错误」时会直接 return（control.go 的 startControlForwarder），不往 results 投递
+// 任何东西。而 finishControlCancel 的 controlEnded 只能由 attempt.results 上的一次
+// 投递翻转：清理完成后，若这次投递永远不会到来，修复前的 select 就只剩两个永久
+// 阻塞的 case，Supervise 既不返回也不发 result，Electron 永久等待终态。
+//
+// 这条路径在完整 Supervise 流程里构造不出来（forwarderCtx 只在 superviseControlled
+// 的 defer 里取消，那时 finishControlCancel 已经返回），所以直接对
+// finishControlCancel 下探针：给一个没有任何写入方的 results 通道，
+// 等价于「转发 goroutine 已静默退出」。
+func TestBackend_CancelFinishesWhenControlForwarderStoppedSilently(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	var closeCalls atomic.Int32
+	request := f.request()
+	// BeforeControlClose 非 nil 才会让 controlEnded 以 false 起步，
+	// 也就是「还等着控制通道收口」的那个状态。
+	request.BeforeControlClose = func() { closeCalls.Add(1) }
+	snapshot := &controlState{}
+	// 没有任何一方会向这个通道投递或关闭它，模拟已静默退出的转发 goroutine。
+	attempt := &controlAttempt{process: f.proc, logger: f.logger, results: make(chan controlResult)}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.supervisor().finishControlCancel(t.Context(), request, snapshot, attempt, "cancel-silent-forwarder")
+	}()
+
+	select {
+	case err := <-done:
+		if !hasBackendCode(err, protocol.CodeOperationCancelled) {
+			t.Fatalf("finishControlCancel() error = %v, want OPERATION_CANCELLED", err)
+		}
+	case <-time.After(4 * controlDrainTimeout):
+		t.Fatal("finishControlCancel() blocked forever waiting for a control result that will never arrive")
+	}
+
+	if got := closeCalls.Load(); got != 1 {
+		t.Fatalf("BeforeControlClose calls = %d, want 1", got)
+	}
+	states := f.emitter.states()
+	if len(states) == 0 || states[len(states)-1].Status != protocol.StateStopped {
+		t.Fatalf("states = %#v, want stopped as the terminal state", states)
+	}
+	if !f.proc.closed {
+		t.Fatal("process was not closed; cleanup did not run to completion")
 	}
 }
 
