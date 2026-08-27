@@ -4,10 +4,11 @@
 
 M7 为 Runtime 建立可重复的 Windows x64 发布流水线。受保护的 `v*` tag 触发一次构建，
 流水线在 `windows-latest` 上运行仓库测试，使用固定的 Go 模块路径把 tag、提交和构建时间
-注入 `internal/version`，生成未签名的 `auto-mas-runtime.exe`，再直接发布该 EXE 和校验和资产。
+注入 `internal/version`，生成未签名的 `auto-mas-runtime-<version>.exe`，再直接发布该 EXE
+和校验和资产。
 
 Runtime 本身不执行自更新、不签名、不上传用户数据，也不把 GitHub Actions 逻辑迁入 Runtime。
-本仓库 workflow 只发布 `auto-mas-runtime.exe`；AUTO-MAS 后端仓库的
+本仓库 workflow 只发布 `auto-mas-runtime-<version>.exe`；AUTO-MAS 后端仓库的
 `release/<version>` 分支与同名 tag 创建、锁定和 `uv lock --check` 属于 AUTO-MAS 侧
 `TODO-CI-2/3`，不由本仓库 M7 创建或校验。
 SignPath 接入继续遵守决策 D3，留在 T7.5；CNB 镜像同步在没有目标仓库和凭据前不启用。
@@ -48,8 +49,9 @@ smoke (windows-latest)
 ```
 
 `package` 只产生工作区资产；`publish` 拥有最小的 `contents: write` 权限并上传
-`auto-mas-runtime.exe` 与 `SHA256SUMS.txt`；`smoke` 依赖发布 job，重新下载已发布 EXE 后直接验证真实产物。构建脚本不接触
-token。强制移动 tag、无效 tag 和已存在 Release 直接失败，避免同一发布名被静默覆盖。
+`auto-mas-runtime-<version>.exe` 与 `SHA256SUMS.txt`；`smoke` 依赖发布 job，重新下载已发布
+EXE 后直接验证真实产物。动态文件名与 linker `Version` 共用已校验的 release tag；构建脚本
+不接触 token。强制移动 tag、无效 tag 和已存在 Release 直接失败，避免同一发布名被静默覆盖。
 
 JavaScript action 固定使用原生 Node.js 24 的稳定主版本：`actions/upload-artifact@v7`、
 `actions/download-artifact@v8` 和 `softprops/action-gh-release@v3`。发布 workflow 不依赖
@@ -58,9 +60,11 @@ Node.js 20 弃用注释。
 
 ## 4. 资产布局与校验
 
-Release 页固定直接提供 `auto-mas-runtime.exe`，不再创建 zip，也不再把 `LICENSE` 和
-`README.md` 复制进发布包。校验文件使用标准 SHA-256 两空格格式，覆盖该 EXE，并作为
-独立 Release 资产发布。产物不包含签名或私钥材料。
+Release 页直接提供 `auto-mas-runtime-<version>.exe`，其中 `<version>` 为保留 `v` 前缀的
+release tag；不追加日期、时间或 Commit hash。流水线不创建 zip，也不再把 `LICENSE` 和
+`README.md` 复制进发布包。校验文件使用标准 SHA-256 两空格格式，记录该动态 EXE 文件名，
+并作为独立 Release 资产发布。产物不包含签名或私钥材料。Electron 打包集成在校验后将其
+落盘为稳定运行名 `auto-mas-runtime.exe`。
 
 ## 5. 验收边界
 
@@ -69,4 +73,6 @@ Release 页固定直接提供 `auto-mas-runtime.exe`，不再创建 zip，也不
   静态检查并在本地复演打包命令。
 - T7.3：冒烟 job 必须下载刚发布的 EXE，直接检查两个命令的退出码、首 `hello`、末 `result`
   和 NDJSON 行合法性。
+- T7.6：package、publish 和 smoke 必须消费同一个版本化 `binary_name`，不得回退固定 Release
+  文件名或以通配符猜测产物。
 - T7.4：本阶段明确跳过 CNB 同步，不创建需要未配置 secret 的外发 job。

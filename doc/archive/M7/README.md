@@ -2,14 +2,17 @@
 
 M7 建立了 Windows x64 的 GitHub Release 流水线：受保护的 `v*` tag 触发
 `package → publish → smoke` 三个 job，构建期注入版本、Commit 和 UTC 构建时间，发布未签名
-`auto-mas-runtime.exe` 与 SHA-256 校验资产，并从真实 Release 直接下载 EXE 执行严格 NDJSON 冒烟。
+`auto-mas-runtime-<version>.exe` 与 SHA-256 校验资产，并从真实 Release 直接下载 EXE 执行
+严格 NDJSON 冒烟。Electron 打包时仍将其落盘为 `auto-mas-runtime.exe`。
 
 ## 文档索引
 
 - [`设计-M7-GitHub-CI-CD.md`](./设计-M7-GitHub-CI-CD.md)：版本来源、workflow 拓扑、资产布局、
   不可变 tag 门禁和验收边界。
+- [`设计-T7.6-发布成品版本命名.md`](./设计-T7.6-发布成品版本命名.md)：版本化 Release EXE 名称、
+  动态 `binary_name` 数据流和稳定安装名边界。
 
-已执行的 T7.1～T7.3 实施计划不在工作树长期保留，可通过 Git 历史按任务编号检索。
+已执行的 T7.1～T7.3、T7.6 实施计划不在工作树长期保留，可通过 Git 历史按任务编号检索。
 
 ## 发布验收事实
 
