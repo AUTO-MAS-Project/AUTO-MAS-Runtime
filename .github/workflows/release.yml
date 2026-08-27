@@ -73,7 +73,7 @@ jobs:
 
           $isPrerelease = $env:RELEASE_TAG -imatch '-(?:beta|rc|alpha)'
           $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $binaryName = "auto-mas-runtime.exe"
+          $binaryName = "auto-mas-runtime-$($env:RELEASE_TAG).exe"
 
           @(
             "tag=$($env:RELEASE_TAG)"
@@ -96,6 +96,7 @@ jobs:
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
           SOURCE_COMMIT: ${{ steps.metadata.outputs.source_commit }}
+          BINARY_NAME: ${{ steps.metadata.outputs.binary_name }}
           AUTO_MAS_SENTRY_DSN: ${{ secrets.AUTO_MAS_SENTRY_DSN }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -103,7 +104,7 @@ jobs:
           $env:GOARCH = "amd64"
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
-          $binary = Join-Path $dist "auto-mas-runtime.exe"
+          $binary = Join-Path $dist $env:BINARY_NAME
           $ldflagValues = @(
             "-s"
             "-w"
@@ -120,7 +121,7 @@ jobs:
             throw "Windows x64 build failed"
           }
           if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-            throw "Windows x64 build did not produce auto-mas-runtime.exe"
+            throw "Windows x64 build did not produce $($env:BINARY_NAME)"
           }
 
       - name: Assemble executable and checksums
@@ -146,7 +147,7 @@ jobs:
         with:
           name: runtime-release-assets
           path: |
-            dist/auto-mas-runtime.exe
+            dist/${{ steps.metadata.outputs.binary_name }}
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 7
@@ -263,7 +264,7 @@ jobs:
           tag_name: ${{ needs.package.outputs.tag }}
           name: AUTO-MAS Runtime ${{ needs.package.outputs.tag }}
           files: |
-            release-assets/auto-mas-runtime.exe
+            release-assets/${{ needs.package.outputs.binary_name }}
             release-assets/SHA256SUMS.txt
           fail_on_unmatched_files: true
           prerelease: ${{ needs.package.outputs.prerelease }}

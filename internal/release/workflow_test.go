@@ -33,10 +33,10 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "Sentry DSN ldflag", snippet: "internal/telemetry.BuildSentryDSN=$($env:AUTO_MAS_SENTRY_DSN)"},
 		{name: "peeled source commit", snippet: "git rev-parse --verify \"HEAD^{commit}\""},
 		{name: "source commit output", snippet: "source_commit=$sourceCommit"},
-		{name: "direct executable name", snippet: "$binaryName = \"auto-mas-runtime.exe\""},
+		{name: "versioned executable name", snippet: "$binaryName = \"auto-mas-runtime-$($env:RELEASE_TAG).exe\""},
 		{name: "direct executable checksum", snippet: "Get-FileHash -LiteralPath $binary -Algorithm SHA256"},
-		{name: "direct executable upload", snippet: "dist/auto-mas-runtime.exe"},
-		{name: "direct executable release", snippet: "release-assets/auto-mas-runtime.exe"},
+		{name: "direct executable upload", snippet: "dist/${{ steps.metadata.outputs.binary_name }}"},
+		{name: "direct executable release", snippet: "release-assets/${{ needs.package.outputs.binary_name }}"},
 		{name: "upload action", snippet: "uses: actions/upload-artifact@v7"},
 		{name: "download action", snippet: "uses: actions/download-artifact@v8"},
 		{name: "release action", snippet: "uses: softprops/action-gh-release@v3"},
@@ -138,7 +138,7 @@ func TestReleaseWorkflow_SmokeAndImmutabilityContract(t *testing.T) {
 func TestReleaseWorkflow_DirectExecutableContract(t *testing.T) {
 	source := releaseWorkflowSource(t)
 	for _, want := range []string{
-		"$binaryName = \"auto-mas-runtime.exe\"",
+		"$binaryName = \"auto-mas-runtime-$($env:RELEASE_TAG).exe\"",
 		"$hash  $($env:BINARY_NAME)",
 		"--pattern $env:BINARY_NAME",
 		"& $env:BINARY_PATH version --output ndjson",
@@ -146,6 +146,39 @@ func TestReleaseWorkflow_DirectExecutableContract(t *testing.T) {
 	} {
 		if !strings.Contains(source, want) {
 			t.Fatalf("release workflow missing direct executable behavior %q", want)
+		}
+	}
+}
+
+func TestReleaseWorkflow_VersionedExecutableName(t *testing.T) {
+	source := releaseWorkflowSource(t)
+	required := []struct {
+		name    string
+		snippet string
+	}{
+		{name: "versioned executable name", snippet: "$binaryName = \"auto-mas-runtime-$($env:RELEASE_TAG).exe\""},
+		{name: "dynamic executable upload", snippet: "dist/${{ steps.metadata.outputs.binary_name }}"},
+		{name: "dynamic executable release", snippet: "release-assets/${{ needs.package.outputs.binary_name }}"},
+		{name: "checksum dynamic executable", snippet: "$hash  $($env:BINARY_NAME)"},
+		{name: "smoke exact executable", snippet: "--pattern $env:BINARY_NAME"},
+	}
+	for _, test := range required {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(source, test.snippet) {
+				t.Fatalf("release workflow missing %s snippet %q", test.name, test.snippet)
+			}
+		})
+	}
+	if got := strings.Count(source, "$binary = Join-Path $dist $env:BINARY_NAME"); got != 2 {
+		t.Fatalf("dynamic build and checksum path count = %d, want 2", got)
+	}
+	for _, fixed := range []string{
+		"$binaryName = \"auto-mas-runtime.exe\"",
+		"dist/auto-mas-runtime.exe",
+		"release-assets/auto-mas-runtime.exe",
+	} {
+		if strings.Contains(source, fixed) {
+			t.Errorf("release workflow still contains fixed executable path %q", fixed)
 		}
 	}
 }
