@@ -19,6 +19,62 @@ func TestBackendSuperviseContract(t *testing.T) {
 	contracttest.Register(t, "backend supervise", backendContractRunner())
 }
 
+// TestBackendSupervise_AdvertisesEveryAcceptedControlCommand 钉住「公告集合 ==
+// 实际接受的控制命令集合」。此前 backend supervise 只公告 cancel/state/log，
+// 却真实接受 shutdown 与 status，而 README 与架构文档都写「实际可用命令以
+// hello.capabilities 为准」——照文档写的客户端永远不会发 shutdown，优雅关闭
+// 会退化成 Job 强杀。这条测试让公告与 ControlReader 的注册列表不能再分叉。
+func TestBackendSupervise_AdvertisesEveryAcceptedControlCommand(t *testing.T) {
+	root := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", root, "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(root),
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+			return backendServiceFunc(func(context.Context, backend.Request) error { return nil }), nil
+		}),
+	)
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	events := parseNDJSON(t, stdout.String())
+	if len(events) == 0 || eventType(events[0]) != string(protocol.TypeHello) {
+		t.Fatalf("first event = %#v, want hello", events)
+	}
+	raw, ok := events[0].object["capabilities"].([]any)
+	if !ok {
+		t.Fatalf("hello capabilities = %#v, want array", events[0].object["capabilities"])
+	}
+	announced := make(map[string]bool, len(raw))
+	for _, value := range raw {
+		text, ok := value.(string)
+		if !ok {
+			t.Fatalf("capability %#v is not a string", value)
+		}
+		if !protocol.IsKnownCapability(protocol.Capability(text)) {
+			t.Errorf("capability %q is not part of the frozen set", text)
+		}
+		announced[text] = true
+	}
+	// 与 runBackendSuperviseSession 里 NewControlReader 注册的命令一一对应。
+	for command, capability := range map[protocol.ControlKind]protocol.Capability{
+		protocol.ControlCancel:   protocol.CapabilityStdinCancel,
+		protocol.ControlShutdown: protocol.CapabilityStdinShutdown,
+		protocol.ControlStatus:   protocol.CapabilityStdinStatus,
+	} {
+		if !announced[string(capability)] {
+			t.Errorf("hello capabilities = %#v, want %q for accepted control command %q", raw, capability, command)
+		}
+	}
+	for _, capability := range []protocol.Capability{protocol.CapabilityStateV1, protocol.CapabilityLogStream} {
+		if !announced[string(capability)] {
+			t.Errorf("hello capabilities = %#v, want %q", raw, capability)
+		}
+	}
+}
+
 func backendContractRunner() contracttest.Runner {
 	return func(t *testing.T, terminal contracttest.Terminal) contracttest.Transcript {
 		t.Helper()

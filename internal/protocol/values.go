@@ -153,12 +153,20 @@ const (
 	CapabilityStdinCancel Capability = "stdin.cancel"
 	CapabilityStateV1     Capability = "state.v1"
 	CapabilityLogStream   Capability = "log.stream"
+	// CapabilityStdinShutdown 与 CapabilityStdinStatus 是 backend supervise 早已
+	// 接受、却一直没有公告的两条 stdin 控制命令。README 与架构文档都规定
+	// 「实际可用命令以 hello.capabilities 为准」，不公告等于让守规矩的调用方
+	// 永远不发 shutdown，优雅关闭退化成 Job 强杀。
+	CapabilityStdinShutdown Capability = "stdin.shutdown"
+	CapabilityStdinStatus   Capability = "stdin.status"
 )
 
 var knownCapabilities = []Capability{
 	CapabilityStdinCancel,
 	CapabilityStateV1,
 	CapabilityLogStream,
+	CapabilityStdinShutdown,
+	CapabilityStdinStatus,
 }
 
 // AllCapabilities 按文档顺序返回全部稳定能力标识的防御性副本。

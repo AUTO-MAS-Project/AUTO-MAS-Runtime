@@ -240,8 +240,8 @@ func documentedCapabilities(t *testing.T) []protocol.Capability {
 	for _, match := range matches {
 		capabilities = append(capabilities, protocol.Capability(match[1]))
 	}
-	if len(capabilities) != 3 {
-		t.Fatalf("documented capability count = %d, want 3", len(capabilities))
+	if len(capabilities) != 5 {
+		t.Fatalf("documented capability count = %d, want 5", len(capabilities))
 	}
 	return capabilities
 }
