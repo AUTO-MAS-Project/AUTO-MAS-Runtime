@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -945,6 +946,51 @@ func TestBackend_ShutdownFailedIfTreeUncertain(t *testing.T) {
 	assertBackendCode(t, <-done, protocol.CodeBackendShutdownFailed)
 	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:BACKEND_FORCE_TERMINATED") >= 0 {
 		t.Fatal("uncertain tree emitted force warning")
+	}
+}
+
+// TestBackend_ControlledManagedUsesAppRootAndAbsoluteEntry 覆盖受控 managed 启动路径
+// （supervisor.go 的无控制路径之外的第二处 StartManaged），并顺带证明单次自动重启
+// 之后 cwd 与入口都不漂移——两代进程走的是同一处参数装配。
+func TestBackend_ControlledManagedUsesAppRootAndAbsoluteEntry(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	second := &fakeProcess{pid: 4343, keepAlive: true}
+	f.uv.procSequence = []ManagedProcess{f.proc, second}
+	mailbox := NewControlMailbox(8)
+	done := make(chan error, 1)
+	go func() {
+		req := f.request()
+		req.Control = mailbox
+		done <- f.supervisor().Supervise(t.Context(), req)
+	}()
+	waitFor(t, f.emitter.running)
+	wantArgs := []string{"run", "--project", f.layout.RepoDir(), "--no-sync", f.layout.BackendEntryFile()}
+	if !equalStrings(f.uv.args, wantArgs) {
+		t.Fatalf("uv args = %#v, want %#v", f.uv.args, wantArgs)
+	}
+	if !filepath.IsAbs(f.uv.args[len(f.uv.args)-1]) {
+		t.Fatalf("uv entry argument = %q, want an absolute path", f.uv.args[len(f.uv.args)-1])
+	}
+	if got, want := f.uv.options.WorkingDir, f.layout.AppRoot(); got != want {
+		t.Fatalf("managed working dir = %q, want app root %q", got, want)
+	}
+	if got, want := f.uv.options.ProjectDir, f.layout.RepoDir(); got != want {
+		t.Fatalf("managed project dir = %q, want %q", got, want)
+	}
+	f.proc.Exit()
+	waitForStateStatusCount(t, f.emitter, protocol.StateRunning, 2)
+	if !equalStrings(f.uv.args, wantArgs) {
+		t.Fatalf("uv args after restart = %#v, want %#v", f.uv.args, wantArgs)
+	}
+	if got, want := f.uv.options.WorkingDir, f.layout.AppRoot(); got != want {
+		t.Fatalf("managed working dir after restart = %q, want app root %q", got, want)
+	}
+	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Command: protocol.ControlCancel, CommandID: "cancel-after-workdir-check"}); err != nil {
+		t.Fatalf("Submit(cancel) error = %v", err)
+	}
+	if err := <-done; !hasBackendCode(err, protocol.CodeOperationCancelled) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise() error = %v, want cancellation", err)
 	}
 }
 

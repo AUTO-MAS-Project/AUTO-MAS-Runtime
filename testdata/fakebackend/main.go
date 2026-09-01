@@ -30,10 +30,13 @@ const (
 )
 
 type fakeBackendConfig struct {
-	ListenAddress            string           `json:"listenAddress"`
-	ListenDelayMS            int              `json:"listenDelayMs"`
-	ReadyFile                string           `json:"readyFile"`
-	PIDFile                  string           `json:"pidFile"`
+	ListenAddress string `json:"listenAddress"`
+	ListenDelayMS int    `json:"listenDelayMs"`
+	ReadyFile     string `json:"readyFile"`
+	PIDFile       string `json:"pidFile"`
+	// WorkingDirFile 让假后端报告自己的 os.Getwd()，供 T13.1 端到端断言
+	// Runtime 设定的工作目录真的生效；父进程侧的 StartSpec 断言证明不了这件事。
+	WorkingDirFile           string           `json:"workingDirFile"`
 	GrandchildPIDFile        string           `json:"grandchildPidFile"`
 	SpawnGrandchild          bool             `json:"spawnGrandchild"`
 	GrandchildLifetimeMS     int              `json:"grandchildLifetimeMs"`
@@ -194,6 +197,17 @@ func runFakeBackend() int {
 		if err := writeSignalFile(config.PIDFile, []byte(strconv.Itoa(os.Getpid())+"\n")); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 98
+		}
+	}
+	if config.WorkingDirFile != "" {
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 97
+		}
+		if err := writeSignalFile(config.WorkingDirFile, []byte(filepath.Clean(workingDirectory)+"\n")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 97
 		}
 	}
 

@@ -75,6 +75,81 @@ func TestManaged_UsesRunnerEnvironmentAndArguments(t *testing.T) {
 	}
 }
 
+// TestManaged_WorkingDirOverridesProjectDir 证明 C6 的显式工作目录字段：
+// 受管子进程的 cwd 由 WorkingDir 决定，而不再固定跟随 ProjectDir。
+func TestManaged_WorkingDirOverridesProjectDir(t *testing.T) {
+	runner := newTestRunner(t)
+	workingDir := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "managed-workingdir-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			WorkingDir:  workingDir,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result, err := managed.Wait(ctx)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Wait() = %#v, %v, want exit 0", result, err)
+	}
+	if err := managed.WaitEmpty(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := readTestRecord(t, recordPath)
+	if got, want := record["cwd"], filepath.Clean(workingDir); got != want {
+		t.Fatalf("child cwd = %q, want %q", got, want)
+	}
+	if got := record["cwd"]; got == filepath.Clean(runner.ProjectDir) {
+		t.Fatalf("child cwd = %q, want a directory other than the project dir", got)
+	}
+}
+
+// TestManaged_WorkingDirDefaultsToProjectDir 锁定 development 的既有行为：
+// 不传 WorkingDir 时 cwd 必须仍是 ProjectDir。
+func TestManaged_WorkingDirDefaultsToProjectDir(t *testing.T) {
+	runner := newTestRunner(t)
+	projectDir := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "managed-default-workingdir-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			ProjectDir:  projectDir,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result, err := managed.Wait(ctx)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Wait() = %#v, %v, want exit 0", result, err)
+	}
+	if err := managed.WaitEmpty(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := readTestRecord(t, recordPath)
+	if got, want := record["cwd"], filepath.Clean(projectDir); got != want {
+		t.Fatalf("child cwd = %q, want %q", got, want)
+	}
+}
+
 func TestManaged_ScrubsHostSupervisionEnvironment(t *testing.T) {
 	for _, key := range []string{
 		autoMASUVExecutable,

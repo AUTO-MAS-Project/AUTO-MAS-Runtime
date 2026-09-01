@@ -25,6 +25,49 @@ func telemetryEnvironmentKeysForTest() []string {
 	}
 }
 
+// TestRunner_WorkingDirDefaultsToProjectDir 覆盖一次性 uv 命令：所有既有调用方
+// 都不传 WorkingDir，它们的 cwd 必须逐字节保持为 ProjectDir（C6 只改 managed 后端）。
+func TestRunner_WorkingDirDefaultsToProjectDir(t *testing.T) {
+	tests := []struct {
+		name       string
+		workingDir func(t *testing.T) string
+		want       func(t *testing.T, runner *UVRunner, workingDir string) string
+	}{
+		{
+			name:       "empty falls back to project dir",
+			workingDir: func(*testing.T) string { return "" },
+			want: func(_ *testing.T, runner *UVRunner, _ string) string {
+				return filepath.Clean(runner.ProjectDir)
+			},
+		},
+		{
+			name:       "explicit value wins",
+			workingDir: func(t *testing.T) string { return t.TempDir() },
+			want: func(_ *testing.T, _ *UVRunner, workingDir string) string {
+				return filepath.Clean(workingDir)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newTestRunner(t)
+			workingDir := test.workingDir(t)
+			recordPath := filepath.Join(t.TempDir(), "run-workingdir-record.txt")
+			if _, err := runner.Run(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, RunOptions{
+				Stage:       protocol.StageDependenciesSync,
+				WorkingDir:  workingDir,
+				Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+			}); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			record := readTestRecord(t, recordPath)
+			if got, want := record["cwd"], test.want(t, runner, workingDir); got != want {
+				t.Fatalf("child cwd = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestRunner_ScrubsUnmanagedUVEnvironment(t *testing.T) {
 	t.Setenv("UV_INSECURE_HOST", "unsafe.example")
 	t.Setenv("uv_no_sources", "1")
@@ -579,6 +622,13 @@ func TestFakeUVProcess(t *testing.T) {
 		for index, argument := range os.Args {
 			lines = append(lines, fmt.Sprintf("arg%d=%s", index, argument))
 		}
+		// cwd 是 T13.1 断言子进程工作目录的唯一真实证据：只有真实子进程
+		// 报告的 Getwd 才能证明 StartSpec.Dir 生效，父进程侧断言做不到。
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, "cwd="+filepath.Clean(workingDirectory))
 		lines = append(lines, os.Environ()...)
 		for _, key := range []string{
 			uvPythonInstallDirEnv,

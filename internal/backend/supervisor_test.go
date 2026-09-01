@@ -110,8 +110,11 @@ func TestBackendManaged_UsesExactUVArgsAndEnvironment(t *testing.T) {
 		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
 	}
 
-	if got, want := f.uv.args, []string{"run", "--project", f.layout.RepoDir(), "--no-sync", "main.py"}; !equalStrings(got, want) {
+	if got, want := f.uv.args, []string{"run", "--project", f.layout.RepoDir(), "--no-sync", f.layout.BackendEntryFile()}; !equalStrings(got, want) {
 		t.Fatalf("uv args = %#v, want %#v", got, want)
+	}
+	if got, want := f.uv.options.WorkingDir, f.layout.AppRoot(); got != want {
+		t.Fatalf("managed working dir = %q, want app root %q", got, want)
 	}
 	if got, want := f.uv.checkOptions.ProjectDir, f.layout.RepoDir(); got != want {
 		t.Fatalf("managed uv preflight ProjectDir = %q, want %q", got, want)

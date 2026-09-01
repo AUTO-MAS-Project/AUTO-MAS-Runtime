@@ -201,10 +201,13 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	sink := s.streamSink(request, logger, gate)
 	processOwned := false
 	proc, err := s.deps.UV.StartManaged(ctx, []string{
-		"run", "--project", s.layout.RepoDir(), "--no-sync", "main.py",
+		"run", "--project", s.layout.RepoDir(), "--no-sync", s.layout.BackendEntryFile(),
 	}, uv.ManagedOptions{
 		RunOptions: uv.RunOptions{
-			Stage:      protocol.StageBackendSpawn,
+			Stage: protocol.StageBackendSpawn,
+			// cwd 是 app-root 而不是 repo：后端相对 cwd 创建的用户数据必须留在
+			// workspace sync 整体替换范围之外（增补 1 C6）。入口随之改传绝对路径。
+			WorkingDir: s.layout.AppRoot(),
 			ProjectDir: s.layout.RepoDir(),
 			Line:       nil,
 		},

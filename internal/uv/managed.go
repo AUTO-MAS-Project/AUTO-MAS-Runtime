@@ -80,7 +80,7 @@ func (r *UVRunner) StartManaged(
 	managed, err := process.StartManaged(ctx, process.StartSpec{
 		Executable: r.Executable,
 		Args:       append([]string(nil), args...),
-		Dir:        resolved.ProjectDir,
+		Dir:        resolved.WorkingDir,
 		Env:        buildEnvironmentWithSupervision(resolved, supervision),
 		Sink:       sink,
 	})

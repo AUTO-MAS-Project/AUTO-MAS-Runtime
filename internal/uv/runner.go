@@ -55,7 +55,11 @@ type RunnerConfig struct {
 
 // RunOptions 描述单次 uv 调用的可变信息。
 type RunOptions struct {
-	Stage            protocol.Stage
+	Stage protocol.Stage
+	// WorkingDir 是子进程的工作目录；为空时回退 ProjectDir。
+	// managed 后端按增补 1 C6 传 app-root，使用户数据不再落在会被
+	// workspace sync 整体替换的 repo/ 里；一次性 uv 命令都不传，行为不变。
+	WorkingDir       string
 	ProjectDir       string
 	PythonInstallDir string
 	ProjectEnvDir    string
@@ -151,7 +155,7 @@ func (r *UVRunner) Run(
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	command := exec.CommandContext(runContext, r.Executable, args...)
-	command.Dir = resolved.ProjectDir
+	command.Dir = resolved.WorkingDir
 	command.Env = buildEnvironment(resolved)
 	// 不使用 command.StdoutPipe/StderrPipe：那两者返回的读端归 exec 所有，
 	// command.Wait() 会在子进程退出后立即关闭它们，导致仍在进行或尚未被调度的
@@ -398,6 +402,7 @@ func normalizeVersionOutput(output string) string {
 }
 
 type resolvedRunOptions struct {
+	WorkingDir       string
 	ProjectDir       string
 	PythonInstallDir string
 	ProjectEnvDir    string
@@ -433,11 +438,18 @@ func (r *UVRunner) resolveOptions(options RunOptions) resolvedRunOptions {
 	if options.CacheDir != "" {
 		values.CacheDir = options.CacheDir
 	}
+	// WorkingDir 在 ProjectDir 解析完成之后再定，回退值必须是最终的
+	// ProjectDir，否则 development 传 ProjectDir 时 cwd 会漂到 runner 默认值。
+	values.WorkingDir = values.ProjectDir
+	if options.WorkingDir != "" {
+		values.WorkingDir = options.WorkingDir
+	}
 	return values
 }
 
 func validateRunnerPaths(options resolvedRunOptions) error {
 	for name, path := range map[string]string{
+		"working directory":             options.WorkingDir,
 		"project directory":             options.ProjectDir,
 		"python install directory":      options.PythonInstallDir,
 		"project environment directory": options.ProjectEnvDir,

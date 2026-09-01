@@ -41,6 +41,7 @@ const (
 type backendE2EConfig struct {
 	ListenAddress            string             `json:"listenAddress,omitempty"`
 	PIDFile                  string             `json:"pidFile,omitempty"`
+	WorkingDirFile           string             `json:"workingDirFile,omitempty"`
 	GrandchildPIDFile        string             `json:"grandchildPidFile,omitempty"`
 	SpawnGrandchild          bool               `json:"spawnGrandchild,omitempty"`
 	GrandchildLifetimeMS     int                `json:"grandchildLifetimeMs,omitempty"`
@@ -238,6 +239,7 @@ type backendE2EFixture struct {
 	repo          string
 	configPath    string
 	rootPID       string
+	workingDir    string
 	grandchildPID string
 	uvExecReady   string
 	uvExecRelease string
@@ -380,6 +382,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	}
 	configValue.ListenAddress = "127.0.0.1:36163"
 	configValue.PIDFile = filepath.Join(root, "python.pid")
+	configValue.WorkingDirFile = filepath.Join(root, "backend.cwd")
 	configValue.GrandchildPIDFile = filepath.Join(root, "grandchild.pid")
 	rootPIDPath := filepath.Join(root, "uv.pid")
 	uvExecReadyPath := ""
@@ -434,6 +437,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		repo:          repo,
 		configPath:    backendConfigPath,
 		rootPID:       rootPIDPath,
+		workingDir:    configValue.WorkingDirFile,
 		grandchildPID: configValue.GrandchildPIDFile,
 		uvExecReady:   uvExecReadyPath,
 		uvExecRelease: uvExecReleasePath,
@@ -550,6 +554,7 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 		t.Fatalf("development tree changed: got %#v, want %#v", got, repositorySnapshot)
 	}
 	assertE2EDevelopmentUVEnvironment(t, fixture)
+	assertE2EDevelopmentWorkingDir(t, fixture)
 	assertE2EStateSequence(t, fixture.emitter.statesSnapshot(), protocol.StateStartingBackend, protocol.StateRunning, protocol.StateStoppingBackend, protocol.StateStopped)
 	assertE2EPersistentLog(t, running, "lifecycle")
 	assertE2ETimelineBefore(t, fixture.emitter, "state:"+string(protocol.StateStartingBackend), "log:lifecycle ")
@@ -575,6 +580,24 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	}
 	if !strings.Contains(string(payload), "lifecycle stdout") || !strings.Contains(string(payload), "lifecycle stderr") {
 		t.Fatalf("runtime log = %q, want both stream messages", string(payload))
+	}
+}
+
+// assertE2EDevelopmentWorkingDir 证明 development 的 cwd 仍是 --repo：增补 1 C6
+// 只把 managed 的工作目录改到 app-root，development 一个字节都不能变。
+func assertE2EDevelopmentWorkingDir(t *testing.T, fixture *backendE2EFixture) {
+	t.Helper()
+	waitE2EFile(t, fixture.workingDir)
+	payload, err := os.ReadFile(fixture.workingDir)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", fixture.workingDir, err)
+	}
+	got := filepath.Clean(strings.TrimSpace(string(payload)))
+	if want := filepath.Clean(fixture.repo); got != want {
+		t.Fatalf("development backend cwd = %q, want %q", got, want)
+	}
+	if got == filepath.Clean(fixture.layout.AppRoot()) {
+		t.Fatalf("development backend cwd = %q, want the repo rather than the app root", got)
 	}
 }
 

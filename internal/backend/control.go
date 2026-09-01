@@ -21,6 +21,9 @@ const (
 	defaultRestartDelay           = 2 * time.Second
 	controlDrainTimeout           = time.Second
 	backendCloseURL               = "http://127.0.0.1:36163/api/core/close"
+	// developmentEntryArgument 是 development 模式沿用的相对入口：cwd 就是
+	// --repo 指定的源码目录，绝对路径只属于 managed（增补 1 C6 第 2 条）。
+	developmentEntryArgument = "main.py"
 )
 
 var (
@@ -1223,12 +1226,18 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	mode := modeForRequest(request)
 	projectDir := s.layout.RepoDir()
 	projectEnvDir := ""
+	// managed 的 cwd 与入口按增补 1 C6 固定为 app-root 与绝对入口路径；
+	// development 保持空 WorkingDir（回退 --repo）与裸入口，行为不变。
+	workingDir := s.layout.AppRoot()
+	entryArgument := s.layout.BackendEntryFile()
 	var identity *uv.SupervisionIdentity
 	pythonPaths := append([]string(nil), s.deps.PythonPaths...)
 	if mode == ModeDevelopment {
 		projectDir = request.DevelopmentRepo
 		projectEnvDir = developmentProjectEnv(projectDir)
 		pythonPaths = []string{developmentPythonPath(projectDir)}
+		workingDir = ""
+		entryArgument = developmentEntryArgument
 	} else {
 		identity = &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit}
 	}
@@ -1295,8 +1304,8 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		)
 		return nil, errors.Join(ctxErr, cleanupErr)
 	}
-	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", "main.py"}, uv.ManagedOptions{
-		RunOptions: uv.RunOptions{Stage: protocol.StageBackendSpawn, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
+	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", entryArgument}, uv.ManagedOptions{
+		RunOptions: uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
 		Identity:   identity,
 	}, s.streamSink(request, logger, gate))
 	if err != nil || proc == nil {

@@ -62,6 +62,13 @@ func TestBackendDevelopment_UsesExistingVenvWithoutSync(t *testing.T) {
 	if !equalStrings(f.uv.args, wantArgs) {
 		t.Fatalf("uv args = %#v, want %#v", f.uv.args, wantArgs)
 	}
+	// C6 只改 managed：development 不传 WorkingDir，cwd 仍由 ProjectDir（--repo）决定。
+	if got := f.uv.options.WorkingDir; got != "" {
+		t.Fatalf("development working dir = %q, want empty so it falls back to the repo", got)
+	}
+	if got, want := f.uv.options.ProjectDir, repo; got != want {
+		t.Fatalf("development project dir = %q, want %q", got, want)
+	}
 	if f.uv.options.Identity != nil {
 		t.Fatalf("development identity = %#v, want nil", f.uv.options.Identity)
 	}
