@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -164,21 +165,19 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	if got, ok := environment.pythonRequest.MirrorPolicy.Preferred(mirror.KindPython); !ok || got != "github" {
 		t.Fatalf("Python request preference = %q/%t, want github/true", got, ok)
 	}
-	// 原本这里用 package-index=pypi 断言镜像策略透传，但架构设计要求 bootstrap
-	// 对显式 package-index 首选直接返回 INVALID_ARGUMENT，该用例只是因为依赖服务
-	// 被替换成假实现才没撞上。改用 git 首选验证同一条透传路径，
-	// 拒绝行为由 TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects 覆盖。
+	// 用 git 首选验证依赖请求的策略透传路径；package-index 首选的透传与「不再拒绝」
+	// 由 TestM5CommandsAcceptPackageIndexPreference 覆盖。
 	if got, ok := environment.dependencyRequest.MirrorPolicy.Preferred(mirror.KindGit); !ok || got != "cnb" {
 		t.Fatalf("dependency request preference = %q/%t, want cnb/true", got, ok)
 	}
 }
 
-// TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects 锁定架构设计的要求：
-// bootstrap 与顶层 repair 对显式 --mirror package-index=<键> 返回 INVALID_ARGUMENT，
-// 且必须在调用 uv 之前失败关闭。断言重点是「一次副作用都没发生」——
-// 既没抢 mutation 锁，也没开状态库、没下载 uv、没同步仓库。
-// 修复前该拒绝发生在 uv/仓库/Python 全部落盘之后的依赖同步阶段。
-func TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects(t *testing.T) {
+// TestM5CommandsAcceptPackageIndexPreference 锁定增补 1 C10 的 2026-09-01 修订：
+// bootstrap 与顶层 repair 不再对显式 --mirror package-index=<键> 返回 INVALID_ARGUMENT，
+// 而是把它原样透传给依赖服务，由后者排在镜像尝试顺序最前。
+// 修订理由：改写锁副本不是覆盖索引，--locked 校验仍对原锁做，因此显式指定与自动轮换
+// 本就是同一条路径，只差顺序；保留拒绝会让用户想优先用某个可达镜像时反被判参数错误。
+func TestM5CommandsAcceptPackageIndexPreference(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
@@ -199,7 +198,7 @@ func TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects(t *testing.T) {
 				[]string{
 					"--app-root", root,
 					"--output", "ndjson",
-					"--mirror", "package-index=pypi",
+					"--mirror", "package-index=aliyun",
 				},
 				test.args...,
 			)
@@ -220,38 +219,24 @@ func TestM5CommandsRejectPackageIndexOverrideBeforeSideEffects(t *testing.T) {
 					return log, nil
 				}),
 			)
-			if code != int(protocol.ExitCodeInvalidArgument) {
-				t.Fatalf("exit code = %d, want %d; stderr=%q", code, protocol.ExitCodeInvalidArgument, stderr.String())
+			if code != int(protocol.ExitCodeSuccess) {
+				t.Fatalf("exit code = %d, want %d; stderr=%q", code, protocol.ExitCodeSuccess, stderr.String())
 			}
-			if len(log.calls) != 0 {
-				t.Fatalf("calls = %#v, want no side effect before rejection", log.calls)
+			if environment.syncCalls != 1 {
+				t.Fatalf("dependency sync calls = %d, want 1", environment.syncCalls)
 			}
-			if len(store.writes) != 0 {
-				t.Fatalf("state writes = %#v, want none", store.writes)
-			}
-			if environment.uvRepairCalls != 0 || environment.pythonPrepareCalls != 0 || environment.syncCalls != 0 {
-				t.Fatalf(
-					"environment calls = uvRepair %d python %d sync %d, want all zero",
-					environment.uvRepairCalls,
-					environment.pythonPrepareCalls,
-					environment.syncCalls,
-				)
+			got, ok := environment.dependencyRequest.MirrorPolicy.Preferred(mirror.KindPackageIndex)
+			if !ok || got != "aliyun" {
+				t.Fatalf("dependency request package-index preference = %q/%t, want aliyun/true", got, ok)
 			}
 			events := parseNDJSON(t, stdout.String())
-			var errorEvent, resultEvent parsedEvent
 			for _, event := range events {
-				switch eventType(event) {
-				case string(protocol.TypeError):
-					errorEvent = event
-				case string(protocol.TypeResult):
-					resultEvent = event
+				if eventType(event) == string(protocol.TypeError) {
+					t.Fatalf("unexpected error event: %#v", event.object)
 				}
 			}
-			if got := eventString(errorEvent, "code"); got != string(protocol.CodeInvalidArgument) {
-				t.Errorf("error code = %q, want INVALID_ARGUMENT", got)
-			}
-			if got := eventString(resultEvent, "code"); got != string(protocol.CodeInvalidArgument) {
-				t.Errorf("result code = %q, want INVALID_ARGUMENT", got)
+			if got := eventString(events[len(events)-1], "code"); got != "OK" {
+				t.Errorf("result code = %q, want OK", got)
 			}
 		})
 	}
@@ -1097,14 +1082,111 @@ func (s *m5TestEnvironment) CheckPython(context.Context, uv.PythonRequest) (uv.P
 	return uv.PythonCheckResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil
 }
 
-func (s *m5TestEnvironment) SyncDependencies(_ context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
+func (s *m5TestEnvironment) SyncDependencies(ctx context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
 	s.dependencyRequest = request
 	s.syncCalls++
 	*s.calls = append(*s.calls, "dependencies")
+	if request.Attempt != nil {
+		// 模拟一次镜像轮换：首选失败后由次选完成，调用方据此发 progress。
+		for index, attempt := range m5TestMirrorAttempts {
+			if err := request.Attempt(ctx, attempt); err != nil {
+				return uv.DependenciesResult{}, fmt.Errorf("report attempt %d: %w", index, err)
+			}
+		}
+	}
 	if s.dependencyErr != nil {
 		return uv.DependenciesResult{}, s.dependencyErr
 	}
-	return uv.DependenciesResult{LockfileChecked: true, Synchronized: true}, nil
+	return uv.DependenciesResult{
+		LockfileChecked: true,
+		Synchronized:    true,
+		SourceKind:      "package-index",
+		Source:          "tsinghua",
+		AttemptCount:    2,
+		LockRewritten:   true,
+	}, nil
+}
+
+// m5TestMirrorAttempts 是假依赖服务回放的镜像尝试序列。
+var m5TestMirrorAttempts = []uv.MirrorAttempt{
+	{SourceKind: "package-index", Source: "aliyun", SourceTry: 1, GlobalTry: 1},
+	{SourceKind: "package-index", Source: "tsinghua", SourceTry: 1, GlobalTry: 2},
+}
+
+// TestDependenciesSync_ResultReportsMirrorSource 锁定 C10 第 7 条：
+// dependencies sync 的 result.details 报告本次实际使用的包索引源与尝试次数，
+// 每次尝试另发一条 progress 供人类查看（progress 没有 details，机器只读 result）。
+func TestDependenciesSync_ResultReportsMirrorSource(t *testing.T) {
+	root := t.TempDir()
+	log := &m5TestLog{}
+	environment := &m5TestEnvironment{calls: &log.calls}
+	workspace := &m5TestWorkspace{calls: &log.calls}
+	store := &m5TestStateStore{
+		calls: &log.calls,
+		initial: state.EnvironmentState{
+			Status: protocol.StateEnvironmentBroken,
+			LastSuccessful: state.Revision{
+				Version: "v5.4.0",
+				Commit:  "0123456789abcdef0123456789abcdef01234567",
+			},
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", root, "--output", "ndjson", "dependencies", "sync"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(root),
+		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
+		WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+			return store, nil
+		}),
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return &m5TestCoordinator{calls: &log.calls}, nil
+		}),
+		WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+			return log, nil
+		}),
+	)
+	if code != int(protocol.ExitCodeSuccess) {
+		t.Fatalf("exit code = %d, want 0; stderr=%q; stdout=%q", code, stderr.String(), stdout.String())
+	}
+	events := parseNDJSON(t, stdout.String())
+	result := events[len(events)-1]
+	details, ok := result.object["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("result details = %#v, want object", result.object["details"])
+	}
+	wants := map[string]any{
+		"sourceKind":    "package-index",
+		"source":        "tsinghua",
+		"attemptCount":  float64(2),
+		"lockRewritten": true,
+	}
+	for key, want := range wants {
+		if got := details[key]; got != want {
+			t.Errorf("result details[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+	progressMessages := make([]string, 0, len(events))
+	for _, event := range events {
+		if eventType(event) == string(protocol.TypeProgress) && eventString(event, "stage") == string(protocol.StageDependenciesSync) {
+			progressMessages = append(progressMessages, eventString(event, "message"))
+		}
+	}
+	for _, attempt := range m5TestMirrorAttempts {
+		found := false
+		for _, message := range progressMessages {
+			if strings.Contains(message, attempt.Source) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no dependencies.sync progress mentions source %q; got %#v", attempt.Source, progressMessages)
+		}
+	}
 }
 
 func (s *m5TestEnvironment) CheckDependencies(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error) {
