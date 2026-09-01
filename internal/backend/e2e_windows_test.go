@@ -43,6 +43,7 @@ type backendE2EConfig struct {
 	ListenAddress             string             `json:"listenAddress,omitempty"`
 	PIDFile                   string             `json:"pidFile,omitempty"`
 	WorkingDirFile            string             `json:"workingDirFile,omitempty"`
+	EnvironmentFile           string             `json:"environmentFile,omitempty"`
 	GrandchildPIDFile         string             `json:"grandchildPidFile,omitempty"`
 	SpawnGrandchild           bool               `json:"spawnGrandchild,omitempty"`
 	GrandchildLifetimeMS      int                `json:"grandchildLifetimeMs,omitempty"`
@@ -242,6 +243,7 @@ type backendE2EFixture struct {
 	configPath    string
 	rootPID       string
 	workingDir    string
+	environment   string
 	grandchildPID string
 	uvExecReady   string
 	uvExecRelease string
@@ -413,6 +415,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	configValue.ListenAddress = "127.0.0.1:36163"
 	configValue.PIDFile = filepath.Join(root, "python.pid")
 	configValue.WorkingDirFile = filepath.Join(root, "backend.cwd")
+	configValue.EnvironmentFile = filepath.Join(root, "backend.env")
 	configValue.GrandchildPIDFile = filepath.Join(root, "grandchild.pid")
 	rootPIDPath := filepath.Join(root, "uv.pid")
 	uvExecReadyPath := ""
@@ -472,6 +475,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		configPath:    backendConfigPath,
 		rootPID:       rootPIDPath,
 		workingDir:    configValue.WorkingDirFile,
+		environment:   configValue.EnvironmentFile,
 		grandchildPID: configValue.GrandchildPIDFile,
 		uvExecReady:   uvExecReadyPath,
 		uvExecRelease: uvExecReleasePath,
@@ -589,6 +593,7 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	}
 	assertE2EDevelopmentUVEnvironment(t, fixture)
 	assertE2EDevelopmentWorkingDir(t, fixture)
+	assertE2EBackendInfrastructureEnvironment(t, fixture)
 	// 后代随父进程一起退出，属于优雅路径，不得出现强制回收警告。
 	for _, warning := range fixture.emitter.warningsSnapshot() {
 		if warning.Code == string(protocol.CodeBackendForceTerminated) {
@@ -639,6 +644,65 @@ func assertE2EDevelopmentWorkingDir(t *testing.T, fixture *backendE2EFixture) {
 	if got == filepath.Clean(fixture.layout.AppRoot()) {
 		t.Fatalf("development backend cwd = %q, want the repo rather than the app root", got)
 	}
+}
+
+// assertE2EBackendInfrastructureEnvironment 证明增补 1 C11 的四个变量确实到达了
+// 真实的后端子进程（fakeuv 之后的那一层），而不只是出现在 Runtime 交给 uv 的
+// StartSpec 里。取值同时与 layout 和 mirror 的 plan 顺序逐项核对。
+func assertE2EBackendInfrastructureEnvironment(t *testing.T, fixture *backendE2EFixture) {
+	t.Helper()
+	waitE2EFile(t, fixture.environment)
+	payload, err := os.ReadFile(fixture.environment)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", fixture.environment, err)
+	}
+	received := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(string(payload), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			t.Fatalf("backend environment line %q is malformed", line)
+		}
+		received[key] = value
+	}
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{})
+	if err != nil {
+		t.Fatalf("mirror.NewPolicy() error = %v", err)
+	}
+	want := map[string]string{
+		"AUTO_MAS_UV_CACHE_DIR":          fixture.layout.UVCacheDir(),
+		"AUTO_MAS_UV_PYTHON_INSTALL_DIR": fixture.layout.PythonDir(),
+		"AUTO_MAS_MIRROR_PACKAGE_INDEX":  e2EMirrorSourceList(t, policy, mirror.KindPackageIndex),
+		"AUTO_MAS_MIRROR_PYTHON":         e2EMirrorSourceList(t, policy, mirror.KindPython),
+	}
+	for key, expected := range want {
+		got, ok := received[key]
+		if !ok {
+			t.Fatalf("backend environment is missing %q; got %#v", key, received)
+		}
+		if got != expected {
+			t.Fatalf("backend environment[%q] = %q, want %q", key, got, expected)
+		}
+	}
+}
+
+func e2EMirrorSourceList(t *testing.T, policy mirror.Policy, kind mirror.Kind) string {
+	t.Helper()
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		t.Fatalf("DefaultCatalog() error = %v", err)
+	}
+	plan, err := mirror.BuildPlan(catalog, policy, kind)
+	if err != nil {
+		t.Fatalf("BuildPlan(%s) error = %v", kind, err)
+	}
+	addresses := make([]string, 0, len(plan.Sources()))
+	for _, source := range plan.Sources() {
+		addresses = append(addresses, source.BaseURL())
+	}
+	return strings.Join(addresses, ";")
 }
 
 func assertE2EDevelopmentUVEnvironment(t *testing.T, fixture *backendE2EFixture) {

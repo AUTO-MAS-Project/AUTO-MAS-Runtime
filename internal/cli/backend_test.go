@@ -185,6 +185,57 @@ func TestBackendDevelopment_CLIResolvesExplicitRepoFromCWD(t *testing.T) {
 	}
 }
 
+// TestBackendSupervise_PassesMirrorPolicyToFactory 锁定增补 1 C11 的数据流起点：
+// 全局镜像策略只在 CLI 侧被解析，backend 需要它才能算出下发给后端的有序源列表。
+func TestBackendSupervise_PassesMirrorPolicyToFactory(t *testing.T) {
+	tests := []struct {
+		name          string
+		arguments     []string
+		wantOffline   bool
+		wantOnly      bool
+		wantPreferred string
+	}{
+		{name: "default policy", arguments: nil},
+		{name: "offline", arguments: []string{"--offline"}, wantOffline: true},
+		{name: "mirror only", arguments: []string{"--mirror-only"}, wantOnly: true},
+		{
+			name:          "explicit package index preference",
+			arguments:     []string{"--mirror", "package-index=ustc"},
+			wantPreferred: "ustc",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured mirror.Policy
+			var stdout, stderr bytes.Buffer
+			arguments := append([]string{"--app-root", t.TempDir(), "--output", "ndjson"}, test.arguments...)
+			arguments = append(arguments, "backend", "supervise", "--mode", "managed")
+			code := Execute(
+				context.Background(),
+				arguments,
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithBackendFactory(func(_ context.Context, _ *config.Layout, _ io.Writer, _ func() time.Time, policy mirror.Policy) (backendService, error) {
+					captured = policy
+					return backendServiceFunc(func(context.Context, backend.Request) error { return nil }), nil
+				}),
+			)
+			if code != protocol.ExitCodeSuccess {
+				t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
+			}
+			if got := captured.Offline(); got != test.wantOffline {
+				t.Errorf("policy offline = %t, want %t", got, test.wantOffline)
+			}
+			if got := captured.MirrorOnly(); got != test.wantOnly {
+				t.Errorf("policy mirrorOnly = %t, want %t", got, test.wantOnly)
+			}
+			preferred, _ := captured.Preferred(mirror.KindPackageIndex)
+			if preferred != test.wantPreferred {
+				t.Errorf("preferred package index = %q, want %q", preferred, test.wantPreferred)
+			}
+		})
+	}
+}
+
 type backendServiceFunc func(context.Context, backend.Request) error
 
 func (f backendServiceFunc) Supervise(ctx context.Context, request backend.Request) error {

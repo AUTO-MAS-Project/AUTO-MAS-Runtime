@@ -36,7 +36,11 @@ type fakeBackendConfig struct {
 	PIDFile       string `json:"pidFile"`
 	// WorkingDirFile 让假后端报告自己的 os.Getwd()，供 T13.1 端到端断言
 	// Runtime 设定的工作目录真的生效；父进程侧的 StartSpec 断言证明不了这件事。
-	WorkingDirFile       string `json:"workingDirFile"`
+	WorkingDirFile string `json:"workingDirFile"`
+	// EnvironmentFile 让假后端把自己进程里读到的受监督环境变量落盘，供 T13.5
+	// 端到端断言增补 1 C11 的四个变量确实穿过 uv 到达了真实后端进程；父进程侧
+	// 的 StartSpec 断言只能证明 Runtime 传了什么，证明不了后端收到了什么。
+	EnvironmentFile      string `json:"environmentFile"`
 	GrandchildPIDFile    string `json:"grandchildPidFile"`
 	SpawnGrandchild      bool   `json:"spawnGrandchild"`
 	GrandchildLifetimeMS int    `json:"grandchildLifetimeMs"`
@@ -212,6 +216,12 @@ func runFakeBackend() int {
 		if err := writeSignalFile(config.WorkingDirFile, []byte(filepath.Clean(workingDirectory)+"\n")); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 97
+		}
+	}
+	if config.EnvironmentFile != "" {
+		if err := writeSignalFile(config.EnvironmentFile, supervisedEnvironmentReport()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 89
 		}
 	}
 
@@ -486,6 +496,28 @@ func startGrandchild(config fakeBackendConfig) (*grandchildProcess, error) {
 		}
 	}
 	return process, nil
+}
+
+// supervisedEnvironmentReport 逐行输出 `<键>=<值>`，缺席的键整行不出现，
+// 因此断言方能区分「注入了空串」和「根本没注入」。
+func supervisedEnvironmentReport() []byte {
+	var builder bytes.Buffer
+	for _, key := range []string{
+		"AUTO_MAS_UV_CACHE_DIR",
+		"AUTO_MAS_UV_PYTHON_INSTALL_DIR",
+		"AUTO_MAS_MIRROR_PACKAGE_INDEX",
+		"AUTO_MAS_MIRROR_PYTHON",
+	} {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		builder.WriteString(key)
+		builder.WriteString("=")
+		builder.WriteString(value)
+		builder.WriteString("\n")
+	}
+	return builder.Bytes()
 }
 
 func writeSignalFile(path string, payload []byte) error {
