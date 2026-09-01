@@ -91,9 +91,10 @@ func (e *networkExecutor) run(
 		switch kind {
 		case mirror.KindPython:
 			attemptOptions.Environment[uvPythonInstallMirrorEnv] = attempt.Source.BaseURL()
-		case mirror.KindPackageIndex:
-			attemptArgs = append(attemptArgs, "--default-index", attempt.Source.BaseURL())
 		default:
+			// 包索引不走这条路径：锁定依赖靠改写锁副本参与轮换，绝不能传
+			// --default-index —— 那会让 uv 判定锁需要更新并破坏 --locked
+			// 不变量（增补 1 C10 的实验依据第 1 条已实测）。
 			return mirror.AttemptOutcome{
 				Kind:        mirror.OutcomeTargetFailure,
 				FailureKind: mirror.FailureKind("unsupported_kind"),
