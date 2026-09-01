@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -18,9 +20,37 @@ type replayConfig struct {
 type replayRule struct {
 	replayAction
 	ArgumentsPrefix []string `json:"argumentsPrefix"`
+	// ArgumentsContain 要求这些参数全部出现，用于匹配 --frozen 这类与位置无关的开关。
+	ArgumentsContain []string `json:"argumentsContain"`
+	// LockContains 要求 --project 指向目录里的 uv.lock 含该子串，
+	// 用于按「改写成了哪个镜像」注入失败。
+	LockContains string `json:"lockContains"`
+}
+
+// matches 报告规则的全部条件是否都满足；没有任何条件的规则不匹配。
+func (r replayRule) matches(arguments []string, lock string) bool {
+	if len(r.ArgumentsPrefix) == 0 && len(r.ArgumentsContain) == 0 && r.LockContains == "" {
+		return false
+	}
+	if len(r.ArgumentsPrefix) > 0 && !hasArgumentsPrefix(arguments, r.ArgumentsPrefix) {
+		return false
+	}
+	for _, needle := range r.ArgumentsContain {
+		if !containsArgument(arguments, needle) {
+			return false
+		}
+	}
+	if r.LockContains != "" && !strings.Contains(lock, r.LockContains) {
+		return false
+	}
+	return true
 }
 
 type replayAction struct {
+	// ReadyFile 在动作开始时写出，ReleaseFile 出现前进程不返回；
+	// 两者配合可以让测试在假 uv 正在运行时精确注入取消。
+	ReadyFile         string        `json:"readyFile"`
+	ReleaseFile       string        `json:"releaseFile"`
 	ExitCode          int           `json:"exitCode"`
 	Stdout            []string      `json:"stdout"`
 	Stderr            []string      `json:"stderr"`
@@ -43,6 +73,10 @@ type replayEvent struct {
 type invocationRecord struct {
 	Arguments   []string          `json:"arguments"`
 	Environment map[string]string `json:"environment"`
+	// ProjectDir 是 --project 的取值，LockIndexPrefixes 是该目录 uv.lock 里出现的
+	// 索引与 artifact 前缀（去重排序），测试据此断言实际用的是哪个镜像源。
+	ProjectDir        string   `json:"projectDir,omitempty"`
+	LockIndexPrefixes []string `json:"lockIndexPrefixes,omitempty"`
 }
 
 func main() {
@@ -58,9 +92,12 @@ func main() {
 			os.Exit(91)
 		}
 	}
+	arguments := os.Args[1:]
+	projectDir := argumentValue(arguments, "--project")
+	lock := readProjectLock(projectDir)
 	action := config.replayAction
 	for _, rule := range config.Rules {
-		if hasArgumentsPrefix(os.Args[1:], rule.ArgumentsPrefix) {
+		if rule.matches(arguments, lock) {
 			action = rule.replayAction
 			break
 		}
@@ -74,8 +111,10 @@ func main() {
 			}
 		}
 		record := invocationRecord{
-			Arguments:   append([]string(nil), os.Args[1:]...),
-			Environment: environment,
+			Arguments:         append([]string(nil), arguments...),
+			Environment:       environment,
+			ProjectDir:        projectDir,
+			LockIndexPrefixes: lockIndexPrefixes(lock),
 		}
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
@@ -127,6 +166,18 @@ func main() {
 		}
 		os.Exit(0)
 	}
+	if action.ReadyFile != "" {
+		if err := writeSignalFile(action.ReadyFile, []byte("ready\n")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(96)
+		}
+	}
+	if action.ReleaseFile != "" {
+		if err := waitForSignalFile(action.ReleaseFile); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(96)
+		}
+	}
 	if action.DelayMS > 0 {
 		time.Sleep(time.Duration(action.DelayMS) * time.Millisecond)
 	}
@@ -151,6 +202,77 @@ func main() {
 		}
 	}
 	os.Exit(action.ExitCode)
+}
+
+// argumentValue 返回 name 后面紧跟的那个参数值。
+func argumentValue(arguments []string, name string) string {
+	for index := 0; index+1 < len(arguments); index++ {
+		if arguments[index] == name {
+			return arguments[index+1]
+		}
+	}
+	return ""
+}
+
+func containsArgument(arguments []string, needle string) bool {
+	for _, argument := range arguments {
+		if argument == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// readProjectLock 读取 --project 目录里的 uv.lock；缺失时返回空串。
+func readProjectLock(projectDir string) string {
+	if projectDir == "" {
+		return ""
+	}
+	payload, err := os.ReadFile(filepath.Join(projectDir, "uv.lock"))
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
+// lockIndexPrefixes 提取锁文本里出现的索引与 artifact 前缀，去重后排序。
+func lockIndexPrefixes(lock string) []string {
+	unique := make(map[string]struct{})
+	rest := lock
+	for {
+		start := strings.Index(rest, "https://")
+		if start < 0 {
+			break
+		}
+		rest = rest[start:]
+		end := strings.IndexAny(rest, "\"' \t\r\n,")
+		token := rest
+		if end >= 0 {
+			token = rest[:end]
+			rest = rest[end:]
+		}
+		if prefix, ok := indexPrefixOf(token); ok {
+			unique[prefix] = struct{}{}
+		}
+		if end < 0 {
+			break
+		}
+	}
+	prefixes := make([]string, 0, len(unique))
+	for prefix := range unique {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+	return prefixes
+}
+
+func indexPrefixOf(url string) (string, bool) {
+	for _, marker := range []string{"/simple", "/packages/"} {
+		if index := strings.Index(url, marker); index >= 0 {
+			return url[:index+len(marker)], true
+		}
+	}
+	return "", false
 }
 
 func hasArgumentsPrefix(arguments, prefix []string) bool {
