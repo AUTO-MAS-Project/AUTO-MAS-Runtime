@@ -91,6 +91,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 						deps.global.layout,
 						deps.io.Err,
 						deps.options.clock,
+						deps.global.mirrorPolicy,
 					)
 					if err != nil {
 						return sessionSuccess{}, err

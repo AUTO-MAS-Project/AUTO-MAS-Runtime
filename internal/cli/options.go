@@ -24,11 +24,14 @@ type backendService interface {
 	Supervise(context.Context, backend.Request) error
 }
 
+// backendFactory 多接一个 mirror.Policy：backend 需要它按增补 1 C11 解析出
+// 下发给后端的有序镜像源列表，而全局镜像策略只在 CLI 侧被解析。
 type backendFactory func(
 	context.Context,
 	*config.Layout,
 	io.Writer,
 	func() time.Time,
+	mirror.Policy,
 ) (backendService, error)
 
 // WithBackendFactory 注入后端监督器工厂，供命令契约测试隔离真实 Job 与端口。

@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -22,6 +24,10 @@ const cleanupTimeout = 30 * time.Second
 type ManagedSupervisor struct {
 	layout *config.Layout
 	deps   Dependencies
+	// infrastructure 是按增补 1 C11 下发给后端的受管基础设施。layout 与
+	// MirrorPolicy 在 supervisor 生命周期内不变，因此只在构造期解析一次，
+	// 首次启动与单次自动重启、managed 与 development 都读同一份值。
+	infrastructure uv.SupervisionInfrastructure
 }
 
 // NewManagedSupervisor 创建可按请求选择 managed 或 development 的后端监督器。
@@ -54,7 +60,71 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	if deps.UVPath == "" || deps.PythonPath == "" {
 		return nil, errors.New("backend process identity paths are incomplete")
 	}
-	return &ManagedSupervisor{layout: layout, deps: deps}, nil
+	infrastructure, err := supervisionInfrastructure(layout, deps.MirrorPolicy)
+	if err != nil {
+		return nil, err
+	}
+	return &ManagedSupervisor{layout: layout, deps: deps, infrastructure: infrastructure}, nil
+}
+
+// supervisionInfrastructure 解析增补 1 C11 下发给后端的受管基础设施。
+//
+// 这里是 Runtime 里唯一同时持有 layout 与 mirror.Policy 的位置：目录取自 layout，
+// 两个有序源列表由 mirror.BuildPlan 给出——plan 的顺序**就是**尝试顺序
+// （显式首选最前、目录顺序其次、官方源末位），`--mirror-only` 不含官方源，
+// `--offline` 得到空列表。本任务因此不需要任何新的 mirror API。
+func supervisionInfrastructure(
+	layout *config.Layout,
+	policy mirror.Policy,
+) (uv.SupervisionInfrastructure, error) {
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		return uv.SupervisionInfrastructure{}, fmt.Errorf("build backend mirror catalog: %w", err)
+	}
+	packageIndex, err := mirrorSources(catalog, policy, mirror.KindPackageIndex)
+	if err != nil {
+		return uv.SupervisionInfrastructure{}, err
+	}
+	python, err := mirrorSources(catalog, policy, mirror.KindPython)
+	if err != nil {
+		return uv.SupervisionInfrastructure{}, err
+	}
+	return uv.SupervisionInfrastructure{
+		UVCacheDir:          layout.UVCacheDir(),
+		PythonInstallDir:    layout.PythonDir(),
+		PackageIndexSources: packageIndex,
+		PythonSources:       python,
+	}, nil
+}
+
+// mirrorSources 返回单个 Kind 的有序源地址。
+//
+// 失败语义与 internal/uv 的网络路径一致：ErrPolicyRejected 表示用户显式指定了一个
+// 选不出来的源，必须失败关闭（静默换源等于无视用户意图）；其他错误只说明 Policy
+// 本身没被配置（例如零值 Policy），退回目录默认顺序。
+func mirrorSources(catalog *mirror.Catalog, policy mirror.Policy, kind mirror.Kind) ([]string, error) {
+	plan, err := mirror.BuildPlan(catalog, policy, kind)
+	if err != nil {
+		if errors.Is(err, mirror.ErrPolicyRejected) {
+			return nil, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "镜像源选择无效", map[string]any{
+				"sourceKind": kind.String(),
+			}, err)
+		}
+		defaultPolicy, defaultErr := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
+		if defaultErr != nil {
+			return nil, fmt.Errorf("build default backend mirror policy: %w", defaultErr)
+		}
+		plan, defaultErr = mirror.BuildPlan(catalog, defaultPolicy, kind)
+		if defaultErr != nil {
+			return nil, fmt.Errorf("build backend mirror plan: %w", errors.Join(err, defaultErr))
+		}
+	}
+	sources := plan.Sources()
+	addresses := make([]string, 0, len(sources))
+	for _, source := range sources {
+		addresses = append(addresses, source.BaseURL())
+	}
+	return addresses, nil
 }
 
 // Supervise 启动并长驻监督指定模式的后端，直到调用方取消或 Job 根进程退出。
@@ -211,7 +281,8 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 			ProjectDir: s.layout.RepoDir(),
 			Line:       nil,
 		},
-		Identity: &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit},
+		Identity:       &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit},
+		Infrastructure: s.infrastructure,
 	}, sink)
 	if err != nil || proc == nil {
 		if fault := gate.Fault(); fault != nil {

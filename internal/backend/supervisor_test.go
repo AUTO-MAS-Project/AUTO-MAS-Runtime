@@ -13,6 +13,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -605,6 +606,7 @@ type backendFixture struct {
 	pid             *fakePID
 	depsHTTP        HTTPCloser
 	shutdownTimeout time.Duration
+	mirrorPolicy    mirror.Policy
 }
 
 func newBackendFixture(t *testing.T) *backendFixture {
@@ -634,18 +636,19 @@ func newBackendFixture(t *testing.T) *backendFixture {
 func (f *backendFixture) supervisor() *ManagedSupervisor {
 	f.t.Helper()
 	s, err := NewManagedSupervisor(f.layout, Dependencies{
-		Lock:       f.lock,
-		State:      f.state,
-		Repository: f.repository,
-		Entry:      f.entry,
-		UV:         f.uv,
-		Health:     f.health,
-		Logger:     func(context.Context, Request) (Logger, error) { return f.logger, f.loggerErr },
-		Clock:      func() time.Time { return time.Unix(1, 0).UTC() },
-		UVPath:     "uv.exe",
-		PythonPath: "python.exe",
-		PID:        f.pid,
-		NewTimer:   func(time.Duration) Timer { return immediateTimer{} },
+		Lock:         f.lock,
+		State:        f.state,
+		Repository:   f.repository,
+		Entry:        f.entry,
+		UV:           f.uv,
+		Health:       f.health,
+		Logger:       func(context.Context, Request) (Logger, error) { return f.logger, f.loggerErr },
+		Clock:        func() time.Time { return time.Unix(1, 0).UTC() },
+		UVPath:       "uv.exe",
+		PythonPath:   "python.exe",
+		PID:          f.pid,
+		NewTimer:     func(time.Duration) Timer { return immediateTimer{} },
+		MirrorPolicy: f.mirrorPolicy,
 	})
 	if err != nil {
 		f.t.Fatalf("NewManagedSupervisor() error = %v", err)
@@ -1232,3 +1235,170 @@ func (immediateTimer) Stop() bool { return true }
 
 func (e *fakeCodeError) Error() string       { return string(e.code) }
 func (e *fakeCodeError) Code() protocol.Code { return e.code }
+
+// TestBackendManaged_PassesInfrastructureAndMirrorPlan 锁定增补 1 C11 的数据流：
+// backend 是唯一同时持有 layout 与 mirror.Policy 的地方，因此由它解析出两个
+// 有序源列表和两个受管目录，再交给 StartManaged 注入。
+func TestBackendManaged_PassesInfrastructureAndMirrorPlan(t *testing.T) {
+	f := newBackendFixture(t)
+	f.mirrorPolicy = testMirrorPolicy(t, mirror.PolicySpec{})
+	options := runManagedSpawnForInfrastructure(t, f)
+	if got, want := options.Infrastructure.UVCacheDir, f.layout.UVCacheDir(); got != want {
+		t.Errorf("UVCacheDir = %q, want %q", got, want)
+	}
+	if got, want := options.Infrastructure.PythonInstallDir, f.layout.PythonDir(); got != want {
+		t.Errorf("PythonInstallDir = %q, want %q", got, want)
+	}
+	assertMirrorSourcesMatchPlan(t, f.mirrorPolicy, mirror.KindPackageIndex, options.Infrastructure.PackageIndexSources)
+	assertMirrorSourcesMatchPlan(t, f.mirrorPolicy, mirror.KindPython, options.Infrastructure.PythonSources)
+	if last := options.Infrastructure.PackageIndexSources[len(options.Infrastructure.PackageIndexSources)-1]; last != "https://pypi.org/simple/" {
+		t.Errorf("last package index source = %q, want the official source", last)
+	}
+}
+
+// TestBackendSupervision_MirrorPolicyShapesInjectedSources 覆盖策略矩阵：
+// 顺序、--mirror-only 去掉官方源、--offline 空列表，以及零值 Policy 的默认回退。
+func TestBackendSupervision_MirrorPolicyShapesInjectedSources(t *testing.T) {
+	tests := []struct {
+		name   string
+		spec   *mirror.PolicySpec
+		verify func(*testing.T, uv.SupervisionInfrastructure)
+	}{
+		{
+			name: "explicit preference first",
+			spec: &mirror.PolicySpec{Preferred: map[mirror.Kind]string{mirror.KindPackageIndex: "ustc"}},
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				if got := infrastructure.PackageIndexSources[0]; got != "https://pypi.mirrors.ustc.edu.cn/simple/" {
+					t.Errorf("first package index source = %q, want the explicitly preferred source", got)
+				}
+			},
+		},
+		{
+			name: "mirror only drops the official source",
+			spec: &mirror.PolicySpec{MirrorOnly: true},
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				for _, source := range infrastructure.PackageIndexSources {
+					if source == "https://pypi.org/simple/" {
+						t.Errorf("package index sources = %#v, want no official source under --mirror-only", infrastructure.PackageIndexSources)
+					}
+				}
+				for _, source := range infrastructure.PythonSources {
+					if source == "https://github.com/astral-sh/python-build-standalone/releases/download" {
+						t.Errorf("python sources = %#v, want no official source under --mirror-only", infrastructure.PythonSources)
+					}
+				}
+			},
+		},
+		{
+			name: "offline yields empty lists",
+			spec: &mirror.PolicySpec{Offline: true},
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				if len(infrastructure.PackageIndexSources) != 0 || len(infrastructure.PythonSources) != 0 {
+					t.Errorf("offline sources = %#v / %#v, want empty lists",
+						infrastructure.PackageIndexSources, infrastructure.PythonSources)
+				}
+			},
+		},
+		{
+			// 零值 Policy 不是「用户传了非法参数」，而是调用方没配置；与
+			// internal/uv 其他网络路径一致地退回目录默认顺序，不失败关闭。
+			name: "zero value policy falls back to catalog order",
+			spec: nil,
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				assertMirrorSourcesMatchPlan(t, testMirrorPolicy(t, mirror.PolicySpec{}),
+					mirror.KindPackageIndex, infrastructure.PackageIndexSources)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			if test.spec != nil {
+				f.mirrorPolicy = testMirrorPolicy(t, *test.spec)
+			}
+			options := runManagedSpawnForInfrastructure(t, f)
+			test.verify(t, options.Infrastructure)
+		})
+	}
+}
+
+// TestBackendSupervision_RejectsUnselectableMirrorPreference 证明失败关闭：
+// 用户显式指定了一个选不出来的源时映射 INVALID_ARGUMENT，绝不静默换源。
+// 解析发生在构造期，因此在获取任何 Mutex、事务或日志之前就已经拒绝。
+func TestBackendSupervision_RejectsUnselectableMirrorPreference(t *testing.T) {
+	f := newBackendFixture(t)
+	f.mirrorPolicy = testMirrorPolicy(t, mirror.PolicySpec{
+		Preferred: map[mirror.Kind]string{mirror.KindPackageIndex: "missing"},
+	})
+	supervisor, err := NewManagedSupervisor(f.layout, Dependencies{
+		Lock:         f.lock,
+		State:        f.state,
+		Repository:   f.repository,
+		Entry:        f.entry,
+		UV:           f.uv,
+		Health:       f.health,
+		Logger:       func(context.Context, Request) (Logger, error) { return f.logger, nil },
+		UVPath:       "uv.exe",
+		PythonPath:   "python.exe",
+		MirrorPolicy: f.mirrorPolicy,
+	})
+	if supervisor != nil {
+		t.Fatalf("NewManagedSupervisor() = %#v, want nil", supervisor)
+	}
+	assertBackendCode(t, err, protocol.CodeInvalidArgument)
+	if f.uv.startCalls != 0 {
+		t.Fatalf("StartManaged calls = %d, want 0", f.uv.startCalls)
+	}
+}
+
+func runManagedSpawnForInfrastructure(t *testing.T, f *backendFixture) uv.ManagedOptions {
+	t.Helper()
+	f.proc.keepAlive = true
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, f.request()) }()
+	waitFor(t, f.emitter.running)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
+	}
+	if f.uv.startCalls != 1 {
+		t.Fatalf("StartManaged calls = %d, want 1", f.uv.startCalls)
+	}
+	return f.uv.options
+}
+
+func testMirrorPolicy(t *testing.T, spec mirror.PolicySpec) mirror.Policy {
+	t.Helper()
+	policy, err := mirror.NewPolicy(spec)
+	if err != nil {
+		t.Fatalf("NewPolicy(%#v) error = %v", spec, err)
+	}
+	return policy
+}
+
+// assertMirrorSourcesMatchPlan 用 mirror 自己的 BuildPlan 作为期望值，
+// 保证「注入顺序 == Runtime 解析后的尝试顺序」这条契约不靠人工抄写维持。
+func assertMirrorSourcesMatchPlan(t *testing.T, policy mirror.Policy, kind mirror.Kind, got []string) {
+	t.Helper()
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		t.Fatalf("DefaultCatalog() error = %v", err)
+	}
+	plan, err := mirror.BuildPlan(catalog, policy, kind)
+	if err != nil {
+		t.Fatalf("BuildPlan(%s) error = %v", kind, err)
+	}
+	want := make([]string, 0, len(plan.Sources()))
+	for _, source := range plan.Sources() {
+		want = append(want, source.BaseURL())
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("%s sources = %#v, want %#v in plan order", kind, got, want)
+	}
+}

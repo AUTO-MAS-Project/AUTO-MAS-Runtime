@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -17,6 +18,7 @@ func NewProductionManagedSupervisor(
 	*config.Layout,
 	io.Writer,
 	func() time.Time,
+	mirror.Policy,
 ) (*ManagedSupervisor, error) {
 	return nil, newError(protocol.CodeUnsupportedMode, protocol.StageBackendSpawn, "受管后端监督不支持当前平台", map[string]any{"reason": "platform_unsupported"}, nil)
 }

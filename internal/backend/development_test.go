@@ -12,6 +12,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
@@ -406,6 +407,41 @@ func TestBackendDevelopment_RejectsRuntimeRootInsideRepoBeforeSideEffects(t *tes
 	if f.lock.acquireStarted != nil || f.lock.closeCalls != 0 || f.state.closeCalls != 0 || f.logger.closeCalls != 0 || f.uv.startCalls != 0 {
 		t.Fatalf("side effects before containment rejection: lock=%d state=%d logger=%d uv=%d", f.lock.closeCalls, f.state.closeCalls, f.logger.closeCalls, f.uv.startCalls)
 	}
+}
+
+// TestBackendDevelopment_PassesInfrastructureAndMirrorPlan 证明增补 1 C11 的四项
+// 在 development 下同样注入：契约表两列都是「必填」，不能只服务 managed。
+// 两个目录必须仍是**受管**目录，而不是开发源码目录里的 .venv。
+func TestBackendDevelopment_PassesInfrastructureAndMirrorPlan(t *testing.T) {
+	f := newBackendFixture(t)
+	f.mirrorPolicy = testMirrorPolicy(t, mirror.PolicySpec{})
+	repo := newDevelopmentRepo(t)
+	f.proc.keepAlive = true
+	mailbox := NewControlMailbox(8)
+	t.Cleanup(mailbox.Close)
+	request := developmentRequest(f.request(), repo)
+	request.Control = mailbox
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(t.Context(), request) }()
+	waitFor(t, f.emitter.running)
+	if err := mailbox.Submit(t.Context(), protocol.ControlCommand{
+		Command:   protocol.ControlShutdown,
+		CommandID: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+	}); err != nil {
+		t.Fatalf("Submit(shutdown) error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	infrastructure := f.uv.options.Infrastructure
+	if got, want := infrastructure.UVCacheDir, f.layout.UVCacheDir(); got != want {
+		t.Errorf("development UVCacheDir = %q, want the managed cache %q", got, want)
+	}
+	if got, want := infrastructure.PythonInstallDir, f.layout.PythonDir(); got != want {
+		t.Errorf("development PythonInstallDir = %q, want the managed python dir %q", got, want)
+	}
+	assertMirrorSourcesMatchPlan(t, f.mirrorPolicy, mirror.KindPackageIndex, infrastructure.PackageIndexSources)
+	assertMirrorSourcesMatchPlan(t, f.mirrorPolicy, mirror.KindPython, infrastructure.PythonSources)
 }
 
 func developmentRequest(request Request, repo string) Request {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -40,7 +41,7 @@ func TestBackendSupervise_RequiresExplicitManagedMode(t *testing.T) {
 				context.Background(),
 				args,
 				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
-				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 					factoryCalls++
 					return backendServiceFunc(func(context.Context, backend.Request) error { return nil }), nil
 				}),
@@ -90,7 +91,7 @@ func TestBackendSupervise_ShutdownTimeoutArgument(t *testing.T) {
 				context.Background(),
 				args,
 				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
-				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 					return backendServiceFunc(func(_ context.Context, request backend.Request) error {
 						captured = request
 						return nil
@@ -129,7 +130,7 @@ func TestBackendSupervise_ShutdownTimeoutArgument(t *testing.T) {
 					"backend", "supervise", "--mode", "managed", "--shutdown-timeout", test.value,
 				},
 				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
-				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 					factoryCalls++
 					return backendServiceFunc(func(context.Context, backend.Request) error { return nil }), nil
 				}),
@@ -166,7 +167,7 @@ func TestBackendDevelopment_CLIResolvesExplicitRepoFromCWD(t *testing.T) {
 		[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "development", "--repo", "source"},
 		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
 		WithCWD(cwd),
-		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 			return backendServiceFunc(func(_ context.Context, request backend.Request) error {
 				captured = request
 				return nil
@@ -201,7 +202,7 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 				context.Background(),
 				[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
 				IO{In: input, Out: &stdout, Err: &stderr},
-				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 					return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
 						close(started)
 						_, err := request.Control.Receive(ctx)
@@ -238,7 +239,7 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 			context.Background(),
 			[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
 			IO{In: input, Out: &stdout, Err: &stderr},
-			WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+			WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 				return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
 					command, err := request.Control.Receive(ctx)
 					if err != nil {
@@ -282,7 +283,7 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 			context.Background(),
 			[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
 			IO{In: input, Out: &stdout, Err: &stderr},
-			WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+			WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 				return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
 					for range 3 {
 						command, err := request.Control.Receive(ctx)
@@ -314,7 +315,7 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 				ctx,
 				[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
 				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
-				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 					return backendServiceFunc(func(ctx context.Context, _ backend.Request) error {
 						close(started)
 						<-ctx.Done()

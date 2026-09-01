@@ -21,6 +21,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/lock"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
@@ -438,7 +439,11 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	if err := assertE2EPortBindable(); err != nil {
 		t.Fatalf("port 36163 cannot bind before fixture: %v", err)
 	}
-	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now)
+	mirrorPolicy, err := mirror.NewPolicy(mirror.PolicySpec{})
+	if err != nil {
+		t.Fatalf("mirror.NewPolicy() error = %v", err)
+	}
+	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now, mirrorPolicy)
 	if err != nil {
 		t.Fatalf("NewProductionManagedSupervisor() error = %v", err)
 	}
@@ -1001,7 +1006,11 @@ func TestBackendE2E_RuntimeTerminationLeavesNoDescendants(t *testing.T) {
 	// 并在正常关闭时删除它。
 	t.Setenv(e2eFakeBackendEnv, filepath.Join(signal.Root, "backend-config.json"))
 	t.Setenv(e2eFakeUVConfigEnv, filepath.Join(signal.Root, "uv-config.json"))
-	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now)
+	recoveryPolicy, err := mirror.NewPolicy(mirror.PolicySpec{})
+	if err != nil {
+		t.Fatalf("mirror.NewPolicy() error = %v", err)
+	}
+	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now, recoveryPolicy)
 	if err != nil {
 		t.Fatalf("NewProductionManagedSupervisor(recovery) error = %v", err)
 	}

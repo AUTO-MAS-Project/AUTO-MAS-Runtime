@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -68,6 +69,9 @@ type Dependencies struct {
 	RestartDelay    time.Duration
 	Timer           func(time.Duration) <-chan time.Time
 	NewTimer        func(time.Duration) Timer
+	// MirrorPolicy 是已解析的全局镜像策略，用于按增补 1 C11 生成下发给后端的
+	// 有序源列表。零值表示调用方未配置，按目录默认顺序处理。
+	MirrorPolicy mirror.Policy
 }
 
 // Timer 是可停止的重启等待计时器，避免 timer channel 在收口后泄漏。

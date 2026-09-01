@@ -1305,8 +1305,9 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		return nil, errors.Join(ctxErr, cleanupErr)
 	}
 	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", entryArgument}, uv.ManagedOptions{
-		RunOptions: uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
-		Identity:   identity,
+		RunOptions:     uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
+		Identity:       identity,
+		Infrastructure: s.infrastructure,
 	}, s.streamSink(request, logger, gate))
 	if err != nil || proc == nil {
 		fault := gate.Fault()

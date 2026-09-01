@@ -10,6 +10,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol/contracttest"
 )
@@ -70,7 +71,7 @@ func backendContractRunner() contracttest.Runner {
 			IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
 			WithCWD(root),
 			WithClock(func() time.Time { return time.Date(2026, 8, 9, 8, 0, 0, 0, time.UTC) }),
-			WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+			WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 				return service, nil
 			}),
 		)
