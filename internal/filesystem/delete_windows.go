@@ -230,6 +230,9 @@ func (o *Operator) expectedDeletePath(
 		return o.layout.RepoDir(), false, nil
 	case DeleteBuildCache:
 		return o.layout.BuildCacheDir(), true, nil
+	case DeleteDependencySync:
+		path, err := o.layout.DependencySyncDir(request.OperationID)
+		return path, true, wrapLayoutArgument(err)
 	default:
 		return "", false, ErrInvalidArgument
 	}

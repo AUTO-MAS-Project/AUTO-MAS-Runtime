@@ -72,6 +72,14 @@ func TestLayout_DynamicPathsPreserveSegments(t *testing.T) {
 	if want := filepath.Join(layout.BuildCacheDir(), "uv", "0.8.0", "Op-ID_1"); staging != want {
 		t.Fatalf("UVStagingDir() = %q, want %q", staging, want)
 	}
+
+	dependencySync, err := layout.DependencySyncDir("Op-ID_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(layout.BuildCacheDir(), "dependencies", "Op-ID_1"); dependencySync != want {
+		t.Fatalf("DependencySyncDir() = %q, want %q", dependencySync, want)
+	}
 }
 
 func TestLayout_DynamicPathsRejectUnsafeSegments(t *testing.T) {
@@ -112,6 +120,9 @@ func TestLayout_DynamicPathsRejectUnsafeSegments(t *testing.T) {
 			})
 			assertInvalidSegment(t, "RuntimeLogFile", func() (string, error) {
 				return layout.RuntimeLogFile(value, time.Date(2026, 7, 30, 0, 30, 0, 0, time.UTC))
+			})
+			assertInvalidSegment(t, "DependencySyncDir", func() (string, error) {
+				return layout.DependencySyncDir(value)
 			})
 		})
 
