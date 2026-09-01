@@ -388,7 +388,7 @@ func newM5ComponentGitFixture(t *testing.T) *m5ComponentGitFixture {
 	files := map[string]string{
 		".python-version":  "3.12.10\n",
 		"pyproject.toml":   "[project]\nrequires-python = \">=3.12,<3.13\"\n",
-		"uv.lock":          "version = 1\n",
+		"uv.lock":          m13ComponentLock,
 		"res/version.json": "{\"version\":\"v5.4.0\"}\n",
 	}
 	worktree, err := repository.Worktree()
