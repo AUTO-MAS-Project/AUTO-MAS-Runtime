@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -1081,14 +1082,111 @@ func (s *m5TestEnvironment) CheckPython(context.Context, uv.PythonRequest) (uv.P
 	return uv.PythonCheckResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil
 }
 
-func (s *m5TestEnvironment) SyncDependencies(_ context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
+func (s *m5TestEnvironment) SyncDependencies(ctx context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
 	s.dependencyRequest = request
 	s.syncCalls++
 	*s.calls = append(*s.calls, "dependencies")
+	if request.Attempt != nil {
+		// 模拟一次镜像轮换：首选失败后由次选完成，调用方据此发 progress。
+		for index, attempt := range m5TestMirrorAttempts {
+			if err := request.Attempt(ctx, attempt); err != nil {
+				return uv.DependenciesResult{}, fmt.Errorf("report attempt %d: %w", index, err)
+			}
+		}
+	}
 	if s.dependencyErr != nil {
 		return uv.DependenciesResult{}, s.dependencyErr
 	}
-	return uv.DependenciesResult{LockfileChecked: true, Synchronized: true}, nil
+	return uv.DependenciesResult{
+		LockfileChecked: true,
+		Synchronized:    true,
+		SourceKind:      "package-index",
+		Source:          "tsinghua",
+		AttemptCount:    2,
+		LockRewritten:   true,
+	}, nil
+}
+
+// m5TestMirrorAttempts 是假依赖服务回放的镜像尝试序列。
+var m5TestMirrorAttempts = []uv.MirrorAttempt{
+	{SourceKind: "package-index", Source: "aliyun", SourceTry: 1, GlobalTry: 1},
+	{SourceKind: "package-index", Source: "tsinghua", SourceTry: 1, GlobalTry: 2},
+}
+
+// TestDependenciesSync_ResultReportsMirrorSource 锁定 C10 第 7 条：
+// dependencies sync 的 result.details 报告本次实际使用的包索引源与尝试次数，
+// 每次尝试另发一条 progress 供人类查看（progress 没有 details，机器只读 result）。
+func TestDependenciesSync_ResultReportsMirrorSource(t *testing.T) {
+	root := t.TempDir()
+	log := &m5TestLog{}
+	environment := &m5TestEnvironment{calls: &log.calls}
+	workspace := &m5TestWorkspace{calls: &log.calls}
+	store := &m5TestStateStore{
+		calls: &log.calls,
+		initial: state.EnvironmentState{
+			Status: protocol.StateEnvironmentBroken,
+			LastSuccessful: state.Revision{
+				Version: "v5.4.0",
+				Commit:  "0123456789abcdef0123456789abcdef01234567",
+			},
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", root, "--output", "ndjson", "dependencies", "sync"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithCWD(root),
+		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
+		WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+			return store, nil
+		}),
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return &m5TestCoordinator{calls: &log.calls}, nil
+		}),
+		WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+			return log, nil
+		}),
+	)
+	if code != int(protocol.ExitCodeSuccess) {
+		t.Fatalf("exit code = %d, want 0; stderr=%q; stdout=%q", code, stderr.String(), stdout.String())
+	}
+	events := parseNDJSON(t, stdout.String())
+	result := events[len(events)-1]
+	details, ok := result.object["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("result details = %#v, want object", result.object["details"])
+	}
+	wants := map[string]any{
+		"sourceKind":    "package-index",
+		"source":        "tsinghua",
+		"attemptCount":  float64(2),
+		"lockRewritten": true,
+	}
+	for key, want := range wants {
+		if got := details[key]; got != want {
+			t.Errorf("result details[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+	progressMessages := make([]string, 0, len(events))
+	for _, event := range events {
+		if eventType(event) == string(protocol.TypeProgress) && eventString(event, "stage") == string(protocol.StageDependenciesSync) {
+			progressMessages = append(progressMessages, eventString(event, "message"))
+		}
+	}
+	for _, attempt := range m5TestMirrorAttempts {
+		found := false
+		for _, message := range progressMessages {
+			if strings.Contains(message, attempt.Source) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no dependencies.sync progress mentions source %q; got %#v", attempt.Source, progressMessages)
+		}
+	}
 }
 
 func (s *m5TestEnvironment) CheckDependencies(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error) {

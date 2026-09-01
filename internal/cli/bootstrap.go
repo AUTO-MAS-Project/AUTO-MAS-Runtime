@@ -319,6 +319,7 @@ func runBootstrap(
 		Commit:        revision.Commit(),
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(operationLogger),
+		Attempt:       mirrorAttemptProgress(emitter),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesSync, err)

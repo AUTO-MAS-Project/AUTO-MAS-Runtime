@@ -240,6 +240,7 @@ func runRepair(
 		Commit:        check.Commit,
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(logger),
+		Attempt:       mirrorAttemptProgress(emitter),
 	}
 	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesRebuild); err != nil {
 		return sessionSuccess{}, err
