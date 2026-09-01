@@ -315,6 +315,12 @@ func runRepair(
 			"uvVersion":     uv.FixedVersion,
 			"pythonVersion": pythonResult.Spec.Version.String(),
 			"synchronized":  dependencyResult.Synchronized,
+			// repair 的最后一步同样是 uv sync，镜像源事实与 dependencies sync
+			// 同口径上报（C10 第 7 条）。
+			"sourceKind":    dependencyResult.SourceKind,
+			"source":        dependencyResult.Source,
+			"attemptCount":  dependencyResult.AttemptCount,
+			"lockRewritten": dependencyResult.LockRewritten,
 		},
 	}, nil
 }

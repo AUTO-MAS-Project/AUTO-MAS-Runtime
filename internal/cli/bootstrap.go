@@ -353,6 +353,13 @@ func runBootstrap(
 			"pythonVersion":   pythonResult.Spec.Version.String(),
 			"lockfileChecked": dependencyResult.LockfileChecked,
 			"synchronized":    dependencyResult.Synchronized,
+			// bootstrap 同样跑 uv sync，因此和 dependencies sync 一样报告本次
+			// 实际使用的镜像源（C10 第 7 条）；否则首装失败时调用方无从判断
+			// 装的是哪个源。
+			"sourceKind":    dependencyResult.SourceKind,
+			"source":        dependencyResult.Source,
+			"attemptCount":  dependencyResult.AttemptCount,
+			"lockRewritten": dependencyResult.LockRewritten,
 		},
 	}, nil
 }
