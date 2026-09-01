@@ -25,14 +25,19 @@ type windowsJob struct {
 // Supported 报告 Windows 已提供 Job Object 进程树回收实现。
 func Supported() bool { return true }
 
-// NewJob 创建带 KILL_ON_JOB_CLOSE 的 Windows Job Object。
+// NewJob 创建带 KILL_ON_JOB_CLOSE 与 BREAKAWAY_OK 的 Windows Job Object。
+// BREAKAWAY_OK 只允许**显式**带 CREATE_BREAKAWAY_FROM_JOB 的子进程脱离，
+// 供 AUTO-MAS 拉起的模拟器与 PC 游戏不随后端退出（增补 1 C8）；未请求脱离的
+// 进程归属不受影响。刻意不用 SILENT_BREAKAWAY_OK——那会让所有子进程默认脱离，
+// 后端自己的 worker 与 Agent 也会逃出回收边界。
 func NewJob() (Job, error) {
 	handle, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+		windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
 	if result, err := windows.SetInformationJobObject(
 		handle,
 		windows.JobObjectExtendedLimitInformation,
