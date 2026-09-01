@@ -39,18 +39,19 @@ const (
 )
 
 type backendE2EConfig struct {
-	ListenAddress            string             `json:"listenAddress,omitempty"`
-	PIDFile                  string             `json:"pidFile,omitempty"`
-	WorkingDirFile           string             `json:"workingDirFile,omitempty"`
-	GrandchildPIDFile        string             `json:"grandchildPidFile,omitempty"`
-	SpawnGrandchild          bool               `json:"spawnGrandchild,omitempty"`
-	GrandchildLifetimeMS     int                `json:"grandchildLifetimeMs,omitempty"`
-	LeaveGrandchildOnCrash   bool               `json:"leaveGrandchildOnCrash,omitempty"`
-	Health                   []backendE2EHealth `json:"health,omitempty"`
-	CloseStatus              int                `json:"closeStatus,omitempty"`
-	CrashAfterHealthRequests int                `json:"crashAfterHealthRequests,omitempty"`
-	CrashExitCode            int                `json:"crashExitCode,omitempty"`
-	Events                   []backendE2EEvent  `json:"events,omitempty"`
+	ListenAddress             string             `json:"listenAddress,omitempty"`
+	PIDFile                   string             `json:"pidFile,omitempty"`
+	WorkingDirFile            string             `json:"workingDirFile,omitempty"`
+	GrandchildPIDFile         string             `json:"grandchildPidFile,omitempty"`
+	SpawnGrandchild           bool               `json:"spawnGrandchild,omitempty"`
+	GrandchildLifetimeMS      int                `json:"grandchildLifetimeMs,omitempty"`
+	LeaveGrandchildOnCrash    bool               `json:"leaveGrandchildOnCrash,omitempty"`
+	LeaveGrandchildOnShutdown bool               `json:"leaveGrandchildOnShutdown,omitempty"`
+	Health                    []backendE2EHealth `json:"health,omitempty"`
+	CloseStatus               int                `json:"closeStatus,omitempty"`
+	CrashAfterHealthRequests  int                `json:"crashAfterHealthRequests,omitempty"`
+	CrashExitCode             int                `json:"crashExitCode,omitempty"`
+	Events                    []backendE2EEvent  `json:"events,omitempty"`
 }
 
 type backendE2EHealth struct {
@@ -279,6 +280,34 @@ func (f *backendE2EFixture) captureGeneration(t *testing.T, running protocol.Sta
 		grandchildPID: grandchildPID,
 	}
 	for _, pid := range []uint32{rootPID, pythonPID, grandchildPID} {
+		handle, err := openE2ESyncHandle(pid)
+		if err != nil {
+			if closeErr := generation.close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+			t.Fatalf("OpenProcess(%d) for active generation: %v", pid, err)
+		}
+		generation.handles = append(generation.handles, handle)
+	}
+	return generation
+}
+
+// captureGenerationWithoutGrandchild 与 captureGeneration 相同，但用于没有配置
+// 孙进程的场景：grandchild.pid 永远不会出现，等它只会白白超时。
+func (f *backendE2EFixture) captureGenerationWithoutGrandchild(t *testing.T, running protocol.StateEvent) backendE2EPIDGeneration {
+	t.Helper()
+	rootPID, ok := e2EUint32(running.Details["pid"])
+	if !ok {
+		t.Fatalf("running details pid = %#v, want uint32", running.Details["pid"])
+	}
+	if rootFilePID := waitE2EPIDFile(t, f.rootPID); rootFilePID != rootPID {
+		t.Fatalf("uv root PID file = %d, running state pid = %d", rootFilePID, rootPID)
+	}
+	generation := backendE2EPIDGeneration{
+		rootPID:   rootPID,
+		pythonPID: waitE2EPIDFile(t, f.config.PIDFile),
+	}
+	for _, pid := range []uint32{generation.rootPID, generation.pythonPID} {
 		handle, err := openE2ESyncHandle(pid)
 		if err != nil {
 			if closeErr := generation.close(); closeErr != nil {
@@ -555,6 +584,12 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	}
 	assertE2EDevelopmentUVEnvironment(t, fixture)
 	assertE2EDevelopmentWorkingDir(t, fixture)
+	// 后代随父进程一起退出，属于优雅路径，不得出现强制回收警告。
+	for _, warning := range fixture.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendForceTerminated) {
+			t.Fatalf("graceful lifecycle emitted %s: details=%#v", warning.Code, warning.Details)
+		}
+	}
 	assertE2EStateSequence(t, fixture.emitter.statesSnapshot(), protocol.StateStartingBackend, protocol.StateRunning, protocol.StateStoppingBackend, protocol.StateStopped)
 	assertE2EPersistentLog(t, running, "lifecycle")
 	assertE2ETimelineBefore(t, fixture.emitter, "state:"+string(protocol.StateStartingBackend), "log:lifecycle ")
@@ -646,6 +681,61 @@ func assertE2EDevelopmentUVEnvironment(t *testing.T, fixture *backendE2EFixture)
 		if _, ok := record.Environment[forbidden]; ok {
 			t.Fatalf("uv environment contains forbidden host value %q: %#v", forbidden, record.Environment)
 		}
+	}
+}
+
+// TestBackendE2E_GracefulShutdownDoesNotWarnForceTerminated 复现并锁定一个真机误报：
+// 后端收到 close 后自行退出（exit 0、无残留进程），Runtime 却仍发出
+// BACKEND_FORCE_TERMINATED 并把它带进 result.details.warnings。根因是根进程刚退出时
+// 的进程表过渡态被当成了「有存活后代」，而不是后端真的没关干净。
+func TestBackendE2E_GracefulShutdownDoesNotWarnForceTerminated(t *testing.T) {
+	fixture := newBackendE2EFixture(t, backendE2EConfig{
+		Events: e2EOutputEvents("graceful"),
+	})
+	done := fixture.supervise(t.Context())
+	running := fixture.emitter.waitState(t, protocol.StateRunning, 1)
+	generation := fixture.captureGenerationWithoutGrandchild(t, running)
+	fixture.submitShutdown(t)
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	fixture.emitter.waitState(t, protocol.StateStopped, 1)
+	fixture.assertResourcesReleased(t, &generation)
+	for _, warning := range fixture.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendForceTerminated) {
+			t.Fatalf("graceful shutdown emitted %s: details=%#v", warning.Code, warning.Details)
+		}
+	}
+}
+
+// TestBackendE2E_ShutdownWithSurvivingDescendantWarnsForceTerminated 是上一条的对照组：
+// 后端优雅退出但故意漏下一个仍在运行的孙进程。这种情况必须仍然强制回收整棵树并
+// 发出 BACKEND_FORCE_TERMINATED——修误报不能顺手把真实的残留也一并放过。
+func TestBackendE2E_ShutdownWithSurvivingDescendantWarnsForceTerminated(t *testing.T) {
+	fixture := newBackendE2EFixture(t, backendE2EConfig{
+		SpawnGrandchild:           true,
+		GrandchildLifetimeMS:      60_000,
+		LeaveGrandchildOnShutdown: true,
+		Events:                    e2EOutputEvents("surviving"),
+	})
+	done := fixture.supervise(t.Context())
+	running := fixture.emitter.waitState(t, protocol.StateRunning, 1)
+	generation := fixture.captureGeneration(t, running)
+	fixture.submitShutdown(t)
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	fixture.emitter.waitState(t, protocol.StateStopped, 1)
+	// assertResourcesReleased 会等孙进程退出，证明它确实被 Job 回收了。
+	fixture.assertResourcesReleased(t, &generation)
+	forced := false
+	for _, warning := range fixture.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendForceTerminated) {
+			forced = true
+		}
+	}
+	if !forced {
+		t.Fatalf("warnings = %#v, want %s for a surviving descendant", fixture.emitter.warningsSnapshot(), protocol.CodeBackendForceTerminated)
 	}
 }
 

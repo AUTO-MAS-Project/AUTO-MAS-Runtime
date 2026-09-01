@@ -702,10 +702,7 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		// proc.Wait 等待读者直到长预算耗尽。
 		members, err := proc.Snapshot()
 		snapshotErr = err
-		if err != nil {
-			outcome.forced = true
-			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
-		} else if len(members) > 0 {
+		if err != nil || hasSurvivingDescendant(members, proc.PID()) {
 			outcome.forced = true
 			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		}
@@ -768,6 +765,19 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 	}
 	outcome.err = withFailureDetailsExtra(resultErr, logger, proc, outcome.details)
 	return outcome
+}
+
+// hasSurvivingDescendant 判断根进程退出后 Job 里是否还留着别的成员。
+// 根进程自身可能因为进程表尚未收敛而短暂留在快照里，而 Exited 已经证明它退出了；
+// 把它算成残留会让优雅关闭误报 BACKEND_FORCE_TERMINATED。真正的后代（例如后端
+// 漏掉的 worker）仍然会被识别出来并强制回收。
+func hasSurvivingDescendant(members []process.Info, rootPID uint32) bool {
+	for _, member := range members {
+		if member.PID != rootPID {
+			return true
+		}
+	}
+	return false
 }
 
 func withoutExpectedCancellation(err error, keepDeadline bool) error {

@@ -36,20 +36,24 @@ type fakeBackendConfig struct {
 	PIDFile       string `json:"pidFile"`
 	// WorkingDirFile 让假后端报告自己的 os.Getwd()，供 T13.1 端到端断言
 	// Runtime 设定的工作目录真的生效；父进程侧的 StartSpec 断言证明不了这件事。
-	WorkingDirFile           string           `json:"workingDirFile"`
-	GrandchildPIDFile        string           `json:"grandchildPidFile"`
-	SpawnGrandchild          bool             `json:"spawnGrandchild"`
-	GrandchildLifetimeMS     int              `json:"grandchildLifetimeMs"`
-	LeaveGrandchildOnCrash   bool             `json:"leaveGrandchildOnCrash"`
-	Health                   []healthResponse `json:"health"`
-	HealthRaw                []string         `json:"healthRaw"`
-	HealthHTTPStatus         []int            `json:"healthHttpStatus"`
-	CloseStatus              int              `json:"closeStatus"`
-	CrashAfterHealthRequests int              `json:"crashAfterHealthRequests"`
-	CrashExitCode            int              `json:"crashExitCode"`
-	Events                   []outputEvent    `json:"events"`
-	Stdout                   []outputEvent    `json:"stdout"`
-	Stderr                   []outputEvent    `json:"stderr"`
+	WorkingDirFile       string `json:"workingDirFile"`
+	GrandchildPIDFile    string `json:"grandchildPidFile"`
+	SpawnGrandchild      bool   `json:"spawnGrandchild"`
+	GrandchildLifetimeMS int    `json:"grandchildLifetimeMs"`
+	// LeaveGrandchildOnCrash / LeaveGrandchildOnShutdown 都让孙进程脱离父进程的
+	// liveness 管道并跳过自清理，区别只是在崩溃还是优雅关闭路径上留下它。
+	// 后者用于证明「真有存活后代」时 Runtime 仍会强制回收并发出警告。
+	LeaveGrandchildOnCrash    bool             `json:"leaveGrandchildOnCrash"`
+	LeaveGrandchildOnShutdown bool             `json:"leaveGrandchildOnShutdown"`
+	Health                    []healthResponse `json:"health"`
+	HealthRaw                 []string         `json:"healthRaw"`
+	HealthHTTPStatus          []int            `json:"healthHttpStatus"`
+	CloseStatus               int              `json:"closeStatus"`
+	CrashAfterHealthRequests  int              `json:"crashAfterHealthRequests"`
+	CrashExitCode             int              `json:"crashExitCode"`
+	Events                    []outputEvent    `json:"events"`
+	Stdout                    []outputEvent    `json:"stdout"`
+	Stderr                    []outputEvent    `json:"stderr"`
 }
 
 type healthResponse struct {
@@ -281,6 +285,9 @@ func runFakeBackend() int {
 		}
 		return code
 	case <-shutdownRequests:
+		if config.LeaveGrandchildOnShutdown {
+			cleanupGrandchild = false
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := server.Shutdown(ctx)
 		cancel()
@@ -435,7 +442,8 @@ func startGrandchild(config fakeBackendConfig) (*grandchildProcess, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var parentRead *os.File
 	var parentWrite *os.File
-	if config.LeaveGrandchildOnCrash {
+	detached := config.LeaveGrandchildOnCrash || config.LeaveGrandchildOnShutdown
+	if detached {
 		parentRead, err = os.Open(os.DevNull)
 		if err != nil {
 			cancel()
@@ -454,7 +462,7 @@ func startGrandchild(config fakeBackendConfig) (*grandchildProcess, error) {
 		fakeBackendRoleEnv+"="+grandchildRole,
 		grandchildLifetimeEnv+"="+strconv.Itoa(config.GrandchildLifetimeMS),
 	)
-	if config.LeaveGrandchildOnCrash {
+	if detached {
 		command.Env = append(command.Env, grandchildDetachedEnv+"=1")
 	}
 	command.Stdin = parentRead

@@ -256,6 +256,40 @@ func TestJob_QueryConfirmsTreeEmpty(t *testing.T) {
 	}
 }
 
+// TestJob_SnapshotAfterRootExitReportsEmptyTreeWithoutError 锁定一个曾造成
+// BACKEND_FORCE_TERMINATED 系统性误报的过渡态：snapshot 先查 Job 的 pid 列表、
+// 再查 Toolhelp32，刚退出的根进程会出现在前者而不在后者。那不是故障，是「成员在
+// 两次查询之间退出了」，必须当成已退出跳过，而不是让整个快照失败。
+func TestJob_SnapshotAfterRootExitReportsEmptyTreeWithoutError(t *testing.T) {
+	// 该竞态与调度相关，重复若干轮以免偶然的时序掩盖回归。
+	for attempt := range 5 {
+		spec, signal, release := testManagedSpec(t, managedChildRootRole)
+		managed, err := StartManaged(t.Context(), spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = waitTestSignal(t, signal)
+		if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		<-managed.Exited()
+		members, snapshotErr := managed.Snapshot()
+		if snapshotErr != nil {
+			t.Fatalf("attempt %d: Snapshot() right after root exit error = %v, want nil", attempt, snapshotErr)
+		}
+		for _, member := range members {
+			if member.PID == managed.PID() {
+				continue
+			}
+			t.Fatalf("attempt %d: snapshot after root exit = %#v, want no surviving descendant", attempt, members)
+		}
+		waitManagedSuccess(t, managed)
+		if err := managed.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestJobE2E_FastChildSpawnIsAlreadyInJob(t *testing.T) {
 	managed, signal, _ := startTestManaged(t.Context(), t, managedChildSpawnerRole)
 	defer cleanupTestManaged(t, managed)

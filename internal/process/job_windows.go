@@ -137,10 +137,19 @@ func (j *windowsJob) snapshot() ([]Info, error) {
 	for _, pid := range pids {
 		entry, ok := entries[pid]
 		if !ok {
-			return nil, fmt.Errorf("query process job member %d identity: process entry is missing", pid)
+			// 成员在两次查询之间退出了：pid 列表来自 Job，进程表来自 Toolhelp32
+			// 快照，两者不是原子的。已经不存在的进程本就不属于「仍在树里」，
+			// 跳过它——让整个快照失败会把优雅退出误判成需要强制回收的残留树，
+			// 进而系统性误报 BACKEND_FORCE_TERMINATED。
+			continue
 		}
 		path, pathErr := processImagePath(pid)
 		if pathErr != nil {
+			// 同一个过渡态的另一种表现：pid 已经无效，OpenProcess 直接拒绝。
+			// 其余错误（权限、系统故障）仍必须上报，不能被静默。
+			if errors.Is(pathErr, windows.ERROR_INVALID_PARAMETER) {
+				continue
+			}
 			return nil, fmt.Errorf("query process job member %d image: %w", pid, pathErr)
 		}
 		if path == "" {
