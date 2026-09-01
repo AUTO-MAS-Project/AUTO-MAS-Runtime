@@ -286,15 +286,9 @@ func (s *DependenciesService) validateRequest(
 			return fmt.Errorf("%s is invalid", name)
 		}
 	}
-	if source, ok := request.MirrorPolicy.Preferred(mirror.KindPackageIndex); ok {
-		return newError(
-			protocol.CodeInvalidArgument,
-			protocol.StageDependenciesCheck,
-			"锁定依赖不支持覆盖包索引",
-			map[string]any{"sourceKind": mirror.KindPackageIndex.String(), "source": source},
-			errors.New("package index override conflicts with locked sources"),
-		)
-	}
+	// 显式 --mirror package-index=<键> 不再是参数错误：改写不是覆盖索引，
+	// --locked 校验仍对原锁做，因此显式指定只是把该源排在尝试顺序最前
+	// （见增补 1 C10 的 2026-09-01 修订）。不存在的 key 仍由 BuildPlan 拒绝。
 	return nil
 }
 

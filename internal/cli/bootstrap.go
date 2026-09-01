@@ -62,11 +62,6 @@ func runBootstrap(
 			cause:   err,
 		}
 	}
-	// 必须在建状态库、抢 mutation 锁、下载 uv 之前拒绝，否则一个参数错误要等到
-	// 依赖同步阶段才报出来，而那时 uv、仓库与 Python 都已落盘。
-	if err := rejectPackageIndexOverride(deps.global.mirrorPolicy, protocol.StageBootstrap); err != nil {
-		return sessionSuccess{}, err
-	}
 	store, err := deps.options.environmentStateStoreFactory(ctx, deps.global.layout, deps.options.clock)
 	if err != nil {
 		return sessionSuccess{}, stateStoreError(protocol.StageBootstrap, err)

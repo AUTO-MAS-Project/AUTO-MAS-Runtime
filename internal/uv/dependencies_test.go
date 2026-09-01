@@ -182,43 +182,69 @@ func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 	}
 }
 
-func TestDependencies_PackageIndexOverrideRejected(t *testing.T) {
+// TestDependencies_SyncPrefersExplicitSource 锁定 C10 的 2026-09-01 修订：
+// 显式 --mirror package-index=<键> 不再是参数错误，而是把该源排在尝试顺序最前，
+// 与自动轮换走同一条改写路径。显式指定官方源时第一次就用原锁。
+func TestDependencies_SyncPrefersExplicitSource(t *testing.T) {
 	tests := []struct {
-		name string
-		key  string
+		name          string
+		key           string
+		wantRewritten bool
 	}{
-		{name: "mirror", key: "tsinghua"},
+		{name: "mirror", key: "ustc", wantRewritten: true},
 		{name: "official", key: "pypi"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			layout, err := config.NewLayout(root, filepath.Dir(root))
-			if err != nil {
-				t.Fatalf("NewLayout() error = %v", err)
-			}
-			writeLockfile(t, layout.UVLockFile())
-			runner := &fakeDependenciesRunner{}
-			service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
-			if err != nil {
-				t.Fatalf("NewDependenciesService() error = %v", err)
-			}
-			policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{
+			fixture := newMirrorSyncFixture(t)
+			fixture.runner.responses = []fakeRunnerResponse{{}, {}}
+			request := fixture.request(t, mirror.PolicySpec{Preferred: map[mirror.Kind]string{
 				mirror.KindPackageIndex: test.key,
 			}})
-			if err != nil {
-				t.Fatalf("NewPolicy() error = %v", err)
-			}
-			request := dependencyTestRequest(layout)
-			request.MirrorPolicy = policy
 
-			_, err = service.Sync(t.Context(), request)
-			assertPythonCode(t, err, protocol.CodeInvalidArgument)
-			if got := len(runner.calls); got != 0 {
-				t.Fatalf("runner calls = %d, want 0", got)
+			result, err := fixture.service.Sync(t.Context(), request)
+			if err != nil {
+				t.Fatalf("Sync() error = %v", err)
 			}
+			if result.Source != test.key || result.AttemptCount != 1 {
+				t.Fatalf("result = %#v, want %q on the first attempt", result, test.key)
+			}
+			if result.LockRewritten != test.wantRewritten {
+				t.Fatalf("LockRewritten = %t, want %t", result.LockRewritten, test.wantRewritten)
+			}
+			if got, want := len(fixture.attempts), 1; got != want {
+				t.Fatalf("attempts = %d, want %d", got, want)
+			}
+			if fixture.attempts[0].Source != test.key {
+				t.Fatalf("first attempt source = %q, want %q", fixture.attempts[0].Source, test.key)
+			}
+			wantArgs := mirrorSyncArgsFor(fixture.stagingDir(t))
+			if !test.wantRewritten {
+				wantArgs = lockedSyncArgsFor(fixture.layout.RepoDir())
+			}
+			if got := fixture.runner.calls[1].args; !reflect.DeepEqual(got, wantArgs) {
+				t.Fatalf("sync args = %#v, want %#v", got, wantArgs)
+			}
+			fixture.assertRepositoryUntouched(t)
+			fixture.assertNoStagingLeftovers(t)
 		})
 	}
+}
+
+// TestDependencies_SyncRejectsUnknownSourceKey 证明策略校验本身没有放松：
+// 目录里不存在的 key 仍然是参数错误，绝不静默换成别的源。
+func TestDependencies_SyncRejectsUnknownSourceKey(t *testing.T) {
+	fixture := newMirrorSyncFixture(t)
+	request := fixture.request(t, mirror.PolicySpec{Preferred: map[mirror.Kind]string{
+		mirror.KindPackageIndex: "unknown-mirror",
+	}})
+
+	_, err := fixture.service.Sync(t.Context(), request)
+	assertPythonCode(t, err, protocol.CodeInvalidArgument)
+	if got, want := len(fixture.runner.calls), 1; got != want {
+		t.Fatalf("runner calls = %d, want %d (lock check only)", got, want)
+	}
+	fixture.assertNoStagingLeftovers(t)
 }
 
 func TestDependencies_OnlineSyncFailureMapsToDependencySyncFailed(t *testing.T) {

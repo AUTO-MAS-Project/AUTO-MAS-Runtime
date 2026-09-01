@@ -37,10 +37,6 @@ func runRepair(
 	deps *deps,
 	emitter *protocol.Emitter,
 ) (success sessionSuccess, returnErr error) {
-	// repair 也会走 SyncDependencies，同样必须在任何副作用之前拒绝包索引覆盖。
-	if err := rejectPackageIndexOverride(deps.global.mirrorPolicy, protocol.StageRepair); err != nil {
-		return sessionSuccess{}, err
-	}
 	store, err := deps.options.environmentStateStoreFactory(ctx, deps.global.layout, deps.options.clock)
 	if err != nil {
 		return sessionSuccess{}, stateStoreError(protocol.StageRepair, err)
