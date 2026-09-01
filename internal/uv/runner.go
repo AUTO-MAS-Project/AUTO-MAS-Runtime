@@ -32,6 +32,15 @@ const (
 	autoMASVersion        = "AUTO_MAS_EXPECTED_VERSION"
 	autoMASCommit         = "AUTO_MAS_EXPECTED_COMMIT"
 	autoMASSupervised     = "AUTO_MAS_SUPERVISED"
+	// 以下四个键按增补 1 C11 下发受管基础设施与有序镜像源，与上面五个身份键
+	// 同属受监督进程的环境契约：宿主同名变量被清除，调用方也不能经
+	// RunOptions.Environment 覆盖。
+	autoMASUVCacheDir         = "AUTO_MAS_UV_CACHE_DIR"
+	autoMASUVPythonInstallDir = "AUTO_MAS_UV_PYTHON_INSTALL_DIR"
+	autoMASMirrorPackageIndex = "AUTO_MAS_MIRROR_PACKAGE_INDEX"
+	autoMASMirrorPython       = "AUTO_MAS_MIRROR_PYTHON"
+	// mirrorSourceSeparator 是有序源列表的分隔符；单个源里不得出现它。
+	mirrorSourceSeparator = ";"
 	autoMASTelemetry      = "AUTO_MAS_TELEMETRY"
 	autoMASSentryDSN      = "AUTO_MAS_SENTRY_DSN"
 	autoMASSentryEnv      = "AUTO_MAS_SENTRY_ENVIRONMENT"
@@ -540,6 +549,10 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASVersion,
 		autoMASCommit,
 		autoMASSupervised,
+		autoMASUVCacheDir,
+		autoMASUVPythonInstallDir,
+		autoMASMirrorPackageIndex,
+		autoMASMirrorPython,
 	} {
 		if strings.EqualFold(key, managed) {
 			return managed, true
