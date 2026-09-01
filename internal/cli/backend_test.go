@@ -63,6 +63,100 @@ func TestBackendSupervise_RequiresExplicitManagedMode(t *testing.T) {
 	}
 }
 
+// TestBackendSupervise_ShutdownTimeoutArgument 覆盖增补 1 C9 的参数契约：
+// 正整数秒、合法范围 1~120、默认 5；越界或非整数映射 INVALID_ARGUMENT 并
+// 在建立任何后端资源之前失败关闭。
+func TestBackendSupervise_ShutdownTimeoutArgument(t *testing.T) {
+	t.Parallel()
+
+	accepted := []struct {
+		name string
+		args []string
+		want time.Duration
+	}{
+		{name: "default", want: 5 * time.Second},
+		{name: "lower bound", args: []string{"--shutdown-timeout", "1"}, want: time.Second},
+		{name: "upper bound", args: []string{"--shutdown-timeout", "120"}, want: 120 * time.Second},
+		{name: "middle", args: []string{"--shutdown-timeout", "30"}, want: 30 * time.Second},
+	}
+	for _, test := range accepted {
+		t.Run("accepted/"+test.name, func(t *testing.T) {
+			t.Parallel()
+			var captured backend.Request
+			var stdout, stderr bytes.Buffer
+			args := []string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"}
+			args = append(args, test.args...)
+			code := Execute(
+				context.Background(),
+				args,
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+					return backendServiceFunc(func(_ context.Context, request backend.Request) error {
+						captured = request
+						return nil
+					}), nil
+				}),
+			)
+			if code != protocol.ExitCodeSuccess {
+				t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+			}
+			if got := captured.ShutdownTimeout; got != test.want {
+				t.Fatalf("shutdown timeout = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name  string
+		value string
+	}{
+		{name: "zero", value: "0"},
+		{name: "above upper bound", value: "121"},
+		{name: "negative", value: "-1"},
+		{name: "not an integer", value: "abc"},
+		{name: "fractional", value: "1.5"},
+		{name: "empty", value: ""},
+	}
+	for _, test := range rejected {
+		t.Run("rejected/"+test.name, func(t *testing.T) {
+			t.Parallel()
+			var factoryCalls int
+			var stdout, stderr bytes.Buffer
+			code := Execute(
+				context.Background(),
+				[]string{
+					"--app-root", t.TempDir(), "--output", "ndjson",
+					"backend", "supervise", "--mode", "managed", "--shutdown-timeout", test.value,
+				},
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+					factoryCalls++
+					return backendServiceFunc(func(context.Context, backend.Request) error { return nil }), nil
+				}),
+			)
+			if factoryCalls != 0 {
+				t.Fatalf("backend factory calls = %d, want 0", factoryCalls)
+			}
+			definition, ok := protocol.LookupErrorDefinition(protocol.CodeInvalidArgument)
+			if !ok {
+				t.Fatal("INVALID_ARGUMENT definition is missing")
+			}
+			if code != definition.ExitCode {
+				t.Fatalf("exit code = %d, want %d; stderr=%q", code, definition.ExitCode, stderr.String())
+			}
+			events := parseNDJSON(t, stdout.String())
+			result := events[len(events)-1]
+			if got := eventString(result, "code"); got != string(protocol.CodeInvalidArgument) {
+				t.Fatalf("result code = %q, want INVALID_ARGUMENT", got)
+			}
+			details, ok := result.object["details"].(map[string]any)
+			if !ok || details["field"] != "shutdown-timeout" {
+				t.Fatalf("result details = %#v, want field=shutdown-timeout", result.object["details"])
+			}
+		})
+	}
+}
+
 func TestBackendDevelopment_CLIResolvesExplicitRepoFromCWD(t *testing.T) {
 	cwd := t.TempDir()
 	var captured backend.Request

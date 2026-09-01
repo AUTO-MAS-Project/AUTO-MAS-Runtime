@@ -926,6 +926,107 @@ func TestBackend_ForceTerminationWarnsAndSucceeds(t *testing.T) {
 	}
 }
 
+// TestBackend_ShutdownTimeoutBudgetComesFromRequest 证明增补 1 C9 的开关真实生效：
+// 关闭预算随 Request.ShutdownTimeout 变化，且预算大于后端退出耗时时优雅收场、
+// 小于时仍走既有的 Job 兜底与 BACKEND_FORCE_TERMINATED 路径。
+func TestBackend_ShutdownTimeoutBudgetComesFromRequest(t *testing.T) {
+	tests := []struct {
+		name        string
+		timeout     time.Duration
+		exitOnClose bool
+		wantForced  bool
+	}{
+		{name: "budget outlasts backend exit", timeout: 30 * time.Second, exitOnClose: true},
+		{name: "budget expires before backend exit", timeout: 10 * time.Millisecond, wantForced: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			f.proc.keepAlive = true
+			closer := &budgetHTTPCloser{process: f.proc, exitOnClose: test.exitOnClose}
+			f.depsHTTP = closer
+			// deps 侧留一个明显不同的值，证明 Request 的优先级高于依赖默认值。
+			f.shutdownTimeout = time.Hour
+			mailbox := NewControlMailbox(8)
+			done := make(chan error, 1)
+			go func() {
+				req := f.request()
+				req.Control = mailbox
+				req.ShutdownTimeout = test.timeout
+				done <- f.supervisorWithHTTP(t.Context(), req)
+			}()
+			waitFor(t, f.emitter.running)
+			if err := mailbox.Submit(context.Background(), protocol.ControlCommand{
+				Command:   protocol.ControlShutdown,
+				CommandID: "shutdown-budget",
+			}); err != nil {
+				t.Fatalf("Submit(shutdown) error = %v", err)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("Supervise() error = %v, want nil", err)
+			}
+			budget, calls := closer.observed()
+			if calls != 1 {
+				t.Fatalf("close calls = %d, want 1", calls)
+			}
+			// 预算按真实时钟从 WithTimeout 起算，观测值必然略小于配置值。
+			if budget <= 0 || budget > test.timeout {
+				t.Fatalf("close budget = %v, want (0, %v]", budget, test.timeout)
+			}
+			if slack := test.timeout - budget; slack > test.timeout/2 {
+				t.Fatalf("close budget = %v, want close to the configured %v", budget, test.timeout)
+			}
+			forced := indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) >= 0
+			if forced != test.wantForced {
+				t.Fatalf("force warning = %t, want %t; events=%#v", forced, test.wantForced, f.emitter.eventsSnapshot())
+			}
+		})
+	}
+}
+
+// TestBackend_ShutdownTimeoutFallsBackToDependencyAndDefault 锁定三级回退：
+// Request 未设置时用依赖注入值，依赖也未设置时用编译期默认的 5 秒。
+func TestBackend_ShutdownTimeoutFallsBackToDependencyAndDefault(t *testing.T) {
+	tests := []struct {
+		name       string
+		dependency time.Duration
+		want       time.Duration
+	}{
+		{name: "dependency value", dependency: 45 * time.Second, want: 45 * time.Second},
+		{name: "compiled default", want: defaultShutdownTimeout},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			f.proc.keepAlive = true
+			closer := &budgetHTTPCloser{process: f.proc, exitOnClose: true}
+			f.depsHTTP = closer
+			f.shutdownTimeout = test.dependency
+			mailbox := NewControlMailbox(8)
+			done := make(chan error, 1)
+			go func() {
+				req := f.request()
+				req.Control = mailbox
+				done <- f.supervisorWithHTTP(t.Context(), req)
+			}()
+			waitFor(t, f.emitter.running)
+			if err := mailbox.Submit(context.Background(), protocol.ControlCommand{
+				Command:   protocol.ControlShutdown,
+				CommandID: "shutdown-fallback",
+			}); err != nil {
+				t.Fatalf("Submit(shutdown) error = %v", err)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("Supervise() error = %v, want nil", err)
+			}
+			budget, _ := closer.observed()
+			if budget <= 0 || budget > test.want || test.want-budget > test.want/2 {
+				t.Fatalf("close budget = %v, want close to %v", budget, test.want)
+			}
+		})
+	}
+}
+
 func TestBackend_ShutdownFailedIfTreeUncertain(t *testing.T) {
 	f := newBackendFixture(t)
 	f.proc.keepAlive = true
@@ -1357,6 +1458,38 @@ func (r *delayedControlReceiver) InfrastructureError() error {
 type orderedHTTPCloser struct {
 	process *fakeProcess
 	record  func(string)
+}
+
+// budgetHTTPCloser 记录 Runtime 交给关闭请求的真实预算，并按 exitOnClose
+// 决定后端收到 close 之后是否真的退出——这是「close 后 N 秒才退出」的确定性替身，
+// 不靠 time.Sleep 撞运气。
+type budgetHTTPCloser struct {
+	process     *fakeProcess
+	exitOnClose bool
+
+	// mu 保护 budget 与 calls；Close 由监督 goroutine 调用，断言在测试 goroutine。
+	mu     sync.Mutex
+	budget time.Duration
+	calls  int
+}
+
+func (c *budgetHTTPCloser) Close(ctx context.Context) error {
+	c.mu.Lock()
+	c.calls++
+	if deadline, ok := ctx.Deadline(); ok {
+		c.budget = time.Until(deadline)
+	}
+	c.mu.Unlock()
+	if c.exitOnClose {
+		return c.process.Terminate(0)
+	}
+	return nil
+}
+
+func (c *budgetHTTPCloser) observed() (time.Duration, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.budget, c.calls
 }
 
 type errorHTTPCloser struct{}

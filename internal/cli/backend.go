@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -17,11 +19,17 @@ import (
 const (
 	backendModeManaged     = "managed"
 	backendModeDevelopment = "development"
+	// 关闭预算的取值范围与默认值按增补 1 C9 冻结；默认值待 AUTO-MAS 侧
+	// 实测「MaaFW 任务运行中收到 close」的耗时后再议，本任务只加开关。
+	backendShutdownTimeoutDefault = "5"
+	backendShutdownTimeoutMin     = 1
+	backendShutdownTimeoutMax     = 120
 )
 
 func backendSuperviseCommand(deps *deps) *cobra.Command {
 	var mode string
 	var repo string
+	var shutdownTimeout string
 	command := &cobra.Command{
 		Use:   "supervise",
 		Short: "启动并监督后端进程",
@@ -74,6 +82,10 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 							cause:   errors.New("managed mode does not accept development repository"),
 						}
 					}
+					shutdownBudget, err := parseBackendShutdownTimeout(shutdownTimeout)
+					if err != nil {
+						return sessionSuccess{}, err
+					}
 					service, err := deps.options.backendFactory(
 						ctx,
 						deps.global.layout,
@@ -107,6 +119,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 						RuntimePID:         uint32(pid),
 						Mode:               backend.Mode(mode),
 						DevelopmentRepo:    repo,
+						ShutdownTimeout:    shutdownBudget,
 						Emitter:            &backendEventEmitter{emitter: emitter, control: control},
 						Control:            mailbox,
 						BeforeShutdown:     mailbox.BeforeShutdown,
@@ -126,7 +139,37 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 	}
 	command.Flags().StringVar(&mode, "mode", "", "后端运行模式：managed 或 development")
 	command.Flags().StringVar(&repo, "repo", "", "development 模式源码目录")
+	command.Flags().StringVar(
+		&shutdownTimeout,
+		"shutdown-timeout",
+		backendShutdownTimeoutDefault,
+		"关闭后端的等待上限（秒），取值 1~120",
+	)
 	return command
+}
+
+// parseBackendShutdownTimeout 校验 --shutdown-timeout（增补 1 C9）：正整数秒、
+// 合法范围 1~120。这里刻意收 string 而不是让 pflag 收 int——pflag 的整数解析失败
+// 发生在 Cobra 解析阶段，只会走 stderr 诊断通道，产不出 INVALID_ARGUMENT 的
+// result 事件；自行解析才能让越界与非整数共用同一条失败语义。
+func parseBackendShutdownTimeout(raw string) (time.Duration, error) {
+	reject := func(cause error) error {
+		return &commandError{
+			code:    protocol.CodeInvalidArgument,
+			stage:   protocol.StageBackendSpawn,
+			message: "关闭超时必须是 1 到 120 之间的整数秒",
+			details: map[string]any{"field": "shutdown-timeout", "value": raw},
+			cause:   cause,
+		}
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, reject(errors.New("backend shutdown timeout is not an integer"))
+	}
+	if seconds < backendShutdownTimeoutMin || seconds > backendShutdownTimeoutMax {
+		return 0, reject(errors.New("backend shutdown timeout is out of range"))
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func runBackendSuperviseSession(

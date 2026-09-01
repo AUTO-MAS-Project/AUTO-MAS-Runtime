@@ -1930,11 +1930,7 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 		snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
 		return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
 	}
-	timeout := s.deps.ShutdownTimeout
-	if timeout <= 0 {
-		timeout = defaultShutdownTimeout
-	}
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.shutdownTimeout(request))
 	defer cancel()
 	closer := s.deps.HTTP
 	if closer == nil {
@@ -1971,6 +1967,19 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	}
 	snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
 	return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
+}
+
+// shutdownTimeout 解析本次关闭的等待上限（增补 1 C9）：调用方显式给出的预算优先，
+// 其次是注入的依赖默认值，最后才是编译期常量。三级都在这一处解析，避免出现
+// 第二个真值来源。
+func (s *ManagedSupervisor) shutdownTimeout(request Request) time.Duration {
+	if request.ShutdownTimeout > 0 {
+		return request.ShutdownTimeout
+	}
+	if s.deps.ShutdownTimeout > 0 {
+		return s.deps.ShutdownTimeout
+	}
+	return defaultShutdownTimeout
 }
 
 func emitForceWarning(emitter EventEmitter, details map[string]any) error {
