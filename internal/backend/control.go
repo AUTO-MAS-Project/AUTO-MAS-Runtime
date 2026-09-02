@@ -722,6 +722,9 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 	var restartFacts map[string]any
 	for {
 		if fault := attempt.gate.Fault(); fault != nil {
+			if commandID, ok := shutdownLatchedBehindOutputFault(request.Control, fault); ok {
+				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
+			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
 		}
@@ -742,6 +745,9 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 		select {
 		case <-attempt.gate.Faulted():
 			fault := attempt.gate.Fault()
+			if commandID, ok := shutdownLatchedBehindOutputFault(request.Control, fault); ok {
+				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
+			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
 		case <-ctx.Done():
@@ -1897,6 +1903,23 @@ func (s *ManagedSupervisor) finishControlCancel(ctx context.Context, request Req
 	}
 }
 
+// shutdownLatchedBehindOutputFault 判断 gate 故障是否只是宿主管道失效、而关闭已在路上：
+// 宿主崩溃时 stdout 与 stdin 一起失效，后端若恰好在输出日志，gate 会先于 EOF 观察到写失败；
+// 此时按增补 1 C13 结论第 4 条仍应优雅关闭，而不是把后端硬杀。
+func shutdownLatchedBehindOutputFault(receiver ControlReceiver, fault error) (string, bool) {
+	if !backendErrorHasCode(fault, protocol.CodeOutputWriteFailed) {
+		return "", false
+	}
+	command, ok := terminalCommand(receiver)
+	if !ok || command.Command != protocol.ControlShutdown {
+		return "", false
+	}
+	return command.CommandID, true
+}
+
+// finishControlShutdown 执行显式或隐式 shutdown 的优雅关闭。按增补 1 C13 结论第 4 条，
+// 进入关闭之后协议输出失败只记录、不中断：HTTP close、等待退出、Job 兜底与资源收口照常执行，
+// 首个输出错误最后才交给 CLI 映射为 OUTPUT_WRITE_FAILED；宿主崩溃时后端因此仍能优雅收尾。
 func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request Request, attempt *controlAttempt, snapshot *controlState, commandID string) error {
 	details := map[string]any{}
 	if commandID != "" {
@@ -1914,19 +1937,20 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	}
 	setControlStage(request.Control, protocol.StageBackendShutdown)
 	snapshot.set(protocol.StageBackendShutdown, protocol.StateStoppingBackend, details)
-	if err := s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStoppingBackend, "正在关闭后端", details); err != nil {
-		var cleanup processCleanup
-		if attempt != nil && attempt.process != nil {
-			cleanup = s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
+	var outputErr error
+	recordOutput := func(err error) {
+		if err != nil && outputErr == nil {
+			outputErr = err
 		}
-		return errors.Join(cleanup.err, err)
 	}
+	recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStoppingBackend, "正在关闭后端", details))
 	if attempt == nil || attempt.process == nil {
 		if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
-			return s.emitControlFailure(request, snapshot, resourceErr)
+			return s.emitControlFailure(request, snapshot, errors.Join(outputErr, resourceErr))
 		}
 		snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
-		return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
+		recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details))
+		return outputErr
 	}
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.shutdownTimeout(request))
 	defer cancel()
@@ -1936,35 +1960,23 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	}
 	httpErr := closer.Close(closeCtx)
 	graceful := httpErr == nil && waitProcessExit(closeCtx, attempt.process)
-	if httpErr == nil && graceful {
-		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-		if cleanup.err != nil {
-			return s.emitControlFailure(request, snapshot, cleanup.err)
-		}
-		if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
-			return s.emitControlFailure(request, snapshot, resourceErr)
-		}
-		if cleanup.forced {
-			if err := emitForceWarning(request.Emitter, cleanup.details); err != nil {
-				return err
-			}
-		}
-		snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
-		return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
-	}
 	cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 	if cleanup.err != nil {
+		if graceful {
+			return s.emitControlFailure(request, snapshot, errors.Join(outputErr, cleanup.err))
+		}
 		failure := newError(protocol.CodeBackendShutdownFailed, protocol.StageBackendCleanup, "后端进程树未能确认清空", cleanup.details, httpErr)
-		return s.emitControlFailure(request, snapshot, errors.Join(failure, cleanup.err))
+		return s.emitControlFailure(request, snapshot, errors.Join(outputErr, failure, cleanup.err))
 	}
 	if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
-		return s.emitControlFailure(request, snapshot, resourceErr)
+		return s.emitControlFailure(request, snapshot, errors.Join(outputErr, resourceErr))
 	}
-	if err := emitForceWarning(request.Emitter, cleanup.details); err != nil {
-		return err
+	if !graceful || cleanup.forced {
+		recordOutput(emitForceWarning(request.Emitter, cleanup.details))
 	}
 	snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
-	return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
+	recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details))
+	return outputErr
 }
 
 // shutdownTimeout 解析本次关闭的等待上限（增补 1 C9）：调用方显式给出的预算优先，
