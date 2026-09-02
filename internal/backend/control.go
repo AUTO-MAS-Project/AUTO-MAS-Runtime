@@ -1971,8 +1971,10 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
 		return s.emitControlFailure(request, snapshot, errors.Join(outputErr, resourceErr))
 	}
-	if !graceful || cleanup.forced {
+	if !graceful || cleanup.rootForced {
 		recordOutput(emitForceWarning(request.Emitter, cleanup.details))
+	} else if cleanup.forced {
+		recordOutput(emitOrphansWarning(request.Emitter, cleanup))
 	}
 	snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
 	recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details))
@@ -1990,6 +1992,37 @@ func (s *ManagedSupervisor) shutdownTimeout(request Request) time.Duration {
 		return s.deps.ShutdownTimeout
 	}
 	return defaultShutdownTimeout
+}
+
+// maxReportedOrphans 是 BACKEND_ORPHANS_REAPED details 里孤儿清单的上限（增补 1 C14）。
+const maxReportedOrphans = 20
+
+// emitOrphansWarning 发出增补 1 C14 的孤儿回收 warning：根进程自己退出、残留成员被 Job 回收。
+// details 在既有 pid / logPath / exitCode 之外附上 orphanCount、orphans 与 orphansTruncated。
+func emitOrphansWarning(emitter EventEmitter, cleanup processCleanup) error {
+	details := cloneControlDetails(cleanup.details)
+	reported := make([]map[string]any, 0, min(len(cleanup.orphans), maxReportedOrphans))
+	for index, orphan := range cleanup.orphans {
+		if index == maxReportedOrphans {
+			break
+		}
+		reported = append(reported, map[string]any{"pid": orphan.PID, "executable": orphan.Executable})
+	}
+	count := len(cleanup.orphans)
+	if cleanup.orphansUnknown && count == 0 {
+		count = -1
+	}
+	details["orphanCount"] = count
+	details["orphans"] = reported
+	details["orphansTruncated"] = len(cleanup.orphans) > maxReportedOrphans
+	warning, err := protocol.NewWarningEvent(protocol.CodeBackendOrphansReaped, protocol.StageBackendShutdown, "后端已退出，已回收其遗留的孤儿进程", details)
+	if err != nil {
+		return err
+	}
+	if err := emitter.EmitWarning(warning); err != nil {
+		return newError(protocol.CodeOutputWriteFailed, protocol.StageBackendShutdown, "协议 warning 输出失败", nil, err)
+	}
+	return nil
 }
 
 func emitForceWarning(emitter EventEmitter, details map[string]any) error {

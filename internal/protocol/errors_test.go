@@ -72,6 +72,7 @@ func TestErrorDefinitionsMatchArchitectureDocument(t *testing.T) {
 		protocol.CodeBackendRestartFailed,
 		protocol.CodeBackendShutdownFailed,
 		protocol.CodeBackendForceTerminated,
+		protocol.CodeBackendOrphansReaped,
 	}
 
 	if len(declaredCodes) != len(documented) {
@@ -293,6 +294,7 @@ func TestNewErrorEventRejectsWarningOnlyCodes(t *testing.T) {
 	for _, code := range []protocol.Code{
 		protocol.CodeInvalidControlCommand,
 		protocol.CodeBackendForceTerminated,
+		protocol.CodeBackendOrphansReaped,
 	} {
 		code := code
 		t.Run(string(code), func(t *testing.T) {

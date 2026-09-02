@@ -707,6 +707,7 @@ type fakeEmitter struct {
 	mu             sync.Mutex
 	events         []string
 	state          []protocol.StateEvent
+	warnings       []protocol.WarningEvent
 	stateErr       error
 	logErr         error
 	running        chan struct{}
@@ -746,8 +747,15 @@ func (e *fakeEmitter) EmitLog(event protocol.LogEvent) error {
 func (e *fakeEmitter) EmitWarning(event protocol.WarningEvent) error {
 	e.mu.Lock()
 	e.events = append(e.events, "warning:"+event.Code)
+	e.warnings = append(e.warnings, event)
 	e.mu.Unlock()
 	return nil
+}
+
+func (e *fakeEmitter) warningsSnapshot() []protocol.WarningEvent {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]protocol.WarningEvent(nil), e.warnings...)
 }
 
 func (e *fakeEmitter) states() []protocol.StateEvent {

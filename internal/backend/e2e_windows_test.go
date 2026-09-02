@@ -809,10 +809,11 @@ func TestBackendE2E_GracefulShutdownDoesNotWarnForceTerminated(t *testing.T) {
 	}
 }
 
-// TestBackendE2E_ShutdownWithSurvivingDescendantWarnsForceTerminated 是上一条的对照组：
-// 后端优雅退出但故意漏下一个仍在运行的孙进程。这种情况必须仍然强制回收整棵树并
-// 发出 BACKEND_FORCE_TERMINATED——修误报不能顺手把真实的残留也一并放过。
-func TestBackendE2E_ShutdownWithSurvivingDescendantWarnsForceTerminated(t *testing.T) {
+// TestBackendE2E_ShutdownWithSurvivingDescendantWarnsOrphansReaped 是上一条的对照组：
+// 后端优雅退出但故意漏下一个仍在运行的 detached 孙进程。这种情况必须仍然强制回收整棵树，
+// 但按增补 1 C14 报的是 BACKEND_ORPHANS_REAPED（details 列出被回收的孙进程），
+// 而不是冒充 BACKEND_FORCE_TERMINATED——后端主进程本身是自己退出的。
+func TestBackendE2E_ShutdownWithSurvivingDescendantWarnsOrphansReaped(t *testing.T) {
 	fixture := newBackendE2EFixture(t, backendE2EConfig{
 		SpawnGrandchild:           true,
 		GrandchildLifetimeMS:      60_000,
@@ -829,14 +830,42 @@ func TestBackendE2E_ShutdownWithSurvivingDescendantWarnsForceTerminated(t *testi
 	fixture.emitter.waitState(t, protocol.StateStopped, 1)
 	// assertResourcesReleased 会等孙进程退出，证明它确实被 Job 回收了。
 	fixture.assertResourcesReleased(t, &generation)
-	forced := false
+	var reaped *protocol.WarningEvent
 	for _, warning := range fixture.emitter.warningsSnapshot() {
 		if warning.Code == string(protocol.CodeBackendForceTerminated) {
-			forced = true
+			t.Fatalf("warnings = %#v, want no %s: the backend exited on its own", fixture.emitter.warningsSnapshot(), protocol.CodeBackendForceTerminated)
+		}
+		if warning.Code == string(protocol.CodeBackendOrphansReaped) {
+			clone := warning
+			reaped = &clone
 		}
 	}
-	if !forced {
-		t.Fatalf("warnings = %#v, want %s for a surviving descendant", fixture.emitter.warningsSnapshot(), protocol.CodeBackendForceTerminated)
+	if reaped == nil {
+		t.Fatalf("warnings = %#v, want %s for a surviving descendant", fixture.emitter.warningsSnapshot(), protocol.CodeBackendOrphansReaped)
+	}
+	orphans, ok := reaped.Details["orphans"].([]map[string]any)
+	if !ok || len(orphans) == 0 {
+		t.Fatalf("orphans warning details = %#v, want an orphans list", reaped.Details)
+	}
+	if count, ok := e2EUint32(reaped.Details["orphanCount"]); !ok || int(count) != len(orphans) {
+		t.Fatalf("orphanCount = %#v, want %d", reaped.Details["orphanCount"], len(orphans))
+	}
+	found := false
+	for _, orphan := range orphans {
+		pid, ok := e2EUint32(orphan["pid"])
+		executable, _ := orphan["executable"].(string)
+		if ok && pid == generation.grandchildPID {
+			found = true
+			if !strings.EqualFold(filepath.Base(executable), "python.exe") {
+				t.Fatalf("orphan executable = %q, want the fake backend image python.exe", executable)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("orphans = %#v, want the surviving grandchild pid %d", orphans, generation.grandchildPID)
+	}
+	if reaped.Details["orphansTruncated"] != false {
+		t.Fatalf("orphansTruncated = %#v, want false", reaped.Details["orphansTruncated"])
 	}
 }
 
@@ -1002,6 +1031,11 @@ func TestBackendE2E_ForcedShutdownReapsTree(t *testing.T) {
 	warnings := fixture.emitter.warningsSnapshot()
 	if len(warnings) == 0 || warnings[len(warnings)-1].Code != string(protocol.CodeBackendForceTerminated) {
 		t.Fatalf("warnings = %#v, want BACKEND_FORCE_TERMINATED", warnings)
+	}
+	for _, warning := range warnings {
+		if warning.Code == string(protocol.CodeBackendOrphansReaped) {
+			t.Fatalf("warnings = %#v, want no orphans warning when the root itself was force-killed", warnings)
+		}
 	}
 	fixture.assertResourcesReleased(t, &generation)
 	assertE2EStateSequence(t, fixture.emitter.statesSnapshot(), protocol.StateStartingBackend, protocol.StateRunning, protocol.StateStoppingBackend, protocol.StateStopped)

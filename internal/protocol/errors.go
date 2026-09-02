@@ -61,6 +61,9 @@ const (
 	CodeBackendRestartFailed      Code = "BACKEND_RESTART_FAILED"
 	CodeBackendShutdownFailed     Code = "BACKEND_SHUTDOWN_FAILED"
 	CodeBackendForceTerminated    Code = "BACKEND_FORCE_TERMINATED"
+	// CodeBackendOrphansReaped 是 warning-only 码（增补 1 C14）：后端主进程自己退出，
+	// Job 里残留的孤儿被 Runtime 回收；与 BACKEND_FORCE_TERMINATED 互斥。
+	CodeBackendOrphansReaped Code = "BACKEND_ORPHANS_REAPED"
 )
 
 // ExitCode 是进程结果的粗粒度分类。
@@ -157,6 +160,7 @@ var errorDefinitions = []ErrorDefinition{
 	{Code: CodeBackendRestartFailed, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationRebuildEnvironment}},
 	{Code: CodeBackendShutdownFailed, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRetry, RemediationOpenLog}},
 	{Code: CodeBackendForceTerminated, ExitCode: ExitCodeSuccess, Retryable: false, Remediation: []Remediation{RemediationOpenLog}},
+	{Code: CodeBackendOrphansReaped, ExitCode: ExitCodeSuccess, Retryable: false, Remediation: []Remediation{RemediationOpenLog}},
 }
 
 var errorDefinitionByCode = buildErrorDefinitionIndex(errorDefinitions)

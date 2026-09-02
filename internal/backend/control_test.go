@@ -897,8 +897,13 @@ func TestBackend_GracefulShutdownForceClearsDescendants(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("Supervise() error = %v, want nil after forced empty tree", err)
 	}
-	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) < 0 {
-		t.Fatalf("events = %#v, want force warning", f.emitter.eventsSnapshot())
+	// 根进程是收到 close 后自己退出的，被兜底回收的只是残留后代：按增补 1 C14 报孤儿回收，
+	// 不再冒充强制终止。
+	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendOrphansReaped)) < 0 {
+		t.Fatalf("events = %#v, want orphans-reaped warning", f.emitter.eventsSnapshot())
+	}
+	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) >= 0 {
+		t.Fatalf("events = %#v, want no force warning when the root exited on its own", f.emitter.eventsSnapshot())
 	}
 }
 
@@ -1588,5 +1593,100 @@ func TestBackend_ShutdownContinuesGracefullyWhenOutputFails(t *testing.T) {
 	}
 	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) >= 0 {
 		t.Fatalf("events = %#v, want no force warning: the backend exited on HTTP close", f.emitter.eventsSnapshot())
+	}
+}
+
+// TestBackend_OrphansReapedWarnsWithoutForceTerminated 锁定增补 1 C14：后端主进程收到 close
+// 后自己退出，Job 里残留的孤儿被回收时报 BACKEND_ORPHANS_REAPED（details 列出孤儿），
+// 且不再报 BACKEND_FORCE_TERMINATED。
+func TestBackend_OrphansReapedWarnsWithoutForceTerminated(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	f.proc.snapshotSet = true
+	f.proc.snapshotMembers = []process.Info{
+		{PID: f.proc.pid, Executable: "uv.exe"},
+		{PID: 5150, ParentPID: 5100, Executable: `C:\Windows\System32\PING.EXE`},
+	}
+	mailbox := NewControlMailbox(8)
+	f.depsHTTP = &orderedHTTPCloser{process: f.proc, record: func(string) {}}
+	done := make(chan error, 1)
+	go func() {
+		req := f.request()
+		req.Control = mailbox
+		done <- f.supervisorWithHTTP(t.Context(), req)
+	}()
+	waitFor(t, f.emitter.running)
+	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Command: protocol.ControlShutdown, CommandID: "shutdown-orphans"}); err != nil {
+		t.Fatalf("Submit(shutdown) error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) >= 0 {
+		t.Fatalf("events = %#v, want no BACKEND_FORCE_TERMINATED for a root that exited on its own", f.emitter.eventsSnapshot())
+	}
+	var reaped *protocol.WarningEvent
+	for _, warning := range f.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendOrphansReaped) {
+			clone := warning
+			reaped = &clone
+		}
+	}
+	if reaped == nil {
+		t.Fatalf("warnings = %#v, want %s", f.emitter.warningsSnapshot(), protocol.CodeBackendOrphansReaped)
+	}
+	if reaped.Stage != protocol.StageBackendShutdown {
+		t.Errorf("orphans warning stage = %q, want %s", reaped.Stage, protocol.StageBackendShutdown)
+	}
+	if got := reaped.Details["orphanCount"]; got != 1 {
+		t.Errorf("orphanCount = %#v, want 1", got)
+	}
+	if got := reaped.Details["orphansTruncated"]; got != false {
+		t.Errorf("orphansTruncated = %#v, want false", got)
+	}
+	orphans, ok := reaped.Details["orphans"].([]map[string]any)
+	if !ok || len(orphans) != 1 {
+		t.Fatalf("orphans = %#v, want one entry", reaped.Details["orphans"])
+	}
+	if orphans[0]["pid"] != uint32(5150) || orphans[0]["executable"] != `C:\Windows\System32\PING.EXE` {
+		t.Errorf("orphans[0] = %#v, want pid 5150 PING.EXE", orphans[0])
+	}
+	if reaped.Details["pid"] != f.proc.pid || reaped.Details["logPath"] == nil {
+		t.Errorf("orphans warning details = %#v, want the existing pid/logPath facts", reaped.Details)
+	}
+}
+
+// TestBackend_ForceTerminatedOnlyWhenRootKilled 是对照组：close 被拒、根进程在预算内没退出，
+// Runtime 强杀整棵树——即使树里同样有别的成员，也只报 BACKEND_FORCE_TERMINATED，不报孤儿回收。
+func TestBackend_ForceTerminatedOnlyWhenRootKilled(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	f.proc.snapshotSet = true
+	f.proc.snapshotMembers = []process.Info{
+		{PID: f.proc.pid, Executable: "uv.exe"},
+		{PID: 5150, ParentPID: f.proc.pid, Executable: "python.exe"},
+	}
+	f.shutdownTimeout = 10 * time.Millisecond
+	f.depsHTTP = errorHTTPCloser{}
+	mailbox := NewControlMailbox(8)
+	done := make(chan error, 1)
+	go func() {
+		req := f.request()
+		req.Control = mailbox
+		done <- f.supervisorWithHTTP(t.Context(), req)
+	}()
+	waitFor(t, f.emitter.running)
+	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Command: protocol.ControlShutdown, CommandID: "shutdown-root-killed"}); err != nil {
+		t.Fatalf("Submit(shutdown) error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	events := f.emitter.eventsSnapshot()
+	if indexOfEvent(events, "warning:"+string(protocol.CodeBackendForceTerminated)) < 0 {
+		t.Fatalf("events = %#v, want BACKEND_FORCE_TERMINATED", events)
+	}
+	if indexOfEvent(events, "warning:"+string(protocol.CodeBackendOrphansReaped)) >= 0 {
+		t.Fatalf("events = %#v, want no orphans warning when the root itself was killed", events)
 	}
 }

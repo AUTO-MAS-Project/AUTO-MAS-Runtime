@@ -749,10 +749,16 @@ func failureDetails(logger Logger, proc ManagedProcess, extra map[string]any) ma
 	return details
 }
 
+// processCleanup 是一次进程树收口的事实：forced 表示动用了 Job 兜底，rootForced 进一步
+// 区分「根进程仍存活时被强杀」与「根进程已自行退出、只回收残留孤儿」（增补 1 C14），
+// orphans 是后一种情况下终止前快照到的残留成员（不含根进程）；快照失败时 orphansUnknown 为 true。
 type processCleanup struct {
-	details map[string]any
-	err     error
-	forced  bool
+	details        map[string]any
+	err            error
+	forced         bool
+	rootForced     bool
+	orphans        []process.Info
+	orphansUnknown bool
 }
 
 func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProcess, tx TransactionHandle, logger Logger) processCleanup {
@@ -782,6 +788,7 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		snapshotErr = err
 		if err != nil || hasSurvivingDescendant(members, proc.PID()) {
 			outcome.forced = true
+			outcome.recordOrphans(members, err, proc.PID())
 			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		}
 		exitResult, waitErr := proc.Wait(cleanupCtx)
@@ -790,6 +797,8 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		}
 		processErr = errors.Join(processErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
 	default:
+		// 根进程仍存活：这是真正的强制终止，无论树里还有没有别的成员。
+		outcome.rootForced = true
 		processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		exitResult, waitErr := proc.Wait(cleanupCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
@@ -802,6 +811,11 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		// 根进程可能已退出但后代仍占用 Job；先强制终止，再次 Wait/WaitEmpty，
 		// 只有第二次确认空树才允许后续成功收口。
 		forceCtx, forceCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		if !outcome.rootForced {
+			// 根进程早已自行退出，此刻残留的成员就是它遗留的孤儿；在终止前留下清单。
+			members, err := proc.Snapshot()
+			outcome.recordOrphans(members, err, proc.PID())
+		}
 		terminateErr := proc.Terminate(1)
 		exitResult, waitErr := proc.Wait(forceCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
@@ -843,6 +857,30 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 	}
 	outcome.err = withFailureDetailsExtra(resultErr, logger, proc, outcome.details)
 	return outcome
+}
+
+// recordOrphans 把快照里根进程以外的成员记为孤儿；快照失败时只能标记未知。
+// 多次调用取并集去重，因为 Exited 分支与 WaitEmpty 兜底分支可能先后各拍一次。
+func (c *processCleanup) recordOrphans(members []process.Info, snapshotErr error, rootPID uint32) {
+	if snapshotErr != nil {
+		c.orphansUnknown = true
+		return
+	}
+	for _, member := range members {
+		if member.PID == rootPID {
+			continue
+		}
+		duplicate := false
+		for _, known := range c.orphans {
+			if known.PID == member.PID {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			c.orphans = append(c.orphans, member)
+		}
+	}
 }
 
 // hasSurvivingDescendant 判断根进程退出后 Job 里是否还留着别的成员。
