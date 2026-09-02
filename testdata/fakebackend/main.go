@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,7 +27,12 @@ const (
 	grandchildRole        = "grandchild"
 	healthPath            = "/api/core/health"
 	closePath             = "/api/core/close"
-	defaultListenAddress  = "127.0.0.1:36163"
+	// supervisedPortEnv 是增补 1 C12 下 Runtime 注入的端口；listenAddress 留空时假后端
+	// 像真后端一样只认它，缺失或非法则回退缺省地址。
+	supervisedPortEnv    = "AUTO_MAS_SUPERVISED_PORT"
+	defaultListenAddress = "127.0.0.1:36163"
+	minSupervisedPort    = 1024
+	maxSupervisedPort    = 65535
 )
 
 type fakeBackendConfig struct {
@@ -245,7 +251,7 @@ func runFakeBackend() int {
 	}
 	address := config.ListenAddress
 	if address == "" {
-		address = defaultListenAddress
+		address = listenAddressFromEnvironment(os.Getenv(supervisedPortEnv))
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -313,6 +319,16 @@ func runFakeBackend() int {
 		}
 		return 0
 	}
+}
+
+// listenAddressFromEnvironment 按 C12 解释 AUTO_MAS_SUPERVISED_PORT：十进制且落在
+// 合法范围内才采用，否则按缺失处理回退缺省地址——与真后端的回退语义一致。
+func listenAddressFromEnvironment(raw string) string {
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || port < minSupervisedPort || port > maxSupervisedPort {
+		return defaultListenAddress
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 }
 
 func loadFakeBackendConfig(path string) (fakeBackendConfig, error) {

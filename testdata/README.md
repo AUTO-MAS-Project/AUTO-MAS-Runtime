@@ -16,8 +16,10 @@ pack 和响应中断，同时记录 Depth、分支移动和请求次数；测试
   在子进程退出后提供确定性的退出屏障，用于观察 Job 清理窗口；
 - `fakebackend`：通过 `FAKE_BACKEND_CONFIG=<json 文件>` 配置监听延迟、health 序列、
   原始/畸形 health body、HTTP 状态、protocol/version/commit、崩溃退出、close 接受或拒绝、
-  stdout/stderr 事件和孙进程。配置采用严格 JSON 解码并拒绝未知字段和越界值。默认监听协议
-  固定端口 `127.0.0.1:36163`；夹具自测显式使用 `127.0.0.1:0`，不争抢生产契约端口。
+  stdout/stderr 事件和孙进程。配置采用严格 JSON 解码并拒绝未知字段和越界值。`listenAddress`
+  留空时像真后端一样只认 Runtime 注入的 `AUTO_MAS_SUPERVISED_PORT`（增补 1 C12），缺失或非法
+  回退 `127.0.0.1:36163`；E2E 夹具不设 `listenAddress`，健康检查能通过即证明端口来自环境变量。
+  夹具自测显式使用 `127.0.0.1:0`，不争抢任何固定端口。
   `readyFile` 写入实际 base URL，`pidFile` 写入后端自身 PID，`grandchildPidFile` 只用于测试
   断言和收口；孙进程默认随父进程退出，`leaveGrandchildOnCrash` 仅用于 Job Object 异常回收
   测试，并会让孙进程继续持有继承的 stdout/stderr 管道。
