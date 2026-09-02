@@ -47,7 +47,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
 | M12 遥测与错误观测（Sentry-only） | T12.1、T12.2、T12.4、T12.5、T12.7 已完成；T12.6 本地发布配置已提交，待 Repository secret 与授权后的远端验收；T12.3/Umami 已取消 |
-| M13 dev 基线接入配套 | 2026-08-31 按决策 D12 与 `doc/契约补充-v1-增补1.md`（C6~C11）立项；T13.1（后端工作目录）、T13.2（Job 允许显式脱离）、T13.3（关闭超时参数化，含优雅关闭误报修复）、T13.4（锁副本改写参与包索引镜像轮换，显式 package-index 排最前）**已完成**；T13.5 **已完成**（注入面 `020b3b9`：`AUTO_MAS_UV_CACHE_DIR` / `AUTO_MAS_UV_PYTHON_INSTALL_DIR` / `AUTO_MAS_MIRROR_PACKAGE_INDEX` / `AUTO_MAS_MIRROR_PYTHON`；池目录重新分类按设计关闭——Runtime 的 repair/cleanup 只处理自己的目录，池 venv 失效后由后端判定重建）；T13.6 ⏸ 未开始；2026-09-02 真机联调后按增补 1 **C12 / C13** 立项 T13.7（`backend supervise --port`，缺省 managed 36163 / development 36164，注入 `AUTO_MAS_SUPERVISED_PORT`，健康/关闭地址与 `baseUrl` 由它派生，E2E 改用空闲端口）与 T13.8（`backend supervise` 的 stdin EOF 视为隐式 shutdown，宿主崩溃不再留孤儿）🚧 进行中 |
+| M13 dev 基线接入配套 | 2026-08-31 按决策 D12 与 `doc/契约补充-v1-增补1.md`（C6~C11）立项；T13.1（后端工作目录）、T13.2（Job 允许显式脱离）、T13.3（关闭超时参数化，含优雅关闭误报修复）、T13.4（锁副本改写参与包索引镜像轮换，显式 package-index 排最前）**已完成**；T13.5 **已完成**（注入面 `020b3b9`：`AUTO_MAS_UV_CACHE_DIR` / `AUTO_MAS_UV_PYTHON_INSTALL_DIR` / `AUTO_MAS_MIRROR_PACKAGE_INDEX` / `AUTO_MAS_MIRROR_PYTHON`；池目录重新分类按设计关闭——Runtime 的 repair/cleanup 只处理自己的目录，池 venv 失效后由后端判定重建）；T13.6 ⏸ 未开始；2026-09-02 真机联调后按增补 1 **C12 / C13** 完成 T13.7（`f7d5edb`：`backend supervise --port`，缺省 managed 36163 / development 36164，注入 `AUTO_MAS_SUPERVISED_PORT`，健康/关闭地址与 `baseUrl` 由 `internal/health` 派生，E2E 改用空闲端口）与 T13.8（`41c51d3`：`backend supervise` 的 stdin EOF / 读取出错视为隐式 shutdown，真实 exe 黑盒 E2E 锁定，宿主崩溃不再留孤儿）**已完成** |
 
 代码现状：
 
