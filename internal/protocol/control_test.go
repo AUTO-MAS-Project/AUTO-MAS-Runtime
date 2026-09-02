@@ -1924,3 +1924,85 @@ func assertInvalidControlWarning(t *testing.T, got WarningEvent, wantDetails map
 		t.Fatalf("warning details = %#v, want %#v", got.Details, wantDetails)
 	}
 }
+
+// TestControlReader_InputClosedDistinguishesEOFFromStop 锁定增补 1 C13 需要的唯一
+// 协议层事实：Run 因输入 EOF 返回时 InputClosed 为 true，因 StopAccepting 或 ctx 取消
+// 返回时为 false——Run 的返回值本身不变，其他命令的行为因此一个字节都不动。
+func TestControlReader_InputClosedDistinguishesEOFFromStop(t *testing.T) {
+	t.Run("empty input reaches EOF", func(t *testing.T) {
+		reader, err := NewControlReader(strings.NewReader(""), &controlContractWarningEmitter{}, &controlContractHandler{}, ControlCancel)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+		if reader.InputClosed() {
+			t.Fatal("InputClosed() = true before Run")
+		}
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !reader.InputClosed() {
+			t.Fatal("InputClosed() = false after EOF, want true")
+		}
+	})
+
+	t.Run("last line without newline reaches EOF", func(t *testing.T) {
+		handler := &controlContractHandler{}
+		reader, err := NewControlReader(strings.NewReader(controlTestLine(ControlStatus, controlTestID(1))), &controlContractWarningEmitter{}, handler, ControlStatus)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+		if err := reader.Run(context.Background()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if len(handler.prepared) != 1 {
+			t.Fatalf("prepared commands = %#v, want the unterminated line dispatched", handler.prepared)
+		}
+		if !reader.InputClosed() {
+			t.Fatal("InputClosed() = false after unterminated EOF, want true")
+		}
+	})
+
+	t.Run("stop accepting is not input closure", func(t *testing.T) {
+		pipeReader, pipeWriter := io.Pipe()
+		input := &signalingControlInput{reader: pipeReader, started: make(chan struct{})}
+		reader, err := NewControlReader(input, &controlContractWarningEmitter{}, &controlContractHandler{}, ControlCancel)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+		runDone := make(chan error, 1)
+		go func() { runDone <- reader.Run(context.Background()) }()
+		select {
+		case <-input.started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for stdin read")
+		}
+		reader.StopAccepting()
+		if err := pipeReader.CloseWithError(errors.New("owner closed stdin")); err != nil {
+			t.Fatalf("CloseWithError() error = %v", err)
+		}
+		if err := waitControlDone(t, runDone); err != nil {
+			t.Fatalf("Run() error = %v, want nil after stop", err)
+		}
+		if reader.InputClosed() {
+			t.Fatal("InputClosed() = true after StopAccepting, want false")
+		}
+		if err := pipeWriter.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("close pipe writer: %v", err)
+		}
+	})
+
+	t.Run("context cancellation is not input closure", func(t *testing.T) {
+		reader, err := NewControlReader(strings.NewReader(""), &controlContractWarningEmitter{}, &controlContractHandler{}, ControlCancel)
+		if err != nil {
+			t.Fatalf("NewControlReader() error = %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := reader.Run(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+		if reader.InputClosed() {
+			t.Fatal("InputClosed() = true after context cancellation, want false")
+		}
+	})
+}
