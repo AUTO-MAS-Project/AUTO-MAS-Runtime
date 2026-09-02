@@ -654,3 +654,52 @@ func (t *manualTimer) Stop() bool {
 	t.fired = true
 	return true
 }
+
+// TestHealth_RequestURLFollowsExpectationPort 锁定增补 1 C12：健康检查地址由
+// Expectation.Port 派生，零值回退缺省端口，因此既有调用方行为不变。
+func TestHealth_RequestURLFollowsExpectationPort(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+		want string
+	}{
+		{name: "zero falls back to the default port", port: 0, want: HealthURL},
+		{name: "development default", port: 36164, want: "http://127.0.0.1:36164/api/core/health"},
+		{name: "explicit port", port: 5555, want: "http://127.0.0.1:5555/api/core/health"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ready := jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))
+			rt := &sequenceTransport{responses: []transportResult{{response: ready}, {response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))}}}
+			expected := managedExpectation()
+			expected.Port = test.port
+			if err := testChecker(rt).Check(t.Context(), expected, testProbe()); err != nil {
+				t.Fatalf("Check() error = %v, want nil", err)
+			}
+			if got := rt.lastURL; got != test.want {
+				t.Fatalf("request URL = %q, want %q", got, test.want)
+			}
+		})
+	}
+	if got, want := HealthURL, HealthURLForPort(DefaultPort); got != want {
+		t.Fatalf("HealthURL = %q, want the derived default %q", got, want)
+	}
+	if got := BaseURL(DefaultPort); got != "http://127.0.0.1:36163" || strings.HasSuffix(got, "/") {
+		t.Fatalf("BaseURL(DefaultPort) = %q, want no trailing slash", got)
+	}
+}
+
+// TestHealth_RejectsOutOfRangePort 证明越界端口在发出任何请求之前失败关闭。
+func TestHealth_RejectsOutOfRangePort(t *testing.T) {
+	for _, port := range []int{1023, 65536, -1} {
+		t.Run(fmt.Sprint(port), func(t *testing.T) {
+			rt := &sequenceTransport{}
+			expected := managedExpectation()
+			expected.Port = port
+			assertHealthCode(t, testChecker(rt).Check(t.Context(), expected, testProbe()), protocol.CodeBackendHealthInvalid)
+			if rt.count != 0 {
+				t.Fatalf("request count = %d, want 0", rt.count)
+			}
+		})
+	}
+}

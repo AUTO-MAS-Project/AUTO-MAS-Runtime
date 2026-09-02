@@ -8,14 +8,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 const (
-	// HealthURL 是受管后端健康端点的固定地址。
-	HealthURL = "http://127.0.0.1:36163/api/core/health"
+	// DefaultPort 是受监督端口的缺省值，也是 managed 模式的缺省（增补 1 C12）。
+	// Expectation.Port 为零时回退到它，使既有调用方行为不变。
+	DefaultPort = 36163
+	// MinPort 与 MaxPort 是受监督端口的合法范围（增补 1 C12）。
+	MinPort = 1024
+	MaxPort = 65535
+	// HealthURL 是缺省端口下健康端点的地址；其他端口用 HealthURLForPort 派生。
+	// 它与 HealthURLForPort(DefaultPort) 的相等由单测锁定。
+	HealthURL = "http://127.0.0.1:36163" + healthPath
+
+	loopbackHost = "127.0.0.1"
+	healthPath   = "/api/core/health"
 
 	maxHealthBodyBytes          = 64 * 1024
 	defaultTotalTimeout         = 60 * time.Second
@@ -40,6 +51,32 @@ type Expectation struct {
 	Protocol int
 	Version  string
 	Commit   string
+	// Port 是受监督后端的监听端口（增补 1 C12）；健康端点地址由它派生，
+	// 零值回退 DefaultPort，非零但越界失败关闭。
+	Port int
+}
+
+// BaseURL 返回受监督后端的根地址（无结尾斜杠），是 baseUrl 与两个接口地址的唯一来源。
+func BaseURL(port int) string {
+	return "http://" + loopbackHost + ":" + strconv.Itoa(port)
+}
+
+// HealthURLForPort 返回指定端口下健康端点的地址。
+func HealthURLForPort(port int) string {
+	return BaseURL(port) + healthPath
+}
+
+// ValidPort 报告端口是否落在增补 1 C12 的合法范围内。
+func ValidPort(port int) bool {
+	return port >= MinPort && port <= MaxPort
+}
+
+// resolvedPort 把 Expectation.Port 的零值解释为缺省端口。
+func (e Expectation) resolvedPort() int {
+	if e.Port == 0 {
+		return DefaultPort
+	}
+	return e.Port
 }
 
 // Probe 验证受管 Job 中的 uv/Python 身份和存活状态。
@@ -139,6 +176,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	}
 
 	exited := probe.Exited()
+	healthURL := HealthURLForPort(expected.resolvedPort())
 	totalTimer := c.clock.NewTimer(c.totalTimeout)
 	defer totalTimer.Stop()
 	total := totalTimer.C()
@@ -155,7 +193,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			return newError(protocol.CodeBackendExitedBeforeReady, "后端在就绪前退出", nil, nil)
 		}
 
-		request := c.request(ctx, total, exited)
+		request := c.request(ctx, healthURL, total, exited)
 		switch request.kind {
 		case requestCancelled:
 			if err := cancellationError(ctx); err != nil {
@@ -302,9 +340,9 @@ type requestResult struct {
 	transportErr error
 }
 
-func (c *Checker) request(ctx context.Context, total <-chan time.Time, exited <-chan struct{}) requestResult {
+func (c *Checker) request(ctx context.Context, healthURL string, total <-chan time.Time, exited <-chan struct{}) requestResult {
 	requestContext, cancel := context.WithCancel(ctx)
-	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, HealthURL, nil)
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, healthURL, nil)
 	if err != nil {
 		cancel()
 		return requestResult{kind: requestTransportError, transportErr: err}
@@ -745,6 +783,9 @@ func validateExpectation(expected Expectation) error {
 	}
 	if expected.Protocol != protocol.Version {
 		return identityError(expected, "protocol", expected.Protocol)
+	}
+	if expected.Port != 0 && !ValidPort(expected.Port) {
+		return newError(protocol.CodeBackendHealthInvalid, "受监督端口超出范围", map[string]any{"port": expected.Port}, errors.New("supervised port is out of range"))
 	}
 	if expected.Mode == ModeManaged {
 		if expected.Version == "" {
