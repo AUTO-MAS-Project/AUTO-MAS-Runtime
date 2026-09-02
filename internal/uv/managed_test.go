@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -619,5 +620,79 @@ func waitManagedProcess(t *testing.T, managed *process.ManagedProcess) {
 	}
 	if err := managed.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// TestManaged_InjectsSupervisedPort 锁定增补 1 C12：端口以十进制注入
+// AUTO_MAS_SUPERVISED_PORT，且该键属于受控监督集合——宿主与 RunOptions.Environment
+// 里的同名项（含大小写变体）都被清除并被受控值覆盖。
+func TestManaged_InjectsSupervisedPort(t *testing.T) {
+	runner := newTestRunner(t)
+	t.Setenv(autoMASSupervisedPort, "1111")
+	recordPath := filepath.Join(t.TempDir(), "managed-port-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage: protocol.StageBackendSpawn,
+			Environment: map[string]string{
+				"FAKE_UV_RECORD":                       recordPath,
+				strings.ToLower(autoMASSupervisedPort): "2222",
+			},
+		},
+		Port: 36164,
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	if got := record[autoMASSupervisedPort]; got != "36164" {
+		t.Errorf("environment[%q] = %q, want %q", autoMASSupervisedPort, got, "36164")
+	}
+	for key := range record {
+		if strings.EqualFold(key, autoMASSupervisedPort) && key != autoMASSupervisedPort {
+			t.Errorf("environment contains case variant %q of the supervised port key", key)
+		}
+	}
+}
+
+// TestManaged_OmitsSupervisedPortWhenUnset 证明零值不注入：internal/uv 是通用启动器，
+// 不替调用方决定端口；backend 保证任何模式都传非零值，由它自己的单测锁定。
+func TestManaged_OmitsSupervisedPortWhenUnset(t *testing.T) {
+	runner := newTestRunner(t)
+	t.Setenv(autoMASSupervisedPort, "1111")
+	recordPath := filepath.Join(t.TempDir(), "managed-no-port-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	if value, ok := record[autoMASSupervisedPort]; ok {
+		t.Errorf("environment[%q] = %q, want the key absent (host value must not leak either)", autoMASSupervisedPort, value)
+	}
+}
+
+// TestManaged_RejectsInvalidSupervisedPort 覆盖失败关闭：越界端口在 spawn 之前被拒绝。
+func TestManaged_RejectsInvalidSupervisedPort(t *testing.T) {
+	for _, port := range []int{1023, 65536, -1} {
+		t.Run(strconv.Itoa(port), func(t *testing.T) {
+			runner := newTestRunner(t)
+			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+				RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
+				Port:       port,
+			}, nil)
+			if managed != nil || err == nil {
+				t.Fatalf("StartManaged() = %#v, %v, want validation error", managed, err)
+			}
+		})
 	}
 }

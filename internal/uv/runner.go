@@ -41,12 +41,18 @@ const (
 	autoMASMirrorPython       = "AUTO_MAS_MIRROR_PYTHON"
 	// mirrorSourceSeparator 是有序源列表的分隔符；单个源里不得出现它。
 	mirrorSourceSeparator = ";"
-	autoMASTelemetry      = "AUTO_MAS_TELEMETRY"
-	autoMASSentryDSN      = "AUTO_MAS_SENTRY_DSN"
-	autoMASSentryEnv      = "AUTO_MAS_SENTRY_ENVIRONMENT"
-	autoMASSentryRelease  = "AUTO_MAS_SENTRY_RELEASE"
-	maxUVOutputLineBytes  = 1 << 20
-	maxUVOutputBytes      = 4 << 20
+	// autoMASSupervisedPort 按增补 1 C12 注入受监督后端的监听端口；它同样是受控键，
+	// 宿主同名变量不得穿透——否则正式版与开发版并存时后端会听错端口。
+	autoMASSupervisedPort = "AUTO_MAS_SUPERVISED_PORT"
+	// 受监督端口的合法范围（增补 1 C12）：避开特权端口，不超过 TCP 上限。
+	minSupervisedPort    = 1024
+	maxSupervisedPort    = 65535
+	autoMASTelemetry     = "AUTO_MAS_TELEMETRY"
+	autoMASSentryDSN     = "AUTO_MAS_SENTRY_DSN"
+	autoMASSentryEnv     = "AUTO_MAS_SENTRY_ENVIRONMENT"
+	autoMASSentryRelease = "AUTO_MAS_SENTRY_RELEASE"
+	maxUVOutputLineBytes = 1 << 20
+	maxUVOutputBytes     = 4 << 20
 	// uvCaptureTruncatedNotice 追加在诊断快照末尾，说明输出被截断而非 uv 失败。
 	uvCaptureTruncatedNotice = "\n[uv 输出已截断：超过诊断保留上限]\n"
 	maxUVStreamBytes         = 16 << 20
@@ -553,6 +559,7 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASUVPythonInstallDir,
 		autoMASMirrorPackageIndex,
 		autoMASMirrorPython,
+		autoMASSupervisedPort,
 	} {
 		if strings.EqualFold(key, managed) {
 			return managed, true

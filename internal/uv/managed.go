@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
@@ -35,6 +36,10 @@ type ManagedOptions struct {
 	RunOptions
 	Identity       *SupervisionIdentity
 	Infrastructure SupervisionInfrastructure
+	// Port 是按增补 1 C12 注入的受监督后端端口（AUTO_MAS_SUPERVISED_PORT）。
+	// 为零时不注入：本包是通用启动器，不替调用方决定端口；backend 保证任何模式
+	// 都传非零值。非零但越界在 spawn 之前失败关闭。
+	Port int
 }
 
 // StartManaged 复用 UVRunner 的路径与环境策略启动长驻 uv，且不提供普通 exec 降级。
@@ -96,6 +101,18 @@ func (r *UVRunner) StartManaged(
 	}
 	for key, value := range infrastructure {
 		supervision[key] = value
+	}
+	if options.Port != 0 {
+		if err := validateSupervisedPort(options.Port); err != nil {
+			return nil, newError(
+				protocol.CodeUVExecFailed,
+				options.Stage,
+				"uv 执行失败",
+				map[string]any{},
+				err,
+			)
+		}
+		supervision[autoMASSupervisedPort] = strconv.Itoa(options.Port)
 	}
 	if err := validateRunnerPaths(resolved); err != nil {
 		return nil, newError(
@@ -189,6 +206,14 @@ func joinSupervisionMirrorSources(sources []string) (string, error) {
 		}
 	}
 	return strings.Join(sources, mirrorSourceSeparator), nil
+}
+
+// validateSupervisedPort 校验增补 1 C12 的端口范围；十进制无前导零由 strconv.Itoa 保证。
+func validateSupervisedPort(port int) error {
+	if port < minSupervisedPort || port > maxSupervisedPort {
+		return fmt.Errorf("supervised port %d is out of range %d-%d", port, minSupervisedPort, maxSupervisedPort)
+	}
+	return nil
 }
 
 func validateSupervisionIdentity(identity SupervisionIdentity) error {
