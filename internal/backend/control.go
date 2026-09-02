@@ -3,9 +3,6 @@ package backend
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 
@@ -20,7 +17,6 @@ const (
 	defaultShutdownTimeout        = 5 * time.Second
 	defaultRestartDelay           = 2 * time.Second
 	controlDrainTimeout           = time.Second
-	backendCloseURL               = "http://127.0.0.1:36163/api/core/close"
 	// developmentEntryArgument 是 development 模式沿用的相对入口：cwd 就是
 	// --repo 指定的源码目录，绝对路径只属于 managed（增补 1 C6 第 2 条）。
 	developmentEntryArgument = "main.py"
@@ -1308,6 +1304,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		RunOptions:     uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
 		Identity:       identity,
 		Infrastructure: s.infrastructure,
+		Port:           request.Port,
 	}, s.streamSink(request, logger, gate))
 	if err != nil || proc == nil {
 		fault := gate.Fault()
@@ -1493,7 +1490,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	}
 	gate.SetStage(protocol.StageBackendRun)
 	setControlStage(request.Control, protocol.StageBackendRun)
-	details := map[string]any{"pid": proc.PID(), "baseUrl": "http://127.0.0.1:36163", "logPath": logger.LogPath()}
+	details := map[string]any{"pid": proc.PID(), "baseUrl": health.BaseURL(request.Port), "logPath": logger.LogPath()}
 	if err := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "后端已就绪", details); err != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(err, logger, proc, cleanup.details)))
@@ -1505,7 +1502,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, probe health.Probe, gate *streamGate, snapshot *controlState, results <-chan controlResult) error {
 	healthCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	expectation := health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit}
+	expectation := health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit, Port: request.Port}
 	if modeForRequest(request) == ModeDevelopment {
 		expectation.Mode = health.ModeDevelopment
 		expectation.Version = ""
@@ -1935,7 +1932,7 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	defer cancel()
 	closer := s.deps.HTTP
 	if closer == nil {
-		closer = fixedHTTPCloser{}
+		closer = newLoopbackHTTPCloser(request.Port)
 	}
 	httpErr := closer.Close(closeCtx)
 	graceful := httpErr == nil && waitProcessExit(closeCtx, attempt.process)
@@ -2005,36 +2002,3 @@ func waitProcessExit(ctx context.Context, proc ManagedProcess) bool {
 		return false
 	}
 }
-
-type fixedHTTPCloser struct{}
-
-func (fixedHTTPCloser) Close(ctx context.Context) error {
-	if ctx == nil {
-		return errors.New("backend shutdown context is nil")
-	}
-	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, backendCloseURL, nil)
-	if err != nil {
-		return err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	readErr := error(nil)
-	if response.Body != nil {
-		_, readErr = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
-	}
-	closeErr := error(nil)
-	if response.Body != nil {
-		closeErr = response.Body.Close()
-	}
-	client.CloseIdleConnections()
-	statusErr := error(nil)
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		statusErr = fmt.Errorf("backend close returned status %d", response.StatusCode)
-	}
-	return errors.Join(statusErr, readErr, closeErr)
-}
-
-var _ HTTPCloser = fixedHTTPCloser{}

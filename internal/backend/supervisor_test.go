@@ -170,7 +170,7 @@ func TestBackendManaged_ReadyEmitsRunningState(t *testing.T) {
 	if got := states[1].Details["pid"]; got != f.proc.pid {
 		t.Fatalf("running pid detail = %#v, want %d", got, f.proc.pid)
 	}
-	if got := states[1].Details["baseUrl"]; got != "http://127.0.0.1:36163" {
+	if got := states[1].Details["baseUrl"]; got != health.BaseURL(health.DefaultPort) {
 		t.Fatalf("running baseUrl = %#v", got)
 	}
 

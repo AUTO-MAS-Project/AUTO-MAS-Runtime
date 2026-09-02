@@ -28,7 +28,11 @@ type Request struct {
 	// ShutdownTimeout 是从发出 POST /api/core/close 到进程退出的等待上限，
 	// 超时才收 Job（增补 1 C9）。CLI 由 --shutdown-timeout 提供，取值 1~120 秒；
 	// 为零或负数时回退 Dependencies.ShutdownTimeout。
-	ShutdownTimeout    time.Duration
+	ShutdownTimeout time.Duration
+	// Port 是受监督后端的监听端口（增补 1 C12）。CLI 由 --port 提供；为零时按模式
+	// 取缺省（managed 36163 / development 36164），越界映射 INVALID_ARGUMENT。
+	// 注入 uv 的 AUTO_MAS_SUPERVISED_PORT、健康检查地址、关闭地址与 baseUrl 全部由它派生。
+	Port               int
 	Emitter            EventEmitter
 	Control            ControlReceiver
 	BeforeShutdown     func(string)

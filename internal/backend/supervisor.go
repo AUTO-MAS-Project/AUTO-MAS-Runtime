@@ -145,6 +145,11 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	port, err := resolveSupervisedPort(request, mode)
+	if err != nil {
+		return err
+	}
+	request.Port = port
 	if mode == ModeDevelopment {
 		var err error
 		request, err = s.normalizeDevelopmentRequest(ctx, request)
@@ -283,6 +288,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		},
 		Identity:       &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit},
 		Infrastructure: s.infrastructure,
+		Port:           request.Port,
 	}, sink)
 	if err != nil || proc == nil {
 		if fault := gate.Fault(); fault != nil {
@@ -343,6 +349,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		Protocol: protocol.Version,
 		Version:  revision.Version,
 		Commit:   revision.Commit,
+		Port:     request.Port,
 	}, probe); err != nil {
 		if fault := gate.Fault(); fault != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
@@ -377,7 +384,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	gate.SetStage(protocol.StageBackendRun)
 	if err := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "后端已就绪", map[string]any{
 		"pid":     proc.PID(),
-		"baseUrl": "http://127.0.0.1:36163",
+		"baseUrl": health.BaseURL(request.Port),
 		"logPath": logger.LogPath(),
 	}); err != nil {
 		return s.failAfterStarting(request, proc, tx, logger, gate, err, &processOwned, &txOwned, &loggerOwned)
