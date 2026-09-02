@@ -243,7 +243,9 @@ func (f backendServiceFunc) Supervise(ctx context.Context, request backend.Reque
 }
 
 func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
-	t.Run("reader failure joins within bound", func(t *testing.T) {
+	// 增补 1 C13：stdin 读取出错等价于宿主断开，走隐式 shutdown 而不是 INTERNAL_ERROR，
+	// 但 Execute 仍必须在有限时间内收口。
+	t.Run("reader failure joins within bound and shuts down", func(t *testing.T) {
 		input := &backendReadError{err: errors.New("stdin read failed")}
 		started := make(chan struct{})
 		var stdout, stderr bytes.Buffer
@@ -256,8 +258,15 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 					return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
 						close(started)
-						_, err := request.Control.Receive(ctx)
-						return err
+						command, err := request.Control.Receive(ctx)
+						if err != nil {
+							return err
+						}
+						if command.Command != protocol.ControlShutdown {
+							return errors.New("unexpected control command")
+						}
+						request.BeforeShutdown(command.CommandID)
+						return nil
 					}), nil
 				}),
 			)
@@ -269,15 +278,15 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 		}
 		select {
 		case code := <-done:
-			if code != protocol.ExitCodePreconditionFailed {
-				t.Fatalf("Execute() exit code = %d, want %d; stderr=%q", code, protocol.ExitCodePreconditionFailed, stderr.String())
+			if code != protocol.ExitCodeSuccess {
+				t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
 			}
 		case <-time.After(time.Second):
 			t.Fatal("Execute() did not join failed control reader")
 		}
 		events := parseNDJSON(t, stdout.String())
-		if got := eventString(events[len(events)-1], "code"); got != string(protocol.CodeInternalError) {
-			t.Fatalf("result code = %q, want INTERNAL_ERROR", got)
+		if got := eventString(events[len(events)-1], "status"); got != string(protocol.StateStopped) {
+			t.Fatalf("result status = %q, want stopped", got)
 		}
 		assertBackendCapabilities(t, events[0])
 	})
@@ -525,5 +534,141 @@ func TestBackendSupervise_PortArgument(t *testing.T) {
 				t.Fatalf("result details = %#v, want field=port", result.object["details"])
 			}
 		})
+	}
+}
+
+// implicitShutdownService 是 C13 用例共用的假监督器：只接收一条控制命令并把它交给断言，
+// 收到 shutdown 时像真实监督器一样调用 BeforeShutdown 后正常返回。
+func implicitShutdownService(received chan<- protocol.ControlCommand) backendService {
+	return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
+		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		command, err := request.Control.Receive(waitCtx)
+		if err != nil {
+			return err
+		}
+		received <- command
+		if command.Command != protocol.ControlShutdown {
+			return errors.New("unexpected control command")
+		}
+		request.BeforeShutdown(command.CommandID)
+		return nil
+	})
+}
+
+// TestBackendSupervise_StdinEOFSubmitsImplicitShutdown 锁定增补 1 C13 的主路径：
+// hello 之后 stdin 到达 EOF，监督器从同一个 mailbox 收到一条没有 commandId 的 shutdown，
+// 结局与显式 shutdown 相同（result.status=stopped、退出码 0），只是不回显 controlCommandId。
+func TestBackendSupervise_StdinEOFSubmitsImplicitShutdown(t *testing.T) {
+	received := make(chan protocol.ControlCommand, 1)
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+			return implicitShutdownService(received), nil
+		}),
+	)
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	select {
+	case command := <-received:
+		if command.Command != protocol.ControlShutdown || command.CommandID != "" {
+			t.Fatalf("received command = %#v, want implicit shutdown without commandId", command)
+		}
+	default:
+		t.Fatal("backend service received no control command")
+	}
+	events := parseNDJSON(t, stdout.String())
+	result := events[len(events)-1]
+	if got := eventString(result, "status"); got != string(protocol.StateStopped) {
+		t.Fatalf("result status = %q, want stopped", got)
+	}
+	if details, ok := result.object["details"].(map[string]any); ok {
+		if _, exists := details["controlCommandId"]; exists {
+			t.Fatalf("result details = %#v, want no controlCommandId for implicit shutdown", details)
+		}
+	}
+}
+
+// TestBackendSupervise_StdinReadErrorSubmitsImplicitShutdown 证明读取出错与 EOF 同样
+// 视为宿主断开：监督器收到隐式 shutdown、退出码 0，且 stderr 保留一条诊断。
+func TestBackendSupervise_StdinReadErrorSubmitsImplicitShutdown(t *testing.T) {
+	received := make(chan protocol.ControlCommand, 1)
+	var stdout, stderr bytes.Buffer
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
+		IO{In: &backendReadError{err: errors.New("stdin read failed")}, Out: &stdout, Err: &stderr},
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+			return implicitShutdownService(received), nil
+		}),
+	)
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	select {
+	case command := <-received:
+		if command.Command != protocol.ControlShutdown || command.CommandID != "" {
+			t.Fatalf("received command = %#v, want implicit shutdown without commandId", command)
+		}
+	default:
+		t.Fatal("backend service received no control command")
+	}
+	if !strings.Contains(stderr.String(), "stdin read failed") {
+		t.Fatalf("stderr = %q, want a diagnostic naming the read failure", stderr.String())
+	}
+	events := parseNDJSON(t, stdout.String())
+	if got := eventString(events[len(events)-1], "status"); got != string(protocol.StateStopped) {
+		t.Fatalf("result status = %q, want stopped", got)
+	}
+}
+
+// TestBackendSupervise_ExplicitShutdownThenEOFIsIdempotent 证明显式 shutdown 之后
+// 再到达的 EOF 不产生第二次关闭：监督器只收到那一条带 commandId 的 shutdown，
+// 后续 Receive 立即得到「已停止」，result 回显的是显式那条的 commandId。
+func TestBackendSupervise_ExplicitShutdownThenEOFIsIdempotent(t *testing.T) {
+	const commandID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	var stdout, stderr bytes.Buffer
+	var got []protocol.ControlCommand
+	var secondErr error
+	code := Execute(
+		context.Background(),
+		[]string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise", "--mode", "managed"},
+		IO{In: strings.NewReader(`{"protocol":1,"command":"shutdown","commandId":"` + commandID + `"}` + "\n"), Out: &stdout, Err: &stderr},
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+			return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
+				command, err := request.Control.Receive(ctx)
+				if err != nil {
+					return err
+				}
+				got = append(got, command)
+				waitCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+				defer cancel()
+				second, err := request.Control.Receive(waitCtx)
+				if err == nil {
+					got = append(got, second)
+				}
+				secondErr = err
+				request.BeforeShutdown(command.CommandID)
+				return nil
+			}), nil
+		}),
+	)
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if len(got) != 1 || got[0].Command != protocol.ControlShutdown || got[0].CommandID != commandID {
+		t.Fatalf("received commands = %#v, want exactly the explicit shutdown", got)
+	}
+	if !errors.Is(secondErr, backend.ErrControlStopped) {
+		t.Fatalf("second Receive error = %v, want ErrControlStopped (no implicit shutdown after explicit one)", secondErr)
+	}
+	events := parseNDJSON(t, stdout.String())
+	details, ok := events[len(events)-1].object["details"].(map[string]any)
+	if !ok || details["controlCommandId"] != commandID {
+		t.Fatalf("result details = %#v, want controlCommandId=%q", events[len(events)-1].object["details"], commandID)
 	}
 }

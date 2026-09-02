@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -307,8 +308,25 @@ func runBackendSuperviseSession(
 	controlDone := make(chan error, 1)
 	go func() {
 		readErr := runControlReaderSafely(readerContext, reader)
-		if readErr != nil && !isWorkspaceControlContextCancellation(readerContext, readErr) {
-			control.SetReaderError(readErr)
+		switch {
+		case readErr == nil:
+			// 增补 1 C13：hello 之后 stdin 到达 EOF 即宿主断开，视为隐式 shutdown；
+			// 被 StopAccepting 或 ctx 停止的 reader 不满足 InputClosed，不会误触发。
+			if reader.InputClosed() {
+				control.SubmitImplicitShutdown()
+			}
+		case isWorkspaceControlContextCancellation(readerContext, readErr):
+		default:
+			if _, panicked := recoveredControlReaderPanic(readErr); panicked {
+				// reader 自身崩溃是 Runtime 缺陷，仍走基础设施故障路径并上报。
+				control.SetReaderError(readErr)
+				break
+			}
+			// C13：读取出错与 EOF 同样视为宿主断开——走优雅关闭对用户只会更好，
+			// 硬失败路径反而会把后端 Job 硬杀；错误本身保留在 stderr 诊断里。
+			writeDiagnostic(deps.io, fmt.Errorf("stdin control read failed, treating as host disconnect: %w", readErr))
+			control.SubmitImplicitShutdown()
+			readErr = nil
 		}
 		controlDone <- readErr
 	}()
@@ -395,6 +413,15 @@ func (c *backendControl) PrepareControl(command protocol.ControlCommand) (protoc
 		}
 		return nil
 	}, nil
+}
+
+// SubmitImplicitShutdown 把宿主断开（stdin EOF 或读取出错）翻译成一条没有 commandId 的
+// shutdown 投进同一个 mailbox（增补 1 C13）。已有终止命令、mailbox 已停止或操作已收口时
+// Submit 返回错误，这正是隐式关闭的幂等语义，因此安全忽略；result 因 commandId 为空
+// 而不回显 controlCommandId。
+func (c *backendControl) SubmitImplicitShutdown() {
+	// 忽略 ErrControlStopped / ErrControlMailboxClosed / ctx 错误：它们都表示关闭已在路上。
+	_ = c.submit(protocol.ControlCommand{Protocol: protocol.Version, Command: protocol.ControlShutdown})
 }
 
 // StopAfterShutdown 保留 cancel-first 后续命令进入 mailbox 的机会；shutdown-first
