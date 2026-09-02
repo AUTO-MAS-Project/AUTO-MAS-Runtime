@@ -10,6 +10,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol/contracttest"
@@ -90,7 +91,7 @@ func backendContractRunner() contracttest.Runner {
 			return request.Emitter.EmitState(protocol.StateEvent{
 				Stage: protocol.StageBackendRun, Status: protocol.StateRunning,
 				Message: "后端已就绪", Details: map[string]any{
-					"pid": uint32(42), "baseUrl": "http://127.0.0.1:36163", "logPath": "backend.log",
+					"pid": uint32(42), "baseUrl": health.BaseURL(health.DefaultPort), "logPath": "backend.log",
 				},
 			})
 		})

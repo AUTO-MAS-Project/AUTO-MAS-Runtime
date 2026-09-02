@@ -428,3 +428,102 @@ func (r *backendReadError) Read([]byte) (int, error) {
 }
 
 func (*backendReadError) Close() error { return nil }
+
+// TestBackendSupervise_PortArgument 覆盖增补 1 C12 的参数契约：整数、合法范围
+// 1024~65535，缺省按模式 managed 36163 / development 36164；越界或非整数映射
+// INVALID_ARGUMENT 并在建立任何后端资源之前失败关闭。
+func TestBackendSupervise_PortArgument(t *testing.T) {
+	t.Parallel()
+
+	accepted := []struct {
+		name string
+		mode []string
+		args []string
+		want int
+	}{
+		{name: "managed default", mode: []string{"--mode", "managed"}, want: 36163},
+		{name: "development default", mode: []string{"--mode", "development", "--repo", "source"}, want: 36164},
+		{name: "lower bound", mode: []string{"--mode", "managed"}, args: []string{"--port", "1024"}, want: 1024},
+		{name: "upper bound", mode: []string{"--mode", "managed"}, args: []string{"--port", "65535"}, want: 65535},
+		{name: "development explicit", mode: []string{"--mode", "development", "--repo", "source"}, args: []string{"--port", "36170"}, want: 36170},
+	}
+	for _, test := range accepted {
+		t.Run("accepted/"+test.name, func(t *testing.T) {
+			t.Parallel()
+			var captured backend.Request
+			var stdout, stderr bytes.Buffer
+			args := []string{"--app-root", t.TempDir(), "--output", "ndjson", "backend", "supervise"}
+			args = append(args, test.mode...)
+			args = append(args, test.args...)
+			code := Execute(
+				context.Background(),
+				args,
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithCWD(t.TempDir()),
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+					return backendServiceFunc(func(_ context.Context, request backend.Request) error {
+						captured = request
+						return nil
+					}), nil
+				}),
+			)
+			if code != protocol.ExitCodeSuccess {
+				t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+			}
+			if got := captured.Port; got != test.want {
+				t.Fatalf("supervised port = %d, want %d", got, test.want)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name  string
+		value string
+	}{
+		{name: "below lower bound", value: "1023"},
+		{name: "above upper bound", value: "65536"},
+		{name: "zero", value: "0"},
+		{name: "negative", value: "-1"},
+		{name: "not an integer", value: "abc"},
+		{name: "fractional", value: "1.5"},
+		{name: "empty", value: ""},
+	}
+	for _, test := range rejected {
+		t.Run("rejected/"+test.name, func(t *testing.T) {
+			t.Parallel()
+			var factoryCalls int
+			var stdout, stderr bytes.Buffer
+			code := Execute(
+				context.Background(),
+				[]string{
+					"--app-root", t.TempDir(), "--output", "ndjson",
+					"backend", "supervise", "--mode", "managed", "--port", test.value,
+				},
+				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr},
+				WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+					factoryCalls++
+					return backendServiceFunc(func(context.Context, backend.Request) error { return nil }), nil
+				}),
+			)
+			if factoryCalls != 0 {
+				t.Fatalf("backend factory calls = %d, want 0", factoryCalls)
+			}
+			definition, ok := protocol.LookupErrorDefinition(protocol.CodeInvalidArgument)
+			if !ok {
+				t.Fatal("INVALID_ARGUMENT definition is missing")
+			}
+			if code != definition.ExitCode {
+				t.Fatalf("exit code = %d, want %d; stderr=%q", code, definition.ExitCode, stderr.String())
+			}
+			events := parseNDJSON(t, stdout.String())
+			result := events[len(events)-1]
+			if got := eventString(result, "code"); got != string(protocol.CodeInvalidArgument) {
+				t.Fatalf("result code = %q, want INVALID_ARGUMENT", got)
+			}
+			details, ok := result.object["details"].(map[string]any)
+			if !ok || details["field"] != "port" {
+				t.Fatalf("result details = %#v, want field=port", result.object["details"])
+			}
+		})
+	}
+}

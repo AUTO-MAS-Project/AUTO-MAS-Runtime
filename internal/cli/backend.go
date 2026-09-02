@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -24,12 +25,17 @@ const (
 	backendShutdownTimeoutDefault = "5"
 	backendShutdownTimeoutMin     = 1
 	backendShutdownTimeoutMax     = 120
+	// 受监督端口按增补 1 C12：缺省随模式而定（managed 36163 / development 36164），
+	// 因此 flag 的默认值留空，由 parseBackendPort 在解析 --mode 之后给出。
+	backendPortManagedDefault     = health.DefaultPort
+	backendPortDevelopmentDefault = 36164
 )
 
 func backendSuperviseCommand(deps *deps) *cobra.Command {
 	var mode string
 	var repo string
 	var shutdownTimeout string
+	var port string
 	command := &cobra.Command{
 		Use:   "supervise",
 		Short: "启动并监督后端进程",
@@ -86,6 +92,10 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 					if err != nil {
 						return sessionSuccess{}, err
 					}
+					supervisedPort, err := parseBackendPort(port, cmd.Flags().Changed("port"), mode)
+					if err != nil {
+						return sessionSuccess{}, err
+					}
 					service, err := deps.options.backendFactory(
 						ctx,
 						deps.global.layout,
@@ -121,6 +131,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 						Mode:               backend.Mode(mode),
 						DevelopmentRepo:    repo,
 						ShutdownTimeout:    shutdownBudget,
+						Port:               supervisedPort,
 						Emitter:            &backendEventEmitter{emitter: emitter, control: control},
 						Control:            mailbox,
 						BeforeShutdown:     mailbox.BeforeShutdown,
@@ -146,7 +157,43 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 		backendShutdownTimeoutDefault,
 		"关闭后端的等待上限（秒），取值 1~120",
 	)
+	command.Flags().StringVar(
+		&port,
+		"port",
+		"",
+		"受监督后端监听端口，取值 1024~65535；缺省 managed 36163、development 36164",
+	)
 	return command
+}
+
+// parseBackendPort 校验 --port（增补 1 C12）：整数、合法范围 1024~65535，未显式给出时
+// 按模式取缺省；显式给出的空串与非整数一样拒绝。与 --shutdown-timeout 同理收 string
+// 自行解析，让非整数与越界共用 INVALID_ARGUMENT 的 result 语义，而不是落到 Cobra 的
+// stderr 诊断通道。
+func parseBackendPort(raw string, explicit bool, mode string) (int, error) {
+	if !explicit {
+		if mode == backendModeDevelopment {
+			return backendPortDevelopmentDefault, nil
+		}
+		return backendPortManagedDefault, nil
+	}
+	reject := func(cause error) error {
+		return &commandError{
+			code:    protocol.CodeInvalidArgument,
+			stage:   protocol.StageBackendSpawn,
+			message: "受监督端口必须是 1024 到 65535 之间的整数",
+			details: map[string]any{"field": "port", "value": raw},
+			cause:   cause,
+		}
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, reject(errors.New("backend port is not an integer"))
+	}
+	if !health.ValidPort(port) {
+		return 0, reject(errors.New("backend port is out of range"))
+	}
+	return port, nil
 }
 
 // parseBackendShutdownTimeout 校验 --shutdown-timeout（增补 1 C9）：正整数秒、
