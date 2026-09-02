@@ -47,6 +47,7 @@ type backendE2EConfig struct {
 	PIDFile                   string             `json:"pidFile,omitempty"`
 	WorkingDirFile            string             `json:"workingDirFile,omitempty"`
 	EnvironmentFile           string             `json:"environmentFile,omitempty"`
+	ShutdownFile              string             `json:"shutdownFile,omitempty"`
 	GrandchildPIDFile         string             `json:"grandchildPidFile,omitempty"`
 	SpawnGrandchild           bool               `json:"spawnGrandchild,omitempty"`
 	GrandchildLifetimeMS      int                `json:"grandchildLifetimeMs,omitempty"`
@@ -248,6 +249,7 @@ type backendE2EFixture struct {
 	rootPID       string
 	workingDir    string
 	environment   string
+	shutdownFile  string
 	grandchildPID string
 	uvExecReady   string
 	uvExecRelease string
@@ -423,6 +425,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	configValue.PIDFile = filepath.Join(root, "python.pid")
 	configValue.WorkingDirFile = filepath.Join(root, "backend.cwd")
 	configValue.EnvironmentFile = filepath.Join(root, "backend.env")
+	configValue.ShutdownFile = filepath.Join(root, "backend.shutdown")
 	configValue.GrandchildPIDFile = filepath.Join(root, "grandchild.pid")
 	rootPIDPath := filepath.Join(root, "uv.pid")
 	uvExecReadyPath := ""
@@ -483,6 +486,7 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		rootPID:       rootPIDPath,
 		workingDir:    configValue.WorkingDirFile,
 		environment:   configValue.EnvironmentFile,
+		shutdownFile:  configValue.ShutdownFile,
 		grandchildPID: configValue.GrandchildPIDFile,
 		uvExecReady:   uvExecReadyPath,
 		uvExecRelease: uvExecReleasePath,

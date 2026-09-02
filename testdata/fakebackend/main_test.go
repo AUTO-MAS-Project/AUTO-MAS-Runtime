@@ -578,8 +578,9 @@ func TestFakeBackend_ListensOnSupervisedPortEnv(t *testing.T) {
 		t.Fatalf("close port probe: %v", err)
 	}
 	readyFile := filepath.Join(root, "env-ready.txt")
+	shutdownFile := filepath.Join(root, "env-shutdown.txt")
 	configPath := filepath.Join(root, "env-config.json")
-	writeConfig(t, configPath, fakeBackendConfig{ReadyFile: readyFile})
+	writeConfig(t, configPath, fakeBackendConfig{ReadyFile: readyFile, ShutdownFile: shutdownFile})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, executable)
@@ -602,6 +603,9 @@ func TestFakeBackend_ListensOnSupervisedPortEnv(t *testing.T) {
 	_ = response.Body.Close()
 	if err := command.Wait(); err != nil {
 		t.Fatalf("fake backend exit = %v, want 0", err)
+	}
+	if got := strings.TrimSpace(waitForFile(t, shutdownFile)); got != "graceful" {
+		t.Fatalf("shutdown marker = %q, want graceful", got)
 	}
 
 	for _, invalid := range []string{"", "abc", "70000", "80"} {

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -240,12 +241,28 @@ func TestBackendE2E_StdinEOFShutsDownGracefully(t *testing.T) {
 		}
 	}
 	waitE2EPIDExit(t, pythonPID)
+	assertE2EBackendClosedGracefully(t, fixture)
 	fixture.assertResourcesReleased(t)
+}
+
+// assertE2EBackendClosedGracefully 用假后端只在 close → server.Shutdown 成功后才落盘的标记，
+// 证明后端是被 HTTP 优雅关闭而不是被 Job 硬杀。
+func assertE2EBackendClosedGracefully(t *testing.T, fixture *backendE2EFixture) {
+	t.Helper()
+	waitE2EFile(t, fixture.shutdownFile)
+	payload, err := os.ReadFile(fixture.shutdownFile)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", fixture.shutdownFile, err)
+	}
+	if got := strings.TrimSpace(string(payload)); got != "graceful" {
+		t.Fatalf("backend shutdown marker = %q, want graceful", got)
+	}
 }
 
 // TestBackendE2E_StdinEOFWithBrokenStdoutStillExits 模拟宿主崩溃的真实形态：stdout 管道
 // 先失效、随后 stdin EOF。Runtime 写不出任何事件，也必须在有限时间内退出并收口后端进程树、
-// 端口、Mutex 与事务；退出码不作要求。
+// 端口、Mutex 与事务；且按 C13 结论第 4 条，后端仍须被 HTTP 优雅关闭而不是被 Job 硬杀，
+// Runtime 最后以 OUTPUT_WRITE_FAILED（退出码 20）收场。
 func TestBackendE2E_StdinEOFWithBrokenStdoutStillExits(t *testing.T) {
 	fixture := newBackendE2EFixture(t, backendE2EConfig{Events: e2EOutputEvents("broken")})
 	process := startBackendE2ERuntime(t, fixture)
@@ -260,6 +277,10 @@ func TestBackendE2E_StdinEOFWithBrokenStdoutStillExits(t *testing.T) {
 
 	code := process.waitExit(t, 30*time.Second)
 	t.Logf("runtime exit code with broken stdout = %d; stderr=%q", code, process.stderr.String())
+	if code != protocol.ExitCodePreconditionFailed {
+		t.Fatalf("runtime exit code = %d, want %d (OUTPUT_WRITE_FAILED); stderr=%q", code, protocol.ExitCodePreconditionFailed, process.stderr.String())
+	}
 	waitE2EPIDExit(t, pythonPID)
+	assertE2EBackendClosedGracefully(t, fixture)
 	fixture.assertResourcesReleased(t)
 }

@@ -1547,3 +1547,46 @@ func waitForStateStatusCount(t *testing.T, emitter *fakeEmitter, status protocol
 		}
 	}
 }
+
+// TestBackend_ShutdownContinuesGracefullyWhenOutputFails 锁定增补 1 C13 结论第 4 条：
+// 进入 shutdown 之后 stdout 写失败不中断关闭流程——仍 HTTP close、等待退出、清理，
+// 最后才把 OUTPUT_WRITE_FAILED 交给 CLI；后端不会因为宿主管道失效而被 Job 硬杀。
+func TestBackend_ShutdownContinuesGracefullyWhenOutputFails(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	mailbox := NewControlMailbox(8)
+	var mu sync.Mutex
+	order := make([]string, 0, 2)
+	f.depsHTTP = &orderedHTTPCloser{process: f.proc, record: func(value string) {
+		mu.Lock()
+		order = append(order, value)
+		mu.Unlock()
+	}}
+	done := make(chan error, 1)
+	go func() {
+		req := f.request()
+		req.Control = mailbox
+		done <- f.supervisorWithHTTP(t.Context(), req)
+	}()
+	waitFor(t, f.emitter.running)
+	// running 之后宿主管道失效：此后每一次协议输出都失败。
+	f.emitter.mu.Lock()
+	f.emitter.stateErr = errors.New("stdout pipe is closed")
+	f.emitter.mu.Unlock()
+	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Command: protocol.ControlShutdown, CommandID: "shutdown-broken-stdout"}); err != nil {
+		t.Fatalf("Submit(shutdown) error = %v", err)
+	}
+	err := <-done
+	assertBackendCode(t, err, protocol.CodeOutputWriteFailed)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 1 || order[0] != "http" {
+		t.Fatalf("shutdown steps = %#v, want the HTTP close to be attempted despite the output failure", order)
+	}
+	if !f.proc.terminated || !f.proc.waitedEmpty || !f.proc.closed {
+		t.Fatalf("process cleanup = terminated:%v waitEmpty:%v closed:%v", f.proc.terminated, f.proc.waitedEmpty, f.proc.closed)
+	}
+	if indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) >= 0 {
+		t.Fatalf("events = %#v, want no force warning: the backend exited on HTTP close", f.emitter.eventsSnapshot())
+	}
+}

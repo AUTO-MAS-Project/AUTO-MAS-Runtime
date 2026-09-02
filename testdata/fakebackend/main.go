@@ -46,7 +46,10 @@ type fakeBackendConfig struct {
 	// EnvironmentFile 让假后端把自己进程里读到的受监督环境变量落盘，供 T13.5
 	// 端到端断言增补 1 C11 的四个变量确实穿过 uv 到达了真实后端进程；父进程侧
 	// 的 StartSpec 断言只能证明 Runtime 传了什么，证明不了后端收到了什么。
-	EnvironmentFile      string `json:"environmentFile"`
+	EnvironmentFile string `json:"environmentFile"`
+	// ShutdownFile 只在「收到 close 并完成 server.Shutdown」的优雅路径上落盘，被 Job 硬杀时
+	// 永远不会出现；T13.8 的 E2E 据此区分「HTTP 优雅关闭」与「被杀」。
+	ShutdownFile         string `json:"shutdownFile"`
 	GrandchildPIDFile    string `json:"grandchildPidFile"`
 	SpawnGrandchild      bool   `json:"spawnGrandchild"`
 	GrandchildLifetimeMS int    `json:"grandchildLifetimeMs"`
@@ -310,6 +313,12 @@ func runFakeBackend() int {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 95
+		}
+		if config.ShutdownFile != "" {
+			if err := writeSignalFile(config.ShutdownFile, []byte("graceful\n")); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 88
+			}
 		}
 		return 0
 	case err := <-serveResult:
