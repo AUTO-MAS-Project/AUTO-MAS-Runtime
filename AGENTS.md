@@ -31,7 +31,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-09-02）
+## 2. 当前状态（截至 2026-09-03）
 
 | 里程碑 | 状态 |
 | --- | --- |
@@ -43,7 +43,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
 | M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `ea886f8`） |
 | M7 GitHub CI/CD 发布 | T7.1~T7.4 **已完成**（beta.2 Release run `31407585577`、三 job 全绿、独立资产/NDJSON 验收通过）；T7.5 按 D3 延后 |
-| M9 联调与首版验收 | T9.1 development 真后端联调 **已完成**（2026-09-02，`ba27db3` 构建对 AUTO-MAS 集成树 `integ/runtime-20260901` 跑通启动→就绪→优雅关闭）；T9.2~T9.4 进行中，尚未回写 |
+| M9 联调与首版验收 | T9.1 development 真后端联调 **已完成**（2026-09-02，`ba27db3` 构建对 AUTO-MAS 集成树 `integ/runtime-20260901` 跑通启动→就绪→优雅关闭）；T9.2 managed 全链路 **已完成**（2026-09-02，用本地 HTTPS smart-git 模拟 `release/*` 分支：bootstrap → supervise → 升级 → 降级 → 关 stdin 隐式关闭，真实发布分支复跑待 push 后）；T9.3 Electron 接入 🚧（`off` 六场景与 `development` 一轮桌面 E2E 完成，复跑进行中，未宣布通过）；T9.4 首版验收清单核对 **已完成**（2026-09-03，[`doc/首版验收记录.md`](doc/首版验收记录.md)：标准第 1~11 条满足，第 12/14 条不满足、第 13 条未验证，均属 AUTO-MAS 侧发布动作并附解除条件）；M9 整体待真实 `release/*` 复跑与阶段 0/5/6 收口后勾选 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
 | M12 遥测与错误观测（Sentry-only） | T12.1、T12.2、T12.4、T12.5、T12.7 已完成；T12.6 本地发布配置已提交，待 Repository secret 与授权后的远端验收；T12.3/Umami 已取消 |
