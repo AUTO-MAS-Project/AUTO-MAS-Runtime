@@ -49,10 +49,14 @@ type fakeBackendConfig struct {
 	EnvironmentFile string `json:"environmentFile"`
 	// ShutdownFile 只在「收到 close 并完成 server.Shutdown」的优雅路径上落盘，被 Job 硬杀时
 	// 永远不会出现；T13.8 的 E2E 据此区分「HTTP 优雅关闭」与「被杀」。
-	ShutdownFile         string `json:"shutdownFile"`
-	GrandchildPIDFile    string `json:"grandchildPidFile"`
-	SpawnGrandchild      bool   `json:"spawnGrandchild"`
-	GrandchildLifetimeMS int    `json:"grandchildLifetimeMs"`
+	ShutdownFile string `json:"shutdownFile"`
+	// ShutdownEvents 与 ShutdownDelayMS 模拟真实后端收到 close 之后的关闭序列：先逐行输出
+	// 关闭日志（此时宿主的 stdout/stderr 可能已经断了），再等待一段时间才真正退出。
+	ShutdownEvents       []outputEvent `json:"shutdownEvents"`
+	ShutdownDelayMS      int           `json:"shutdownDelayMs"`
+	GrandchildPIDFile    string        `json:"grandchildPidFile"`
+	SpawnGrandchild      bool          `json:"spawnGrandchild"`
+	GrandchildLifetimeMS int           `json:"grandchildLifetimeMs"`
 	// LeaveGrandchildOnCrash / LeaveGrandchildOnShutdown 都让孙进程脱离父进程的
 	// liveness 管道并跳过自清理，区别只是在崩溃还是优雅关闭路径上留下它。
 	// 后者用于证明「真有存活后代」时 Runtime 仍会强制回收并发出警告。
@@ -307,6 +311,14 @@ func runFakeBackend() int {
 		if config.LeaveGrandchildOnShutdown {
 			cleanupGrandchild = false
 		}
+		if err := emitConfiguredOutput(fakeBackendConfig{Events: config.ShutdownEvents}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 87
+		}
+		if config.ShutdownDelayMS > 0 {
+			timer := time.NewTimer(time.Duration(config.ShutdownDelayMS) * time.Millisecond)
+			<-timer.C
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := server.Shutdown(ctx)
 		cancel()
@@ -379,6 +391,17 @@ func validateFakeBackendConfig(config fakeBackendConfig) error {
 	}
 	if err := validateMilliseconds("listenDelayMs", config.ListenDelayMS, 60_000); err != nil {
 		return err
+	}
+	if err := validateMilliseconds("shutdownDelayMs", config.ShutdownDelayMS, 60_000); err != nil {
+		return err
+	}
+	for _, event := range config.ShutdownEvents {
+		if event.Stream != "stdout" && event.Stream != "stderr" {
+			return errors.New("validate fake backend shutdownEvents: stream must be stdout or stderr")
+		}
+		if err := validateMilliseconds("shutdownEvents.delayMs", event.DelayMS, 60_000); err != nil {
+			return err
+		}
 	}
 	if err := validateMilliseconds("grandchildLifetimeMs", config.GrandchildLifetimeMS, 86_400_000); err != nil {
 		return err

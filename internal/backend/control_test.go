@@ -396,8 +396,10 @@ func TestBackend_GateFaultOutranksContextCancellation(t *testing.T) {
 		done <- f.supervisor().Supervise(ctx, req)
 	}()
 	waitFor(t, f.emitter.running)
-	if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err == nil {
-		t.Fatal("EmitRecord() error = nil, want protocol sink fault")
+	// C13 结论第 4 条 2026-09-02 修订：协议出口失败只登记 gate 故障，sink 必须返回 nil，
+	// 否则 process 层会按首个 sink 错误 job.Terminate 整棵树。故障仍由下面的结局断言。
+	if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err != nil {
+		t.Fatalf("EmitRecord() error = %v, want nil", err)
 	}
 	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Protocol: protocol.Version, Command: protocol.ControlCancel, CommandID: "cancel-exit-gate"}); err != nil {
 		t.Fatalf("Submit(cancel) error = %v", err)
@@ -428,8 +430,9 @@ func TestBackend_UpdateErrorGateAndContextPriority(t *testing.T) {
 				done <- f.supervisor().Supervise(ctx, req)
 			}()
 			waitFor(t, f.state.updateStarted)
-			if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err == nil {
-				t.Fatal("EmitRecord() error = nil, want protocol sink fault")
+			// 同上：sink 返回 nil，故障经 gate 传递（C13 结论第 4 条 2026-09-02 修订）。
+			if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err != nil {
+				t.Fatalf("EmitRecord() error = %v, want nil", err)
 			}
 			cancel()
 			close(f.state.updateBlock)

@@ -48,6 +48,8 @@ type backendE2EConfig struct {
 	WorkingDirFile            string             `json:"workingDirFile,omitempty"`
 	EnvironmentFile           string             `json:"environmentFile,omitempty"`
 	ShutdownFile              string             `json:"shutdownFile,omitempty"`
+	ShutdownEvents            []backendE2EEvent  `json:"shutdownEvents,omitempty"`
+	ShutdownDelayMS           int                `json:"shutdownDelayMs,omitempty"`
 	GrandchildPIDFile         string             `json:"grandchildPidFile,omitempty"`
 	SpawnGrandchild           bool               `json:"spawnGrandchild,omitempty"`
 	GrandchildLifetimeMS      int                `json:"grandchildLifetimeMs,omitempty"`
