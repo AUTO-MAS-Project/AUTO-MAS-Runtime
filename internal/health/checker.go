@@ -33,6 +33,10 @@ const (
 	defaultPollInterval         = 500 * time.Millisecond
 	defaultRequestTimeout       = 2 * time.Second
 	defaultConsecutiveSuccesses = 2
+	// 探针错误连续这么多次才判失败。单次错误多半是过渡态——后端启动期的短命子进程
+	// 恰在 Job 快照的两次系统查询之间退出，快照就会带着错误返回。明确的否定结果
+	// （probeUnhealthy）不走这条容忍，仍然立即失败。
+	maxConsecutiveProbeErrors = 3
 )
 
 // Mode 是健康检查的身份校验模式。
@@ -182,6 +186,8 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	total := totalTimer.C()
 	startedAt := c.clock.Now()
 	successes := 0
+	// 连续的探针错误计数；任何一次探针成功都清零。
+	probeErrors := 0
 	for {
 		if err := cancellationError(ctx); err != nil {
 			return err
@@ -264,10 +270,15 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 				}
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			case probeError:
-				return preferCancellation(ctx, newError(protocol.CodeBackendHealthInvalid, "无法验证受管后端进程", nil, probeResult.err))
+				probeErrors++
+				if probeErrors >= maxConsecutiveProbeErrors {
+					return preferCancellation(ctx, newError(protocol.CodeBackendHealthInvalid, "无法验证受管后端进程", map[string]any{"consecutiveErrors": probeErrors}, probeResult.err))
+				}
+				successes = 0
 			case probeUnhealthy:
 				return preferCancellation(ctx, newError(protocol.CodeBackendHealthInvalid, "受管后端进程身份无效", map[string]any{"reason": "job_probe_unhealthy"}, nil))
 			case probeHealthy:
+				probeErrors = 0
 				successes++
 				if successes >= c.consecutiveSuccesses {
 					if err := cancellationError(ctx); err != nil {

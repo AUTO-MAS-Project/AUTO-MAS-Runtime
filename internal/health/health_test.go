@@ -120,24 +120,51 @@ func TestHealth_Non200AndUnknownStatusAreImmediate(t *testing.T) {
 	})
 }
 
+// 明确的否定结果（探针判定身份无效）仍然立即失败；探针**错误**改为连续多次才失败，
+// 见 TestHealth_ProbeErrorIsToleratedUntilThreshold。
 func TestHealth_JobProbeFailureIsImmediate(t *testing.T) {
-	for name, probe := range map[string]*fakeProbe{
-		"unhealthy": func() *fakeProbe {
-			p := testProbe()
-			p.healthy = false
-			return p
-		}(),
-		"error": func() *fakeProbe {
-			p := testProbe()
-			p.probeErr = errors.New("job snapshot failed")
-			return p
-		}(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			rt := &sequenceTransport{responses: []transportResult{{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))}}}
-			assertHealthCode(t, testChecker(rt).Check(t.Context(), managedExpectation(), probe), protocol.CodeBackendHealthInvalid)
-		})
+	probe := testProbe()
+	probe.healthy = false
+	rt := &sequenceTransport{responses: []transportResult{{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))}}}
+	assertHealthCode(t, testChecker(rt).Check(t.Context(), managedExpectation(), probe), protocol.CodeBackendHealthInvalid)
+	if probe.calls != 1 {
+		t.Fatalf("身份无效必须立即失败，探针调用 = %d，want 1", probe.calls)
 	}
+}
+
+// TestHealth_ProbeErrorIsToleratedUntilThreshold 锁定 C15：Job 快照带错误返回多半是
+// 过渡态（后端启动期的短命子进程恰在两次系统查询之间退出），单次就判失败会让约四分之一
+// 的正常启动报 BACKEND_HEALTH_INVALID。连续 maxConsecutiveProbeErrors 次才判失败，
+// 中间任何一次成功都清零。
+func TestHealth_ProbeErrorIsToleratedUntilThreshold(t *testing.T) {
+	t.Run("错误后恢复则通过", func(t *testing.T) {
+		probe := testProbe()
+		probe.errLimit = maxConsecutiveProbeErrors - 1
+		probe.probeErr = errors.New("job snapshot failed")
+		rt := &sequenceTransport{responses: readyResponses(maxConsecutiveProbeErrors - 1 + 2)}
+		if err := testChecker(rt).Check(t.Context(), managedExpectation(), probe); err != nil {
+			t.Fatalf("阈值以内的探针错误应被容忍，got %v", err)
+		}
+	})
+
+	t.Run("连续达到阈值才失败", func(t *testing.T) {
+		probe := testProbe()
+		probe.errLimit = maxConsecutiveProbeErrors
+		probe.probeErr = errors.New("job snapshot failed")
+		rt := &sequenceTransport{responses: readyResponses(maxConsecutiveProbeErrors)}
+		assertHealthCode(t, testChecker(rt).Check(t.Context(), managedExpectation(), probe), protocol.CodeBackendHealthInvalid)
+		if probe.calls != maxConsecutiveProbeErrors {
+			t.Fatalf("应恰好在第 %d 次错误后失败，探针调用 = %d", maxConsecutiveProbeErrors, probe.calls)
+		}
+	})
+}
+
+func readyResponses(n int) []transportResult {
+	results := make([]transportResult, 0, n)
+	for range n {
+		results = append(results, transportResult{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))})
+	}
+	return results
 }
 
 func TestHealth_TransportAndRequestContract(t *testing.T) {
@@ -522,7 +549,11 @@ type fakeProbe struct {
 	exited   chan struct{}
 	healthy  bool
 	probeErr error
-	calls    int
+	// errLimit 为正时，只有前这么多次探针返回 probeErr，之后恢复正常；
+	// 为 0 时 probeErr 一直生效（沿用既有用法）。
+	errLimit    int
+	errsEmitted int
+	calls       int
 }
 
 func testProbe() *fakeProbe {
@@ -533,7 +564,8 @@ func (p *fakeProbe) Exited() <-chan struct{} { return p.exited }
 
 func (p *fakeProbe) Healthy(context.Context) (bool, error) {
 	p.calls++
-	if p.probeErr != nil {
+	if p.probeErr != nil && (p.errLimit == 0 || p.errsEmitted < p.errLimit) {
+		p.errsEmitted++
 		return false, p.probeErr
 	}
 	return p.healthy, nil
