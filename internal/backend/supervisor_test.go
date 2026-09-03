@@ -1410,3 +1410,64 @@ func assertMirrorSourcesMatchPlan(t *testing.T, policy mirror.Policy, kind mirro
 		t.Fatalf("%s sources = %#v, want %#v in plan order", kind, got, want)
 	}
 }
+
+// 宿主崩溃时 stdout 读端已断，后端收到 close 后输出的第一行关闭日志会让协议出口写失败。
+// 这个错误绝不能回给 process 层：`ManagedProcess.recordSinkError` 对首个 sink 错误的策略是
+// `job.Terminate(97)`，那会把正在优雅关闭的后端连同进程树一起杀掉（C13 结论第 4 条 2026-09-02 修订）。
+func TestBackend_StreamSinkKeepsDrainingWhenProtocolOutputFails(t *testing.T) {
+	emitter := &fakeEmitter{logErr: errors.New("write /dev/stdout: The pipe is being closed")}
+	logger := &fakeLogger{path: filepath.Join(t.TempDir(), "backend.log")}
+	gate := &streamGate{stage: protocol.StageBackendRun}
+	if err := gate.Open(emitter); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+
+	sink := (&ManagedSupervisor{}).streamSink(Request{Emitter: emitter}, logger, gate)
+	record := process.StreamRecord{Stream: process.StreamStdout, Event: "Application shutdown complete.", EndOfLine: true}
+	if err := sink(context.Background(), record); err != nil {
+		t.Fatalf("协议出口失败必须返回 nil，否则后端会被 job.Terminate 杀掉，got %v", err)
+	}
+	// 后续行同样继续吞，不能因为已故障就开始报错。
+	if err := sink(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "bye", EndOfLine: true}); err != nil {
+		t.Fatalf("故障之后仍应继续读管道，got %v", err)
+	}
+
+	fault := gate.Fault()
+	if fault == nil {
+		t.Fatal("协议出口失败必须登记 gate 故障，监督循环靠它收口")
+	}
+	assertBackendCode(t, fault, protocol.CodeOutputWriteFailed)
+
+	logger.mu.Lock()
+	recorded := len(logger.records)
+	logger.mu.Unlock()
+	if recorded != 2 {
+		t.Fatalf("文件日志必须照常写入，want 2 条，got %d", recorded)
+	}
+}
+
+// 对照组：文件日志写失败仍然失败关闭（沿用既有语义，本次修订不放宽）。
+func TestBackend_StreamSinkStillFailsClosedWhenRuntimeLogFails(t *testing.T) {
+	emitter := &fakeEmitter{}
+	logger := &failingLogger{err: errors.New("disk full")}
+	gate := &streamGate{stage: protocol.StageBackendRun}
+	if err := gate.Open(emitter); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+
+	sink := (&ManagedSupervisor{}).streamSink(Request{Emitter: emitter}, logger, gate)
+	err := sink(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "x", EndOfLine: true})
+	if err == nil {
+		t.Fatal("运行日志写入失败必须返回错误")
+	}
+	assertBackendCode(t, err, protocol.CodeInternalError)
+}
+
+type failingLogger struct {
+	err  error
+	path string
+}
+
+func (l *failingLogger) Record(context.Context, process.StreamRecord) error { return l.err }
+func (l *failingLogger) LogPath() string                                    { return l.path }
+func (l *failingLogger) Close() error                                       { return nil }

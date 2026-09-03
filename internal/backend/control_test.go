@@ -396,8 +396,10 @@ func TestBackend_GateFaultOutranksContextCancellation(t *testing.T) {
 		done <- f.supervisor().Supervise(ctx, req)
 	}()
 	waitFor(t, f.emitter.running)
-	if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err == nil {
-		t.Fatal("EmitRecord() error = nil, want protocol sink fault")
+	// C13 结论第 4 条 2026-09-02 修订：协议出口失败只登记 gate 故障，sink 必须返回 nil，
+	// 否则 process 层会按首个 sink 错误 job.Terminate 整棵树。故障仍由下面的结局断言。
+	if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err != nil {
+		t.Fatalf("EmitRecord() error = %v, want nil", err)
 	}
 	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Protocol: protocol.Version, Command: protocol.ControlCancel, CommandID: "cancel-exit-gate"}); err != nil {
 		t.Fatalf("Submit(cancel) error = %v", err)
@@ -428,8 +430,9 @@ func TestBackend_UpdateErrorGateAndContextPriority(t *testing.T) {
 				done <- f.supervisor().Supervise(ctx, req)
 			}()
 			waitFor(t, f.state.updateStarted)
-			if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err == nil {
-				t.Fatal("EmitRecord() error = nil, want protocol sink fault")
+			// 同上：sink 返回 nil，故障经 gate 传递（C13 结论第 4 条 2026-09-02 修订）。
+			if err := f.proc.EmitRecord(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "fault", EndOfLine: true}); err != nil {
+				t.Fatalf("EmitRecord() error = %v, want nil", err)
 			}
 			cancel()
 			close(f.state.updateBlock)
@@ -1688,5 +1691,92 @@ func TestBackend_ForceTerminatedOnlyWhenRootKilled(t *testing.T) {
 	}
 	if indexOfEvent(events, "warning:"+string(protocol.CodeBackendOrphansReaped)) >= 0 {
 		t.Fatalf("events = %#v, want no orphans warning when the root itself was killed", events)
+	}
+}
+
+// countingHTTPCloser 只记调用次数，用来证明某条路径根本没发出关闭请求；
+// 带上 process 时模拟「后端收到 close 后退出」，让存活分支能优雅收场。
+type countingHTTPCloser struct {
+	process *fakeProcess
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingHTTPCloser) Close(context.Context) error {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	if c.process != nil {
+		c.process.Exit()
+	}
+	return nil
+}
+
+func (c *countingHTTPCloser) observedCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestBackend_ShutdownSkipsCloseWhenBackendAlreadyExited 锁定增补 1 C15：根进程已经
+// 自己退出时不再发 /api/core/close。端口此刻可能已被别的进程接手，那一发就打到了别人
+// 身上——桌面 E2E 里出现过「刚起来的后端收到来源不明的 close」正是这个形态。
+func TestBackend_ShutdownSkipsCloseWhenBackendAlreadyExited(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		exitFirst  bool
+		wantCalls  int
+		wantForced bool
+	}{
+		{name: "根进程已退出：零次 close", exitFirst: true, wantCalls: 0},
+		{name: "根进程仍存活：照常发 close", exitFirst: false, wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			closer := &countingHTTPCloser{process: f.proc}
+			s, err := NewManagedSupervisor(f.layout, Dependencies{
+				Lock:       f.lock,
+				State:      f.state,
+				Repository: f.repository,
+				Entry:      f.entry,
+				UV:         f.uv,
+				Health:     f.health,
+				Logger:     func(context.Context, Request) (Logger, error) { return f.logger, f.loggerErr },
+				Clock:      func() time.Time { return time.Unix(1, 0).UTC() },
+				UVPath:     "uv.exe",
+				PythonPath: "python.exe",
+				PID:        f.pid,
+				HTTP:       closer,
+				NewTimer:   func(time.Duration) Timer { return immediateTimer{} },
+			})
+			if err != nil {
+				t.Fatalf("NewManagedSupervisor() error = %v", err)
+			}
+
+			if test.exitFirst {
+				f.proc.Exit()
+			}
+			attempt := &controlAttempt{
+				process: f.proc,
+				tx:      fakeTransaction{},
+				logger:  f.logger,
+				gate:    &streamGate{stage: protocol.StageBackendRun},
+			}
+			snapshot := &controlState{}
+			request := f.request()
+			request.Port = 36163
+
+			if err := s.finishControlShutdown(t.Context(), request, attempt, snapshot, "01ARZ3NDEKTSV4RRFFQ69G5FAV"); err != nil {
+				t.Fatalf("finishControlShutdown() error = %v, want nil", err)
+			}
+			if got := closer.observedCalls(); got != test.wantCalls {
+				t.Fatalf("close 调用 = %d, want %d", got, test.wantCalls)
+			}
+			forced := indexOfEvent(f.emitter.eventsSnapshot(), "warning:"+string(protocol.CodeBackendForceTerminated)) >= 0
+			if forced != test.wantForced {
+				t.Fatalf("force warning = %t, want %t; events=%#v", forced, test.wantForced, f.emitter.eventsSnapshot())
+			}
+		})
 	}
 }

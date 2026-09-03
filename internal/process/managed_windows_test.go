@@ -798,3 +798,40 @@ func currentProcessInJob() (bool, error) {
 	}
 	return inJob != 0, nil
 }
+
+// TestJob_SnapshotSkipsMemberExitingDuringImageQuery 锁定另一种过渡态：成员出现在
+// Job 的 pid 列表与 Toolhelp32 快照里，却在随后的映像查询时正在消亡。错误码不止
+// ERROR_INVALID_PARAMETER 一种，所以判据改问进程是否已收到信号：已退出就跳过，
+// 仍存活才让整个快照失败。后端启动期的短命子进程（如 `git version`）落在这个窗口里，
+// 让快照失败会把一次正常启动误判成 BACKEND_HEALTH_INVALID。
+func TestJob_SnapshotSkipsMemberExitingDuringImageQuery(t *testing.T) {
+	managed, signal, _ := startTestManaged(t.Context(), t, managedChildRootRole)
+	defer cleanupTestManaged(t, managed)
+	_ = waitTestSignal(t, signal)
+
+	originalImagePath, originalExited := processImagePathFn, processExitedFn
+	t.Cleanup(func() { processImagePathFn, processExitedFn = originalImagePath, originalExited })
+
+	// 映像查询失败，错误码不是 ERROR_INVALID_PARAMETER。
+	queryErr := fmt.Errorf("query image: %w", windows.ERROR_ACCESS_DENIED)
+	processImagePathFn = func(uint32) (string, error) { return "", queryErr }
+
+	// 进程已退出：跳过该成员，快照本身成功。
+	processExitedFn = func(uint32) (bool, error) { return true, nil }
+	members, err := managed.Snapshot()
+	if err != nil {
+		t.Fatalf("成员已退出时快照应成功，got %v", err)
+	}
+	if len(members) != 0 {
+		t.Fatalf("已退出的成员必须被跳过，got %#v", members)
+	}
+
+	// 进程仍存活：这才是真故障，必须上报。
+	processExitedFn = func(uint32) (bool, error) { return false, nil }
+	if _, err = managed.Snapshot(); err == nil {
+		t.Fatal("成员仍存活时映像查询失败必须上报，不能静默跳过")
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("上报的错误应保留原因，got %v", err)
+	}
+}

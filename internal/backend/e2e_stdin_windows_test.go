@@ -98,9 +98,18 @@ type backendE2ERuntimeProcess struct {
 	command    *exec.Cmd
 	stdin      io.WriteCloser
 	stdoutRead *os.File
-	stderr     bytes.Buffer
-	events     *backendE2EProcessEvents
-	waitErr    chan error
+	stderrRead *os.File
+	// stderrMu 保护 stderr：拷贝 goroutine 写、断言读。
+	stderrMu sync.Mutex
+	stderr   bytes.Buffer
+	events   *backendE2EProcessEvents
+	waitErr  chan error
+}
+
+func (p *backendE2ERuntimeProcess) stderrText() string {
+	p.stderrMu.Lock()
+	defer p.stderrMu.Unlock()
+	return p.stderr.String()
 }
 
 // startBackendE2ERuntime 构建并启动真实 Runtime，以 development 模式监督夹具后端。
@@ -127,23 +136,33 @@ func startBackendE2ERuntime(t *testing.T, fixture *backendE2EFixture) *backendE2
 	if err != nil {
 		t.Fatalf("os.Pipe() error = %v", err)
 	}
+	stderrRead, stderrWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
 	command.Stdout = stdoutWrite
+	command.Stderr = stderrWrite
 	process := &backendE2ERuntimeProcess{
 		command:    command,
 		stdin:      stdin,
 		stdoutRead: stdoutRead,
+		stderrRead: stderrRead,
 		events:     newBackendE2EProcessEvents(),
 		waitErr:    make(chan error, 1),
 	}
-	command.Stderr = &process.stderr
 	if err := command.Start(); err != nil {
 		_ = stdoutWrite.Close()
 		_ = stdoutRead.Close()
+		_ = stderrWrite.Close()
+		_ = stderrRead.Close()
 		t.Fatalf("start runtime: %v", err)
 	}
 	// 子进程已持有写端副本，父进程这一份必须立刻关闭，否则读端永远等不到 EOF。
 	if err := stdoutWrite.Close(); err != nil {
 		t.Fatalf("close stdout write end: %v", err)
+	}
+	if err := stderrWrite.Close(); err != nil {
+		t.Fatalf("close stderr write end: %v", err)
 	}
 	t.Cleanup(func() {
 		select {
@@ -155,7 +174,22 @@ func startBackendE2ERuntime(t *testing.T, fixture *backendE2EFixture) *backendE2
 			<-process.waitErr
 		}
 		_ = stdoutRead.Close()
+		_ = stderrRead.Close()
 	})
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			n, err := stderrRead.Read(buffer)
+			if n > 0 {
+				process.stderrMu.Lock()
+				process.stderr.Write(buffer[:n])
+				process.stderrMu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 	go func() {
 		scanner := bufio.NewScanner(stdoutRead)
 		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -191,7 +225,7 @@ func (p *backendE2ERuntimeProcess) waitExit(t *testing.T, timeout time.Duration)
 			return -1
 		}
 	case <-time.After(timeout):
-		t.Fatalf("runtime did not exit within %s after stdin EOF; events=%#v; stderr=%q", timeout, p.events.snapshot(), p.stderr.String())
+		t.Fatalf("runtime did not exit within %s after stdin EOF; events=%#v; stderr=%q", timeout, p.events.snapshot(), p.stderrText())
 		return -1
 	}
 }
@@ -219,7 +253,7 @@ func TestBackendE2E_StdinEOFShutsDownGracefully(t *testing.T) {
 	process.closeStdin(t)
 
 	if code := process.waitExit(t, 30*time.Second); code != 0 {
-		t.Fatalf("runtime exit code = %d, want 0; stderr=%q; events=%#v", code, process.stderr.String(), process.events.snapshot())
+		t.Fatalf("runtime exit code = %d, want 0; stderr=%q; events=%#v", code, process.stderrText(), process.events.snapshot())
 	}
 	process.events.waitFor(t, "stopping_backend state", e2EEventIs("state", protocol.StateStoppingBackend))
 	process.events.waitFor(t, "stopped state", e2EEventIs("state", protocol.StateStopped))
@@ -276,9 +310,53 @@ func TestBackendE2E_StdinEOFWithBrokenStdoutStillExits(t *testing.T) {
 	process.closeStdin(t)
 
 	code := process.waitExit(t, 30*time.Second)
-	t.Logf("runtime exit code with broken stdout = %d; stderr=%q", code, process.stderr.String())
+	t.Logf("runtime exit code with broken stdout = %d; stderr=%q", code, process.stderrText())
 	if code != protocol.ExitCodePreconditionFailed {
-		t.Fatalf("runtime exit code = %d, want %d (OUTPUT_WRITE_FAILED); stderr=%q", code, protocol.ExitCodePreconditionFailed, process.stderr.String())
+		t.Fatalf("runtime exit code = %d, want %d (OUTPUT_WRITE_FAILED); stderr=%q", code, protocol.ExitCodePreconditionFailed, process.stderrText())
+	}
+	waitE2EPIDExit(t, pythonPID)
+	assertE2EBackendClosedGracefully(t, fixture)
+	fixture.assertResourcesReleased(t)
+}
+
+// TestBackendE2E_HostCrashBrokenStdoutStderrStillClosesGracefully 复现桌面 E2E 抓到的真实宿主崩溃
+// 组合：stdout 与 stderr 的读端一起断掉，随后 stdin EOF；而后端收到 close 之后还会先输出
+// 若干行关闭日志、再过一段时间才退出。Runtime 必须让后端走完这段关闭序列（假后端的优雅
+// 标记只在 close → 日志 → 延迟 → server.Shutdown 之后落盘），不能因为写 stdout/stderr
+// 失败就提前收场把后端连 Job 一起杀掉；最后以 OUTPUT_WRITE_FAILED 退出。
+func TestBackendE2E_HostCrashBrokenStdoutStderrStillClosesGracefully(t *testing.T) {
+	const shutdownDelay = 1500 * time.Millisecond
+	fixture := newBackendE2EFixture(t, backendE2EConfig{
+		Events:          e2EOutputEvents("hostcrash"),
+		ShutdownDelayMS: int(shutdownDelay / time.Millisecond),
+		ShutdownEvents: []backendE2EEvent{
+			{Stream: "stdout", Line: "hostcrash shutting down"},
+			{Stream: "stderr", Line: "hostcrash stopping tasks"},
+			{Stream: "stdout", Line: "hostcrash cleanup complete"},
+		},
+	})
+	process := startBackendE2ERuntime(t, fixture)
+	process.events.waitFor(t, "running state", e2EEventIs("state", protocol.StateRunning))
+	pythonPID := waitE2EPIDFile(t, fixture.config.PIDFile)
+
+	// 宿主死了：两条管道的读端同时消失，然后 stdin EOF。
+	if err := process.stdoutRead.Close(); err != nil {
+		t.Fatalf("close stdout read end: %v", err)
+	}
+	if err := process.stderrRead.Close(); err != nil {
+		t.Fatalf("close stderr read end: %v", err)
+	}
+	eofAt := time.Now()
+	process.closeStdin(t)
+
+	code := process.waitExit(t, 30*time.Second)
+	elapsed := time.Since(eofAt)
+	t.Logf("runtime exit code = %d after %s", code, elapsed)
+	if code != protocol.ExitCodePreconditionFailed {
+		t.Fatalf("runtime exit code = %d, want %d (OUTPUT_WRITE_FAILED)", code, protocol.ExitCodePreconditionFailed)
+	}
+	if elapsed < shutdownDelay {
+		t.Fatalf("runtime exited %s after EOF, before the backend's %s shutdown sequence could finish", elapsed, shutdownDelay)
 	}
 	waitE2EPIDExit(t, pythonPID)
 	assertE2EBackendClosedGracefully(t, fixture)

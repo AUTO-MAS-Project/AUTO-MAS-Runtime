@@ -660,12 +660,17 @@ func (s *ManagedSupervisor) streamSink(request Request, logger Logger, gate *str
 		if record.Event == "" && !record.EndOfLine {
 			return nil
 		}
+		// 协议出口写失败只登记 gate 故障，**不能**把错误回给 process 层：
+		// `ManagedProcess.recordSinkError` 对首个 sink 错误的策略是 `job.Terminate(97)`，
+		// 那会在宿主崩溃（stdout 读端已断）时把正在优雅关闭的后端连同进程树一起杀掉，
+		// C13「stdout 已断不影响优雅关闭」的容错根本没机会生效。故障已记在 gate 上，
+		// 监督循环会经 Faulted() 观察到并走关闭收口；这里继续读管道、继续写文件日志。
 		if err := gate.Emit(request.Emitter, protocol.LogEvent{
 			Source:  "backend",
 			Stream:  record.Stream,
 			Message: record.Event,
 		}); err != nil {
-			return err
+			return nil
 		}
 		return nil
 	}

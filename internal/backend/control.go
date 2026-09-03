@@ -1954,12 +1954,18 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	}
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.shutdownTimeout(request))
 	defer cancel()
-	closer := s.deps.HTTP
-	if closer == nil {
-		closer = newLoopbackHTTPCloser(request.Port)
+	var httpErr error
+	graceful := true
+	// 根进程已经自己退出时不再发 /api/core/close（增补 1 C15）：端口此刻可能已经
+	// 被别的进程接手，那一发就打到了别人身上。已退出本就是我们要的结局，直接进清理。
+	if !processAlreadyExited(attempt.process) {
+		closer := s.deps.HTTP
+		if closer == nil {
+			closer = newLoopbackHTTPCloser(request.Port)
+		}
+		httpErr = closer.Close(closeCtx)
+		graceful = httpErr == nil && waitProcessExit(closeCtx, attempt.process)
 	}
-	httpErr := closer.Close(closeCtx)
-	graceful := httpErr == nil && waitProcessExit(closeCtx, attempt.process)
 	cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 	if cleanup.err != nil {
 		if graceful {
@@ -2034,6 +2040,19 @@ func emitForceWarning(emitter EventEmitter, details map[string]any) error {
 		return newError(protocol.CodeOutputWriteFailed, protocol.StageBackendShutdown, "协议 warning 输出失败", nil, err)
 	}
 	return nil
+}
+
+// processAlreadyExited 非阻塞地判断受管根进程是否已经结束。
+func processAlreadyExited(proc ManagedProcess) bool {
+	if proc == nil {
+		return false
+	}
+	select {
+	case <-proc.Exited():
+		return true
+	default:
+		return false
+	}
 }
 
 func waitProcessExit(ctx context.Context, proc ManagedProcess) bool {
