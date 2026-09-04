@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/lock"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
@@ -34,22 +36,30 @@ const (
 	e2eSkipPortMutex   = "BACKEND_E2E_SKIP_PORT_MUTEX"
 	e2eRuntimeHelper   = "BACKEND_E2E_RUNTIME_HELPER"
 	e2eRuntimeSignal   = "BACKEND_E2E_RUNTIME_SIGNAL"
-	e2ePortMutexName   = `Local\AUTO-MAS-RUNTIME-M6-E2E-PORT-36163`
-	e2eOperationID     = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	// e2ePortMutexName 串行化本包的 Windows E2E（含跨进程 helper）；端口按夹具动态探取，
+	// Mutex 只负责限制同时活跃的真实进程树数量，与具体端口无关。
+	e2ePortMutexName = `Local\AUTO-MAS-RUNTIME-M6-E2E-SERIAL`
+	e2eOperationID   = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 )
 
 type backendE2EConfig struct {
-	ListenAddress            string             `json:"listenAddress,omitempty"`
-	PIDFile                  string             `json:"pidFile,omitempty"`
-	GrandchildPIDFile        string             `json:"grandchildPidFile,omitempty"`
-	SpawnGrandchild          bool               `json:"spawnGrandchild,omitempty"`
-	GrandchildLifetimeMS     int                `json:"grandchildLifetimeMs,omitempty"`
-	LeaveGrandchildOnCrash   bool               `json:"leaveGrandchildOnCrash,omitempty"`
-	Health                   []backendE2EHealth `json:"health,omitempty"`
-	CloseStatus              int                `json:"closeStatus,omitempty"`
-	CrashAfterHealthRequests int                `json:"crashAfterHealthRequests,omitempty"`
-	CrashExitCode            int                `json:"crashExitCode,omitempty"`
-	Events                   []backendE2EEvent  `json:"events,omitempty"`
+	ListenAddress             string             `json:"listenAddress,omitempty"`
+	PIDFile                   string             `json:"pidFile,omitempty"`
+	WorkingDirFile            string             `json:"workingDirFile,omitempty"`
+	EnvironmentFile           string             `json:"environmentFile,omitempty"`
+	ShutdownFile              string             `json:"shutdownFile,omitempty"`
+	ShutdownEvents            []backendE2EEvent  `json:"shutdownEvents,omitempty"`
+	ShutdownDelayMS           int                `json:"shutdownDelayMs,omitempty"`
+	GrandchildPIDFile         string             `json:"grandchildPidFile,omitempty"`
+	SpawnGrandchild           bool               `json:"spawnGrandchild,omitempty"`
+	GrandchildLifetimeMS      int                `json:"grandchildLifetimeMs,omitempty"`
+	LeaveGrandchildOnCrash    bool               `json:"leaveGrandchildOnCrash,omitempty"`
+	LeaveGrandchildOnShutdown bool               `json:"leaveGrandchildOnShutdown,omitempty"`
+	Health                    []backendE2EHealth `json:"health,omitempty"`
+	CloseStatus               int                `json:"closeStatus,omitempty"`
+	CrashAfterHealthRequests  int                `json:"crashAfterHealthRequests,omitempty"`
+	CrashExitCode             int                `json:"crashExitCode,omitempty"`
+	Events                    []backendE2EEvent  `json:"events,omitempty"`
 }
 
 type backendE2EHealth struct {
@@ -69,6 +79,7 @@ type backendE2EEvent struct {
 
 type backendE2ERuntimeSignal struct {
 	Root                 string `json:"root"`
+	Port                 int    `json:"port"`
 	AppRoot              string `json:"appRoot"`
 	Repo                 string `json:"repo"`
 	BackendState         string `json:"backendState"`
@@ -238,6 +249,9 @@ type backendE2EFixture struct {
 	repo          string
 	configPath    string
 	rootPID       string
+	workingDir    string
+	environment   string
+	shutdownFile  string
 	grandchildPID string
 	uvExecReady   string
 	uvExecRelease string
@@ -248,6 +262,9 @@ type backendE2EFixture struct {
 	supervisor    *ManagedSupervisor
 	config        backendE2EConfig
 	timerReady    chan *backendE2ETimer
+	// port 是本次夹具探出的空闲端口（增补 1 C12）：E2E 不再依赖 36163 空闲，
+	// 假后端也不再被告知监听地址，只能从 AUTO_MAS_SUPERVISED_PORT 读到它。
+	port int
 }
 
 // backendE2EPIDGeneration 保存一次启动中三个真实进程的同步句柄；句柄
@@ -277,6 +294,34 @@ func (f *backendE2EFixture) captureGeneration(t *testing.T, running protocol.Sta
 		grandchildPID: grandchildPID,
 	}
 	for _, pid := range []uint32{rootPID, pythonPID, grandchildPID} {
+		handle, err := openE2ESyncHandle(pid)
+		if err != nil {
+			if closeErr := generation.close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+			t.Fatalf("OpenProcess(%d) for active generation: %v", pid, err)
+		}
+		generation.handles = append(generation.handles, handle)
+	}
+	return generation
+}
+
+// captureGenerationWithoutGrandchild 与 captureGeneration 相同，但用于没有配置
+// 孙进程的场景：grandchild.pid 永远不会出现，等它只会白白超时。
+func (f *backendE2EFixture) captureGenerationWithoutGrandchild(t *testing.T, running protocol.StateEvent) backendE2EPIDGeneration {
+	t.Helper()
+	rootPID, ok := e2EUint32(running.Details["pid"])
+	if !ok {
+		t.Fatalf("running details pid = %#v, want uint32", running.Details["pid"])
+	}
+	if rootFilePID := waitE2EPIDFile(t, f.rootPID); rootFilePID != rootPID {
+		t.Fatalf("uv root PID file = %d, running state pid = %d", rootFilePID, rootPID)
+	}
+	generation := backendE2EPIDGeneration{
+		rootPID:   rootPID,
+		pythonPID: waitE2EPIDFile(t, f.config.PIDFile),
+	}
+	for _, pid := range []uint32{generation.rootPID, generation.pythonPID} {
 		handle, err := openE2ESyncHandle(pid)
 		if err != nil {
 			if closeErr := generation.close(); closeErr != nil {
@@ -378,8 +423,11 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	if err := copyE2EFile(fakeBackend, developmentPythonPath); err != nil {
 		t.Fatalf("copy fake backend to development venv: %v", err)
 	}
-	configValue.ListenAddress = "127.0.0.1:36163"
+	port := pickE2EFreePort(t)
 	configValue.PIDFile = filepath.Join(root, "python.pid")
+	configValue.WorkingDirFile = filepath.Join(root, "backend.cwd")
+	configValue.EnvironmentFile = filepath.Join(root, "backend.env")
+	configValue.ShutdownFile = filepath.Join(root, "backend.shutdown")
 	configValue.GrandchildPIDFile = filepath.Join(root, "grandchild.pid")
 	rootPIDPath := filepath.Join(root, "uv.pid")
 	uvExecReadyPath := ""
@@ -400,13 +448,17 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 	t.Setenv("UV_DEFAULT_INDEX", "https://must-not-leak.example/simple")
 	t.Setenv("AUTO_MAS_EXPECTED_VERSION", "stale-version")
 	t.Setenv("AUTO_MAS_EXPECTED_COMMIT", "stale-commit")
-	if err := waitE2EPortClosed(t.Context()); err != nil {
-		t.Fatalf("port 36163 is occupied before fixture: %v", err)
+	if err := waitE2EPortClosed(t.Context(), port); err != nil {
+		t.Fatalf("port %d is occupied before fixture: %v", port, err)
 	}
-	if err := assertE2EPortBindable(); err != nil {
-		t.Fatalf("port 36163 cannot bind before fixture: %v", err)
+	if err := assertE2EPortBindable(port); err != nil {
+		t.Fatalf("port %d cannot bind before fixture: %v", port, err)
 	}
-	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now)
+	mirrorPolicy, err := mirror.NewPolicy(mirror.PolicySpec{})
+	if err != nil {
+		t.Fatalf("mirror.NewPolicy() error = %v", err)
+	}
+	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now, mirrorPolicy)
 	if err != nil {
 		t.Fatalf("NewProductionManagedSupervisor() error = %v", err)
 	}
@@ -434,6 +486,9 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		repo:          repo,
 		configPath:    backendConfigPath,
 		rootPID:       rootPIDPath,
+		workingDir:    configValue.WorkingDirFile,
+		environment:   configValue.EnvironmentFile,
+		shutdownFile:  configValue.ShutdownFile,
 		grandchildPID: configValue.GrandchildPIDFile,
 		uvExecReady:   uvExecReadyPath,
 		uvExecRelease: uvExecReleasePath,
@@ -444,7 +499,23 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		supervisor:    supervisor,
 		config:        configValue,
 		timerReady:    timerReady,
+		port:          port,
 	}
+}
+
+// pickE2EFreePort 让内核分配一个空闲端口后立即释放；本机 36163 被正式版 AUTO-MAS 占用，
+// E2E 不得触碰它（增补 1 C12）。
+func pickE2EFreePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(127.0.0.1:0) error = %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close free port probe: %v", err)
+	}
+	return port
 }
 
 func (f *backendE2EFixture) request() Request {
@@ -454,6 +525,7 @@ func (f *backendE2EFixture) request() Request {
 		RuntimePID:         uint32(os.Getpid()),
 		Mode:               ModeDevelopment,
 		DevelopmentRepo:    f.repo,
+		Port:               f.port,
 		Emitter:            f.emitter,
 		Control:            f.mailbox,
 		BeforeShutdown:     f.mailbox.BeforeShutdown,
@@ -463,11 +535,11 @@ func (f *backendE2EFixture) request() Request {
 
 func (f *backendE2EFixture) supervise(ctx context.Context) <-chan error {
 	f.t.Helper()
-	if err := waitE2EPortClosed(ctx); err != nil {
-		f.t.Fatalf("port 36163 is occupied before supervise: %v", err)
+	if err := waitE2EPortClosed(ctx, f.port); err != nil {
+		f.t.Fatalf("port %d is occupied before supervise: %v", f.port, err)
 	}
-	if err := assertE2EPortBindable(); err != nil {
-		f.t.Fatalf("port 36163 cannot bind before supervise: %v", err)
+	if err := assertE2EPortBindable(f.port); err != nil {
+		f.t.Fatalf("port %d cannot bind before supervise: %v", f.port, err)
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -530,6 +602,9 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	if running.Details["pid"] == nil || running.Details["logPath"] == nil {
 		t.Fatalf("running details = %#v, want pid/logPath", running.Details)
 	}
+	if got, want := running.Details["baseUrl"], health.BaseURL(fixture.port); got != want {
+		t.Fatalf("running baseUrl = %#v, want %q derived from the supervised port", got, want)
+	}
 	generation := fixture.captureGeneration(t, running)
 	assertE2ETransactionRunning(t, fixture)
 	assertE2EBackendMutexHeld(t, fixture.layout)
@@ -550,6 +625,14 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 		t.Fatalf("development tree changed: got %#v, want %#v", got, repositorySnapshot)
 	}
 	assertE2EDevelopmentUVEnvironment(t, fixture)
+	assertE2EDevelopmentWorkingDir(t, fixture)
+	assertE2EBackendInfrastructureEnvironment(t, fixture)
+	// 后代随父进程一起退出，属于优雅路径，不得出现强制回收警告。
+	for _, warning := range fixture.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendForceTerminated) {
+			t.Fatalf("graceful lifecycle emitted %s: details=%#v", warning.Code, warning.Details)
+		}
+	}
 	assertE2EStateSequence(t, fixture.emitter.statesSnapshot(), protocol.StateStartingBackend, protocol.StateRunning, protocol.StateStoppingBackend, protocol.StateStopped)
 	assertE2EPersistentLog(t, running, "lifecycle")
 	assertE2ETimelineBefore(t, fixture.emitter, "state:"+string(protocol.StateStartingBackend), "log:lifecycle ")
@@ -576,6 +659,83 @@ func TestBackendE2E_LifecycleSpawnReadyShutdown(t *testing.T) {
 	if !strings.Contains(string(payload), "lifecycle stdout") || !strings.Contains(string(payload), "lifecycle stderr") {
 		t.Fatalf("runtime log = %q, want both stream messages", string(payload))
 	}
+}
+
+// assertE2EDevelopmentWorkingDir 证明 development 的 cwd 仍是 --repo：增补 1 C6
+// 只把 managed 的工作目录改到 app-root，development 一个字节都不能变。
+func assertE2EDevelopmentWorkingDir(t *testing.T, fixture *backendE2EFixture) {
+	t.Helper()
+	waitE2EFile(t, fixture.workingDir)
+	payload, err := os.ReadFile(fixture.workingDir)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", fixture.workingDir, err)
+	}
+	got := filepath.Clean(strings.TrimSpace(string(payload)))
+	if want := filepath.Clean(fixture.repo); got != want {
+		t.Fatalf("development backend cwd = %q, want %q", got, want)
+	}
+	if got == filepath.Clean(fixture.layout.AppRoot()) {
+		t.Fatalf("development backend cwd = %q, want the repo rather than the app root", got)
+	}
+}
+
+// assertE2EBackendInfrastructureEnvironment 证明增补 1 C11 的四个变量确实到达了
+// 真实的后端子进程（fakeuv 之后的那一层），而不只是出现在 Runtime 交给 uv 的
+// StartSpec 里。取值同时与 layout 和 mirror 的 plan 顺序逐项核对。
+func assertE2EBackendInfrastructureEnvironment(t *testing.T, fixture *backendE2EFixture) {
+	t.Helper()
+	waitE2EFile(t, fixture.environment)
+	payload, err := os.ReadFile(fixture.environment)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", fixture.environment, err)
+	}
+	received := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(string(payload), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			t.Fatalf("backend environment line %q is malformed", line)
+		}
+		received[key] = value
+	}
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{})
+	if err != nil {
+		t.Fatalf("mirror.NewPolicy() error = %v", err)
+	}
+	want := map[string]string{
+		"AUTO_MAS_UV_CACHE_DIR":          fixture.layout.UVCacheDir(),
+		"AUTO_MAS_UV_PYTHON_INSTALL_DIR": fixture.layout.PythonDir(),
+		"AUTO_MAS_MIRROR_PACKAGE_INDEX":  e2EMirrorSourceList(t, policy, mirror.KindPackageIndex),
+		"AUTO_MAS_MIRROR_PYTHON":         e2EMirrorSourceList(t, policy, mirror.KindPython),
+	}
+	for key, expected := range want {
+		got, ok := received[key]
+		if !ok {
+			t.Fatalf("backend environment is missing %q; got %#v", key, received)
+		}
+		if got != expected {
+			t.Fatalf("backend environment[%q] = %q, want %q", key, got, expected)
+		}
+	}
+}
+
+func e2EMirrorSourceList(t *testing.T, policy mirror.Policy, kind mirror.Kind) string {
+	t.Helper()
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		t.Fatalf("DefaultCatalog() error = %v", err)
+	}
+	plan, err := mirror.BuildPlan(catalog, policy, kind)
+	if err != nil {
+		t.Fatalf("BuildPlan(%s) error = %v", kind, err)
+	}
+	addresses := make([]string, 0, len(plan.Sources()))
+	for _, source := range plan.Sources() {
+		addresses = append(addresses, source.BaseURL())
+	}
+	return strings.Join(addresses, ";")
 }
 
 func assertE2EDevelopmentUVEnvironment(t *testing.T, fixture *backendE2EFixture) {
@@ -608,6 +768,7 @@ func assertE2EDevelopmentUVEnvironment(t *testing.T, fixture *backendE2EFixture)
 		"UV_PROJECT_ENVIRONMENT":    filepath.Join(fixture.repo, ".venv"),
 		"AUTO_MAS_SUPERVISED":       "1",
 		"AUTO_MAS_RUNTIME_PROTOCOL": "1",
+		"AUTO_MAS_SUPERVISED_PORT":  strconv.Itoa(fixture.port),
 	}
 	for key, want := range wantControlled {
 		if got := record.Environment[key]; got != want {
@@ -623,6 +784,90 @@ func assertE2EDevelopmentUVEnvironment(t *testing.T, fixture *backendE2EFixture)
 		if _, ok := record.Environment[forbidden]; ok {
 			t.Fatalf("uv environment contains forbidden host value %q: %#v", forbidden, record.Environment)
 		}
+	}
+}
+
+// TestBackendE2E_GracefulShutdownDoesNotWarnForceTerminated 复现并锁定一个真机误报：
+// 后端收到 close 后自行退出（exit 0、无残留进程），Runtime 却仍发出
+// BACKEND_FORCE_TERMINATED 并把它带进 result.details.warnings。根因是根进程刚退出时
+// 的进程表过渡态被当成了「有存活后代」，而不是后端真的没关干净。
+func TestBackendE2E_GracefulShutdownDoesNotWarnForceTerminated(t *testing.T) {
+	fixture := newBackendE2EFixture(t, backendE2EConfig{
+		Events: e2EOutputEvents("graceful"),
+	})
+	done := fixture.supervise(t.Context())
+	running := fixture.emitter.waitState(t, protocol.StateRunning, 1)
+	generation := fixture.captureGenerationWithoutGrandchild(t, running)
+	fixture.submitShutdown(t)
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	fixture.emitter.waitState(t, protocol.StateStopped, 1)
+	fixture.assertResourcesReleased(t, &generation)
+	for _, warning := range fixture.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendForceTerminated) {
+			t.Fatalf("graceful shutdown emitted %s: details=%#v", warning.Code, warning.Details)
+		}
+	}
+}
+
+// TestBackendE2E_ShutdownWithSurvivingDescendantWarnsOrphansReaped 是上一条的对照组：
+// 后端优雅退出但故意漏下一个仍在运行的 detached 孙进程。这种情况必须仍然强制回收整棵树，
+// 但按增补 1 C14 报的是 BACKEND_ORPHANS_REAPED（details 列出被回收的孙进程），
+// 而不是冒充 BACKEND_FORCE_TERMINATED——后端主进程本身是自己退出的。
+func TestBackendE2E_ShutdownWithSurvivingDescendantWarnsOrphansReaped(t *testing.T) {
+	fixture := newBackendE2EFixture(t, backendE2EConfig{
+		SpawnGrandchild:           true,
+		GrandchildLifetimeMS:      60_000,
+		LeaveGrandchildOnShutdown: true,
+		Events:                    e2EOutputEvents("surviving"),
+	})
+	done := fixture.supervise(t.Context())
+	running := fixture.emitter.waitState(t, protocol.StateRunning, 1)
+	generation := fixture.captureGeneration(t, running)
+	fixture.submitShutdown(t)
+	if err := <-done; err != nil {
+		t.Fatalf("Supervise() error = %v, want nil", err)
+	}
+	fixture.emitter.waitState(t, protocol.StateStopped, 1)
+	// assertResourcesReleased 会等孙进程退出，证明它确实被 Job 回收了。
+	fixture.assertResourcesReleased(t, &generation)
+	var reaped *protocol.WarningEvent
+	for _, warning := range fixture.emitter.warningsSnapshot() {
+		if warning.Code == string(protocol.CodeBackendForceTerminated) {
+			t.Fatalf("warnings = %#v, want no %s: the backend exited on its own", fixture.emitter.warningsSnapshot(), protocol.CodeBackendForceTerminated)
+		}
+		if warning.Code == string(protocol.CodeBackendOrphansReaped) {
+			clone := warning
+			reaped = &clone
+		}
+	}
+	if reaped == nil {
+		t.Fatalf("warnings = %#v, want %s for a surviving descendant", fixture.emitter.warningsSnapshot(), protocol.CodeBackendOrphansReaped)
+	}
+	orphans, ok := reaped.Details["orphans"].([]map[string]any)
+	if !ok || len(orphans) == 0 {
+		t.Fatalf("orphans warning details = %#v, want an orphans list", reaped.Details)
+	}
+	if count, ok := e2EUint32(reaped.Details["orphanCount"]); !ok || int(count) != len(orphans) {
+		t.Fatalf("orphanCount = %#v, want %d", reaped.Details["orphanCount"], len(orphans))
+	}
+	found := false
+	for _, orphan := range orphans {
+		pid, ok := e2EUint32(orphan["pid"])
+		executable, _ := orphan["executable"].(string)
+		if ok && pid == generation.grandchildPID {
+			found = true
+			if !strings.EqualFold(filepath.Base(executable), "python.exe") {
+				t.Fatalf("orphan executable = %q, want the fake backend image python.exe", executable)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("orphans = %#v, want the surviving grandchild pid %d", orphans, generation.grandchildPID)
+	}
+	if reaped.Details["orphansTruncated"] != false {
+		t.Fatalf("orphansTruncated = %#v, want false", reaped.Details["orphansTruncated"])
 	}
 }
 
@@ -698,7 +943,7 @@ func TestBackendE2E_FirstCrashRestartSuccess(t *testing.T) {
 	generation1 := fixture.captureGeneration(t, running1)
 	assertE2ETransactionRunning(t, fixture)
 	assertE2EBackendMutexHeld(t, fixture.layout)
-	triggerE2ECrash(t)
+	triggerE2ECrash(t, fixture.port)
 	fixture.emitter.waitState(t, protocol.StateRestarting, 1)
 	fixture.config.CrashAfterHealthRequests = 0
 	fixture.config.Events = e2EOutputEvents("first-restart")
@@ -739,14 +984,14 @@ func TestBackendE2E_SecondCrashTerminates(t *testing.T) {
 	done := fixture.supervise(t.Context())
 	running1 := fixture.emitter.waitState(t, protocol.StateRunning, 1)
 	generation1 := fixture.captureGeneration(t, running1)
-	triggerE2ECrash(t)
+	triggerE2ECrash(t, fixture.port)
 	fixture.emitter.waitState(t, protocol.StateRestarting, 1)
 	fixture.config.Events = e2EOutputEvents("second-restart")
 	writeE2EConfig(t, fixture.configPath, fixture.config)
 	fixture.waitRestartTimer(t).Fire()
 	running2 := fixture.emitter.waitState(t, protocol.StateRunning, 2)
 	generation2 := fixture.captureGeneration(t, running2)
-	triggerE2ECrash(t)
+	triggerE2ECrash(t, fixture.port)
 	err := <-done
 	assertBackendCode(t, err, protocol.CodeBackendExitedUnexpectedly)
 	if got := countE2EStates(fixture.emitter.statesSnapshot(), protocol.StateRunning); got != 2 {
@@ -788,6 +1033,11 @@ func TestBackendE2E_ForcedShutdownReapsTree(t *testing.T) {
 	warnings := fixture.emitter.warningsSnapshot()
 	if len(warnings) == 0 || warnings[len(warnings)-1].Code != string(protocol.CodeBackendForceTerminated) {
 		t.Fatalf("warnings = %#v, want BACKEND_FORCE_TERMINATED", warnings)
+	}
+	for _, warning := range warnings {
+		if warning.Code == string(protocol.CodeBackendOrphansReaped) {
+			t.Fatalf("warnings = %#v, want no orphans warning when the root itself was force-killed", warnings)
+		}
 	}
 	fixture.assertResourcesReleased(t, &generation)
 	assertE2EStateSequence(t, fixture.emitter.statesSnapshot(), protocol.StateStartingBackend, protocol.StateRunning, protocol.StateStoppingBackend, protocol.StateStopped)
@@ -863,7 +1113,7 @@ func TestBackendE2E_RuntimeTerminationLeavesNoDescendants(t *testing.T) {
 		t.Fatal("runtime helper exited successfully, want TerminateProcess interruption")
 	}
 	waitE2EHandles(t, runtimeHandles)
-	if err := waitE2EPortClosed(t.Context()); err != nil {
+	if err := waitE2EPortClosed(t.Context(), signal.Port); err != nil {
 		t.Fatalf("port after runtime termination: %v", err)
 	}
 	if payload, err := os.ReadFile(signal.BackendState); err != nil {
@@ -888,7 +1138,11 @@ func TestBackendE2E_RuntimeTerminationLeavesNoDescendants(t *testing.T) {
 	// 并在正常关闭时删除它。
 	t.Setenv(e2eFakeBackendEnv, filepath.Join(signal.Root, "backend-config.json"))
 	t.Setenv(e2eFakeUVConfigEnv, filepath.Join(signal.Root, "uv-config.json"))
-	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now)
+	recoveryPolicy, err := mirror.NewPolicy(mirror.PolicySpec{})
+	if err != nil {
+		t.Fatalf("mirror.NewPolicy() error = %v", err)
+	}
+	supervisor, err := NewProductionManagedSupervisor(t.Context(), layout, io.Discard, time.Now, recoveryPolicy)
 	if err != nil {
 		t.Fatalf("NewProductionManagedSupervisor(recovery) error = %v", err)
 	}
@@ -908,6 +1162,7 @@ func TestBackendE2E_RuntimeTerminationLeavesNoDescendants(t *testing.T) {
 			RuntimePID:         uint32(os.Getpid()),
 			Mode:               ModeDevelopment,
 			DevelopmentRepo:    signal.Repo,
+			Port:               signal.Port,
 			Emitter:            emitter,
 			Control:            mailbox,
 			BeforeShutdown:     mailbox.BeforeShutdown,
@@ -921,7 +1176,7 @@ func TestBackendE2E_RuntimeTerminationLeavesNoDescendants(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("recovery supervisor error = %v", err)
 	}
-	recovery := &backendE2EFixture{layout: layout, grandchildPID: signal.GrandchildPID}
+	recovery := &backendE2EFixture{layout: layout, grandchildPID: signal.GrandchildPID, port: signal.Port}
 	recovery.assertResourcesReleased(t)
 }
 
@@ -945,6 +1200,7 @@ func runBackendE2ERuntimeHelper(t *testing.T) {
 	}
 	payload, err := json.Marshal(backendE2ERuntimeSignal{
 		Root:                 fixture.root,
+		Port:                 fixture.port,
 		AppRoot:              fixture.appRoot,
 		Repo:                 fixture.repo,
 		BackendState:         fixture.layout.BackendStateFile(),
@@ -978,7 +1234,7 @@ func TestBackendE2E_DescendantHoldingPipeCannotBlockCleanup(t *testing.T) {
 	generation1 := fixture.captureGeneration(t, running1)
 	assertE2ETransactionRunning(t, fixture)
 	crashStarted := time.Now()
-	triggerE2ECrash(t)
+	triggerE2ECrash(t, fixture.port)
 	waitE2EFile(t, fixture.uvExecReady)
 	if result, err := windows.WaitForSingleObject(generation1.handles[0], 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
 		t.Fatalf("uv root during descendant cleanup = result %d, err %v, want WAIT_TIMEOUT", result, err)
@@ -1180,7 +1436,7 @@ func (f *backendE2EFixture) assertResourcesReleased(t *testing.T, generations ..
 	} else if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ReadDir(%q) error = %v", f.layout.StateDir(), err)
 	}
-	if err := assertE2EPortClosed(); err != nil {
+	if err := assertE2EPortClosed(f.port); err != nil {
 		t.Fatal(err)
 	}
 	if payload, err := os.ReadFile(f.grandchildPID); err == nil {
@@ -1309,18 +1565,22 @@ func assertE2EBackendMutexHeld(t *testing.T, layout *config.Layout) {
 	}
 }
 
-func assertE2EPortClosed() error {
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:36163", 200*time.Millisecond)
+func e2EPortAddress(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+func assertE2EPortClosed(port int) error {
+	conn, err := net.DialTimeout("tcp", e2EPortAddress(port), 200*time.Millisecond)
 	if err == nil {
-		return errors.Join(errors.New("backend port 36163 still accepts connections"), conn.Close())
+		return errors.Join(fmt.Errorf("backend port %d still accepts connections", port), conn.Close())
 	}
 	return nil
 }
 
-func assertE2EPortBindable() error {
-	listener, err := net.Listen("tcp4", "127.0.0.1:36163")
+func assertE2EPortBindable(port int) error {
+	listener, err := net.Listen("tcp4", e2EPortAddress(port))
 	if err != nil {
-		return fmt.Errorf("bind/listen 127.0.0.1:36163: %w", err)
+		return fmt.Errorf("bind/listen %s: %w", e2EPortAddress(port), err)
 	}
 	if err := listener.Close(); err != nil {
 		return fmt.Errorf("close bind/listen probe: %w", err)
@@ -1328,7 +1588,7 @@ func assertE2EPortBindable() error {
 	return nil
 }
 
-func waitE2EPortClosed(ctx context.Context) error {
+func waitE2EPortClosed(ctx context.Context, port int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1337,14 +1597,14 @@ func waitE2EPortClosed(ctx context.Context) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if err := assertE2EPortClosed(); err == nil {
+		if err := assertE2EPortClosed(port); err == nil {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return errors.New("backend port 36163 remained occupied")
+			return fmt.Errorf("backend port %d remained occupied", port)
 		case <-ticker.C:
 		}
 	}
@@ -1520,12 +1780,12 @@ func e2EExitCode(value any) (int, bool) {
 	}
 }
 
-func triggerE2ECrash(t *testing.T) {
+func triggerE2ECrash(t *testing.T, port int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	for request := 0; request < 20; request++ {
-		if err := triggerE2EHealthRequest(ctx); err != nil {
+		if err := triggerE2EHealthRequest(ctx, port); err != nil {
 			// 连接被重置/拒绝表示假后端已越过崩溃阈值；随后状态断言
 			// 负责证明生命周期确实完成了退出。
 			return
@@ -1534,9 +1794,9 @@ func triggerE2ECrash(t *testing.T) {
 	t.Fatalf("fake backend did not exit after 20 health requests")
 }
 
-func triggerE2EHealthRequest(ctx context.Context) error {
+func triggerE2EHealthRequest(ctx context.Context, port int) error {
 	client := &net.Dialer{Timeout: time.Second}
-	conn, err := client.DialContext(ctx, "tcp", "127.0.0.1:36163")
+	conn, err := client.DialContext(ctx, "tcp", e2EPortAddress(port))
 	if err != nil {
 		return err
 	}

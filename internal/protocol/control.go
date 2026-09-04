@@ -68,18 +68,22 @@ type ControlWarningEmitter interface {
 // ControlReader 读取并分派以换行符分隔的 stdin 控制命令。
 type ControlReader struct {
 	// mu 保护一次性运行状态和 commandId 去重账本，同时串行化 prepare、action 与 warning。
-	mu       sync.Mutex
-	started  bool
-	stopped  bool
-	input    *bufio.Reader
-	read     *controlReadTracker
-	warnings ControlWarningEmitter
-	handler  ControlHandler
-	allowed  map[ControlKind]struct{}
-	seen     map[string]ControlKind
-	order    [controlLedgerCapacity]string
-	next     int
-	size     int
+	mu      sync.Mutex
+	started bool
+	stopped bool
+	// inputClosed 记录 Run 是否因输入到达 EOF 而结束；被 StopAccepting 或 ctx 终止时
+	// 保持 false。backend supervise 据此把宿主断开解释为隐式 shutdown（增补 1 C13），
+	// 其他命令不读它，Run 的返回值也不因此改变。
+	inputClosed bool
+	input       *bufio.Reader
+	read        *controlReadTracker
+	warnings    ControlWarningEmitter
+	handler     ControlHandler
+	allowed     map[ControlKind]struct{}
+	seen        map[string]ControlKind
+	order       [controlLedgerCapacity]string
+	next        int
+	size        int
 }
 
 // NewControlReader 构造带输入与去重上限的 stdin 控制读取器。
@@ -167,6 +171,7 @@ func (r *ControlReader) Run(ctx context.Context) error {
 			return fmt.Errorf("read stdin control: %w", err)
 		}
 		if !hasLine {
+			r.inputClosed = true
 			r.mu.Unlock()
 			return nil
 		}
@@ -191,11 +196,12 @@ func (r *ControlReader) Run(ctx context.Context) error {
 				return err
 			}
 		}
-		r.mu.Unlock()
-
 		if reachedEOF {
+			r.inputClosed = true
+			r.mu.Unlock()
 			return nil
 		}
+		r.mu.Unlock()
 	}
 }
 
@@ -205,6 +211,14 @@ func (r *ControlReader) StopAccepting() {
 	r.mu.Lock()
 	r.stopped = true
 	r.mu.Unlock()
+}
+
+// InputClosed 报告 Run 是否因输入到达 EOF 而结束。
+// 因 StopAccepting 或 ctx 取消结束时返回 false；Run 之前恒为 false。
+func (r *ControlReader) InputClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inputClosed
 }
 
 func (r *ControlReader) readPhysicalLine() (

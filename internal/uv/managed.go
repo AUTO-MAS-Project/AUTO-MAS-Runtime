@@ -3,6 +3,9 @@ package uv
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
@@ -15,10 +18,28 @@ type SupervisionIdentity struct {
 	Commit  string
 }
 
+// SupervisionInfrastructure 描述按增补 1 C11 下发给后端的受管基础设施事实。
+//
+// 四项在 managed 与 development 两种模式下都会被注入。两个目录留空时回退到本次
+// uv 调用实际解析出的受管目录，保证下发值与 UV_CACHE_DIR / UV_PYTHON_INSTALL_DIR
+// 永远同源——C11 要的是「共用一份缓存与一份解释器」，两者一旦分叉契约即失效。
+// 两个源列表按 Runtime 解析后的尝试顺序排列，空切片对应 --offline 的空串注入。
+type SupervisionInfrastructure struct {
+	UVCacheDir          string
+	PythonInstallDir    string
+	PackageIndexSources []string
+	PythonSources       []string
+}
+
 // ManagedOptions 把通用 uv 选项与长驻监督身份策略分开，避免调用方直接拼受控环境键。
 type ManagedOptions struct {
 	RunOptions
-	Identity *SupervisionIdentity
+	Identity       *SupervisionIdentity
+	Infrastructure SupervisionInfrastructure
+	// Port 是按增补 1 C12 注入的受监督后端端口（AUTO_MAS_SUPERVISED_PORT）。
+	// 为零时不注入：本包是通用启动器，不替调用方决定端口；backend 保证任何模式
+	// 都传非零值。非零但越界在 spawn 之前失败关闭。
+	Port int
 }
 
 // StartManaged 复用 UVRunner 的路径与环境策略启动长驻 uv，且不提供普通 exec 降级。
@@ -68,6 +89,31 @@ func (r *UVRunner) StartManaged(
 		supervision[autoMASVersion] = options.Identity.Version
 		supervision[autoMASCommit] = options.Identity.Commit
 	}
+	infrastructure, err := resolveSupervisionInfrastructure(resolved, options.Infrastructure)
+	if err != nil {
+		return nil, newError(
+			protocol.CodeUVExecFailed,
+			options.Stage,
+			"uv 执行失败",
+			map[string]any{},
+			err,
+		)
+	}
+	for key, value := range infrastructure {
+		supervision[key] = value
+	}
+	if options.Port != 0 {
+		if err := validateSupervisedPort(options.Port); err != nil {
+			return nil, newError(
+				protocol.CodeUVExecFailed,
+				options.Stage,
+				"uv 执行失败",
+				map[string]any{},
+				err,
+			)
+		}
+		supervision[autoMASSupervisedPort] = strconv.Itoa(options.Port)
+	}
 	if err := validateRunnerPaths(resolved); err != nil {
 		return nil, newError(
 			protocol.CodeUVExecFailed,
@@ -80,7 +126,7 @@ func (r *UVRunner) StartManaged(
 	managed, err := process.StartManaged(ctx, process.StartSpec{
 		Executable: r.Executable,
 		Args:       append([]string(nil), args...),
-		Dir:        resolved.ProjectDir,
+		Dir:        resolved.WorkingDir,
 		Env:        buildEnvironmentWithSupervision(resolved, supervision),
 		Sink:       sink,
 	})
@@ -97,6 +143,77 @@ func (r *UVRunner) StartManaged(
 		)
 	}
 	return managed, nil
+}
+
+// resolveSupervisionInfrastructure 把 C11 的四个受控键解析成最终注入值。
+//
+// 目录必须是绝对路径并被规范化；源列表逐项校验后用 `;` 连接，空列表得到空串
+// 但键仍然存在（契约表两列都是「必填」，空串是合法取值、缺键不是）。
+func resolveSupervisionInfrastructure(
+	resolved resolvedRunOptions,
+	requested SupervisionInfrastructure,
+) (map[string]string, error) {
+	cacheDir := requested.UVCacheDir
+	if cacheDir == "" {
+		cacheDir = resolved.CacheDir
+	}
+	pythonInstallDir := requested.PythonInstallDir
+	if pythonInstallDir == "" {
+		pythonInstallDir = resolved.PythonInstallDir
+	}
+	cleanCacheDir, err := canonicalSupervisionDirectory(cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve supervised uv cache directory: %w", err)
+	}
+	cleanPythonInstallDir, err := canonicalSupervisionDirectory(pythonInstallDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve supervised python install directory: %w", err)
+	}
+	packageIndex, err := joinSupervisionMirrorSources(requested.PackageIndexSources)
+	if err != nil {
+		return nil, fmt.Errorf("resolve supervised package index sources: %w", err)
+	}
+	python, err := joinSupervisionMirrorSources(requested.PythonSources)
+	if err != nil {
+		return nil, fmt.Errorf("resolve supervised python sources: %w", err)
+	}
+	return map[string]string{
+		autoMASUVCacheDir:         cleanCacheDir,
+		autoMASUVPythonInstallDir: cleanPythonInstallDir,
+		autoMASMirrorPackageIndex: packageIndex,
+		autoMASMirrorPython:       python,
+	}, nil
+}
+
+func canonicalSupervisionDirectory(path string) (string, error) {
+	if path == "" || strings.ContainsRune(path, '\x00') {
+		return "", errors.New("supervised directory is invalid")
+	}
+	cleaned := filepath.Clean(path)
+	if !filepath.IsAbs(cleaned) {
+		return "", errors.New("supervised directory must be absolute")
+	}
+	return cleaned, nil
+}
+
+func joinSupervisionMirrorSources(sources []string) (string, error) {
+	for _, source := range sources {
+		if source == "" || strings.ContainsRune(source, '\x00') {
+			return "", errors.New("supervised mirror source is empty")
+		}
+		if strings.Contains(source, mirrorSourceSeparator) {
+			return "", errors.New("supervised mirror source must not contain the list separator")
+		}
+	}
+	return strings.Join(sources, mirrorSourceSeparator), nil
+}
+
+// validateSupervisedPort 校验增补 1 C12 的端口范围；十进制无前导零由 strconv.Itoa 保证。
+func validateSupervisedPort(port int) error {
+	if port < minSupervisedPort || port > maxSupervisedPort {
+		return fmt.Errorf("supervised port %d is out of range %d-%d", port, minSupervisedPort, maxSupervisedPort)
+	}
+	return nil
 }
 
 func validateSupervisionIdentity(identity SupervisionIdentity) error {

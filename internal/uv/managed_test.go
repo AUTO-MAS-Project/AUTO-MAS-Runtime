@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -72,6 +74,81 @@ func TestManaged_UsesRunnerEnvironmentAndArguments(t *testing.T) {
 	}
 	if len(records) == 0 {
 		t.Fatal("managed runner did not drain process output")
+	}
+}
+
+// TestManaged_WorkingDirOverridesProjectDir 证明 C6 的显式工作目录字段：
+// 受管子进程的 cwd 由 WorkingDir 决定，而不再固定跟随 ProjectDir。
+func TestManaged_WorkingDirOverridesProjectDir(t *testing.T) {
+	runner := newTestRunner(t)
+	workingDir := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "managed-workingdir-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			WorkingDir:  workingDir,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result, err := managed.Wait(ctx)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Wait() = %#v, %v, want exit 0", result, err)
+	}
+	if err := managed.WaitEmpty(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := readTestRecord(t, recordPath)
+	if got, want := record["cwd"], filepath.Clean(workingDir); got != want {
+		t.Fatalf("child cwd = %q, want %q", got, want)
+	}
+	if got := record["cwd"]; got == filepath.Clean(runner.ProjectDir) {
+		t.Fatalf("child cwd = %q, want a directory other than the project dir", got)
+	}
+}
+
+// TestManaged_WorkingDirDefaultsToProjectDir 锁定 development 的既有行为：
+// 不传 WorkingDir 时 cwd 必须仍是 ProjectDir。
+func TestManaged_WorkingDirDefaultsToProjectDir(t *testing.T) {
+	runner := newTestRunner(t)
+	projectDir := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "managed-default-workingdir-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			ProjectDir:  projectDir,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result, err := managed.Wait(ctx)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Wait() = %#v, %v, want exit 0", result, err)
+	}
+	if err := managed.WaitEmpty(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := readTestRecord(t, recordPath)
+	if got, want := record["cwd"], filepath.Clean(projectDir); got != want {
+		t.Fatalf("child cwd = %q, want %q", got, want)
 	}
 }
 
@@ -315,5 +392,307 @@ func TestManaged_StartFailureIncludesStableDiagnostics(t *testing.T) {
 	}
 	if _, ok := details["windowsError"]; !ok {
 		t.Fatalf("StartManaged() details = %#v, want windowsError", details)
+	}
+}
+
+// TestManaged_InjectsInfrastructureAndMirrorSources 锁定增补 1 C11 的四个注入变量：
+// 两个目录是规范化绝对路径且与 uv 自己使用的目录同源，两个镜像列表按 `;` 保序。
+func TestManaged_InjectsInfrastructureAndMirrorSources(t *testing.T) {
+	runner := newTestRunner(t)
+	packageIndex := []string{
+		"https://mirrors.aliyun.com/pypi/simple/",
+		"https://pypi.tuna.tsinghua.edu.cn/simple/",
+		"https://pypi.org/simple/",
+	}
+	pythonSources := []string{
+		"https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download",
+		"https://github.com/astral-sh/python-build-standalone/releases/download",
+	}
+	recordPath := filepath.Join(t.TempDir(), "managed-infrastructure-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+		Infrastructure: SupervisionInfrastructure{
+			// 刻意传未清理的形态，证明注入值经过 filepath.Clean。
+			UVCacheDir:          filepath.Join(runner.CacheDir, "sub", ".."),
+			PythonInstallDir:    runner.PythonInstallDir,
+			PackageIndexSources: packageIndex,
+			PythonSources:       pythonSources,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	for key, want := range map[string]string{
+		autoMASUVCacheDir:         filepath.Clean(runner.CacheDir),
+		autoMASUVPythonInstallDir: filepath.Clean(runner.PythonInstallDir),
+		autoMASMirrorPackageIndex: strings.Join(packageIndex, ";"),
+		autoMASMirrorPython:       strings.Join(pythonSources, ";"),
+	} {
+		if got := record[key]; got != want {
+			t.Errorf("environment[%q] = %q, want %q", key, got, want)
+		}
+	}
+	// C11 的目的是「共用一份缓存与一份解释器」：下发值一旦与 uv 自己用的目录
+	// 分叉，这条契约就名存实亡，因此把等式本身锁进测试。
+	if record[autoMASUVCacheDir] != record[uvCacheDirEnv] {
+		t.Errorf("AUTO_MAS_UV_CACHE_DIR = %q, want the same value as UV_CACHE_DIR %q",
+			record[autoMASUVCacheDir], record[uvCacheDirEnv])
+	}
+	if record[autoMASUVPythonInstallDir] != record[uvPythonInstallDirEnv] {
+		t.Errorf("AUTO_MAS_UV_PYTHON_INSTALL_DIR = %q, want the same value as UV_PYTHON_INSTALL_DIR %q",
+			record[autoMASUVPythonInstallDir], record[uvPythonInstallDirEnv])
+	}
+	if got := strings.Split(record[autoMASMirrorPackageIndex], ";"); !slices.Equal(got, packageIndex) {
+		t.Errorf("package index sources = %#v, want %#v in plan order", got, packageIndex)
+	}
+}
+
+// TestManaged_InjectsEmptyMirrorListsWhenOffline 锁定 --offline 的取值形态：
+// 键必须存在且为空串，而不是缺席——契约表两列都写「必填」。
+func TestManaged_InjectsEmptyMirrorListsWhenOffline(t *testing.T) {
+	runner := newTestRunner(t)
+	recordPath := filepath.Join(t.TempDir(), "managed-offline-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+		Infrastructure: SupervisionInfrastructure{
+			UVCacheDir:       runner.CacheDir,
+			PythonInstallDir: runner.PythonInstallDir,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	for _, key := range []string{autoMASMirrorPackageIndex, autoMASMirrorPython} {
+		value, ok := record[key]
+		if !ok {
+			t.Errorf("environment is missing %q, want the key with an empty value", key)
+			continue
+		}
+		if value != "" {
+			t.Errorf("environment[%q] = %q, want an empty string", key, value)
+		}
+	}
+}
+
+// TestManaged_InfrastructureKeysAreControlled 证明四个键属于受控监督集合：
+// 宿主与 RunOptions.Environment 里的同名项（含大小写变体）都被清除并被受控值覆盖。
+func TestManaged_InfrastructureKeysAreControlled(t *testing.T) {
+	runner := newTestRunner(t)
+	t.Setenv(autoMASUVCacheDir, `C:\host\stale-cache`)
+	t.Setenv(autoMASMirrorPackageIndex, "https://host.example/simple/")
+	recordPath := filepath.Join(t.TempDir(), "managed-controlled-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage: protocol.StageBackendSpawn,
+			Environment: map[string]string{
+				"FAKE_UV_RECORD":                           recordPath,
+				strings.ToLower(autoMASUVCacheDir):         `C:\option\stale-cache`,
+				strings.ToLower(autoMASUVPythonInstallDir): `C:\option\stale-python`,
+				autoMASMirrorPackageIndex:                  "https://option.example/simple/",
+				autoMASMirrorPython:                        "https://option.example/python",
+			},
+		},
+		Infrastructure: SupervisionInfrastructure{
+			UVCacheDir:          runner.CacheDir,
+			PythonInstallDir:    runner.PythonInstallDir,
+			PackageIndexSources: []string{"https://pypi.org/simple/"},
+			PythonSources:       []string{"https://github.com/astral-sh/python-build-standalone/releases/download"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	for key, want := range map[string]string{
+		autoMASUVCacheDir:         filepath.Clean(runner.CacheDir),
+		autoMASUVPythonInstallDir: filepath.Clean(runner.PythonInstallDir),
+		autoMASMirrorPackageIndex: "https://pypi.org/simple/",
+		autoMASMirrorPython:       "https://github.com/astral-sh/python-build-standalone/releases/download",
+	} {
+		if got := record[key]; got != want {
+			t.Errorf("environment[%q] = %q, want the controlled value %q", key, got, want)
+		}
+	}
+	for key := range record {
+		if strings.EqualFold(key, autoMASUVCacheDir) && key != autoMASUVCacheDir {
+			t.Errorf("environment contains case variant %q of a controlled supervision key", key)
+		}
+	}
+}
+
+// TestManaged_InfrastructureFallsBackToResolvedDirectories 证明调用方不传目录时
+// 回退到本次 uv 调用实际解析出的受管目录，而不是留空破坏契约。
+func TestManaged_InfrastructureFallsBackToResolvedDirectories(t *testing.T) {
+	runner := newTestRunner(t)
+	overrideCache := t.TempDir()
+	overridePython := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "managed-fallback-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:            protocol.StageBackendSpawn,
+			CacheDir:         overrideCache,
+			PythonInstallDir: overridePython,
+			Environment:      map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	if got, want := record[autoMASUVCacheDir], filepath.Clean(overrideCache); got != want {
+		t.Errorf("AUTO_MAS_UV_CACHE_DIR = %q, want the resolved cache dir %q", got, want)
+	}
+	if got, want := record[autoMASUVPythonInstallDir], filepath.Clean(overridePython); got != want {
+		t.Errorf("AUTO_MAS_UV_PYTHON_INSTALL_DIR = %q, want the resolved python install dir %q", got, want)
+	}
+}
+
+// TestManaged_RejectsInvalidInfrastructure 覆盖失败关闭：相对目录与含 `;` 的源
+// 都在 spawn 之前被拒绝，绝不下发一个调用方无法正确切分的列表。
+func TestManaged_RejectsInvalidInfrastructure(t *testing.T) {
+	tests := []struct {
+		name           string
+		infrastructure SupervisionInfrastructure
+	}{
+		{
+			name:           "relative cache dir",
+			infrastructure: SupervisionInfrastructure{UVCacheDir: `relative\cache`},
+		},
+		{
+			name:           "relative python install dir",
+			infrastructure: SupervisionInfrastructure{PythonInstallDir: `relative\python`},
+		},
+		{
+			name: "package index source contains separator",
+			infrastructure: SupervisionInfrastructure{
+				PackageIndexSources: []string{"https://mirror.example/simple/;https://other.example/simple/"},
+			},
+		},
+		{
+			name:           "python source is empty",
+			infrastructure: SupervisionInfrastructure{PythonSources: []string{""}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newTestRunner(t)
+			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+				RunOptions:     RunOptions{Stage: protocol.StageBackendSpawn},
+				Infrastructure: test.infrastructure,
+			}, nil)
+			if managed != nil || err == nil {
+				t.Fatalf("StartManaged() = %#v, %v, want validation error", managed, err)
+			}
+		})
+	}
+}
+
+func waitManagedProcess(t *testing.T, managed *process.ManagedProcess) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result, err := managed.Wait(ctx)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("Wait() = %#v, %v, want exit 0", result, err)
+	}
+	if err := managed.WaitEmpty(ctx); err != nil {
+		t.Fatalf("WaitEmpty() error = %v", err)
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// TestManaged_InjectsSupervisedPort 锁定增补 1 C12：端口以十进制注入
+// AUTO_MAS_SUPERVISED_PORT，且该键属于受控监督集合——宿主与 RunOptions.Environment
+// 里的同名项（含大小写变体）都被清除并被受控值覆盖。
+func TestManaged_InjectsSupervisedPort(t *testing.T) {
+	runner := newTestRunner(t)
+	t.Setenv(autoMASSupervisedPort, "1111")
+	recordPath := filepath.Join(t.TempDir(), "managed-port-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage: protocol.StageBackendSpawn,
+			Environment: map[string]string{
+				"FAKE_UV_RECORD":                       recordPath,
+				strings.ToLower(autoMASSupervisedPort): "2222",
+			},
+		},
+		Port: 36164,
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	if got := record[autoMASSupervisedPort]; got != "36164" {
+		t.Errorf("environment[%q] = %q, want %q", autoMASSupervisedPort, got, "36164")
+	}
+	for key := range record {
+		if strings.EqualFold(key, autoMASSupervisedPort) && key != autoMASSupervisedPort {
+			t.Errorf("environment contains case variant %q of the supervised port key", key)
+		}
+	}
+}
+
+// TestManaged_OmitsSupervisedPortWhenUnset 证明零值不注入：internal/uv 是通用启动器，
+// 不替调用方决定端口；backend 保证任何模式都传非零值，由它自己的单测锁定。
+func TestManaged_OmitsSupervisedPortWhenUnset(t *testing.T) {
+	runner := newTestRunner(t)
+	t.Setenv(autoMASSupervisedPort, "1111")
+	recordPath := filepath.Join(t.TempDir(), "managed-no-port-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{
+		"-test.run=^TestFakeUVProcess$",
+	}, ManagedOptions{
+		RunOptions: RunOptions{
+			Stage:       protocol.StageBackendSpawn,
+			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	if value, ok := record[autoMASSupervisedPort]; ok {
+		t.Errorf("environment[%q] = %q, want the key absent (host value must not leak either)", autoMASSupervisedPort, value)
+	}
+}
+
+// TestManaged_RejectsInvalidSupervisedPort 覆盖失败关闭：越界端口在 spawn 之前被拒绝。
+func TestManaged_RejectsInvalidSupervisedPort(t *testing.T) {
+	for _, port := range []int{1023, 65536, -1} {
+		t.Run(strconv.Itoa(port), func(t *testing.T) {
+			runner := newTestRunner(t)
+			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+				RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
+				Port:       port,
+			}, nil)
+			if managed != nil || err == nil {
+				t.Fatalf("StartManaged() = %#v, %v, want validation error", managed, err)
+			}
+		})
 	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol/contracttest"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -108,6 +109,7 @@ func m5ContractRunner(command string, stage protocol.Stage, arguments ...string)
 			t.Errorf("exit code = %d, want %d; stderr=%q", code, wantExit, stderr.String())
 		}
 		assertM5ContractStage(t, terminal, stage, stdout.String())
+		assertM5ContractMirrorDetails(t, terminal, command, stdout.String())
 		return contracttest.Transcript{Stdout: stdout.Bytes()}
 	}
 }
@@ -124,6 +126,57 @@ func m5ContractInitialState(command string) state.EnvironmentState {
 				Commit:  "0123456789abcdef0123456789abcdef01234567",
 			},
 		}
+	}
+}
+
+// assertM5ContractMirrorDetails 锁定 C10 第 7 条：凡是执行了 uv sync 的命令，
+// 成功 result.details 都必须报告包索引源与尝试次数，字段名与类型不得漂移。
+// bootstrap 与 repair 同样跑 SyncDependencies，调用方没有理由在这两条路径上
+// 看不到本次实际使用的镜像源。
+func assertM5ContractMirrorDetails(
+	t *testing.T,
+	terminal contracttest.Terminal,
+	command string,
+	output string,
+) {
+	t.Helper()
+	if terminal != contracttest.TerminalSuccess || !m5CommandReportsMirrorSource(command) {
+		return
+	}
+	events := parseNDJSON(t, output)
+	for _, event := range events {
+		if eventType(event) != string(protocol.TypeResult) {
+			continue
+		}
+		details, ok := event.object["details"].(map[string]any)
+		if !ok {
+			t.Fatalf("result details = %#v, want object", event.object["details"])
+		}
+		if got, ok := details["sourceKind"].(string); !ok || got != mirror.KindPackageIndex.String() {
+			t.Errorf("result details[sourceKind] = %#v, want %q", details["sourceKind"], mirror.KindPackageIndex)
+		}
+		if _, ok := details["source"].(string); !ok {
+			t.Errorf("result details[source] = %#v, want string", details["source"])
+		}
+		if got, ok := details["attemptCount"].(float64); !ok || got < 1 {
+			t.Errorf("result details[attemptCount] = %#v, want a positive number", details["attemptCount"])
+		}
+		if _, ok := details["lockRewritten"].(bool); !ok {
+			t.Errorf("result details[lockRewritten] = %#v, want bool", details["lockRewritten"])
+		}
+		return
+	}
+	t.Fatal("result event is missing")
+}
+
+// m5CommandReportsMirrorSource 列出会执行 uv sync 的命令。environment repair
+// 只修 uv 与 Python、不同步依赖，因此不在其中。
+func m5CommandReportsMirrorSource(command string) bool {
+	switch command {
+	case "bootstrap", "repair", "dependencies sync", "dependencies rebuild":
+		return true
+	default:
+		return false
 	}
 }
 

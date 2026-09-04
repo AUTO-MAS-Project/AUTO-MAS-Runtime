@@ -105,6 +105,7 @@ const (
 	DeleteUVStaging         DeleteKind = "uv_staging"
 	DeletePythonCache       DeleteKind = "python_cache"
 	DeleteBuildCache        DeleteKind = "build_cache"
+	DeleteDependencySync    DeleteKind = "dependency_sync"
 )
 
 func (k DeleteKind) String() string { return string(k) }
@@ -120,7 +121,8 @@ func (k DeleteKind) Valid() bool {
 		DeleteDownloadTemporary,
 		DeleteUVStaging,
 		DeletePythonCache,
-		DeleteBuildCache:
+		DeleteBuildCache,
+		DeleteDependencySync:
 		return true
 	default:
 		return false

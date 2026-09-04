@@ -228,6 +228,10 @@ func planSeal(kind Kind, sources []Source, offline bool) [sha256.Size]byte {
 		builder.WriteString(source.baseURL)
 		builder.WriteByte(0)
 		builder.WriteString(strconv.FormatBool(source.official))
+		builder.WriteByte(0)
+		builder.WriteString(source.simpleBase)
+		builder.WriteByte(0)
+		builder.WriteString(source.packagesBase)
 	}
 	return sha256.Sum256([]byte(builder.String()))
 }

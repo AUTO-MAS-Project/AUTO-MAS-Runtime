@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -560,5 +561,61 @@ func ensureRecordedProcessStopped(t *testing.T, path string) {
 	}
 	if err := waitTestProcessExit(pid, 2*time.Second); err != nil {
 		t.Errorf("wait grandchild PID %d: %v", pid, err)
+	}
+}
+
+// TestFakeBackend_ListensOnSupervisedPortEnv 锁定增补 1 C12 的夹具行为：listenAddress
+// 留空时从 AUTO_MAS_SUPERVISED_PORT 决定监听端口，非法值回退缺省地址。
+func TestFakeBackend_ListensOnSupervisedPortEnv(t *testing.T) {
+	root := t.TempDir()
+	executable := buildFakeBackend(t, root)
+	probe, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(:0) error = %v", err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close port probe: %v", err)
+	}
+	readyFile := filepath.Join(root, "env-ready.txt")
+	shutdownFile := filepath.Join(root, "env-shutdown.txt")
+	configPath := filepath.Join(root, "env-config.json")
+	writeConfig(t, configPath, fakeBackendConfig{ReadyFile: readyFile, ShutdownFile: shutdownFile})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable)
+	command.Env = append(os.Environ(),
+		fakeBackendConfigEnv+"="+configPath,
+		supervisedPortEnv+"="+strconv.Itoa(port),
+	)
+	if err := command.Start(); err != nil {
+		t.Fatalf("start fake backend: %v", err)
+	}
+	t.Cleanup(func() { _ = command.Process.Kill(); _, _ = command.Process.Wait() })
+	baseURL := strings.TrimSpace(waitForFile(t, readyFile))
+	if want := "http://127.0.0.1:" + strconv.Itoa(port); baseURL != want {
+		t.Fatalf("ready base URL = %q, want %q (listen address must come from %s)", baseURL, want, supervisedPortEnv)
+	}
+	response, err := fakeBackendHTTPClient.Post(baseURL+closePath, "application/json", nil)
+	if err != nil {
+		t.Fatalf("close request: %v", err)
+	}
+	_ = response.Body.Close()
+	if err := command.Wait(); err != nil {
+		t.Fatalf("fake backend exit = %v, want 0", err)
+	}
+	if got := strings.TrimSpace(waitForFile(t, shutdownFile)); got != "graceful" {
+		t.Fatalf("shutdown marker = %q, want graceful", got)
+	}
+
+	for _, invalid := range []string{"", "abc", "70000", "80"} {
+		t.Run("invalid "+invalid, func(t *testing.T) {
+			if got := listenAddressFromEnvironment(invalid); got != defaultListenAddress {
+				t.Fatalf("listenAddressFromEnvironment(%q) = %q, want %q", invalid, got, defaultListenAddress)
+			}
+		})
+	}
+	if got, want := listenAddressFromEnvironment("36164"), "127.0.0.1:36164"; got != want {
+		t.Fatalf("listenAddressFromEnvironment(36164) = %q, want %q", got, want)
 	}
 }

@@ -28,11 +28,16 @@ func (e *sourceURLParseError) Unwrap() []error {
 }
 
 // Source 是经过校验的不可变 HTTPS 网络源。
+//
+// simpleBase 与 packagesBase 只对 KindPackageIndex 有意义，且只能由
+// NewPackageIndexSource 显式赋值，经 PackageIndexRewrite 读取。
 type Source struct {
-	kind     Kind
-	key      string
-	baseURL  string
-	official bool
+	kind         Kind
+	key          string
+	baseURL      string
+	official     bool
+	simpleBase   string
+	packagesBase string
 }
 
 // NewSource 校验并规范化单个网络源。
@@ -161,14 +166,28 @@ func normalizeSourceURL(value string) (string, error) {
 }
 
 func validateSource(source Source) error {
-	normalized, err := NewSource(
+	normalized, err := rebuildSource(source)
+	if err != nil || normalized != source {
+		return errInvalidSource
+	}
+	return nil
+}
+
+// rebuildSource 用公开构造函数重建 Source，使校验与构造走同一条路径。
+func rebuildSource(source Source) (Source, error) {
+	if source.simpleBase != "" || source.packagesBase != "" {
+		return NewPackageIndexSource(PackageIndexSpec{
+			Key:          source.key,
+			BaseURL:      source.baseURL,
+			SimpleBase:   source.simpleBase,
+			PackagesBase: source.packagesBase,
+			Official:     source.official,
+		})
+	}
+	return NewSource(
 		source.kind,
 		source.key,
 		source.baseURL,
 		source.official,
 	)
-	if err != nil || normalized != source {
-		return errInvalidSource
-	}
-	return nil
 }

@@ -190,6 +190,13 @@ func TestAuthorizeDeleteRequest_AcceptsOnlyExactLayoutIdentity(t *testing.T) {
 		}
 		return path
 	}
+	dependencySync := func(operationID string) string {
+		path, err := fixture.layout.DependencySyncDir(operationID)
+		if err != nil {
+			t.Fatalf("DependencySyncDir() error = %v", err)
+		}
+		return path
+	}
 	tests := []requestCase{
 		{name: "uv cache", kind: DeleteUVCache, target: fixture.layout.UVCacheDir()},
 		{name: "venv", kind: DeleteManagedVenv, target: fixture.layout.VenvDir()},
@@ -221,6 +228,11 @@ func TestAuthorizeDeleteRequest_AcceptsOnlyExactLayoutIdentity(t *testing.T) {
 			target: filepath.Join(fixture.layout.RepoDir(), "pkg", "__pycache__"),
 		},
 		{name: "build cache", kind: DeleteBuildCache, target: fixture.layout.BuildCacheDir()},
+		{
+			name:          "dependency sync",
+			kind:          DeleteDependencySync,
+			dynamicTarget: dependencySync,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

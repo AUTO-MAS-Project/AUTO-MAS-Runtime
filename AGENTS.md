@@ -31,7 +31,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 
 ---
 
-## 2. 当前状态（截至 2026-08-13）
+## 2. 当前状态（截至 2026-09-03）
 
 | 里程碑 | 状态 |
 | --- | --- |
@@ -43,10 +43,11 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
 | M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `ea886f8`） |
 | M7 GitHub CI/CD 发布 | T7.1~T7.4 **已完成**（beta.2 Release run `31407585577`、三 job 全绿、独立资产/NDJSON 验收通过）；T7.5 按 D3 延后 |
-| M9 联调与首版验收 | 未开始 |
+| M9 联调与首版验收 | T9.1 development 真后端联调 **已完成**（2026-09-02，`ba27db3` 构建对 AUTO-MAS 集成树 `integ/runtime-20260901` 跑通启动→就绪→优雅关闭）；T9.2 managed 全链路 **已完成**（2026-09-02，用本地 HTTPS smart-git 模拟 `release/*` 分支：bootstrap → supervise → 升级 → 降级 → 关 stdin 隐式关闭，真实发布分支复跑待 push 后）；T9.3 Electron 接入 🚧（`off` 六场景与 `development` 一轮桌面 E2E 完成，复跑进行中，未宣布通过）；T9.4 首版验收清单核对 **已完成**（2026-09-03，[`doc/首版验收记录.md`](doc/首版验收记录.md)：标准第 1~11 条满足，第 12/14 条不满足、第 13 条未验证，均属 AUTO-MAS 侧发布动作并附解除条件）；M9 整体待真实 `release/*` 复跑与阶段 0/5/6 收口后勾选 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
 | M12 遥测与错误观测（Sentry-only） | T12.1、T12.2、T12.4、T12.5、T12.7 已完成；T12.6 本地发布配置已提交，待 Repository secret 与授权后的远端验收；T12.3/Umami 已取消 |
+| M13 dev 基线接入配套 | 2026-08-31 按决策 D12 与 `doc/契约补充-v1-增补1.md`（C6~C11）立项；T13.1（后端工作目录）、T13.2（Job 允许显式脱离）、T13.3（关闭超时参数化，含优雅关闭误报修复）、T13.4（锁副本改写参与包索引镜像轮换，显式 package-index 排最前）**已完成**；T13.5 **已完成**（注入面 `020b3b9`：`AUTO_MAS_UV_CACHE_DIR` / `AUTO_MAS_UV_PYTHON_INSTALL_DIR` / `AUTO_MAS_MIRROR_PACKAGE_INDEX` / `AUTO_MAS_MIRROR_PYTHON`；池目录重新分类按设计关闭——Runtime 的 repair/cleanup 只处理自己的目录，池 venv 失效后由后端判定重建）；T13.6 ⏸ 未开始；2026-09-02 真机联调后按增补 1 **C12 / C13** 完成 T13.7（`f7d5edb`：`backend supervise --port`，缺省 managed 36163 / development 36164，注入 `AUTO_MAS_SUPERVISED_PORT`，健康/关闭地址与 `baseUrl` 由 `internal/health` 派生，E2E 改用空闲端口）与 T13.8（`41c51d3`，收尾 `23033f9`：`backend supervise` 的 stdin EOF / 读取出错视为隐式 shutdown，stdout 已断不影响 HTTP 优雅关闭，真实 exe 黑盒 E2E 锁定，宿主崩溃不再留孤儿）**已完成**；T13.9（`da710c4`，增补 1 C14：新 warning `BACKEND_ORPHANS_REAPED`，`BACKEND_FORCE_TERMINATED` 收窄为主进程被强杀）**已完成**；T13.10（`c46babf`，C13 第 4 条修订：协议日志转发失败不再回给 process 层，避免宿主崩溃时把正在优雅关闭的后端连同进程树杀掉）与 T13.11（`7fa56a1`，C15：Job 快照跳过正在消亡的成员、健康探针错误连续 3 次才判失败、根进程已退出时不再发 close）**已完成** |
 
 代码现状：
 
@@ -76,13 +77,14 @@ Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`�
 | --- | --- | --- |
 | [doc/README.md](doc/README.md) | 文档导航、分层与生命周期规则 | 查找任何项目文档时 |
 | [doc/架构设计.md](doc/架构设计.md) | 冻结的系统架构：边界、CLI 命令树、NDJSON 协议、错误码/退出码/stage/state 全集、Git 更新流程、uv 策略、目录安全、测试矩阵、验收标准 | 任何涉及对外契约的改动 |
-| [doc/契约补充-v1.md](doc/契约补充-v1.md) | 协议 v1 的 5 项定稿细节（C1~C5：固定端口 36163、身份注入环境变量、`failed` 字面量、`AUTO_MAS_SUPERVISED=1`、development 检查边界） | 涉及后端启动/健康检查/环境变量 |
-| [doc/任务拆分.md](doc/任务拆分.md) | 逐任务清单、依赖、验收项、决策记录 D1~D6、待决项 D-open-*、AUTO-MAS 侧 TODO、变更记录 | **每次开工前**确认自己在做哪个任务 |
+| [doc/契约补充-v1.md](doc/契约补充-v1.md) | 协议 v1 的 5 项定稿细节（C1~C5：后端端口（已由增补 1 C12 改为 Runtime 注入）、身份注入环境变量、`failed` 字面量、`AUTO_MAS_SUPERVISED=1`、development 检查边界） | 涉及后端启动/健康检查/环境变量 |
+| [doc/契约补充-v1-增补1.md](doc/契约补充-v1-增补1.md) | 对 v1 的增量修订（C6~C11：后端工作目录、受监督优先级扩展到端口、Job 逃逸、关闭预算参数化、依赖镜像改写轮换、运行池基础设施共享），并修订 C2 第 1 条与 C4 第 1 条 | 同上；**与 `契约补充-v1.md` 冲突时以本文件为准** |
+| [doc/任务拆分.md](doc/任务拆分.md) | 逐任务清单、依赖、验收项、决策记录 D1~D12、待决项 D-open-*、AUTO-MAS 侧 TODO、变更记录 | **每次开工前**确认自己在做哪个任务 |
 | [doc/代码审查清单.md](doc/代码审查清单.md) | 自动化门禁覆盖不到的架构边界检查 | 提交前自查、审查他人代码 |
 | `doc/current/M*/` | 尚未完成任务的设计与实施计划 | 执行某个具体任务时 |
 | `doc/archive/M*/` | 已完成阶段仍有解释价值的设计与审查记录 | 追溯设计背景时 |
 
-**优先级：** 契约补充-v1（更具体） > 架构设计（概括） > 任务拆分（派生清单）。
+**优先级：** 契约补充-v1-增补1（最新增量修订） > 契约补充-v1（更具体） > 架构设计（概括） > 任务拆分（派生清单）。
 
 ---
 
@@ -472,5 +474,7 @@ Go 测试惯例（[Go Code Review Comments](https://go.dev/wiki/CodeReviewCommen
   “退出码为 0”“输出不含 `[no tests to run]`”“出现 `--- PASS:`”，照抄这个模式。
 - **注释中文、标识符英文**：注释（含 doc comment）写中文，doc comment 仍以英文标识符开头；
   Go error 字符串保持英文小写；不要把设计文档写成英文，也不要在同一声明里中英混排。
-- **改协议前先看 `doc/契约补充-v1.md`**：架构设计里的概括描述常被它进一步收紧。
-- **决策已冻结的事项不要重开**：D1~D6 与 C1~C5 是用户已确认的结论；D-open-4~7 才是待决项。
+- **改协议前先看 `doc/契约补充-v1.md` 和 `doc/契约补充-v1-增补1.md`**：架构设计里的概括描述常被它们进一步收紧；
+  增补 1 还修订了 C2 第 1 条（`protocol` 由后端自报而非回显）与 C4 第 1 条（受监督但非管理员时记 warning 并继续运行）。
+- **决策已冻结的事项不要重开**：D1~D12 与 C1~C11 是用户已确认的结论（D2/D4/D8/D9/D10 已被后续决策取代，原文只作追溯）；
+  当前仍待决的是 D-open-4、D-open-5、D-open-7、D-open-10。

@@ -32,12 +32,27 @@ const (
 	autoMASVersion        = "AUTO_MAS_EXPECTED_VERSION"
 	autoMASCommit         = "AUTO_MAS_EXPECTED_COMMIT"
 	autoMASSupervised     = "AUTO_MAS_SUPERVISED"
-	autoMASTelemetry      = "AUTO_MAS_TELEMETRY"
-	autoMASSentryDSN      = "AUTO_MAS_SENTRY_DSN"
-	autoMASSentryEnv      = "AUTO_MAS_SENTRY_ENVIRONMENT"
-	autoMASSentryRelease  = "AUTO_MAS_SENTRY_RELEASE"
-	maxUVOutputLineBytes  = 1 << 20
-	maxUVOutputBytes      = 4 << 20
+	// 以下四个键按增补 1 C11 下发受管基础设施与有序镜像源，与上面五个身份键
+	// 同属受监督进程的环境契约：宿主同名变量被清除，调用方也不能经
+	// RunOptions.Environment 覆盖。
+	autoMASUVCacheDir         = "AUTO_MAS_UV_CACHE_DIR"
+	autoMASUVPythonInstallDir = "AUTO_MAS_UV_PYTHON_INSTALL_DIR"
+	autoMASMirrorPackageIndex = "AUTO_MAS_MIRROR_PACKAGE_INDEX"
+	autoMASMirrorPython       = "AUTO_MAS_MIRROR_PYTHON"
+	// mirrorSourceSeparator 是有序源列表的分隔符；单个源里不得出现它。
+	mirrorSourceSeparator = ";"
+	// autoMASSupervisedPort 按增补 1 C12 注入受监督后端的监听端口；它同样是受控键，
+	// 宿主同名变量不得穿透——否则正式版与开发版并存时后端会听错端口。
+	autoMASSupervisedPort = "AUTO_MAS_SUPERVISED_PORT"
+	// 受监督端口的合法范围（增补 1 C12）：避开特权端口，不超过 TCP 上限。
+	minSupervisedPort    = 1024
+	maxSupervisedPort    = 65535
+	autoMASTelemetry     = "AUTO_MAS_TELEMETRY"
+	autoMASSentryDSN     = "AUTO_MAS_SENTRY_DSN"
+	autoMASSentryEnv     = "AUTO_MAS_SENTRY_ENVIRONMENT"
+	autoMASSentryRelease = "AUTO_MAS_SENTRY_RELEASE"
+	maxUVOutputLineBytes = 1 << 20
+	maxUVOutputBytes     = 4 << 20
 	// uvCaptureTruncatedNotice 追加在诊断快照末尾，说明输出被截断而非 uv 失败。
 	uvCaptureTruncatedNotice = "\n[uv 输出已截断：超过诊断保留上限]\n"
 	maxUVStreamBytes         = 16 << 20
@@ -55,7 +70,11 @@ type RunnerConfig struct {
 
 // RunOptions 描述单次 uv 调用的可变信息。
 type RunOptions struct {
-	Stage            protocol.Stage
+	Stage protocol.Stage
+	// WorkingDir 是子进程的工作目录；为空时回退 ProjectDir。
+	// managed 后端按增补 1 C6 传 app-root，使用户数据不再落在会被
+	// workspace sync 整体替换的 repo/ 里；一次性 uv 命令都不传，行为不变。
+	WorkingDir       string
 	ProjectDir       string
 	PythonInstallDir string
 	ProjectEnvDir    string
@@ -151,7 +170,7 @@ func (r *UVRunner) Run(
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	command := exec.CommandContext(runContext, r.Executable, args...)
-	command.Dir = resolved.ProjectDir
+	command.Dir = resolved.WorkingDir
 	command.Env = buildEnvironment(resolved)
 	// 不使用 command.StdoutPipe/StderrPipe：那两者返回的读端归 exec 所有，
 	// command.Wait() 会在子进程退出后立即关闭它们，导致仍在进行或尚未被调度的
@@ -398,6 +417,7 @@ func normalizeVersionOutput(output string) string {
 }
 
 type resolvedRunOptions struct {
+	WorkingDir       string
 	ProjectDir       string
 	PythonInstallDir string
 	ProjectEnvDir    string
@@ -433,11 +453,18 @@ func (r *UVRunner) resolveOptions(options RunOptions) resolvedRunOptions {
 	if options.CacheDir != "" {
 		values.CacheDir = options.CacheDir
 	}
+	// WorkingDir 在 ProjectDir 解析完成之后再定，回退值必须是最终的
+	// ProjectDir，否则 development 传 ProjectDir 时 cwd 会漂到 runner 默认值。
+	values.WorkingDir = values.ProjectDir
+	if options.WorkingDir != "" {
+		values.WorkingDir = options.WorkingDir
+	}
 	return values
 }
 
 func validateRunnerPaths(options resolvedRunOptions) error {
 	for name, path := range map[string]string{
+		"working directory":             options.WorkingDir,
 		"project directory":             options.ProjectDir,
 		"python install directory":      options.PythonInstallDir,
 		"project environment directory": options.ProjectEnvDir,
@@ -528,6 +555,11 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASVersion,
 		autoMASCommit,
 		autoMASSupervised,
+		autoMASUVCacheDir,
+		autoMASUVPythonInstallDir,
+		autoMASMirrorPackageIndex,
+		autoMASMirrorPython,
+		autoMASSupervisedPort,
 	} {
 		if strings.EqualFold(key, managed) {
 			return managed, true

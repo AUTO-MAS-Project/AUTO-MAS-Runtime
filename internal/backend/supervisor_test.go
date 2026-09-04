@@ -13,6 +13,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -110,8 +111,11 @@ func TestBackendManaged_UsesExactUVArgsAndEnvironment(t *testing.T) {
 		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
 	}
 
-	if got, want := f.uv.args, []string{"run", "--project", f.layout.RepoDir(), "--no-sync", "main.py"}; !equalStrings(got, want) {
+	if got, want := f.uv.args, []string{"run", "--project", f.layout.RepoDir(), "--no-sync", f.layout.BackendEntryFile()}; !equalStrings(got, want) {
 		t.Fatalf("uv args = %#v, want %#v", got, want)
+	}
+	if got, want := f.uv.options.WorkingDir, f.layout.AppRoot(); got != want {
+		t.Fatalf("managed working dir = %q, want app root %q", got, want)
 	}
 	if got, want := f.uv.checkOptions.ProjectDir, f.layout.RepoDir(); got != want {
 		t.Fatalf("managed uv preflight ProjectDir = %q, want %q", got, want)
@@ -166,7 +170,7 @@ func TestBackendManaged_ReadyEmitsRunningState(t *testing.T) {
 	if got := states[1].Details["pid"]; got != f.proc.pid {
 		t.Fatalf("running pid detail = %#v, want %d", got, f.proc.pid)
 	}
-	if got := states[1].Details["baseUrl"]; got != "http://127.0.0.1:36163" {
+	if got := states[1].Details["baseUrl"]; got != health.BaseURL(health.DefaultPort) {
 		t.Fatalf("running baseUrl = %#v", got)
 	}
 
@@ -602,6 +606,7 @@ type backendFixture struct {
 	pid             *fakePID
 	depsHTTP        HTTPCloser
 	shutdownTimeout time.Duration
+	mirrorPolicy    mirror.Policy
 }
 
 func newBackendFixture(t *testing.T) *backendFixture {
@@ -631,18 +636,19 @@ func newBackendFixture(t *testing.T) *backendFixture {
 func (f *backendFixture) supervisor() *ManagedSupervisor {
 	f.t.Helper()
 	s, err := NewManagedSupervisor(f.layout, Dependencies{
-		Lock:       f.lock,
-		State:      f.state,
-		Repository: f.repository,
-		Entry:      f.entry,
-		UV:         f.uv,
-		Health:     f.health,
-		Logger:     func(context.Context, Request) (Logger, error) { return f.logger, f.loggerErr },
-		Clock:      func() time.Time { return time.Unix(1, 0).UTC() },
-		UVPath:     "uv.exe",
-		PythonPath: "python.exe",
-		PID:        f.pid,
-		NewTimer:   func(time.Duration) Timer { return immediateTimer{} },
+		Lock:         f.lock,
+		State:        f.state,
+		Repository:   f.repository,
+		Entry:        f.entry,
+		UV:           f.uv,
+		Health:       f.health,
+		Logger:       func(context.Context, Request) (Logger, error) { return f.logger, f.loggerErr },
+		Clock:        func() time.Time { return time.Unix(1, 0).UTC() },
+		UVPath:       "uv.exe",
+		PythonPath:   "python.exe",
+		PID:          f.pid,
+		NewTimer:     func(time.Duration) Timer { return immediateTimer{} },
+		MirrorPolicy: f.mirrorPolicy,
 	})
 	if err != nil {
 		f.t.Fatalf("NewManagedSupervisor() error = %v", err)
@@ -701,6 +707,7 @@ type fakeEmitter struct {
 	mu             sync.Mutex
 	events         []string
 	state          []protocol.StateEvent
+	warnings       []protocol.WarningEvent
 	stateErr       error
 	logErr         error
 	running        chan struct{}
@@ -740,8 +747,15 @@ func (e *fakeEmitter) EmitLog(event protocol.LogEvent) error {
 func (e *fakeEmitter) EmitWarning(event protocol.WarningEvent) error {
 	e.mu.Lock()
 	e.events = append(e.events, "warning:"+event.Code)
+	e.warnings = append(e.warnings, event)
 	e.mu.Unlock()
 	return nil
+}
+
+func (e *fakeEmitter) warningsSnapshot() []protocol.WarningEvent {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]protocol.WarningEvent(nil), e.warnings...)
 }
 
 func (e *fakeEmitter) states() []protocol.StateEvent {
@@ -1229,3 +1243,231 @@ func (immediateTimer) Stop() bool { return true }
 
 func (e *fakeCodeError) Error() string       { return string(e.code) }
 func (e *fakeCodeError) Code() protocol.Code { return e.code }
+
+// TestBackendManaged_PassesInfrastructureAndMirrorPlan 锁定增补 1 C11 的数据流：
+// backend 是唯一同时持有 layout 与 mirror.Policy 的地方，因此由它解析出两个
+// 有序源列表和两个受管目录，再交给 StartManaged 注入。
+func TestBackendManaged_PassesInfrastructureAndMirrorPlan(t *testing.T) {
+	f := newBackendFixture(t)
+	f.mirrorPolicy = testMirrorPolicy(t, mirror.PolicySpec{})
+	options := runManagedSpawnForInfrastructure(t, f)
+	if got, want := options.Infrastructure.UVCacheDir, f.layout.UVCacheDir(); got != want {
+		t.Errorf("UVCacheDir = %q, want %q", got, want)
+	}
+	if got, want := options.Infrastructure.PythonInstallDir, f.layout.PythonDir(); got != want {
+		t.Errorf("PythonInstallDir = %q, want %q", got, want)
+	}
+	assertMirrorSourcesMatchPlan(t, f.mirrorPolicy, mirror.KindPackageIndex, options.Infrastructure.PackageIndexSources)
+	assertMirrorSourcesMatchPlan(t, f.mirrorPolicy, mirror.KindPython, options.Infrastructure.PythonSources)
+	if last := options.Infrastructure.PackageIndexSources[len(options.Infrastructure.PackageIndexSources)-1]; last != "https://pypi.org/simple/" {
+		t.Errorf("last package index source = %q, want the official source", last)
+	}
+}
+
+// TestBackendSupervision_MirrorPolicyShapesInjectedSources 覆盖策略矩阵：
+// 顺序、--mirror-only 去掉官方源、--offline 空列表，以及零值 Policy 的默认回退。
+func TestBackendSupervision_MirrorPolicyShapesInjectedSources(t *testing.T) {
+	tests := []struct {
+		name   string
+		spec   *mirror.PolicySpec
+		verify func(*testing.T, uv.SupervisionInfrastructure)
+	}{
+		{
+			name: "explicit preference first",
+			spec: &mirror.PolicySpec{Preferred: map[mirror.Kind]string{mirror.KindPackageIndex: "ustc"}},
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				if got := infrastructure.PackageIndexSources[0]; got != "https://pypi.mirrors.ustc.edu.cn/simple/" {
+					t.Errorf("first package index source = %q, want the explicitly preferred source", got)
+				}
+			},
+		},
+		{
+			name: "mirror only drops the official source",
+			spec: &mirror.PolicySpec{MirrorOnly: true},
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				for _, source := range infrastructure.PackageIndexSources {
+					if source == "https://pypi.org/simple/" {
+						t.Errorf("package index sources = %#v, want no official source under --mirror-only", infrastructure.PackageIndexSources)
+					}
+				}
+				for _, source := range infrastructure.PythonSources {
+					if source == "https://github.com/astral-sh/python-build-standalone/releases/download" {
+						t.Errorf("python sources = %#v, want no official source under --mirror-only", infrastructure.PythonSources)
+					}
+				}
+			},
+		},
+		{
+			name: "offline yields empty lists",
+			spec: &mirror.PolicySpec{Offline: true},
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				if len(infrastructure.PackageIndexSources) != 0 || len(infrastructure.PythonSources) != 0 {
+					t.Errorf("offline sources = %#v / %#v, want empty lists",
+						infrastructure.PackageIndexSources, infrastructure.PythonSources)
+				}
+			},
+		},
+		{
+			// 零值 Policy 不是「用户传了非法参数」，而是调用方没配置；与
+			// internal/uv 其他网络路径一致地退回目录默认顺序，不失败关闭。
+			name: "zero value policy falls back to catalog order",
+			spec: nil,
+			verify: func(t *testing.T, infrastructure uv.SupervisionInfrastructure) {
+				t.Helper()
+				assertMirrorSourcesMatchPlan(t, testMirrorPolicy(t, mirror.PolicySpec{}),
+					mirror.KindPackageIndex, infrastructure.PackageIndexSources)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			if test.spec != nil {
+				f.mirrorPolicy = testMirrorPolicy(t, *test.spec)
+			}
+			options := runManagedSpawnForInfrastructure(t, f)
+			test.verify(t, options.Infrastructure)
+		})
+	}
+}
+
+// TestBackendSupervision_RejectsUnselectableMirrorPreference 证明失败关闭：
+// 用户显式指定了一个选不出来的源时映射 INVALID_ARGUMENT，绝不静默换源。
+// 解析发生在构造期，因此在获取任何 Mutex、事务或日志之前就已经拒绝。
+func TestBackendSupervision_RejectsUnselectableMirrorPreference(t *testing.T) {
+	f := newBackendFixture(t)
+	f.mirrorPolicy = testMirrorPolicy(t, mirror.PolicySpec{
+		Preferred: map[mirror.Kind]string{mirror.KindPackageIndex: "missing"},
+	})
+	supervisor, err := NewManagedSupervisor(f.layout, Dependencies{
+		Lock:         f.lock,
+		State:        f.state,
+		Repository:   f.repository,
+		Entry:        f.entry,
+		UV:           f.uv,
+		Health:       f.health,
+		Logger:       func(context.Context, Request) (Logger, error) { return f.logger, nil },
+		UVPath:       "uv.exe",
+		PythonPath:   "python.exe",
+		MirrorPolicy: f.mirrorPolicy,
+	})
+	if supervisor != nil {
+		t.Fatalf("NewManagedSupervisor() = %#v, want nil", supervisor)
+	}
+	assertBackendCode(t, err, protocol.CodeInvalidArgument)
+	if f.uv.startCalls != 0 {
+		t.Fatalf("StartManaged calls = %d, want 0", f.uv.startCalls)
+	}
+}
+
+func runManagedSpawnForInfrastructure(t *testing.T, f *backendFixture) uv.ManagedOptions {
+	t.Helper()
+	f.proc.keepAlive = true
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, f.request()) }()
+	waitFor(t, f.emitter.running)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
+	}
+	if f.uv.startCalls != 1 {
+		t.Fatalf("StartManaged calls = %d, want 1", f.uv.startCalls)
+	}
+	return f.uv.options
+}
+
+func testMirrorPolicy(t *testing.T, spec mirror.PolicySpec) mirror.Policy {
+	t.Helper()
+	policy, err := mirror.NewPolicy(spec)
+	if err != nil {
+		t.Fatalf("NewPolicy(%#v) error = %v", spec, err)
+	}
+	return policy
+}
+
+// assertMirrorSourcesMatchPlan 用 mirror 自己的 BuildPlan 作为期望值，
+// 保证「注入顺序 == Runtime 解析后的尝试顺序」这条契约不靠人工抄写维持。
+func assertMirrorSourcesMatchPlan(t *testing.T, policy mirror.Policy, kind mirror.Kind, got []string) {
+	t.Helper()
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		t.Fatalf("DefaultCatalog() error = %v", err)
+	}
+	plan, err := mirror.BuildPlan(catalog, policy, kind)
+	if err != nil {
+		t.Fatalf("BuildPlan(%s) error = %v", kind, err)
+	}
+	want := make([]string, 0, len(plan.Sources()))
+	for _, source := range plan.Sources() {
+		want = append(want, source.BaseURL())
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("%s sources = %#v, want %#v in plan order", kind, got, want)
+	}
+}
+
+// 宿主崩溃时 stdout 读端已断，后端收到 close 后输出的第一行关闭日志会让协议出口写失败。
+// 这个错误绝不能回给 process 层：`ManagedProcess.recordSinkError` 对首个 sink 错误的策略是
+// `job.Terminate(97)`，那会把正在优雅关闭的后端连同进程树一起杀掉（C13 结论第 4 条 2026-09-02 修订）。
+func TestBackend_StreamSinkKeepsDrainingWhenProtocolOutputFails(t *testing.T) {
+	emitter := &fakeEmitter{logErr: errors.New("write /dev/stdout: The pipe is being closed")}
+	logger := &fakeLogger{path: filepath.Join(t.TempDir(), "backend.log")}
+	gate := &streamGate{stage: protocol.StageBackendRun}
+	if err := gate.Open(emitter); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+
+	sink := (&ManagedSupervisor{}).streamSink(Request{Emitter: emitter}, logger, gate)
+	record := process.StreamRecord{Stream: process.StreamStdout, Event: "Application shutdown complete.", EndOfLine: true}
+	if err := sink(context.Background(), record); err != nil {
+		t.Fatalf("协议出口失败必须返回 nil，否则后端会被 job.Terminate 杀掉，got %v", err)
+	}
+	// 后续行同样继续吞，不能因为已故障就开始报错。
+	if err := sink(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "bye", EndOfLine: true}); err != nil {
+		t.Fatalf("故障之后仍应继续读管道，got %v", err)
+	}
+
+	fault := gate.Fault()
+	if fault == nil {
+		t.Fatal("协议出口失败必须登记 gate 故障，监督循环靠它收口")
+	}
+	assertBackendCode(t, fault, protocol.CodeOutputWriteFailed)
+
+	logger.mu.Lock()
+	recorded := len(logger.records)
+	logger.mu.Unlock()
+	if recorded != 2 {
+		t.Fatalf("文件日志必须照常写入，want 2 条，got %d", recorded)
+	}
+}
+
+// 对照组：文件日志写失败仍然失败关闭（沿用既有语义，本次修订不放宽）。
+func TestBackend_StreamSinkStillFailsClosedWhenRuntimeLogFails(t *testing.T) {
+	emitter := &fakeEmitter{}
+	logger := &failingLogger{err: errors.New("disk full")}
+	gate := &streamGate{stage: protocol.StageBackendRun}
+	if err := gate.Open(emitter); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+
+	sink := (&ManagedSupervisor{}).streamSink(Request{Emitter: emitter}, logger, gate)
+	err := sink(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "x", EndOfLine: true})
+	if err == nil {
+		t.Fatal("运行日志写入失败必须返回错误")
+	}
+	assertBackendCode(t, err, protocol.CodeInternalError)
+}
+
+type failingLogger struct {
+	err  error
+	path string
+}
+
+func (l *failingLogger) Record(context.Context, process.StreamRecord) error { return l.err }
+func (l *failingLogger) LogPath() string                                    { return l.path }
+func (l *failingLogger) Close() error                                       { return nil }

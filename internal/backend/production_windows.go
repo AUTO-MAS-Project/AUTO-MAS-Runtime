@@ -12,6 +12,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
@@ -22,6 +23,7 @@ func NewProductionManagedSupervisor(
 	layout *config.Layout,
 	stderr io.Writer,
 	clock func() time.Time,
+	mirrorPolicy mirror.Policy,
 ) (*ManagedSupervisor, error) {
 	if ctx == nil || layout == nil || stderr == nil {
 		return nil, errors.New("production backend arguments are invalid")
@@ -73,10 +75,11 @@ func NewProductionManagedSupervisor(
 			}
 			return productionLogger{logger: logger}, nil
 		},
-		Clock:       clock,
-		UVPath:      uvExecutable,
-		PythonPaths: []string{layout.VenvPythonExecutable(), layout.PythonExecutable()},
-		PID:         state.NewSystemPIDProbe(),
+		Clock:        clock,
+		UVPath:       uvExecutable,
+		PythonPaths:  []string{layout.VenvPythonExecutable(), layout.PythonExecutable()},
+		PID:          state.NewSystemPIDProbe(),
+		MirrorPolicy: mirrorPolicy,
 	}
 	return NewManagedSupervisor(layout, deps)
 }

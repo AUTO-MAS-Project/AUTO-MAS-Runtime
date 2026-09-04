@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -643,6 +644,24 @@ func mutationCloseError(cause error) error {
 		message: "运行环境变更锁收口失败",
 		details: map[string]any{},
 		cause:   cause,
+	}
+}
+
+// mirrorAttemptProgress 把依赖同步的每次镜像尝试报成一条 progress。
+//
+// progress 没有 details 字段，message 只供人类查看；机器可读的源与尝试次数
+// 由 result.details 承载（C10 第 7 条）。log 事件在本协议里专指受管进程输出
+// 转发（能力标识 log.stream），依赖同步没有这种输出，因此不占用它。
+func mirrorAttemptProgress(emitter *protocol.Emitter) uv.MirrorAttemptFunc {
+	if emitter == nil {
+		return nil
+	}
+	return func(_ context.Context, attempt uv.MirrorAttempt) error {
+		message := fmt.Sprintf("正在从镜像源 %s 同步锁定依赖", attempt.Source)
+		if attempt.Fallback {
+			message = fmt.Sprintf("镜像源均不可用，正在从官方源 %s 按原锁同步依赖", attempt.Source)
+		}
+		return emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressRunning, message)
 	}
 }
 

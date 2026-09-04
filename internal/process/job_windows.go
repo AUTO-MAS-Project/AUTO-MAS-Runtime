@@ -25,14 +25,19 @@ type windowsJob struct {
 // Supported 报告 Windows 已提供 Job Object 进程树回收实现。
 func Supported() bool { return true }
 
-// NewJob 创建带 KILL_ON_JOB_CLOSE 的 Windows Job Object。
+// NewJob 创建带 KILL_ON_JOB_CLOSE 与 BREAKAWAY_OK 的 Windows Job Object。
+// BREAKAWAY_OK 只允许**显式**带 CREATE_BREAKAWAY_FROM_JOB 的子进程脱离，
+// 供 AUTO-MAS 拉起的模拟器与 PC 游戏不随后端退出（增补 1 C8）；未请求脱离的
+// 进程归属不受影响。刻意不用 SILENT_BREAKAWAY_OK——那会让所有子进程默认脱离，
+// 后端自己的 worker 与 Agent 也会逃出回收边界。
 func NewJob() (Job, error) {
 	handle, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+		windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
 	if result, err := windows.SetInformationJobObject(
 		handle,
 		windows.JobObjectExtendedLimitInformation,
@@ -132,10 +137,25 @@ func (j *windowsJob) snapshot() ([]Info, error) {
 	for _, pid := range pids {
 		entry, ok := entries[pid]
 		if !ok {
-			return nil, fmt.Errorf("query process job member %d identity: process entry is missing", pid)
+			// 成员在两次查询之间退出了：pid 列表来自 Job，进程表来自 Toolhelp32
+			// 快照，两者不是原子的。已经不存在的进程本就不属于「仍在树里」，
+			// 跳过它——让整个快照失败会把优雅退出误判成需要强制回收的残留树，
+			// 进而系统性误报 BACKEND_FORCE_TERMINATED。
+			continue
 		}
-		path, pathErr := processImagePath(pid)
+		path, pathErr := processImagePathFn(pid)
 		if pathErr != nil {
+			// 同一个过渡态的另一种表现：pid 已经无效，OpenProcess 直接拒绝。
+			if errors.Is(pathErr, windows.ERROR_INVALID_PARAMETER) {
+				continue
+			}
+			// 进程正在消亡时，OpenProcess 可能成功而后续查询失败，错误码不止一种
+			// （后端启动期的 `git version` 等短命子进程就落在这个窗口里）。判据不看
+			// 错误码，改问进程本身是否已经收到信号：已退出就跳过，仍存活才上报。
+			// 让整个快照失败会把一次正常启动误判成 BACKEND_HEALTH_INVALID。
+			if exited, exitedErr := processExitedFn(pid); exitedErr == nil && exited {
+				continue
+			}
 			return nil, fmt.Errorf("query process job member %d image: %w", pid, pathErr)
 		}
 		if path == "" {
@@ -231,6 +251,31 @@ func processEntries() (map[uint32]windows.ProcessEntry32, error) {
 		return nil, err
 	}
 	return entries, nil
+}
+
+// processImagePathFn 与 processExitedFn 是快照的两个注入点，只为测试覆盖
+// 「映像查询失败但进程已退出」这个无法稳定构造的过渡态；生产路径恒为下面两个实现。
+var (
+	processImagePathFn = processImagePath
+	processExitedFn    = processExited
+)
+
+// processExited 判断 pid 对应的进程是否已经结束。pid 已经无效同样算已结束——
+// 那正是它退出后 pid 被回收前的表现。
+func processExited(pid uint32) (bool, error) {
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
+	if err != nil {
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return true, nil
+		}
+		return false, err
+	}
+	defer func() { _ = windows.CloseHandle(handle) }()
+	event, waitErr := windows.WaitForSingleObject(handle, 0)
+	if waitErr != nil {
+		return false, waitErr
+	}
+	return event == windows.WAIT_OBJECT_0, nil
 }
 
 func processImagePath(pid uint32) (string, error) {

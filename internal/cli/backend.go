@@ -3,25 +3,40 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 const (
 	backendModeManaged     = "managed"
 	backendModeDevelopment = "development"
+	// 关闭预算的取值范围与默认值按增补 1 C9 冻结；默认值待 AUTO-MAS 侧
+	// 实测「MaaFW 任务运行中收到 close」的耗时后再议，本任务只加开关。
+	backendShutdownTimeoutDefault = "5"
+	backendShutdownTimeoutMin     = 1
+	backendShutdownTimeoutMax     = 120
+	// 受监督端口按增补 1 C12：缺省随模式而定（managed 36163 / development 36164），
+	// 因此 flag 的默认值留空，由 parseBackendPort 在解析 --mode 之后给出。
+	backendPortManagedDefault     = health.DefaultPort
+	backendPortDevelopmentDefault = 36164
 )
 
 func backendSuperviseCommand(deps *deps) *cobra.Command {
 	var mode string
 	var repo string
+	var shutdownTimeout string
+	var port string
 	command := &cobra.Command{
 		Use:   "supervise",
 		Short: "启动并监督后端进程",
@@ -74,11 +89,20 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 							cause:   errors.New("managed mode does not accept development repository"),
 						}
 					}
+					shutdownBudget, err := parseBackendShutdownTimeout(shutdownTimeout)
+					if err != nil {
+						return sessionSuccess{}, err
+					}
+					supervisedPort, err := parseBackendPort(port, cmd.Flags().Changed("port"), mode)
+					if err != nil {
+						return sessionSuccess{}, err
+					}
 					service, err := deps.options.backendFactory(
 						ctx,
 						deps.global.layout,
 						deps.io.Err,
 						deps.options.clock,
+						deps.global.mirrorPolicy,
 					)
 					if err != nil {
 						return sessionSuccess{}, err
@@ -107,6 +131,8 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 						RuntimePID:         uint32(pid),
 						Mode:               backend.Mode(mode),
 						DevelopmentRepo:    repo,
+						ShutdownTimeout:    shutdownBudget,
+						Port:               supervisedPort,
 						Emitter:            &backendEventEmitter{emitter: emitter, control: control},
 						Control:            mailbox,
 						BeforeShutdown:     mailbox.BeforeShutdown,
@@ -126,7 +152,73 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 	}
 	command.Flags().StringVar(&mode, "mode", "", "后端运行模式：managed 或 development")
 	command.Flags().StringVar(&repo, "repo", "", "development 模式源码目录")
+	command.Flags().StringVar(
+		&shutdownTimeout,
+		"shutdown-timeout",
+		backendShutdownTimeoutDefault,
+		"关闭后端的等待上限（秒），取值 1~120",
+	)
+	command.Flags().StringVar(
+		&port,
+		"port",
+		"",
+		"受监督后端监听端口，取值 1024~65535；缺省 managed 36163、development 36164",
+	)
 	return command
+}
+
+// parseBackendPort 校验 --port（增补 1 C12）：整数、合法范围 1024~65535，未显式给出时
+// 按模式取缺省；显式给出的空串与非整数一样拒绝。与 --shutdown-timeout 同理收 string
+// 自行解析，让非整数与越界共用 INVALID_ARGUMENT 的 result 语义，而不是落到 Cobra 的
+// stderr 诊断通道。
+func parseBackendPort(raw string, explicit bool, mode string) (int, error) {
+	if !explicit {
+		if mode == backendModeDevelopment {
+			return backendPortDevelopmentDefault, nil
+		}
+		return backendPortManagedDefault, nil
+	}
+	reject := func(cause error) error {
+		return &commandError{
+			code:    protocol.CodeInvalidArgument,
+			stage:   protocol.StageBackendSpawn,
+			message: "受监督端口必须是 1024 到 65535 之间的整数",
+			details: map[string]any{"field": "port", "value": raw},
+			cause:   cause,
+		}
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, reject(errors.New("backend port is not an integer"))
+	}
+	if !health.ValidPort(port) {
+		return 0, reject(errors.New("backend port is out of range"))
+	}
+	return port, nil
+}
+
+// parseBackendShutdownTimeout 校验 --shutdown-timeout（增补 1 C9）：正整数秒、
+// 合法范围 1~120。这里刻意收 string 而不是让 pflag 收 int——pflag 的整数解析失败
+// 发生在 Cobra 解析阶段，只会走 stderr 诊断通道，产不出 INVALID_ARGUMENT 的
+// result 事件；自行解析才能让越界与非整数共用同一条失败语义。
+func parseBackendShutdownTimeout(raw string) (time.Duration, error) {
+	reject := func(cause error) error {
+		return &commandError{
+			code:    protocol.CodeInvalidArgument,
+			stage:   protocol.StageBackendSpawn,
+			message: "关闭超时必须是 1 到 120 之间的整数秒",
+			details: map[string]any{"field": "shutdown-timeout", "value": raw},
+			cause:   cause,
+		}
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, reject(errors.New("backend shutdown timeout is not an integer"))
+	}
+	if seconds < backendShutdownTimeoutMin || seconds > backendShutdownTimeoutMax {
+		return 0, reject(errors.New("backend shutdown timeout is out of range"))
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func runBackendSuperviseSession(
@@ -160,7 +252,15 @@ func runBackendSuperviseSession(
 	emitter, err = output.NewEmitter(
 		runtimeVersion,
 		command,
-		[]string{string(protocol.CapabilityStdinCancel), string(protocol.CapabilityStateV1), string(protocol.CapabilityLogStream)},
+		// backend supervise 的 ControlReader 注册了 cancel/shutdown/status 三条命令，
+		// 公告必须与之一致：调用方按契约只信 hello.capabilities。
+		[]string{
+			string(protocol.CapabilityStdinCancel),
+			string(protocol.CapabilityStateV1),
+			string(protocol.CapabilityLogStream),
+			string(protocol.CapabilityStdinShutdown),
+			string(protocol.CapabilityStdinStatus),
+		},
 		protocol.WithClock(deps.options.clock),
 	)
 	if err != nil {
@@ -208,8 +308,25 @@ func runBackendSuperviseSession(
 	controlDone := make(chan error, 1)
 	go func() {
 		readErr := runControlReaderSafely(readerContext, reader)
-		if readErr != nil && !isWorkspaceControlContextCancellation(readerContext, readErr) {
-			control.SetReaderError(readErr)
+		switch {
+		case readErr == nil:
+			// 增补 1 C13：hello 之后 stdin 到达 EOF 即宿主断开，视为隐式 shutdown；
+			// 被 StopAccepting 或 ctx 停止的 reader 不满足 InputClosed，不会误触发。
+			if reader.InputClosed() {
+				control.SubmitImplicitShutdown()
+			}
+		case isWorkspaceControlContextCancellation(readerContext, readErr):
+		default:
+			if _, panicked := recoveredControlReaderPanic(readErr); panicked {
+				// reader 自身崩溃是 Runtime 缺陷，仍走基础设施故障路径并上报。
+				control.SetReaderError(readErr)
+				break
+			}
+			// C13：读取出错与 EOF 同样视为宿主断开——走优雅关闭对用户只会更好，
+			// 硬失败路径反而会把后端 Job 硬杀；错误本身保留在 stderr 诊断里。
+			writeDiagnostic(deps.io, fmt.Errorf("stdin control read failed, treating as host disconnect: %w", readErr))
+			control.SubmitImplicitShutdown()
+			readErr = nil
 		}
 		controlDone <- readErr
 	}()
@@ -296,6 +413,15 @@ func (c *backendControl) PrepareControl(command protocol.ControlCommand) (protoc
 		}
 		return nil
 	}, nil
+}
+
+// SubmitImplicitShutdown 把宿主断开（stdin EOF 或读取出错）翻译成一条没有 commandId 的
+// shutdown 投进同一个 mailbox（增补 1 C13）。已有终止命令、mailbox 已停止或操作已收口时
+// Submit 返回错误，这正是隐式关闭的幂等语义，因此安全忽略；result 因 commandId 为空
+// 而不回显 controlCommandId。
+func (c *backendControl) SubmitImplicitShutdown() {
+	// 忽略 ErrControlStopped / ErrControlMailboxClosed / ctx 错误：它们都表示关闭已在路上。
+	_ = c.submit(protocol.ControlCommand{Protocol: protocol.Version, Command: protocol.ControlShutdown})
 }
 
 // StopAfterShutdown 保留 cancel-first 后续命令进入 mailbox 的机会；shutdown-first

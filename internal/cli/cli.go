@@ -14,6 +14,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
@@ -116,8 +117,9 @@ func applyOptions(values ...Option) (options, error) {
 			layout *config.Layout,
 			stderr io.Writer,
 			clock func() time.Time,
+			mirrorPolicy mirror.Policy,
 		) (backendService, error) {
-			return backend.NewProductionManagedSupervisor(ctx, layout, stderr, clock)
+			return backend.NewProductionManagedSupervisor(ctx, layout, stderr, clock, mirrorPolicy)
 		},
 		telemetryFactory: telemetry.New,
 	}

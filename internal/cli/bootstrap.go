@@ -62,11 +62,6 @@ func runBootstrap(
 			cause:   err,
 		}
 	}
-	// 必须在建状态库、抢 mutation 锁、下载 uv 之前拒绝，否则一个参数错误要等到
-	// 依赖同步阶段才报出来，而那时 uv、仓库与 Python 都已落盘。
-	if err := rejectPackageIndexOverride(deps.global.mirrorPolicy, protocol.StageBootstrap); err != nil {
-		return sessionSuccess{}, err
-	}
 	store, err := deps.options.environmentStateStoreFactory(ctx, deps.global.layout, deps.options.clock)
 	if err != nil {
 		return sessionSuccess{}, stateStoreError(protocol.StageBootstrap, err)
@@ -324,6 +319,7 @@ func runBootstrap(
 		Commit:        revision.Commit(),
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(operationLogger),
+		Attempt:       mirrorAttemptProgress(emitter),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesSync, err)
@@ -357,6 +353,13 @@ func runBootstrap(
 			"pythonVersion":   pythonResult.Spec.Version.String(),
 			"lockfileChecked": dependencyResult.LockfileChecked,
 			"synchronized":    dependencyResult.Synchronized,
+			// bootstrap 同样跑 uv sync，因此和 dependencies sync 一样报告本次
+			// 实际使用的镜像源（C10 第 7 条）；否则首装失败时调用方无从判断
+			// 装的是哪个源。
+			"sourceKind":    dependencyResult.SourceKind,
+			"source":        dependencyResult.Source,
+			"attemptCount":  dependencyResult.AttemptCount,
+			"lockRewritten": dependencyResult.LockRewritten,
 		},
 	}, nil
 }

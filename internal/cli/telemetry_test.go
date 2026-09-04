@@ -14,6 +14,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
@@ -364,7 +365,7 @@ func TestBackendSupervise_TelemetryClosesOnShutdown(t *testing.T) {
 	code := Execute(context.Background(), []string{"--output", "ndjson", "backend", "supervise", "--mode", "managed"},
 		IO{In: input, Out: &stdout, Err: io.Discard}, WithCWD(t.TempDir()),
 		WithTelemetryFactory(func(telemetry.Config) telemetry.Recorder { return recorder }),
-		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 			return backendServiceFunc(func(_ context.Context, request backend.Request) error {
 				command, err := request.Control.Receive(context.Background())
 				if err != nil {
@@ -415,7 +416,7 @@ func TestBackendSupervise_ControlReaderPanicReportsSentry(t *testing.T) {
 	t.Setenv("AUTO_MAS_TELEMETRY", "enabled")
 	code := Execute(context.Background(), []string{"--output", "ndjson", "backend", "supervise", "--mode", "managed"}, IO{In: input, Out: &stdout, Err: &stderr},
 		WithCWD(t.TempDir()), WithTelemetryFactory(func(telemetry.Config) telemetry.Recorder { return recorder }),
-		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time) (backendService, error) {
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
 			return backendServiceFunc(func(ctx context.Context, request backend.Request) error {
 				_, err := request.Control.Receive(ctx)
 				return err

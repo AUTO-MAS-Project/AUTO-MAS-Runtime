@@ -129,6 +129,17 @@ func (l *Layout) UVStagingDir(version, operationID string) (string, error) {
 	return filepath.Join(l.paths.buildCacheDir, "uv", version, operationID), nil
 }
 
+// DependencySyncDir 返回一次依赖同步中改写锁副本使用的临时项目目录。
+//
+// 该目录位于构建缓存下，属于可丢弃缓存：由 Runtime 在每次镜像尝试前创建、
+// 尝试结束后立即删除，绝不落在 repo 或任何用户数据目录里。
+func (l *Layout) DependencySyncDir(operationID string) (string, error) {
+	if err := validateSegment(operationID); err != nil {
+		return "", fmt.Errorf("validate dependency sync operation id: %w", err)
+	}
+	return filepath.Join(l.paths.buildCacheDir, "dependencies", operationID), nil
+}
+
 // RuntimeLogFile 返回指定命令在本地日期的运行日志文件路径。
 func (l *Layout) RuntimeLogFile(command string, localDate time.Time) (string, error) {
 	if err := validateSegment(command); err != nil {

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,27 +27,50 @@ const (
 	grandchildRole        = "grandchild"
 	healthPath            = "/api/core/health"
 	closePath             = "/api/core/close"
-	defaultListenAddress  = "127.0.0.1:36163"
+	// supervisedPortEnv 是增补 1 C12 下 Runtime 注入的端口；listenAddress 留空时假后端
+	// 像真后端一样只认它，缺失或非法则回退缺省地址。
+	supervisedPortEnv    = "AUTO_MAS_SUPERVISED_PORT"
+	defaultListenAddress = "127.0.0.1:36163"
+	minSupervisedPort    = 1024
+	maxSupervisedPort    = 65535
 )
 
 type fakeBackendConfig struct {
-	ListenAddress            string           `json:"listenAddress"`
-	ListenDelayMS            int              `json:"listenDelayMs"`
-	ReadyFile                string           `json:"readyFile"`
-	PIDFile                  string           `json:"pidFile"`
-	GrandchildPIDFile        string           `json:"grandchildPidFile"`
-	SpawnGrandchild          bool             `json:"spawnGrandchild"`
-	GrandchildLifetimeMS     int              `json:"grandchildLifetimeMs"`
-	LeaveGrandchildOnCrash   bool             `json:"leaveGrandchildOnCrash"`
-	Health                   []healthResponse `json:"health"`
-	HealthRaw                []string         `json:"healthRaw"`
-	HealthHTTPStatus         []int            `json:"healthHttpStatus"`
-	CloseStatus              int              `json:"closeStatus"`
-	CrashAfterHealthRequests int              `json:"crashAfterHealthRequests"`
-	CrashExitCode            int              `json:"crashExitCode"`
-	Events                   []outputEvent    `json:"events"`
-	Stdout                   []outputEvent    `json:"stdout"`
-	Stderr                   []outputEvent    `json:"stderr"`
+	ListenAddress string `json:"listenAddress"`
+	ListenDelayMS int    `json:"listenDelayMs"`
+	ReadyFile     string `json:"readyFile"`
+	PIDFile       string `json:"pidFile"`
+	// WorkingDirFile 让假后端报告自己的 os.Getwd()，供 T13.1 端到端断言
+	// Runtime 设定的工作目录真的生效；父进程侧的 StartSpec 断言证明不了这件事。
+	WorkingDirFile string `json:"workingDirFile"`
+	// EnvironmentFile 让假后端把自己进程里读到的受监督环境变量落盘，供 T13.5
+	// 端到端断言增补 1 C11 的四个变量确实穿过 uv 到达了真实后端进程；父进程侧
+	// 的 StartSpec 断言只能证明 Runtime 传了什么，证明不了后端收到了什么。
+	EnvironmentFile string `json:"environmentFile"`
+	// ShutdownFile 只在「收到 close 并完成 server.Shutdown」的优雅路径上落盘，被 Job 硬杀时
+	// 永远不会出现；T13.8 的 E2E 据此区分「HTTP 优雅关闭」与「被杀」。
+	ShutdownFile string `json:"shutdownFile"`
+	// ShutdownEvents 与 ShutdownDelayMS 模拟真实后端收到 close 之后的关闭序列：先逐行输出
+	// 关闭日志（此时宿主的 stdout/stderr 可能已经断了），再等待一段时间才真正退出。
+	ShutdownEvents       []outputEvent `json:"shutdownEvents"`
+	ShutdownDelayMS      int           `json:"shutdownDelayMs"`
+	GrandchildPIDFile    string        `json:"grandchildPidFile"`
+	SpawnGrandchild      bool          `json:"spawnGrandchild"`
+	GrandchildLifetimeMS int           `json:"grandchildLifetimeMs"`
+	// LeaveGrandchildOnCrash / LeaveGrandchildOnShutdown 都让孙进程脱离父进程的
+	// liveness 管道并跳过自清理，区别只是在崩溃还是优雅关闭路径上留下它。
+	// 后者用于证明「真有存活后代」时 Runtime 仍会强制回收并发出警告。
+	LeaveGrandchildOnCrash    bool             `json:"leaveGrandchildOnCrash"`
+	LeaveGrandchildOnShutdown bool             `json:"leaveGrandchildOnShutdown"`
+	Health                    []healthResponse `json:"health"`
+	HealthRaw                 []string         `json:"healthRaw"`
+	HealthHTTPStatus          []int            `json:"healthHttpStatus"`
+	CloseStatus               int              `json:"closeStatus"`
+	CrashAfterHealthRequests  int              `json:"crashAfterHealthRequests"`
+	CrashExitCode             int              `json:"crashExitCode"`
+	Events                    []outputEvent    `json:"events"`
+	Stdout                    []outputEvent    `json:"stdout"`
+	Stderr                    []outputEvent    `json:"stderr"`
 }
 
 type healthResponse struct {
@@ -196,6 +220,23 @@ func runFakeBackend() int {
 			return 98
 		}
 	}
+	if config.WorkingDirFile != "" {
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 97
+		}
+		if err := writeSignalFile(config.WorkingDirFile, []byte(filepath.Clean(workingDirectory)+"\n")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 97
+		}
+	}
+	if config.EnvironmentFile != "" {
+		if err := writeSignalFile(config.EnvironmentFile, supervisedEnvironmentReport()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 89
+		}
+	}
 
 	grandchild, err := startGrandchild(config)
 	if err != nil {
@@ -217,7 +258,7 @@ func runFakeBackend() int {
 	}
 	address := config.ListenAddress
 	if address == "" {
-		address = defaultListenAddress
+		address = listenAddressFromEnvironment(os.Getenv(supervisedPortEnv))
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -267,12 +308,29 @@ func runFakeBackend() int {
 		}
 		return code
 	case <-shutdownRequests:
+		if config.LeaveGrandchildOnShutdown {
+			cleanupGrandchild = false
+		}
+		if err := emitConfiguredOutput(fakeBackendConfig{Events: config.ShutdownEvents}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 87
+		}
+		if config.ShutdownDelayMS > 0 {
+			timer := time.NewTimer(time.Duration(config.ShutdownDelayMS) * time.Millisecond)
+			<-timer.C
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := server.Shutdown(ctx)
 		cancel()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 95
+		}
+		if config.ShutdownFile != "" {
+			if err := writeSignalFile(config.ShutdownFile, []byte("graceful\n")); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 88
+			}
 		}
 		return 0
 	case err := <-serveResult:
@@ -282,6 +340,16 @@ func runFakeBackend() int {
 		}
 		return 0
 	}
+}
+
+// listenAddressFromEnvironment 按 C12 解释 AUTO_MAS_SUPERVISED_PORT：十进制且落在
+// 合法范围内才采用，否则按缺失处理回退缺省地址——与真后端的回退语义一致。
+func listenAddressFromEnvironment(raw string) string {
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || port < minSupervisedPort || port > maxSupervisedPort {
+		return defaultListenAddress
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 }
 
 func loadFakeBackendConfig(path string) (fakeBackendConfig, error) {
@@ -323,6 +391,17 @@ func validateFakeBackendConfig(config fakeBackendConfig) error {
 	}
 	if err := validateMilliseconds("listenDelayMs", config.ListenDelayMS, 60_000); err != nil {
 		return err
+	}
+	if err := validateMilliseconds("shutdownDelayMs", config.ShutdownDelayMS, 60_000); err != nil {
+		return err
+	}
+	for _, event := range config.ShutdownEvents {
+		if event.Stream != "stdout" && event.Stream != "stderr" {
+			return errors.New("validate fake backend shutdownEvents: stream must be stdout or stderr")
+		}
+		if err := validateMilliseconds("shutdownEvents.delayMs", event.DelayMS, 60_000); err != nil {
+			return err
+		}
 	}
 	if err := validateMilliseconds("grandchildLifetimeMs", config.GrandchildLifetimeMS, 86_400_000); err != nil {
 		return err
@@ -421,7 +500,8 @@ func startGrandchild(config fakeBackendConfig) (*grandchildProcess, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var parentRead *os.File
 	var parentWrite *os.File
-	if config.LeaveGrandchildOnCrash {
+	detached := config.LeaveGrandchildOnCrash || config.LeaveGrandchildOnShutdown
+	if detached {
 		parentRead, err = os.Open(os.DevNull)
 		if err != nil {
 			cancel()
@@ -440,7 +520,7 @@ func startGrandchild(config fakeBackendConfig) (*grandchildProcess, error) {
 		fakeBackendRoleEnv+"="+grandchildRole,
 		grandchildLifetimeEnv+"="+strconv.Itoa(config.GrandchildLifetimeMS),
 	)
-	if config.LeaveGrandchildOnCrash {
+	if detached {
 		command.Env = append(command.Env, grandchildDetachedEnv+"=1")
 	}
 	command.Stdin = parentRead
@@ -464,6 +544,28 @@ func startGrandchild(config fakeBackendConfig) (*grandchildProcess, error) {
 		}
 	}
 	return process, nil
+}
+
+// supervisedEnvironmentReport 逐行输出 `<键>=<值>`，缺席的键整行不出现，
+// 因此断言方能区分「注入了空串」和「根本没注入」。
+func supervisedEnvironmentReport() []byte {
+	var builder bytes.Buffer
+	for _, key := range []string{
+		"AUTO_MAS_UV_CACHE_DIR",
+		"AUTO_MAS_UV_PYTHON_INSTALL_DIR",
+		"AUTO_MAS_MIRROR_PACKAGE_INDEX",
+		"AUTO_MAS_MIRROR_PYTHON",
+	} {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		builder.WriteString(key)
+		builder.WriteString("=")
+		builder.WriteString(value)
+		builder.WriteString("\n")
+	}
+	return builder.Bytes()
 }
 
 func writeSignalFile(path string, payload []byte) error {

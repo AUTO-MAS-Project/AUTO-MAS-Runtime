@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -22,6 +24,10 @@ const cleanupTimeout = 30 * time.Second
 type ManagedSupervisor struct {
 	layout *config.Layout
 	deps   Dependencies
+	// infrastructure 是按增补 1 C11 下发给后端的受管基础设施。layout 与
+	// MirrorPolicy 在 supervisor 生命周期内不变，因此只在构造期解析一次，
+	// 首次启动与单次自动重启、managed 与 development 都读同一份值。
+	infrastructure uv.SupervisionInfrastructure
 }
 
 // NewManagedSupervisor 创建可按请求选择 managed 或 development 的后端监督器。
@@ -54,7 +60,71 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	if deps.UVPath == "" || deps.PythonPath == "" {
 		return nil, errors.New("backend process identity paths are incomplete")
 	}
-	return &ManagedSupervisor{layout: layout, deps: deps}, nil
+	infrastructure, err := supervisionInfrastructure(layout, deps.MirrorPolicy)
+	if err != nil {
+		return nil, err
+	}
+	return &ManagedSupervisor{layout: layout, deps: deps, infrastructure: infrastructure}, nil
+}
+
+// supervisionInfrastructure 解析增补 1 C11 下发给后端的受管基础设施。
+//
+// 这里是 Runtime 里唯一同时持有 layout 与 mirror.Policy 的位置：目录取自 layout，
+// 两个有序源列表由 mirror.BuildPlan 给出——plan 的顺序**就是**尝试顺序
+// （显式首选最前、目录顺序其次、官方源末位），`--mirror-only` 不含官方源，
+// `--offline` 得到空列表。本任务因此不需要任何新的 mirror API。
+func supervisionInfrastructure(
+	layout *config.Layout,
+	policy mirror.Policy,
+) (uv.SupervisionInfrastructure, error) {
+	catalog, err := mirror.DefaultCatalog()
+	if err != nil {
+		return uv.SupervisionInfrastructure{}, fmt.Errorf("build backend mirror catalog: %w", err)
+	}
+	packageIndex, err := mirrorSources(catalog, policy, mirror.KindPackageIndex)
+	if err != nil {
+		return uv.SupervisionInfrastructure{}, err
+	}
+	python, err := mirrorSources(catalog, policy, mirror.KindPython)
+	if err != nil {
+		return uv.SupervisionInfrastructure{}, err
+	}
+	return uv.SupervisionInfrastructure{
+		UVCacheDir:          layout.UVCacheDir(),
+		PythonInstallDir:    layout.PythonDir(),
+		PackageIndexSources: packageIndex,
+		PythonSources:       python,
+	}, nil
+}
+
+// mirrorSources 返回单个 Kind 的有序源地址。
+//
+// 失败语义与 internal/uv 的网络路径一致：ErrPolicyRejected 表示用户显式指定了一个
+// 选不出来的源，必须失败关闭（静默换源等于无视用户意图）；其他错误只说明 Policy
+// 本身没被配置（例如零值 Policy），退回目录默认顺序。
+func mirrorSources(catalog *mirror.Catalog, policy mirror.Policy, kind mirror.Kind) ([]string, error) {
+	plan, err := mirror.BuildPlan(catalog, policy, kind)
+	if err != nil {
+		if errors.Is(err, mirror.ErrPolicyRejected) {
+			return nil, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "镜像源选择无效", map[string]any{
+				"sourceKind": kind.String(),
+			}, err)
+		}
+		defaultPolicy, defaultErr := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
+		if defaultErr != nil {
+			return nil, fmt.Errorf("build default backend mirror policy: %w", defaultErr)
+		}
+		plan, defaultErr = mirror.BuildPlan(catalog, defaultPolicy, kind)
+		if defaultErr != nil {
+			return nil, fmt.Errorf("build backend mirror plan: %w", errors.Join(err, defaultErr))
+		}
+	}
+	sources := plan.Sources()
+	addresses := make([]string, 0, len(sources))
+	for _, source := range sources {
+		addresses = append(addresses, source.BaseURL())
+	}
+	return addresses, nil
 }
 
 // Supervise 启动并长驻监督指定模式的后端，直到调用方取消或 Job 根进程退出。
@@ -75,6 +145,11 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	port, err := resolveSupervisedPort(request, mode)
+	if err != nil {
+		return err
+	}
+	request.Port = port
 	if mode == ModeDevelopment {
 		var err error
 		request, err = s.normalizeDevelopmentRequest(ctx, request)
@@ -201,14 +276,19 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	sink := s.streamSink(request, logger, gate)
 	processOwned := false
 	proc, err := s.deps.UV.StartManaged(ctx, []string{
-		"run", "--project", s.layout.RepoDir(), "--no-sync", "main.py",
+		"run", "--project", s.layout.RepoDir(), "--no-sync", s.layout.BackendEntryFile(),
 	}, uv.ManagedOptions{
 		RunOptions: uv.RunOptions{
-			Stage:      protocol.StageBackendSpawn,
+			Stage: protocol.StageBackendSpawn,
+			// cwd 是 app-root 而不是 repo：后端相对 cwd 创建的用户数据必须留在
+			// workspace sync 整体替换范围之外（增补 1 C6）。入口随之改传绝对路径。
+			WorkingDir: s.layout.AppRoot(),
 			ProjectDir: s.layout.RepoDir(),
 			Line:       nil,
 		},
-		Identity: &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit},
+		Identity:       &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit},
+		Infrastructure: s.infrastructure,
+		Port:           request.Port,
 	}, sink)
 	if err != nil || proc == nil {
 		if fault := gate.Fault(); fault != nil {
@@ -269,6 +349,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		Protocol: protocol.Version,
 		Version:  revision.Version,
 		Commit:   revision.Commit,
+		Port:     request.Port,
 	}, probe); err != nil {
 		if fault := gate.Fault(); fault != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
@@ -303,7 +384,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	gate.SetStage(protocol.StageBackendRun)
 	if err := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "后端已就绪", map[string]any{
 		"pid":     proc.PID(),
-		"baseUrl": "http://127.0.0.1:36163",
+		"baseUrl": health.BaseURL(request.Port),
 		"logPath": logger.LogPath(),
 	}); err != nil {
 		return s.failAfterStarting(request, proc, tx, logger, gate, err, &processOwned, &txOwned, &loggerOwned)
@@ -579,12 +660,17 @@ func (s *ManagedSupervisor) streamSink(request Request, logger Logger, gate *str
 		if record.Event == "" && !record.EndOfLine {
 			return nil
 		}
+		// 协议出口写失败只登记 gate 故障，**不能**把错误回给 process 层：
+		// `ManagedProcess.recordSinkError` 对首个 sink 错误的策略是 `job.Terminate(97)`，
+		// 那会在宿主崩溃（stdout 读端已断）时把正在优雅关闭的后端连同进程树一起杀掉，
+		// C13「stdout 已断不影响优雅关闭」的容错根本没机会生效。故障已记在 gate 上，
+		// 监督循环会经 Faulted() 观察到并走关闭收口；这里继续读管道、继续写文件日志。
 		if err := gate.Emit(request.Emitter, protocol.LogEvent{
 			Source:  "backend",
 			Stream:  record.Stream,
 			Message: record.Event,
 		}); err != nil {
-			return err
+			return nil
 		}
 		return nil
 	}
@@ -668,10 +754,16 @@ func failureDetails(logger Logger, proc ManagedProcess, extra map[string]any) ma
 	return details
 }
 
+// processCleanup 是一次进程树收口的事实：forced 表示动用了 Job 兜底，rootForced 进一步
+// 区分「根进程仍存活时被强杀」与「根进程已自行退出、只回收残留孤儿」（增补 1 C14），
+// orphans 是后一种情况下终止前快照到的残留成员（不含根进程）；快照失败时 orphansUnknown 为 true。
 type processCleanup struct {
-	details map[string]any
-	err     error
-	forced  bool
+	details        map[string]any
+	err            error
+	forced         bool
+	rootForced     bool
+	orphans        []process.Info
+	orphansUnknown bool
 }
 
 func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProcess, tx TransactionHandle, logger Logger) processCleanup {
@@ -699,11 +791,9 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		// proc.Wait 等待读者直到长预算耗尽。
 		members, err := proc.Snapshot()
 		snapshotErr = err
-		if err != nil {
+		if err != nil || hasSurvivingDescendant(members, proc.PID()) {
 			outcome.forced = true
-			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
-		} else if len(members) > 0 {
-			outcome.forced = true
+			outcome.recordOrphans(members, err, proc.PID())
 			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		}
 		exitResult, waitErr := proc.Wait(cleanupCtx)
@@ -712,6 +802,8 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		}
 		processErr = errors.Join(processErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
 	default:
+		// 根进程仍存活：这是真正的强制终止，无论树里还有没有别的成员。
+		outcome.rootForced = true
 		processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		exitResult, waitErr := proc.Wait(cleanupCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
@@ -724,6 +816,11 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		// 根进程可能已退出但后代仍占用 Job；先强制终止，再次 Wait/WaitEmpty，
 		// 只有第二次确认空树才允许后续成功收口。
 		forceCtx, forceCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		if !outcome.rootForced {
+			// 根进程早已自行退出，此刻残留的成员就是它遗留的孤儿；在终止前留下清单。
+			members, err := proc.Snapshot()
+			outcome.recordOrphans(members, err, proc.PID())
+		}
 		terminateErr := proc.Terminate(1)
 		exitResult, waitErr := proc.Wait(forceCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
@@ -765,6 +862,43 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 	}
 	outcome.err = withFailureDetailsExtra(resultErr, logger, proc, outcome.details)
 	return outcome
+}
+
+// recordOrphans 把快照里根进程以外的成员记为孤儿；快照失败时只能标记未知。
+// 多次调用取并集去重，因为 Exited 分支与 WaitEmpty 兜底分支可能先后各拍一次。
+func (c *processCleanup) recordOrphans(members []process.Info, snapshotErr error, rootPID uint32) {
+	if snapshotErr != nil {
+		c.orphansUnknown = true
+		return
+	}
+	for _, member := range members {
+		if member.PID == rootPID {
+			continue
+		}
+		duplicate := false
+		for _, known := range c.orphans {
+			if known.PID == member.PID {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			c.orphans = append(c.orphans, member)
+		}
+	}
+}
+
+// hasSurvivingDescendant 判断根进程退出后 Job 里是否还留着别的成员。
+// 根进程自身可能因为进程表尚未收敛而短暂留在快照里，而 Exited 已经证明它退出了；
+// 把它算成残留会让优雅关闭误报 BACKEND_FORCE_TERMINATED。真正的后代（例如后端
+// 漏掉的 worker）仍然会被识别出来并强制回收。
+func hasSurvivingDescendant(members []process.Info, rootPID uint32) bool {
+	for _, member := range members {
+		if member.PID != rootPID {
+			return true
+		}
+	}
+	return false
 }
 
 func withoutExpectedCancellation(err error, keepDeadline bool) error {

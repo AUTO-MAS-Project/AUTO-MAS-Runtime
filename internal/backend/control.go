@@ -3,9 +3,6 @@ package backend
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 
@@ -20,7 +17,9 @@ const (
 	defaultShutdownTimeout        = 5 * time.Second
 	defaultRestartDelay           = 2 * time.Second
 	controlDrainTimeout           = time.Second
-	backendCloseURL               = "http://127.0.0.1:36163/api/core/close"
+	// developmentEntryArgument 是 development 模式沿用的相对入口：cwd 就是
+	// --repo 指定的源码目录，绝对路径只属于 managed（增补 1 C6 第 2 条）。
+	developmentEntryArgument = "main.py"
 )
 
 var (
@@ -723,6 +722,9 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 	var restartFacts map[string]any
 	for {
 		if fault := attempt.gate.Fault(); fault != nil {
+			if commandID, ok := shutdownLatchedBehindOutputFault(request.Control, fault); ok {
+				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
+			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
 		}
@@ -743,6 +745,9 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 		select {
 		case <-attempt.gate.Faulted():
 			fault := attempt.gate.Fault()
+			if commandID, ok := shutdownLatchedBehindOutputFault(request.Control, fault); ok {
+				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
+			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
 		case <-ctx.Done():
@@ -1223,12 +1228,18 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	mode := modeForRequest(request)
 	projectDir := s.layout.RepoDir()
 	projectEnvDir := ""
+	// managed 的 cwd 与入口按增补 1 C6 固定为 app-root 与绝对入口路径；
+	// development 保持空 WorkingDir（回退 --repo）与裸入口，行为不变。
+	workingDir := s.layout.AppRoot()
+	entryArgument := s.layout.BackendEntryFile()
 	var identity *uv.SupervisionIdentity
 	pythonPaths := append([]string(nil), s.deps.PythonPaths...)
 	if mode == ModeDevelopment {
 		projectDir = request.DevelopmentRepo
 		projectEnvDir = developmentProjectEnv(projectDir)
 		pythonPaths = []string{developmentPythonPath(projectDir)}
+		workingDir = ""
+		entryArgument = developmentEntryArgument
 	} else {
 		identity = &uv.SupervisionIdentity{Version: revision.Version, Commit: revision.Commit}
 	}
@@ -1295,9 +1306,11 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		)
 		return nil, errors.Join(ctxErr, cleanupErr)
 	}
-	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", "main.py"}, uv.ManagedOptions{
-		RunOptions: uv.RunOptions{Stage: protocol.StageBackendSpawn, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
-		Identity:   identity,
+	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", entryArgument}, uv.ManagedOptions{
+		RunOptions:     uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
+		Identity:       identity,
+		Infrastructure: s.infrastructure,
+		Port:           request.Port,
 	}, s.streamSink(request, logger, gate))
 	if err != nil || proc == nil {
 		fault := gate.Fault()
@@ -1483,7 +1496,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	}
 	gate.SetStage(protocol.StageBackendRun)
 	setControlStage(request.Control, protocol.StageBackendRun)
-	details := map[string]any{"pid": proc.PID(), "baseUrl": "http://127.0.0.1:36163", "logPath": logger.LogPath()}
+	details := map[string]any{"pid": proc.PID(), "baseUrl": health.BaseURL(request.Port), "logPath": logger.LogPath()}
 	if err := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "后端已就绪", details); err != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(err, logger, proc, cleanup.details)))
@@ -1495,7 +1508,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, probe health.Probe, gate *streamGate, snapshot *controlState, results <-chan controlResult) error {
 	healthCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	expectation := health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit}
+	expectation := health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit, Port: request.Port}
 	if modeForRequest(request) == ModeDevelopment {
 		expectation.Mode = health.ModeDevelopment
 		expectation.Version = ""
@@ -1890,6 +1903,23 @@ func (s *ManagedSupervisor) finishControlCancel(ctx context.Context, request Req
 	}
 }
 
+// shutdownLatchedBehindOutputFault 判断 gate 故障是否只是宿主管道失效、而关闭已在路上：
+// 宿主崩溃时 stdout 与 stdin 一起失效，后端若恰好在输出日志，gate 会先于 EOF 观察到写失败；
+// 此时按增补 1 C13 结论第 4 条仍应优雅关闭，而不是把后端硬杀。
+func shutdownLatchedBehindOutputFault(receiver ControlReceiver, fault error) (string, bool) {
+	if !backendErrorHasCode(fault, protocol.CodeOutputWriteFailed) {
+		return "", false
+	}
+	command, ok := terminalCommand(receiver)
+	if !ok || command.Command != protocol.ControlShutdown {
+		return "", false
+	}
+	return command.CommandID, true
+}
+
+// finishControlShutdown 执行显式或隐式 shutdown 的优雅关闭。按增补 1 C13 结论第 4 条，
+// 进入关闭之后协议输出失败只记录、不中断：HTTP close、等待退出、Job 兜底与资源收口照常执行，
+// 首个输出错误最后才交给 CLI 映射为 OUTPUT_WRITE_FAILED；宿主崩溃时后端因此仍能优雅收尾。
 func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request Request, attempt *controlAttempt, snapshot *controlState, commandID string) error {
 	details := map[string]any{}
 	if commandID != "" {
@@ -1907,61 +1937,98 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	}
 	setControlStage(request.Control, protocol.StageBackendShutdown)
 	snapshot.set(protocol.StageBackendShutdown, protocol.StateStoppingBackend, details)
-	if err := s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStoppingBackend, "正在关闭后端", details); err != nil {
-		var cleanup processCleanup
-		if attempt != nil && attempt.process != nil {
-			cleanup = s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
+	var outputErr error
+	recordOutput := func(err error) {
+		if err != nil && outputErr == nil {
+			outputErr = err
 		}
-		return errors.Join(cleanup.err, err)
 	}
+	recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStoppingBackend, "正在关闭后端", details))
 	if attempt == nil || attempt.process == nil {
 		if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
-			return s.emitControlFailure(request, snapshot, resourceErr)
+			return s.emitControlFailure(request, snapshot, errors.Join(outputErr, resourceErr))
 		}
 		snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
-		return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
+		recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details))
+		return outputErr
 	}
-	timeout := s.deps.ShutdownTimeout
-	if timeout <= 0 {
-		timeout = defaultShutdownTimeout
-	}
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.shutdownTimeout(request))
 	defer cancel()
-	closer := s.deps.HTTP
-	if closer == nil {
-		closer = fixedHTTPCloser{}
-	}
-	httpErr := closer.Close(closeCtx)
-	graceful := httpErr == nil && waitProcessExit(closeCtx, attempt.process)
-	if httpErr == nil && graceful {
-		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-		if cleanup.err != nil {
-			return s.emitControlFailure(request, snapshot, cleanup.err)
+	var httpErr error
+	graceful := true
+	// 根进程已经自己退出时不再发 /api/core/close（增补 1 C15）：端口此刻可能已经
+	// 被别的进程接手，那一发就打到了别人身上。已退出本就是我们要的结局，直接进清理。
+	if !processAlreadyExited(attempt.process) {
+		closer := s.deps.HTTP
+		if closer == nil {
+			closer = newLoopbackHTTPCloser(request.Port)
 		}
-		if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
-			return s.emitControlFailure(request, snapshot, resourceErr)
-		}
-		if cleanup.forced {
-			if err := emitForceWarning(request.Emitter, cleanup.details); err != nil {
-				return err
-			}
-		}
-		snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
-		return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
+		httpErr = closer.Close(closeCtx)
+		graceful = httpErr == nil && waitProcessExit(closeCtx, attempt.process)
 	}
 	cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 	if cleanup.err != nil {
+		if graceful {
+			return s.emitControlFailure(request, snapshot, errors.Join(outputErr, cleanup.err))
+		}
 		failure := newError(protocol.CodeBackendShutdownFailed, protocol.StageBackendCleanup, "后端进程树未能确认清空", cleanup.details, httpErr)
-		return s.emitControlFailure(request, snapshot, errors.Join(failure, cleanup.err))
+		return s.emitControlFailure(request, snapshot, errors.Join(outputErr, failure, cleanup.err))
 	}
 	if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
-		return s.emitControlFailure(request, snapshot, resourceErr)
+		return s.emitControlFailure(request, snapshot, errors.Join(outputErr, resourceErr))
 	}
-	if err := emitForceWarning(request.Emitter, cleanup.details); err != nil {
-		return err
+	if !graceful || cleanup.rootForced {
+		recordOutput(emitForceWarning(request.Emitter, cleanup.details))
+	} else if cleanup.forced {
+		recordOutput(emitOrphansWarning(request.Emitter, cleanup))
 	}
 	snapshot.set(protocol.StageBackendShutdown, protocol.StateStopped, details)
-	return s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details)
+	recordOutput(s.emitState(request.Emitter, protocol.StageBackendShutdown, protocol.StateStopped, "后端已停止", details))
+	return outputErr
+}
+
+// shutdownTimeout 解析本次关闭的等待上限（增补 1 C9）：调用方显式给出的预算优先，
+// 其次是注入的依赖默认值，最后才是编译期常量。三级都在这一处解析，避免出现
+// 第二个真值来源。
+func (s *ManagedSupervisor) shutdownTimeout(request Request) time.Duration {
+	if request.ShutdownTimeout > 0 {
+		return request.ShutdownTimeout
+	}
+	if s.deps.ShutdownTimeout > 0 {
+		return s.deps.ShutdownTimeout
+	}
+	return defaultShutdownTimeout
+}
+
+// maxReportedOrphans 是 BACKEND_ORPHANS_REAPED details 里孤儿清单的上限（增补 1 C14）。
+const maxReportedOrphans = 20
+
+// emitOrphansWarning 发出增补 1 C14 的孤儿回收 warning：根进程自己退出、残留成员被 Job 回收。
+// details 在既有 pid / logPath / exitCode 之外附上 orphanCount、orphans 与 orphansTruncated。
+func emitOrphansWarning(emitter EventEmitter, cleanup processCleanup) error {
+	details := cloneControlDetails(cleanup.details)
+	reported := make([]map[string]any, 0, min(len(cleanup.orphans), maxReportedOrphans))
+	for index, orphan := range cleanup.orphans {
+		if index == maxReportedOrphans {
+			break
+		}
+		reported = append(reported, map[string]any{"pid": orphan.PID, "executable": orphan.Executable})
+	}
+	count := len(cleanup.orphans)
+	if cleanup.orphansUnknown && count == 0 {
+		count = -1
+	}
+	details["orphanCount"] = count
+	details["orphans"] = reported
+	details["orphansTruncated"] = len(cleanup.orphans) > maxReportedOrphans
+	warning, err := protocol.NewWarningEvent(protocol.CodeBackendOrphansReaped, protocol.StageBackendShutdown, "后端已退出，已回收其遗留的孤儿进程", details)
+	if err != nil {
+		return err
+	}
+	if err := emitter.EmitWarning(warning); err != nil {
+		return newError(protocol.CodeOutputWriteFailed, protocol.StageBackendShutdown, "协议 warning 输出失败", nil, err)
+	}
+	return nil
 }
 
 func emitForceWarning(emitter EventEmitter, details map[string]any) error {
@@ -1975,6 +2042,19 @@ func emitForceWarning(emitter EventEmitter, details map[string]any) error {
 	return nil
 }
 
+// processAlreadyExited 非阻塞地判断受管根进程是否已经结束。
+func processAlreadyExited(proc ManagedProcess) bool {
+	if proc == nil {
+		return false
+	}
+	select {
+	case <-proc.Exited():
+		return true
+	default:
+		return false
+	}
+}
+
 func waitProcessExit(ctx context.Context, proc ManagedProcess) bool {
 	if proc == nil {
 		return false
@@ -1986,36 +2066,3 @@ func waitProcessExit(ctx context.Context, proc ManagedProcess) bool {
 		return false
 	}
 }
-
-type fixedHTTPCloser struct{}
-
-func (fixedHTTPCloser) Close(ctx context.Context) error {
-	if ctx == nil {
-		return errors.New("backend shutdown context is nil")
-	}
-	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, backendCloseURL, nil)
-	if err != nil {
-		return err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	readErr := error(nil)
-	if response.Body != nil {
-		_, readErr = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
-	}
-	closeErr := error(nil)
-	if response.Body != nil {
-		closeErr = response.Body.Close()
-	}
-	client.CloseIdleConnections()
-	statusErr := error(nil)
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		statusErr = fmt.Errorf("backend close returned status %d", response.StatusCode)
-	}
-	return errors.Join(statusErr, readErr, closeErr)
-}
-
-var _ HTTPCloser = fixedHTTPCloser{}

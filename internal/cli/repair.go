@@ -37,10 +37,6 @@ func runRepair(
 	deps *deps,
 	emitter *protocol.Emitter,
 ) (success sessionSuccess, returnErr error) {
-	// repair 也会走 SyncDependencies，同样必须在任何副作用之前拒绝包索引覆盖。
-	if err := rejectPackageIndexOverride(deps.global.mirrorPolicy, protocol.StageRepair); err != nil {
-		return sessionSuccess{}, err
-	}
 	store, err := deps.options.environmentStateStoreFactory(ctx, deps.global.layout, deps.options.clock)
 	if err != nil {
 		return sessionSuccess{}, stateStoreError(protocol.StageRepair, err)
@@ -244,6 +240,7 @@ func runRepair(
 		Commit:        check.Commit,
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(logger),
+		Attempt:       mirrorAttemptProgress(emitter),
 	}
 	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesRebuild); err != nil {
 		return sessionSuccess{}, err
@@ -318,6 +315,12 @@ func runRepair(
 			"uvVersion":     uv.FixedVersion,
 			"pythonVersion": pythonResult.Spec.Version.String(),
 			"synchronized":  dependencyResult.Synchronized,
+			// repair 的最后一步同样是 uv sync，镜像源事实与 dependencies sync
+			// 同口径上报（C10 第 7 条）。
+			"sourceKind":    dependencyResult.SourceKind,
+			"source":        dependencyResult.Source,
+			"attemptCount":  dependencyResult.AttemptCount,
+			"lockRewritten": dependencyResult.LockRewritten,
 		},
 	}, nil
 }
