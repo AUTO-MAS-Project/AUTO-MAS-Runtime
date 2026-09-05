@@ -35,7 +35,17 @@ func TestBootstrap_CacheHitAndVersionVerification(t *testing.T) {
 	bootstrapper := newTestBootstrapper(t, layout, artifact, downloader, checker, nil, nil)
 	policy := testMirrorPolicy(t)
 
-	got, err := bootstrapper.Ensure(t.Context(), testOperationID, policy)
+	progressCalls := 0
+	got, err := bootstrapper.EnsureWithProgress(
+		t.Context(),
+		testOperationID,
+		policy,
+		nil,
+		func(mirror.DownloadProgress) error {
+			progressCalls++
+			return nil
+		},
+	)
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
 	}
@@ -47,6 +57,124 @@ func TestBootstrap_CacheHitAndVersionVerification(t *testing.T) {
 	}
 	if downloader.calls != 0 {
 		t.Fatalf("downloads = %d, want 0", downloader.calls)
+	}
+	if progressCalls != 0 {
+		t.Fatalf("download progress calls = %d, want 0 for cache hit", progressCalls)
+	}
+}
+
+func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
+	layout := newUVTestLayout(t)
+	archiveBytes := makeUVArchive(t)
+	artifact := testArtifact(string(archiveBytes))
+	want := []mirror.DownloadProgress{
+		{Received: 0, Total: 1024, Percent: 0},
+		{Received: 512, Total: 1024, Percent: 50},
+		{Received: 1024, Total: 1024, Percent: 100},
+	}
+	downloader := &fakeDownloader{payload: archiveBytes, progress: want}
+	bootstrapper := newTestBootstrapper(
+		t,
+		layout,
+		artifact,
+		downloader,
+		&fakeVersionChecker{},
+		&fakeExtractor{},
+		&fakePublisher{},
+	)
+	got := make([]mirror.DownloadProgress, 0, len(want))
+
+	_, err := bootstrapper.EnsureWithProgress(
+		t.Context(),
+		testOperationID,
+		testMirrorPolicy(t),
+		nil,
+		func(progress mirror.DownloadProgress) error {
+			got = append(got, progress)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("EnsureWithProgress() error = %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("progress events = %#v, want %#v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Errorf("progress[%d] = %#v, want %#v", index, got[index], want[index])
+		}
+	}
+}
+
+func TestBootstrap_DownloadProgressFailurePreservesCause(t *testing.T) {
+	layout := newUVTestLayout(t)
+	archiveBytes := makeUVArchive(t)
+	artifact := testArtifact(string(archiveBytes))
+	downloader := &fakeDownloader{
+		payload: archiveBytes,
+		progress: []mirror.DownloadProgress{
+			{Received: 512, Total: 1024, Percent: 50},
+		},
+	}
+	bootstrapper := newTestBootstrapper(
+		t,
+		layout,
+		artifact,
+		downloader,
+		&fakeVersionChecker{},
+		&fakeExtractor{},
+		&fakePublisher{},
+	)
+	wantErr := errors.New("injected progress failure")
+
+	_, err := bootstrapper.EnsureWithProgress(
+		t.Context(),
+		testOperationID,
+		testMirrorPolicy(t),
+		nil,
+		func(mirror.DownloadProgress) error { return wantErr },
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("EnsureWithProgress() error = %v, want cause %v", err, wantErr)
+	}
+}
+
+func TestBootstrap_RepairForwardsDownloadProgress(t *testing.T) {
+	layout := newUVTestLayout(t)
+	archiveBytes := makeUVArchive(t)
+	artifact := testArtifact(string(archiveBytes))
+	want := mirror.DownloadProgress{Received: 256, Total: 1024, Percent: 25}
+	downloader := &fakeDownloader{
+		payload:  archiveBytes,
+		progress: []mirror.DownloadProgress{want},
+	}
+	bootstrapper := newTestBootstrapper(
+		t,
+		layout,
+		artifact,
+		downloader,
+		&fakeVersionChecker{},
+		&fakeExtractor{},
+		&fakePublisher{},
+	)
+	var got mirror.DownloadProgress
+
+	_, err := bootstrapper.RepairWithProgress(
+		t.Context(),
+		testOperationID,
+		testMirrorPolicy(t),
+		nil,
+		func(progress mirror.DownloadProgress) error {
+			got = progress
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("RepairWithProgress() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("repair progress = %#v, want %#v", got, want)
 	}
 }
 
@@ -368,8 +496,9 @@ func newTestBootstrapper(
 }
 
 type fakeDownloader struct {
-	payload []byte
-	err     error
+	payload  []byte
+	err      error
+	progress []mirror.DownloadProgress
 	// failAfterWrite 在制品已经写到最终位置之后才返回，用来复现真实下载器的
 	// Published 失败：downloader.go 在 PublishNoReplace 之后失败时同时返回
 	// 已填充的 DownloadResult 和 Published=true 的失败，此处必须保持一致。
@@ -393,6 +522,14 @@ func (f *fakeDownloader) Download(
 	}
 	if f.path == "" {
 		return mirror.DownloadResult{}, errors.New("test downloader path is empty")
+	}
+	for _, progress := range f.progress {
+		if request.Progress == nil {
+			return mirror.DownloadResult{}, errors.New("test downloader progress callback is nil")
+		}
+		if err := request.Progress(progress); err != nil {
+			return mirror.DownloadResult{}, err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
 		return mirror.DownloadResult{}, err

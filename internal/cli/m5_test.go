@@ -105,7 +105,12 @@ func containsCapability(values []any, want protocol.Capability) bool {
 func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	root := t.TempDir()
 	log := &m5TestLog{}
-	environment := &m5TestEnvironment{calls: &log.calls}
+	environment := &m5TestEnvironment{
+		calls: &log.calls,
+		uvProgress: []mirror.DownloadProgress{
+			{Received: 512, Total: 1024, Percent: 50},
+		},
+	}
 	workspace := &m5TestWorkspace{calls: &log.calls, emitStates: true}
 	store := &m5TestStateStore{calls: &log.calls}
 	coordinator := &m5TestCoordinator{calls: &log.calls}
@@ -156,6 +161,9 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	if strings.Join(statuses, ",") != strings.Join(wantStatuses, ",") {
 		t.Fatalf("state statuses = %#v, want %#v", statuses, wantStatuses)
 	}
+	assertMeasuredProgress(t, events, protocol.StageUVDownload, 512, 1024, 50)
+	assertProgressLifecycle(t, events, protocol.StagePythonInstall)
+	assertProgressLifecycle(t, events, protocol.StageDependenciesSync)
 	if len(store.writes) != 1 || store.writes[0].Status != protocol.StateReadyToStart {
 		t.Fatalf("state writes = %#v, want one ready_to_start write", store.writes)
 	}
@@ -170,6 +178,88 @@ func TestBootstrapCommand_OrderAndStates(t *testing.T) {
 	if got, ok := environment.dependencyRequest.MirrorPolicy.Preferred(mirror.KindGit); !ok || got != "cnb" {
 		t.Fatalf("dependency request preference = %q/%t, want cnb/true", got, ok)
 	}
+}
+
+func assertMeasuredProgress(
+	t *testing.T,
+	events []parsedEvent,
+	stage protocol.Stage,
+	wantCurrent int64,
+	wantTotal int64,
+	wantPercent float64,
+) {
+	t.Helper()
+	for _, event := range events {
+		if eventType(event) != string(protocol.TypeProgress) ||
+			eventString(event, "stage") != string(stage) {
+			continue
+		}
+		current, currentOK := event.object["current"].(float64)
+		total, totalOK := event.object["total"].(float64)
+		percent, percentOK := event.object["percent"].(float64)
+		if currentOK && totalOK && percentOK &&
+			int64(current) == wantCurrent && int64(total) == wantTotal && percent == wantPercent {
+			return
+		}
+	}
+	t.Fatalf(
+		"%s measured progress not found; want current=%d total=%d percent=%v",
+		stage,
+		wantCurrent,
+		wantTotal,
+		wantPercent,
+	)
+}
+
+func assertProgressLifecycle(t *testing.T, events []parsedEvent, stage protocol.Stage) {
+	t.Helper()
+	statuses := make([]string, 0, 2)
+	for _, event := range events {
+		if eventType(event) == string(protocol.TypeProgress) &&
+			eventString(event, "stage") == string(stage) {
+			statuses = append(statuses, eventString(event, "status"))
+		}
+	}
+	want := []string{string(protocol.ProgressRunning), string(protocol.ProgressSucceeded)}
+	if len(statuses) < 2 || statuses[0] != want[0] || statuses[len(statuses)-1] != want[1] {
+		t.Fatalf("%s progress statuses = %#v, want %#v", stage, statuses, want)
+	}
+}
+
+func TestUVDownloadProgress_OutputFailureMapsToOutputWriteFailed(t *testing.T) {
+	writer := &measuredProgressFailingWriter{}
+	output, err := protocol.NewProcessOutput(writer)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	emitter, err := output.NewEmitter("dev", "bootstrap", nil)
+	if err != nil {
+		t.Fatalf("NewEmitter() error = %v", err)
+	}
+
+	err = uvDownloadProgress(emitter)(mirror.DownloadProgress{
+		Received: 512,
+		Total:    1024,
+		Percent:  50,
+	})
+	var operationErr *commandError
+	if !errors.As(err, &operationErr) {
+		t.Fatalf("progress error = %T %v, want commandError", err, err)
+	}
+	if operationErr.Code() != protocol.CodeOutputWriteFailed {
+		t.Fatalf("progress code = %s, want %s", operationErr.Code(), protocol.CodeOutputWriteFailed)
+	}
+}
+
+type measuredProgressFailingWriter struct {
+	bytes.Buffer
+}
+
+func (w *measuredProgressFailingWriter) Write(value []byte) (int, error) {
+	if bytes.Contains(value, []byte(`"current":512`)) {
+		return 0, errors.New("injected measured progress write failure")
+	}
+	return w.Buffer.Write(value)
 }
 
 // TestM5CommandsAcceptPackageIndexPreference 锁定增补 1 C10 的 2026-09-01 修订：
@@ -1004,6 +1094,7 @@ type m5TestEnvironment struct {
 	uvPolicy               mirror.Policy
 	pythonRequest          uv.PythonRequest
 	dependencyRequest      uv.DependenciesRequest
+	uvProgress             []mirror.DownloadProgress
 }
 
 func (s *m5TestEnvironment) Ensure(context.Context, uv.EnvironmentRequest) (uv.EnvironmentResult, error) {
@@ -1050,6 +1141,24 @@ func (s *m5TestEnvironment) EnsureUV(ctx context.Context, _ string, policy mirro
 	}
 	*s.calls = append(*s.calls, "uv")
 	return "uv.exe", nil
+}
+
+func (s *m5TestEnvironment) EnsureUVWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	_ uv.LineFunc,
+	progress mirror.ProgressFunc,
+) (string, error) {
+	for _, update := range s.uvProgress {
+		if progress == nil {
+			return "", errors.New("test uv progress callback is nil")
+		}
+		if err := progress(update); err != nil {
+			return "", err
+		}
+	}
+	return s.EnsureUV(ctx, operationID, policy)
 }
 
 func (s *m5TestEnvironment) RepairUV(context.Context, string, mirror.Policy) (string, error) {

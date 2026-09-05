@@ -143,6 +143,7 @@ func runRepair(
 		emitter.OperationID(),
 		deps.global.mirrorPolicy,
 		uvLogLine(logger),
+		uvDownloadProgress(emitter),
 	)
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(

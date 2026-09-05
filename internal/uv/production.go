@@ -52,7 +52,7 @@ func (s *ProductionEnvironment) EnsureUV(
 	operationID string,
 	policy mirror.Policy,
 ) (string, error) {
-	return s.ensureUV(ctx, operationID, policy, nil)
+	return s.ensureUV(ctx, operationID, policy, nil, nil)
 }
 
 // EnsureUVWithLine 准备固定版本 uv，并转发版本检查输出。
@@ -62,7 +62,18 @@ func (s *ProductionEnvironment) EnsureUVWithLine(
 	policy mirror.Policy,
 	line LineFunc,
 ) (string, error) {
-	return s.ensureUV(ctx, operationID, policy, line)
+	return s.ensureUV(ctx, operationID, policy, line, nil)
+}
+
+// EnsureUVWithProgress 准备固定版本 uv，并转发版本检查输出与真实下载字节进度。
+func (s *ProductionEnvironment) EnsureUVWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+	progress mirror.ProgressFunc,
+) (string, error) {
+	return s.ensureUV(ctx, operationID, policy, line, progress)
 }
 
 func (s *ProductionEnvironment) ensureUV(
@@ -70,11 +81,12 @@ func (s *ProductionEnvironment) ensureUV(
 	operationID string,
 	policy mirror.Policy,
 	line LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
 	if s == nil || s.bootstrap == nil {
 		return "", errors.New("production environment is invalid")
 	}
-	return s.bootstrap.EnsureWithLine(ctx, operationID, policy, line)
+	return s.bootstrap.EnsureWithProgress(ctx, operationID, policy, line, progress)
 }
 
 // RepairUV 删除固定版本 uv 受管事实并重新下载校验。
@@ -83,7 +95,7 @@ func (s *ProductionEnvironment) RepairUV(
 	operationID string,
 	policy mirror.Policy,
 ) (string, error) {
-	return s.repairUV(ctx, operationID, policy, nil)
+	return s.repairUV(ctx, operationID, policy, nil, nil)
 }
 
 // RepairUVWithLine 删除固定版本 uv 受管事实并重新下载校验，同时转发输出。
@@ -93,7 +105,18 @@ func (s *ProductionEnvironment) RepairUVWithLine(
 	policy mirror.Policy,
 	line LineFunc,
 ) (string, error) {
-	return s.repairUV(ctx, operationID, policy, line)
+	return s.repairUV(ctx, operationID, policy, line, nil)
+}
+
+// RepairUVWithProgress 删除固定版本 uv 受管事实并重新下载校验，同时转发输出与真实下载字节进度。
+func (s *ProductionEnvironment) RepairUVWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+	progress mirror.ProgressFunc,
+) (string, error) {
+	return s.repairUV(ctx, operationID, policy, line, progress)
 }
 
 func (s *ProductionEnvironment) repairUV(
@@ -101,11 +124,12 @@ func (s *ProductionEnvironment) repairUV(
 	operationID string,
 	policy mirror.Policy,
 	line LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
 	if s == nil || s.bootstrap == nil {
 		return "", errors.New("production environment is invalid")
 	}
-	return s.bootstrap.RepairWithLine(ctx, operationID, policy, line)
+	return s.bootstrap.RepairWithProgress(ctx, operationID, policy, line, progress)
 }
 
 // CheckUV 只检查固定版本 uv，不触碰网络或创建目录。

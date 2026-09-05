@@ -159,6 +159,7 @@ func environmentEnsureCommand(deps *deps) *cobra.Command {
 						emitter.OperationID(),
 						deps.global.mirrorPolicy,
 						uvLogLine(logger),
+						uvDownloadProgress(emitter),
 					)
 					if err != nil {
 						revision, _ := activeEnvironmentRevision(initial)
@@ -330,6 +331,7 @@ func runEnvironmentRepair(
 		emitter.OperationID(),
 		deps.global.mirrorPolicy,
 		uvLogLine(logger),
+		uvDownloadProgress(emitter),
 	)
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(

@@ -248,7 +248,7 @@ func (b *Bootstrapper) Ensure(
 	operationID string,
 	policy mirror.Policy,
 ) (executablePath string, returnErr error) {
-	return b.ensure(ctx, operationID, policy, nil)
+	return b.ensure(ctx, operationID, policy, nil, nil)
 }
 
 // EnsureWithLine 返回已通过版本实测的 uv.exe，并转发版本检查输出。
@@ -258,7 +258,18 @@ func (b *Bootstrapper) EnsureWithLine(
 	policy mirror.Policy,
 	line LineFunc,
 ) (executablePath string, returnErr error) {
-	return b.ensure(ctx, operationID, policy, line)
+	return b.ensure(ctx, operationID, policy, line, nil)
+}
+
+// EnsureWithProgress 返回已通过版本实测的 uv.exe，并转发版本检查输出与真实下载字节进度。
+func (b *Bootstrapper) EnsureWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+	progress mirror.ProgressFunc,
+) (executablePath string, returnErr error) {
+	return b.ensure(ctx, operationID, policy, line, progress)
 }
 
 func (b *Bootstrapper) ensure(
@@ -266,6 +277,7 @@ func (b *Bootstrapper) ensure(
 	operationID string,
 	policy mirror.Policy,
 	line LineFunc,
+	progress mirror.ProgressFunc,
 ) (executablePath string, returnErr error) {
 	if ctx == nil || b == nil || b.layout == nil {
 		return "", newError(
@@ -306,7 +318,7 @@ func (b *Bootstrapper) ensure(
 		return "", wrapBootstrapError(protocol.StageUVDownload, err)
 	}
 	if !regularFile(archivePath) {
-		downloadResult, downloadErr := b.download(ctx, policy, spec)
+		downloadResult, downloadErr := b.download(ctx, policy, spec, progress)
 		if downloadErr != nil {
 			return "", downloadErr
 		}
@@ -464,7 +476,7 @@ func (b *Bootstrapper) Repair(
 	operationID string,
 	policy mirror.Policy,
 ) (string, error) {
-	return b.repair(ctx, operationID, policy, nil)
+	return b.repair(ctx, operationID, policy, nil, nil)
 }
 
 // RepairWithLine 删除当前固定版本的 uv 受管事实后重新执行完整 bootstrap，并转发输出。
@@ -474,7 +486,18 @@ func (b *Bootstrapper) RepairWithLine(
 	policy mirror.Policy,
 	line LineFunc,
 ) (string, error) {
-	return b.repair(ctx, operationID, policy, line)
+	return b.repair(ctx, operationID, policy, line, nil)
+}
+
+// RepairWithProgress 重新下载并校验固定版本 uv，同时转发输出与真实下载字节进度。
+func (b *Bootstrapper) RepairWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+	progress mirror.ProgressFunc,
+) (string, error) {
+	return b.repair(ctx, operationID, policy, line, progress)
 }
 
 func (b *Bootstrapper) repair(
@@ -482,6 +505,7 @@ func (b *Bootstrapper) repair(
 	operationID string,
 	policy mirror.Policy,
 	line LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
 	if ctx == nil || b == nil || b.layout == nil || operationID == "" {
 		return "", errors.New("uv bootstrap repair request is invalid")
@@ -511,7 +535,7 @@ func (b *Bootstrapper) repair(
 			return "", wrapBootstrapError(protocol.StageUVVerify, errors.Join(removeErr, closeErr))
 		}
 	}
-	return b.ensure(ctx, operationID, policy, line)
+	return b.ensure(ctx, operationID, policy, line, progress)
 }
 
 func requireUVPlatform(stage protocol.Stage) error {
@@ -531,6 +555,7 @@ func (b *Bootstrapper) download(
 	ctx context.Context,
 	policy mirror.Policy,
 	spec Artifact,
+	progress mirror.ProgressFunc,
 ) (mirror.DownloadResult, error) {
 	target, err := mirror.NewTarget(mirror.TargetSpec{UVVersion: spec.Version})
 	if err != nil {
@@ -553,6 +578,7 @@ func (b *Bootstrapper) download(
 			AllowUnknownSize: true,
 			MaxSize:          maxUVDownloadBytes,
 			ExpectedSHA256:   spec.SHA256,
+			Progress:         progress,
 		})
 		if downloadErr == nil {
 			downloadedPath = downloadResult.Path

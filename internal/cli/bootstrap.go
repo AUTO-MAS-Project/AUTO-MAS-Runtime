@@ -142,6 +142,7 @@ func runBootstrap(
 		emitter.OperationID(),
 		deps.global.mirrorPolicy,
 		uvLogLine(operationLogger),
+		uvDownloadProgress(emitter),
 	)
 	if err != nil {
 		revision, _ := activeEnvironmentRevision(initial)
@@ -310,6 +311,9 @@ func runBootstrap(
 	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesSync); err != nil {
 		return sessionSuccess{}, err
 	}
+	if err := emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressRunning, "正在同步锁定依赖"); err != nil {
+		return sessionSuccess{}, err
+	}
 	dependencyResult, err := service.SyncDependencies(ctx, uv.DependenciesRequest{
 		ProjectDir:    deps.global.layout.RepoDir(),
 		ProjectEnvDir: deps.global.layout.VenvDir(),
@@ -323,6 +327,9 @@ func runBootstrap(
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesSync, err)
+	}
+	if err := emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressSucceeded, "锁定依赖已同步"); err != nil {
+		return sessionSuccess{}, err
 	}
 	ready, err := store.NewReadyEnvironment(revision.Version(), revision.Commit())
 	if err != nil {

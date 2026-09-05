@@ -272,7 +272,13 @@ func ensureM5UV(
 	operationID string,
 	policy mirror.Policy,
 	line uv.LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
+	if withProgress, ok := service.(interface {
+		EnsureUVWithProgress(context.Context, string, mirror.Policy, uv.LineFunc, mirror.ProgressFunc) (string, error)
+	}); ok {
+		return withProgress.EnsureUVWithProgress(ctx, operationID, policy, line, progress)
+	}
 	if withLine, ok := service.(interface {
 		EnsureUVWithLine(context.Context, string, mirror.Policy, uv.LineFunc) (string, error)
 	}); ok {
@@ -287,7 +293,13 @@ func repairM5UV(
 	operationID string,
 	policy mirror.Policy,
 	line uv.LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
+	if withProgress, ok := service.(interface {
+		RepairUVWithProgress(context.Context, string, mirror.Policy, uv.LineFunc, mirror.ProgressFunc) (string, error)
+	}); ok {
+		return withProgress.RepairUVWithProgress(ctx, operationID, policy, line, progress)
+	}
 	if withLine, ok := service.(interface {
 		RepairUVWithLine(context.Context, string, mirror.Policy, uv.LineFunc) (string, error)
 	}); ok {
@@ -662,6 +674,35 @@ func mirrorAttemptProgress(emitter *protocol.Emitter) uv.MirrorAttemptFunc {
 			message = fmt.Sprintf("镜像源均不可用，正在从官方源 %s 按原锁同步依赖", attempt.Source)
 		}
 		return emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressRunning, message)
+	}
+}
+
+// uvDownloadProgress 把下载器确认写入的真实字节进度映射为协议进度。
+func uvDownloadProgress(emitter *protocol.Emitter) mirror.ProgressFunc {
+	if emitter == nil {
+		return nil
+	}
+	return func(progress mirror.DownloadProgress) error {
+		current := progress.Received
+		total := progress.Total
+		percent := progress.Percent
+		if err := emitter.EmitProgress(protocol.ProgressEvent{
+			Stage:   protocol.StageUVDownload,
+			Status:  protocol.ProgressRunning,
+			Current: &current,
+			Total:   &total,
+			Percent: &percent,
+			Message: "正在下载固定版本 uv",
+		}); err != nil {
+			return &commandError{
+				code:    protocol.CodeOutputWriteFailed,
+				stage:   protocol.StageUVDownload,
+				message: "协议输出失败",
+				details: map[string]any{},
+				cause:   err,
+			}
+		}
+		return nil
 	}
 }
 

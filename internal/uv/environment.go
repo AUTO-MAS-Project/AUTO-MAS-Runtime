@@ -179,7 +179,7 @@ func (s *EnvironmentService) EnsureUV(
 	operationID string,
 	policy mirror.Policy,
 ) (string, error) {
-	return s.ensureUV(ctx, operationID, policy, nil)
+	return s.ensureUV(ctx, operationID, policy, nil, nil)
 }
 
 // EnsureUVWithLine 只执行固定 uv bootstrap，并转发版本检查输出。
@@ -189,7 +189,18 @@ func (s *EnvironmentService) EnsureUVWithLine(
 	policy mirror.Policy,
 	line LineFunc,
 ) (string, error) {
-	return s.ensureUV(ctx, operationID, policy, line)
+	return s.ensureUV(ctx, operationID, policy, line, nil)
+}
+
+// EnsureUVWithProgress 只执行固定 uv bootstrap，并转发版本检查输出与真实下载字节进度。
+func (s *EnvironmentService) EnsureUVWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+	progress mirror.ProgressFunc,
+) (string, error) {
+	return s.ensureUV(ctx, operationID, policy, line, progress)
 }
 
 func (s *EnvironmentService) ensureUV(
@@ -197,9 +208,15 @@ func (s *EnvironmentService) ensureUV(
 	operationID string,
 	policy mirror.Policy,
 	line LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
 	if ctx == nil || s == nil || s.uv == nil {
 		return "", errors.New("uv ensure request is invalid")
+	}
+	if withProgress, ok := s.uv.(interface {
+		EnsureWithProgress(context.Context, string, mirror.Policy, LineFunc, mirror.ProgressFunc) (string, error)
+	}); ok {
+		return withProgress.EnsureWithProgress(ctx, operationID, policy, line, progress)
 	}
 	if withLine, ok := s.uv.(interface {
 		EnsureWithLine(context.Context, string, mirror.Policy, LineFunc) (string, error)
@@ -215,7 +232,7 @@ func (s *EnvironmentService) RepairUV(
 	operationID string,
 	policy mirror.Policy,
 ) (string, error) {
-	return s.repairUV(ctx, operationID, policy, nil)
+	return s.repairUV(ctx, operationID, policy, nil, nil)
 }
 
 // RepairUVWithLine 删除固定版本 uv 受管事实并重新下载校验，同时转发输出。
@@ -225,7 +242,18 @@ func (s *EnvironmentService) RepairUVWithLine(
 	policy mirror.Policy,
 	line LineFunc,
 ) (string, error) {
-	return s.repairUV(ctx, operationID, policy, line)
+	return s.repairUV(ctx, operationID, policy, line, nil)
+}
+
+// RepairUVWithProgress 删除固定版本 uv 受管事实并重新下载校验，同时转发输出与真实下载字节进度。
+func (s *EnvironmentService) RepairUVWithProgress(
+	ctx context.Context,
+	operationID string,
+	policy mirror.Policy,
+	line LineFunc,
+	progress mirror.ProgressFunc,
+) (string, error) {
+	return s.repairUV(ctx, operationID, policy, line, progress)
 }
 
 func (s *EnvironmentService) repairUV(
@@ -233,11 +261,17 @@ func (s *EnvironmentService) repairUV(
 	operationID string,
 	policy mirror.Policy,
 	line LineFunc,
+	progress mirror.ProgressFunc,
 ) (string, error) {
 	if ctx == nil || s == nil || s.uv == nil {
 		return "", errors.New("uv repair request is invalid")
 	}
 	if repair, ok := s.uv.(UVRepairOperations); ok {
+		if withProgress, ok := s.uv.(interface {
+			RepairWithProgress(context.Context, string, mirror.Policy, LineFunc, mirror.ProgressFunc) (string, error)
+		}); ok {
+			return withProgress.RepairWithProgress(ctx, operationID, policy, line, progress)
+		}
 		if withLine, ok := s.uv.(interface {
 			RepairWithLine(context.Context, string, mirror.Policy, LineFunc) (string, error)
 		}); ok {
@@ -245,7 +279,7 @@ func (s *EnvironmentService) repairUV(
 		}
 		return repair.Repair(ctx, operationID, policy)
 	}
-	return s.ensureUV(ctx, operationID, policy, line)
+	return s.ensureUV(ctx, operationID, policy, line, progress)
 }
 
 // CheckUV 只读取固定 uv 的可用性。
@@ -427,7 +461,7 @@ func (s *EnvironmentService) ensureUVForRepair(
 	ctx context.Context,
 	request EnvironmentRequest,
 ) (string, error) {
-	return s.repairUV(ctx, request.OperationID, request.BootstrapPolicy, request.Line)
+	return s.repairUV(ctx, request.OperationID, request.BootstrapPolicy, request.Line, nil)
 }
 
 var _ UVOperations = (*Bootstrapper)(nil)
