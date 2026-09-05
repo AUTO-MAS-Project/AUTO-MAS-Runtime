@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"golang.org/x/sys/windows"
 )
 
 // 本文件用真实的 auto-mas-runtime.exe 黑盒验证增补 1 C13：既有 E2E 直接驱动
@@ -106,6 +107,27 @@ type backendE2ERuntimeProcess struct {
 	waitErr  chan error
 }
 
+// breakOutputPipe 直接关闭读端的 Windows 句柄，避免 os.File.Close 等待读操作完成。
+// Runner 上的 Go 1.26.7 会让挂起的管道读阻塞 os.File.Close；宿主崩溃测试需要立即让
+// Runtime 看到 ERROR_BROKEN_PIPE，不能依赖正常的 os.File 生命周期收口。
+func (p *backendE2ERuntimeProcess) breakOutputPipe(t *testing.T, stream **os.File) {
+	t.Helper()
+	file := *stream
+	if file == nil {
+		return
+	}
+	handle := windows.Handle(file.Fd())
+	// 先取消 goroutine 中挂起的同步 ReadFile；仅关闭句柄在 Windows 上可能自身阻塞，
+	// 直到该读操作结束，而子进程仍持有写端时它永远不会结束。
+	if err := windows.CancelIoEx(handle, nil); err != nil && err != windows.ERROR_NOT_FOUND {
+		t.Fatalf("cancel broken output pipe read: %v", err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatalf("close broken output pipe handle: %v", err)
+	}
+	*stream = nil
+}
+
 func (p *backendE2ERuntimeProcess) stderrText() string {
 	p.stderrMu.Lock()
 	defer p.stderrMu.Unlock()
@@ -173,8 +195,12 @@ func startBackendE2ERuntime(t *testing.T, fixture *backendE2EFixture) *backendE2
 			}
 			<-process.waitErr
 		}
-		_ = stdoutRead.Close()
-		_ = stderrRead.Close()
+		if process.stdoutRead != nil {
+			_ = process.stdoutRead.Close()
+		}
+		if process.stderrRead != nil {
+			_ = process.stderrRead.Close()
+		}
 	})
 	go func() {
 		buffer := make([]byte, 4096)
@@ -304,9 +330,7 @@ func TestBackendE2E_StdinEOFWithBrokenStdoutStillExits(t *testing.T) {
 	pythonPID := waitE2EPIDFile(t, fixture.config.PIDFile)
 
 	// 先断 stdout（宿主那端的读端没了），再断 stdin。
-	if err := process.stdoutRead.Close(); err != nil {
-		t.Fatalf("close stdout read end: %v", err)
-	}
+	process.breakOutputPipe(t, &process.stdoutRead)
 	process.closeStdin(t)
 
 	code := process.waitExit(t, 30*time.Second)
@@ -340,12 +364,8 @@ func TestBackendE2E_HostCrashBrokenStdoutStderrStillClosesGracefully(t *testing.
 	pythonPID := waitE2EPIDFile(t, fixture.config.PIDFile)
 
 	// 宿主死了：两条管道的读端同时消失，然后 stdin EOF。
-	if err := process.stdoutRead.Close(); err != nil {
-		t.Fatalf("close stdout read end: %v", err)
-	}
-	if err := process.stderrRead.Close(); err != nil {
-		t.Fatalf("close stderr read end: %v", err)
-	}
+	process.breakOutputPipe(t, &process.stdoutRead)
+	process.breakOutputPipe(t, &process.stderrRead)
 	eofAt := time.Now()
 	process.closeStdin(t)
 
