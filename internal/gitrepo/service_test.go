@@ -863,6 +863,7 @@ func newTestService(t *testing.T, layout *config.Layout, reader repositoryReader
 
 func testSyncRequest(target Target) SyncRequest {
 	return SyncRequest{
+		UseCurrent:  true,
 		Target:      target,
 		OperationID: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
 		PID:         1234,

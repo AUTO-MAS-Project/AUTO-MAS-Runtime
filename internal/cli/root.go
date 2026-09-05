@@ -116,6 +116,7 @@ func workspaceGroup(deps *deps) *cobra.Command {
 	group := &cobra.Command{Use: "workspace", Short: "受管后端仓库操作"}
 	group.AddCommand(
 		workspaceCheckCommand(deps),
+		workspaceStageCommand(deps),
 		workspaceSyncCommand(deps),
 	)
 	return group

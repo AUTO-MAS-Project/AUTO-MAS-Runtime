@@ -24,11 +24,12 @@ var (
 
 // Service 是 workspace check/sync 的应用服务；check 不创建任何运行时能力。
 type Service struct {
-	layout     *config.Layout
-	reader     repositoryReader
-	newLocks   lockFactory
-	newRuntime runtimeFactory
-	buildPlan  planBuilder
+	layout        *config.Layout
+	reader        repositoryReader
+	newLocks      lockFactory
+	newRuntime    runtimeFactory
+	buildPlan     planBuilder
+	resolveRemote func(context.Context, mirror.Plan, Target) (string, error)
 }
 
 // WorkspaceEmitter 是同步服务使用的最小协议事件出口。
@@ -51,6 +52,7 @@ type StageReporter func(protocol.Stage)
 
 // SyncRequest 描述一次 workspace sync 的外部依赖和稳定身份。
 type SyncRequest struct {
+	UseCurrent       bool
 	Target           Target
 	Policy           mirror.Policy
 	OperationID      string
@@ -73,6 +75,13 @@ type CheckResult struct {
 	Source            string
 	Reason            string
 	directoryIdentity *filesystem.DirectoryIdentity
+}
+
+// RemoteCheckResult 是 workspace check --remote 的只读结果。
+type RemoteCheckResult struct {
+	Current         CheckResult
+	RemoteCommit    string
+	UpdateAvailable bool
 }
 
 // SyncResult 是 workspace sync 的稳定业务结果。
@@ -154,11 +163,12 @@ func newServiceWithDependencies(
 		return nil, errInvalidService
 	}
 	return &Service{
-		layout:     layout,
-		reader:     reader,
-		newLocks:   newLocks,
-		newRuntime: newRuntime,
-		buildPlan:  buildPlan,
+		layout:        layout,
+		reader:        reader,
+		newLocks:      newLocks,
+		newRuntime:    newRuntime,
+		buildPlan:     buildPlan,
+		resolveRemote: resolveRemoteCommit,
 	}, nil
 }
 
@@ -393,67 +403,72 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	if err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
-	if check.Healthy && check.Version == request.Target.Version() &&
-		check.Branch == request.Target.Branch() {
-		setStage(request, protocol.StageWorkspaceCleanup)
-		if err := removeTransaction(ctx, runtime, state.TransactionMutation); err != nil {
+	var pendingState state.TransactionState
+	pending, pendingErr := runtime.ReadTransaction(ctx, state.TransactionUpdate)
+	if pendingErr == nil && pending.State().Command == "workspace stage" {
+		pendingState = pending.State()
+		if pendingState.TargetVersion != request.Target.Version() || !check.Healthy || pendingState.BaseCommit != check.Commit || pendingState.TargetCommit == check.Commit {
+			if _, err := runtime.Recover(ctx, RecoveryRequest{LogPath: logger.LogPath(), DiscardStaged: true}); err != nil {
+				return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
+			}
+			pendingState = state.TransactionState{}
+		}
+	} else if pendingErr != nil && !errors.Is(pendingErr, state.ErrNotFound) {
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceCheck, pendingErr))
+	}
+	prepared := pendingState.Command == "workspace stage" && pendingState.Stage == protocol.StageWorkspaceVerify
+	if !prepared && check.Healthy && check.Version == request.Target.Version() && check.Branch == request.Target.Branch() {
+		unchanged := request.UseCurrent || plan.Offline()
+		if !unchanged {
+			commit, err := s.resolveRemote(ctx, plan, request.Target)
+			unchanged = err == nil && commit == check.Commit
+			if ctx.Err() != nil {
+				return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceCancelledError(protocol.StageWorkspaceCheck, ctx.Err()))
+			}
+		}
+		if unchanged {
+			return s.finishUnchanged(ctx, request, runtime, machine, check)
+		}
+	}
+	var update state.TransactionState
+	var fetched FetchResult
+	if prepared {
+		update = pendingState
+		fetched, err = s.readPreparedFetch(ctx, update, request.Target)
+		if err != nil {
 			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 		}
-		if err := machine.RollbackPreparation(); err != nil {
-			return SyncResult{}, serviceInternalError(protocol.StageWorkspaceCheck, err)
+	} else {
+		update, err = runtime.NewTransaction(state.TransactionUpdate, state.TransactionInput{
+			OperationID: request.OperationID, Command: "workspace sync", PID: request.PID,
+			TargetVersion: request.Target.Version(), Stage: protocol.StageWorkspaceClone,
+		})
+		if err != nil {
+			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceClone, err))
 		}
-		setStage(request, protocol.StageWorkspaceCheck)
-		if err := emitState(request, protocol.StageWorkspaceCheck, initialStatus, "后端仓库已是目标版本", map[string]any{
-			"version": request.Target.Version(),
-			"branch":  request.Target.Branch(),
-		}); err != nil {
-			return SyncResult{}, err
+		if err := advanceTransactions(ctx, runtime, &mutation, &update, protocol.StageWorkspaceClone); err != nil {
+			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 		}
-		return SyncResult{
-			Revision: Revision{
-				version:   check.Version,
-				branch:    check.Branch,
-				commit:    check.Commit,
-				sourceKey: check.Source,
-			},
-			Changed:          false,
-			Status:           initialStatus,
-			ControlCommandID: controlCommandID(request),
-		}, nil
+		fetched, err = runtime.Fetch(ctx, FetchRequest{Plan: plan, Target: request.Target, OperationID: request.OperationID, StageReporter: request.StageReporter})
+		if err != nil {
+			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
+		}
 	}
-
-	update, err := runtime.NewTransaction(state.TransactionUpdate, state.TransactionInput{
-		OperationID:   request.OperationID,
-		Command:       "workspace sync",
-		PID:           request.PID,
-		TargetVersion: request.Target.Version(),
-		Stage:         protocol.StageWorkspaceClone,
-	})
-	if err != nil {
-		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceClone, err))
+	update.TargetCommit = fetched.Revision.Commit()
+	if check.Healthy {
+		update.BaseCommit = check.Commit
 	}
-	if err := runtime.WriteTransaction(ctx, state.TransactionUpdate, update); err != nil {
-		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, mapStateWriteError(protocol.StageWorkspaceClone, err))
-	}
-	setStage(request, protocol.StageWorkspaceClone)
-	if err := advanceTransactions(ctx, runtime, &mutation, &update, protocol.StageWorkspaceClone); err != nil {
-		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
-	}
-
-	fetched, err := runtime.Fetch(ctx, FetchRequest{
-		Plan:          plan,
-		Target:        request.Target,
-		OperationID:   request.OperationID,
-		StageReporter: request.StageReporter,
-	})
-	if err != nil {
-		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
-	}
-	setStage(request, protocol.StageWorkspaceVerify)
+	// 启用前转为普通同步事务；Commit 记录让崩溃恢复能够区分同版本的新旧仓库。
+	update.Command = "workspace sync"
 	if err := advanceTransactions(ctx, runtime, &mutation, &update, protocol.StageWorkspaceVerify); err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
-
+	if check.Healthy && check.Version == fetched.Revision.Version() && check.Commit == fetched.Revision.Commit() {
+		if _, err := runtime.Recover(ctx, RecoveryRequest{LogPath: logger.LogPath()}); err != nil {
+			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
+		}
+		return s.finishUnchanged(ctx, request, runtime, machine, check)
+	}
 	setStage(request, protocol.StageWorkspaceSwap)
 	environmentCommitted := false
 	swapResult, swapErr := runtime.Swap(ctx, SwapRequest{
@@ -535,6 +550,19 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	}, nil
 }
 
+func (s *Service) finishUnchanged(ctx context.Context, request SyncRequest, runtime syncRuntime, machine *protocol.LifecycleMachine, check CheckResult) (SyncResult, error) {
+	if err := removeTransaction(ctx, runtime, state.TransactionMutation); err != nil {
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
+	}
+	if err := machine.RollbackPreparation(); err != nil {
+		return SyncResult{}, serviceInternalError(protocol.StageWorkspaceCheck, err)
+	}
+	if err := emitState(request, protocol.StageWorkspaceCheck, machine.Initial(), "后端仓库已是目标版本", map[string]any{"version": check.Version, "branch": check.Branch}); err != nil {
+		return SyncResult{}, err
+	}
+	return SyncResult{Revision: Revision{version: check.Version, branch: check.Branch, commit: check.Commit, sourceKey: check.Source}, Status: machine.Initial(), ControlCommandID: controlCommandID(request)}, nil
+}
+
 func (s *Service) finishPreSwap(
 	ctx context.Context,
 	request SyncRequest,
@@ -552,7 +580,11 @@ func (s *Service) finishPreSwap(
 	}
 	cleanupContext, cancel := serviceCleanupContext(ctx)
 	defer cancel()
-	if !preserveUpdateTransaction(cleanupContext, s.layout, request.OperationID, cause) {
+	updateOperationID := request.OperationID
+	if snapshot, err := runtime.ReadTransaction(cleanupContext, state.TransactionUpdate); err == nil && snapshot.State().OperationID != "" {
+		updateOperationID = snapshot.State().OperationID
+	}
+	if !preserveUpdateTransaction(cleanupContext, s.layout, updateOperationID, cause) {
 		if cleanupErr := removeTransaction(cleanupContext, runtime, state.TransactionUpdate); cleanupErr != nil {
 			cause = errors.Join(cause, cleanupErr)
 		}
@@ -594,10 +626,8 @@ func (s *Service) cancelBeforeSwap(
 ) error {
 	cleanupContext, cancel := serviceCleanupContext(ctx)
 	defer cancel()
-	cleanupErr := errors.Join(
-		removeTransaction(cleanupContext, runtime, state.TransactionUpdate),
-		removeTransaction(cleanupContext, runtime, state.TransactionMutation),
-	)
+	// Recover 可能刚保留了可供下次启动的 stage 事务；取消不能丢失其目录所有权。
+	cleanupErr := removeTransaction(cleanupContext, runtime, state.TransactionMutation)
 	return errors.Join(
 		serviceCancelledErrorWithDetails(stage, cause, controlDetails(request)),
 		cleanupErr,
@@ -863,6 +893,14 @@ func (s productionMutexSet) AcquireMutation(ctx context.Context) (mutationLease,
 }
 
 func (s productionMutexSet) Close() error { return s.set.Close() }
+
+func (s productionMutexSet) AcquireStaging(ctx context.Context) (mutationLease, error) {
+	result, err := s.set.AcquireStaging(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return result.Lease(), nil
+}
 
 type productionRuntime struct {
 	store    *state.Store

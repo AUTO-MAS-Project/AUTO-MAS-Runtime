@@ -17,6 +17,8 @@ import (
 const maxStateFileBytes = filesystem.MaxStateFileBytes
 
 type transactionWire struct {
+	TargetCommit  string          `json:"targetCommit"`
+	BaseCommit    string          `json:"baseCommit"`
 	SchemaVersion *int            `json:"schemaVersion"`
 	OperationID   *string         `json:"operationId"`
 	Command       *string         `json:"command"`
@@ -248,6 +250,8 @@ type jsonObjectShape map[string]jsonObjectShape
 
 func transactionJSONShape() jsonObjectShape {
 	return jsonObjectShape{
+		"targetCommit":  nil,
+		"baseCommit":    nil,
 		"schemaVersion": nil,
 		"operationId":   nil,
 		"command":       nil,
@@ -338,6 +342,8 @@ func (w transactionWire) transaction() (TransactionState, error) {
 		PID:           *w.PID,
 		StartedAt:     time.Time(*w.StartedAt),
 		TargetVersion: *w.TargetVersion,
+		TargetCommit:  w.TargetCommit,
+		BaseCommit:    w.BaseCommit,
 		Stage:         *w.Stage,
 	}, nil
 }

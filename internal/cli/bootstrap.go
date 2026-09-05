@@ -33,6 +33,7 @@ func bootstrapCommand(deps *deps) *cobra.Command {
 		},
 	}
 	command.Flags().String("version", "", "目标版本（例如 v5.4.0-beta.1）")
+	command.Flags().Bool("if-needed", false, "仅在仓库更新或环境未就绪时同步依赖")
 	return command
 }
 
@@ -42,6 +43,10 @@ func runBootstrap(
 	command *cobra.Command,
 	emitter *protocol.Emitter,
 ) (success sessionSuccess, returnErr error) {
+	ifNeeded, err := command.Flags().GetBool("if-needed")
+	if err != nil {
+		return sessionSuccess{}, err
+	}
 	version, err := command.Flags().GetString("version")
 	if err != nil || version == "" {
 		return sessionSuccess{}, &commandError{
@@ -80,7 +85,7 @@ func runBootstrap(
 			returnErr = errors.Join(returnErr, mutationCloseError(closeErr))
 		}
 	}()
-	if err := recoverM5Transaction(ctx, store, deps.global.layout); err != nil {
+	if err := recoverPreparationTransaction(ctx, store, deps.global.layout, true); err != nil {
 		return sessionSuccess{}, err
 	}
 	initial, err := readEnvironmentOrUninitialized(ctx, store)
@@ -189,6 +194,7 @@ func runBootstrap(
 	control := workspaceControlFromContext(ctx)
 	binding := &workspaceLogBinding{}
 	workspaceResult, err := workspace.Sync(ctx, gitrepo.SyncRequest{
+		UseCurrent:    true,
 		Target:        target,
 		Policy:        deps.global.mirrorPolicy,
 		OperationID:   emitter.OperationID(),
@@ -247,6 +253,15 @@ func runBootstrap(
 			details: map[string]any{},
 			cause:   errors.New("workspace sync returned an empty revision"),
 		}
+	}
+	if ifNeeded && !workspaceResult.Changed && workspaceResult.Status == protocol.StateReadyToStart &&
+		initial.Status == protocol.StateReadyToStart && initial.LastSuccessful.Version == revision.Version() && initial.LastSuccessful.Commit == revision.Commit() {
+		if err := rollbackM5Preparation(emitter, machine, protocol.StageBootstrap, "当前运行环境已就绪"); err != nil {
+			return sessionSuccess{}, err
+		}
+		return sessionSuccess{message: "当前运行环境已就绪", status: string(protocol.StateReadyToStart), details: map[string]any{
+			"version": revision.Version(), "branch": revision.Branch(), "commit": revision.Commit(), "unchanged": true,
+		}}, nil
 	}
 	if err := transitionM5State(emitter, machine, protocol.StagePythonCheck, protocol.StatePreparingPython, "正在准备受管 Python"); err != nil {
 		return sessionSuccess{}, err

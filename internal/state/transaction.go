@@ -18,10 +18,14 @@ type TransactionState struct {
 	StartedAt     time.Time      `json:"startedAt"`
 	TargetVersion string         `json:"targetVersion"`
 	Stage         protocol.Stage `json:"stage"`
+	TargetCommit  string         `json:"targetCommit,omitempty"`
+	BaseCommit    string         `json:"baseCommit,omitempty"`
 }
 
 // TransactionInput 是创建新事务时由应用服务提供的业务身份。
 type TransactionInput struct {
+	TargetCommit  string
+	BaseCommit    string
 	OperationID   string
 	Command       string
 	PID           uint32
@@ -44,6 +48,8 @@ func (s *Store) NewTransaction(
 		return TransactionState{}, err
 	}
 	value := TransactionState{
+		TargetCommit:  input.TargetCommit,
+		BaseCommit:    input.BaseCommit,
 		SchemaVersion: SchemaVersion,
 		OperationID:   input.OperationID,
 		Command:       input.Command,
@@ -90,6 +96,19 @@ func ValidateTransaction(kind TransactionKind, value TransactionState) error {
 	if transactionTargetRequired(kind, value.Command) && value.TargetVersion == "" {
 		return validationError("targetVersion")
 	}
+	for field, commit := range map[string]string{"targetCommit": value.TargetCommit, "baseCommit": value.BaseCommit} {
+		if commit != "" && (kind != TransactionUpdate || validateCommit(commit) != nil) {
+			return validationError(field)
+		}
+	}
+	if value.Command == "workspace stage" {
+		if value.BaseCommit == "" {
+			return validationError("baseCommit")
+		}
+		if value.Stage != protocol.StageWorkspaceClone && value.TargetCommit == "" {
+			return validationError("targetCommit")
+		}
+	}
 	return nil
 }
 
@@ -106,7 +125,7 @@ func transactionCommandAllowed(kind TransactionKind, command string) bool {
 			return false
 		}
 	case TransactionUpdate:
-		return command == "bootstrap" || command == "workspace sync"
+		return command == "bootstrap" || command == "workspace sync" || command == "workspace stage"
 	default:
 		return false
 	}

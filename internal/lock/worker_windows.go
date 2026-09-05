@@ -29,11 +29,12 @@ const (
 const maxThreadWaitAttempts = 64
 
 type workerRequest struct {
-	operation  requestKind
-	ctx        context.Context
-	kind       Kind
-	generation uint64
-	response   chan workerResponse
+	allowBackend bool
+	operation    requestKind
+	ctx          context.Context
+	kind         Kind
+	generation   uint64
+	response     chan workerResponse
 }
 
 type workerResponse struct {

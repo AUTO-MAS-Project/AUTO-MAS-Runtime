@@ -84,6 +84,14 @@ type workspaceService interface {
 	Sync(ctx context.Context, request gitrepo.SyncRequest) (gitrepo.SyncResult, error)
 }
 
+type remoteWorkspaceService interface {
+	CheckRemote(context.Context, mirror.Policy) (gitrepo.RemoteCheckResult, error)
+}
+
+type stagedWorkspaceService interface {
+	Stage(context.Context, gitrepo.StageRequest) (gitrepo.StageResult, error)
+}
+
 // workspaceFactory 构造只在调用方法时产生副作用的 workspace 服务。
 type workspaceFactory func(layout *config.Layout) (workspaceService, error)
 

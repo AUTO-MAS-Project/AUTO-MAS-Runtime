@@ -35,6 +35,19 @@ func (s *Set) AcquireMutation(ctx context.Context) (AcquisitionResult, error) {
 	return s.acquire(ctx, KindMutation)
 }
 
+// AcquireStaging 独占 mutation Mutex，允许已运行的后端继续持有 backend Mutex。
+// 此租约只允许修改独立暂存仓库，不允许替换当前 repo 或修改主环境。
+func (s *Set) AcquireStaging(ctx context.Context) (AcquisitionResult, error) {
+	if ctx == nil {
+		return AcquisitionResult{}, errors.New("acquire staging mutex: nil context")
+	}
+	response, err := s.dispatch(ctx, workerRequest{operation: requestAcquire, kind: KindMutation, allowBackend: true})
+	if response.acquisition.lease != nil {
+		response.acquisition.lease.set = s
+	}
+	return response.acquisition, err
+}
+
 func (s *Set) acquire(
 	ctx context.Context,
 	kind Kind,
@@ -184,7 +197,7 @@ func (s *workerState) acquire(request workerRequest) workerResponse {
 	if err := request.ctx.Err(); err != nil {
 		return cleanupPrimary(err)
 	}
-	if peerProbe.Held {
+	if peerProbe.Held && !(request.kind == KindMutation && request.allowBackend) {
 		return cleanupPrimary(s.peerConflict(request.kind))
 	}
 

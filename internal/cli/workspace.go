@@ -18,7 +18,7 @@ import (
 
 // workspaceCheckCommand 注册只读 workspace 检查。
 func workspaceCheckCommand(deps *deps) *cobra.Command {
-	return &cobra.Command{
+	command := &cobra.Command{
 		Use:   "check",
 		Short: "只读检查受管仓库",
 		Args:  cobra.NoArgs,
@@ -33,19 +33,100 @@ func workspaceCheckCommand(deps *deps) *cobra.Command {
 					if err != nil {
 						return sessionSuccess{}, err
 					}
+					remoteRequested, flagErr := cmd.Flags().GetBool("remote")
+					if flagErr != nil {
+						return sessionSuccess{}, flagErr
+					}
+					if remoteRequested {
+						checker, ok := service.(remoteWorkspaceService)
+						if !ok {
+							return sessionSuccess{}, errors.New("remote workspace check is unavailable")
+						}
+						remoteResult, remoteErr := checker.CheckRemote(ctx, deps.global.mirrorPolicy)
+						if remoteErr != nil {
+							return sessionSuccess{}, remoteErr
+						}
+						details := workspaceCheckDetails(remoteResult.Current)
+						details["remoteCommit"] = remoteResult.RemoteCommit
+						details["updateAvailable"] = remoteResult.UpdateAvailable
+						return sessionSuccess{message: "仓库远端检查完成", details: details}, nil
+					}
 					result, err := service.Check(ctx)
 					if err != nil {
 						return sessionSuccess{}, err
 					}
-					return sessionSuccess{
-						message: "仓库检查完成",
-						details: workspaceCheckDetails(result),
-					}, nil
+					return sessionSuccess{message: "仓库检查完成", details: workspaceCheckDetails(result)}, nil
 				},
 			)
 			return nil
 		},
 	}
+	command.Flags().Bool("remote", false, "查询当前版本发布分支的远端 Commit")
+	return command
+}
+
+// workspaceStageCommand 注册允许后端继续运行的后台仓库准备。
+func workspaceStageCommand(deps *deps) *cobra.Command {
+	command := &cobra.Command{
+		Use:   "stage",
+		Short: "后台准备后端仓库更新",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			deps.exitCode = runOperationWithStdinCancel(
+				deps.ctx,
+				deps,
+				commandPath(cmd),
+				protocol.StageWorkspaceClone,
+				[]string{string(protocol.CapabilityStdinCancel)},
+				func(ctx context.Context, emitter *protocol.Emitter) (sessionSuccess, error) {
+					versions, err := depsVersionValues(cmd)
+					if err != nil {
+						return sessionSuccess{}, err
+					}
+					target, err := gitrepo.ParseTarget(versions[0])
+					if err != nil {
+						return sessionSuccess{}, &commandError{code: protocol.CodeInvalidVersion, stage: protocol.StageWorkspaceClone, message: "目标版本无效", details: map[string]any{}, cause: err}
+					}
+					service, err := deps.options.workspaceFactory(deps.global.layout)
+					if err != nil {
+						return sessionSuccess{}, err
+					}
+					stager, ok := service.(stagedWorkspaceService)
+					if !ok {
+						return sessionSuccess{}, errors.New("workspace stage is unavailable")
+					}
+					binding := &workspaceLogBinding{}
+					control := workspaceControlFromContext(ctx)
+					result, err := stager.Stage(ctx, gitrepo.StageRequest{
+						Target: target, Policy: deps.global.mirrorPolicy, OperationID: emitter.OperationID(),
+						PID: uint32(os.Getpid()), Emitter: emitter,
+						LoggerFactory: func(loggerContext context.Context, command string, operationID string) (gitrepo.OperationLogger, error) {
+							logger, loggerErr := deps.options.workspaceLoggerFactory(loggerContext, deps.global.layout, deps.io.Err, command, operationID, deps.options.clock)
+							if loggerErr == nil {
+								binding.Set(logger)
+							}
+							return logger, loggerErr
+						},
+						Auditor: binding, Clock: deps.options.clock,
+						StageReporter: func(stage protocol.Stage) {
+							if control != nil {
+								control.SetStage(stage)
+							}
+						},
+					})
+					if err != nil {
+						return sessionSuccess{}, err
+					}
+					return sessionSuccess{message: "后端更新已准备完成", details: map[string]any{
+						"version": result.Revision.Version(), "branch": result.Revision.Branch(), "commit": result.Revision.Commit(), "staged": result.Staged,
+					}}, nil
+				},
+			)
+			return nil
+		},
+	}
+	command.Flags().StringArray("version", nil, "目标版本（例如 v5.4.0-beta.1）")
+	return command
 }
 
 // workspaceSyncCommand 注册带目标版本和 stdin cancel 的仓库同步。

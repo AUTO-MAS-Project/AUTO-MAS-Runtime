@@ -797,6 +797,25 @@ func TestRecoverM5Transaction_PreservesWorkspaceOwnedEvidence(t *testing.T) {
 	if _, err := store.ReadTransaction(t.Context(), state.TransactionMutation); err != nil {
 		t.Fatalf("ReadTransaction() error = %v, want workspace evidence retained", err)
 	}
+	update, err := store.NewTransaction(state.TransactionUpdate, state.TransactionInput{
+		OperationID: transaction.OperationID, Command: "workspace sync", PID: transaction.PID,
+		TargetVersion: transaction.TargetVersion, Stage: transaction.Stage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteTransaction(t.Context(), state.TransactionUpdate, update); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverPreparationTransaction(t.Context(), store, layout, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadTransaction(t.Context(), state.TransactionMutation); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("mutation = %v, want removed", err)
+	}
+	if _, err := store.ReadTransaction(t.Context(), state.TransactionUpdate); err != nil {
+		t.Fatalf("update ownership lost: %v", err)
+	}
 }
 
 func TestRepair_StagesFollowExecution(t *testing.T) {

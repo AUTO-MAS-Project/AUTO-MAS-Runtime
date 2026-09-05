@@ -79,6 +79,7 @@ func (s *stateRecoveryStore) WriteEnvironment(
 
 // RecoveryRequest 提供补写 repository_changed 所需的当前 Runtime 日志路径。
 type RecoveryRequest struct {
+	DiscardStaged bool
 	LogPath       string
 	StageReporter StageReporter
 }
@@ -169,10 +170,33 @@ func (r *Recovery) Recover(
 			errInvalidRecoveryRequest,
 		)
 	}
+	// workspace stage 是后台准备事务。它故意跨越一次 Runtime 进程生命周期，
+	// 在下次 bootstrap 之前不得按中断事务清理暂存仓库。
+	if transaction.state.Command == "workspace stage" && transaction.state.Stage == protocol.StageWorkspaceVerify {
+		if !request.DiscardStaged {
+			return RecoveryResult{}, nil
+		}
+	}
 
 	paths, err := r.recoveryPaths(transaction.state.OperationID)
 	if err != nil {
 		return RecoveryResult{}, recoveryInternalError(err)
+	}
+	if transaction.state.Command == "workspace stage" && (transaction.state.Stage == protocol.StageWorkspaceClone || transaction.state.Stage == protocol.StageWorkspaceVerify) {
+		update, err := r.classifyPath(ctx, paths.update, transaction.state.Stage == protocol.StageWorkspaceClone)
+		if err != nil {
+			return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "staged_update_unknown", err)
+		}
+		result := RecoveryResult{}
+		if update.exists() {
+			if update.kind == recoveryPathValid && !update.isTarget(transaction.state.TargetVersion) {
+				return result, recoveryAmbiguousError(transaction.state.Stage, "staged_update_identity", errRecoveryIdentityUnknown)
+			}
+			if err := r.removeRecoveryTree(ctx, filesystem.DeleteRepositoryUpdate, paths.update, transaction.state.OperationID, recoveryUpdateCleanupReason, update.directoryIdentity, &result, request.StageReporter, false); err != nil {
+				return result, err
+			}
+		}
+		return r.finishRecovery(ctx, transaction, result, request.StageReporter, false)
 	}
 	allowIncompleteUpdate := transaction.state.Stage == protocol.StageWorkspaceClone
 	allowDamagedRepository := transaction.state.Stage == protocol.StageWorkspaceClone ||
@@ -188,6 +212,22 @@ func (r *Recovery) Recover(
 	previous, err := r.classifyPath(ctx, paths.previous, false)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "previous_unknown", err)
+	}
+	if transaction.state.TargetCommit != "" {
+		targetCommit, baseCommit := transaction.state.TargetCommit, transaction.state.BaseCommit
+		if (update.kind == recoveryPathValid && update.identity.commit != targetCommit) ||
+			(previous.kind == recoveryPathValid && previous.identity.commit != baseCommit) ||
+			(repository.kind == recoveryPathValid && repository.identity.commit != targetCommit && repository.identity.commit != baseCommit) {
+			return RecoveryResult{}, recoveryAmbiguousError(transaction.state.Stage, "transaction_commit_mismatch", errRecoveryIdentityUnknown)
+		}
+	}
+	if transaction.state.TargetCommit != "" {
+		targetCommit, baseCommit := transaction.state.TargetCommit, transaction.state.BaseCommit
+		if (update.kind == recoveryPathValid && update.identity.commit != targetCommit) ||
+			(previous.kind == recoveryPathValid && previous.identity.commit != baseCommit) ||
+			(repository.kind == recoveryPathValid && repository.identity.commit != targetCommit && repository.identity.commit != baseCommit) {
+			return RecoveryResult{}, recoveryAmbiguousError(transaction.state.Stage, "transaction_commit_mismatch", errRecoveryIdentityUnknown)
+		}
 	}
 
 	switch transaction.state.Stage {
@@ -335,7 +375,7 @@ func (r *Recovery) recoverBeforeSwap(
 			errRecoveryIdentityUnknown,
 		)
 	}
-	if repository.isTarget(transaction.state.TargetVersion) &&
+	if transaction.state.TargetCommit == "" && repository.isTarget(transaction.state.TargetVersion) &&
 		update.isTarget(transaction.state.TargetVersion) &&
 		!repository.identity.sameRevision(update.identity) {
 		return RecoveryResult{}, recoveryAmbiguousError(
@@ -392,7 +432,7 @@ func (r *Recovery) recoverSwap(
 		)
 	}
 	targetVersion := transaction.state.TargetVersion
-	if hasMultipleTargetRevisions(targetVersion, repository, update, previous) {
+	if transaction.state.TargetCommit == "" && hasMultipleTargetRevisions(targetVersion, repository, update, previous) {
 		return RecoveryResult{}, recoveryAmbiguousError(
 			transaction.state.Stage,
 			"multiple_target_candidates",
@@ -400,8 +440,11 @@ func (r *Recovery) recoverSwap(
 		)
 	}
 
+	isTarget := func(path recoveryPath) bool {
+		return path.isTarget(targetVersion) && (transaction.state.TargetCommit == "" || path.identity.commit == transaction.state.TargetCommit)
+	}
 	switch {
-	case repository.isTarget(targetVersion):
+	case isTarget(repository):
 		if update.kind != recoveryPathMissing ||
 			previous.kind != recoveryPathMissing && previous.kind != recoveryPathValid {
 			return RecoveryResult{}, recoveryAmbiguousError(
@@ -413,7 +456,7 @@ func (r *Recovery) recoverSwap(
 		return r.completeActiveTarget(ctx, request, transaction, paths, repository.identity, previous)
 
 	case repository.kind == recoveryPathValid:
-		if update.isTarget(targetVersion) && previous.kind == recoveryPathMissing {
+		if isTarget(update) && previous.kind == recoveryPathMissing {
 			result := RecoveryResult{}
 			if err := r.removeRecoveryTree(
 				ctx,
@@ -433,7 +476,7 @@ func (r *Recovery) recoverSwap(
 
 	case repository.kind == recoveryPathMissing:
 		switch {
-		case update.isTarget(targetVersion) && previous.kind == recoveryPathValid:
+		case isTarget(update) && previous.kind == recoveryPathValid:
 			result := RecoveryResult{}
 			if err := r.renameRecoveryRepository(
 				ctx,
@@ -464,7 +507,7 @@ func (r *Recovery) recoverSwap(
 			}
 			return r.finishRecovery(cleanupCtx, transaction, result, request.StageReporter, true)
 
-		case update.isTarget(targetVersion) && previous.kind == recoveryPathMissing:
+		case isTarget(update) && previous.kind == recoveryPathMissing:
 			plan, err := r.prepareEnvironment(ctx, request, update.identity, false)
 			if err != nil {
 				return RecoveryResult{}, err

@@ -81,6 +81,10 @@ func removeM5Transaction(
 // 只有 PID 已退出且 Mutex 已确认空闲时才允许恢复；危险阶段必须先把稳定状态
 // 失效为 environment_broken，再条件删除事务。M4 workspace 现场保留给其专用恢复器。
 func recoverM5Transaction(ctx context.Context, store environmentStateStore, layout *config.Layout) error {
+	return recoverPreparationTransaction(ctx, store, layout, false)
+}
+
+func recoverPreparationTransaction(ctx context.Context, store environmentStateStore, layout *config.Layout, workspaceFollows bool) error {
 	if store == nil || layout == nil {
 		return stateStoreError(protocol.StageWorkspaceCleanup, errors.New("m5 state store is unavailable"))
 	}
@@ -107,6 +111,15 @@ func recoverM5Transaction(ctx context.Context, store environmentStateStore, layo
 		cleanupContext, cancelCleanup := m5TransactionCleanupContext(ctx)
 		defer cancelCleanup()
 		owned, invalidatesEnvironment := classifyStaleM5Stage(transaction.Stage)
+		// 只有同一 mutation 租约内还会执行 workspace 恢复的 bootstrap 才能让出此记录。
+		// update.json 始终保留，目录的分类与恢复继续由 gitrepo 负责。
+		if workspaceFollows && transaction.Command == "workspace sync" {
+			switch transaction.Stage {
+			case protocol.StageWorkspaceCheck, protocol.StageWorkspaceClone, protocol.StageWorkspaceVerify,
+				protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup:
+				owned = true
+			}
+		}
 		if !owned {
 			return staleM5TransactionOwnershipError(transaction)
 		}

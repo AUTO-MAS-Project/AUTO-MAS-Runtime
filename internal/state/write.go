@@ -168,6 +168,8 @@ func sameTransactionState(left, right TransactionState) bool {
 		left.PID == right.PID &&
 		left.StartedAt.Equal(right.StartedAt) &&
 		left.TargetVersion == right.TargetVersion &&
+		left.TargetCommit == right.TargetCommit &&
+		left.BaseCommit == right.BaseCommit &&
 		left.Stage == right.Stage
 }
 
