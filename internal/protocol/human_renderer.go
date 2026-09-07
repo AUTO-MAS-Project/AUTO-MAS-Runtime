@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -64,8 +65,9 @@ func (r *HumanRenderer) RenderProgress(event ProgressEvent) error {
 		builder.WriteString(strconv.FormatInt(*event.Total, 10))
 	}
 	if event.Percent != nil {
+		// human 模式只供人看：百分比保留两位小数；NDJSON 里的数值不在此处改动。
 		builder.WriteString(" percent=")
-		builder.WriteString(strconv.FormatFloat(*event.Percent, 'f', -1, 64))
+		builder.WriteString(strconv.FormatFloat(math.Round(*event.Percent*100)/100, 'f', -1, 64))
 		builder.WriteByte('%')
 	}
 	prefix := builder.String()
