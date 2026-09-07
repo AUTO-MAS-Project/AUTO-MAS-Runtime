@@ -316,7 +316,7 @@ func TestHumanRendererContractMatrix(t *testing.T) {
 			t.Fatalf("EmitResult(failure) error = %v", err)
 		}
 		wantStdout := "HELLO runtime=- command=- capabilities=-\n" +
-			"PROGRESS [unknown\\rstage] unknown\\nstatus percent=0.000000001% — progress\n" +
+			"PROGRESS [unknown\\rstage] unknown\\nstatus percent=0% — progress\n" +
 			"RESULT success=true code=unknown-code stage=unknown-stage status=unknown-status retryable=false remediation=- — success\n"
 		if got := stdout.String() + failureStdout.String(); got != wantStdout {
 			t.Errorf("stdout = %q, want %q", got, wantStdout)
