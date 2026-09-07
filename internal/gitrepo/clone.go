@@ -24,7 +24,10 @@ import (
 )
 
 const (
-	maxCloneProgressPulses = 64
+	// cloneHeartbeatInterval 是传输期 workspace.clone running 心跳的固定间隔。
+	// 1 秒足以让 Electron 的不定进度动画感知到「还活着」，更密只增加 NDJSON 噪声，
+	// 更疏在慢网下会让用户误以为卡死；心跳只报活，不携带任何数值。
+	cloneHeartbeatInterval = time.Second
 	cloneCleanupTimeout    = 30 * time.Second
 	directoryCloseAttempts = 3
 
@@ -120,6 +123,10 @@ type cleanupContextFactory func(
 	ctx context.Context,
 ) (context.Context, context.CancelFunc)
 
+// tickerFactory 创建按固定间隔投递时刻的 ticker，返回其通道与停止函数；
+// 生产使用 time.NewTicker，测试注入假时钟以免依赖真实时间。
+type tickerFactory func(interval time.Duration) (ticks <-chan time.Time, stop func())
+
 type fetcherDependencies struct {
 	layout         *config.Layout
 	rotator        rotationRunner
@@ -130,6 +137,7 @@ type fetcherDependencies struct {
 	emitProgress   progressEmitter
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
+	newTicker      tickerFactory
 }
 
 // Fetcher 获取并验证一个固定目标分支，不负责激活仓库目录。
@@ -143,6 +151,7 @@ type Fetcher struct {
 	emitProgress   progressEmitter
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
+	newTicker      tickerFactory
 }
 
 // NewFetcher 创建使用 go-git 传输和真实静态校验器的仓库获取器。
@@ -171,6 +180,9 @@ func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, err
 	if dependencies.cleanupContext == nil {
 		dependencies.cleanupContext = newCloneCleanupContext
 	}
+	if dependencies.newTicker == nil {
+		dependencies.newTicker = newTimeTicker
+	}
 	if client, ok := dependencies.git.(goGitClient); ok && !client.policy.valid() {
 		policy, err := newCheckoutPolicy(repositoryCheckoutExclusions())
 		if err != nil {
@@ -197,6 +209,7 @@ func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, err
 		emitProgress:   dependencies.emitProgress,
 		caBundle:       append([]byte(nil), dependencies.caBundle...),
 		cleanupContext: dependencies.cleanupContext,
+		newTicker:      dependencies.newTicker,
 	}, nil
 }
 
@@ -410,8 +423,13 @@ func (f *Fetcher) fetchAttempt(
 		}
 	}
 
-	progress := newCloneProgressWriter(f.emitProgress)
-	cloneErr := f.git.Clone(ctx, repositoryPath, git.CloneOptions{
+	// 心跳输出失败时取消派生 context 让传输尽早结束；外层 ctx 不受影响，
+	// 因此后续按外层 ctx 判定取消仍能区分「用户取消」与「输出故障」。
+	cloneCtx, cancelClone := context.WithCancel(ctx)
+	defer cancelClone()
+	heartbeat := newCloneHeartbeat(f.emitProgress, f.newTicker, cloneHeartbeatInterval, cancelClone)
+	heartbeat.start()
+	cloneErr := f.git.Clone(cloneCtx, repositoryPath, git.CloneOptions{
 		URL:               attempt.Source.BaseURL(),
 		RemoteName:        "origin",
 		ReferenceName:     plumbing.NewBranchReferenceName(request.Target.Branch()),
@@ -419,12 +437,14 @@ func (f *Fetcher) fetchAttempt(
 		NoCheckout:        true,
 		Depth:             1,
 		RecurseSubmodules: git.NoRecurseSubmodules,
-		Progress:          progress,
+		Progress:          heartbeat,
 		Tags:              git.NoTags,
 		InsecureSkipTLS:   false,
 		CABundle:          append([]byte(nil), f.caBundle...),
 	})
-	if progressErr := progress.Err(); progressErr != nil {
+	// 先停心跳并等待 goroutine 退出，再判定结果与发终态：保证终态之后不会再有迟到的 running。
+	heartbeat.stop()
+	if progressErr := heartbeat.Err(); progressErr != nil {
 		return f.finishFailedAttempt(
 			ctx,
 			request,
@@ -1002,7 +1022,8 @@ func validFetcher(fetcher *Fetcher) bool {
 		!nilDependency(fetcher.remover) &&
 		!nilDependency(fetcher.verifier) &&
 		fetcher.emitProgress != nil &&
-		fetcher.cleanupContext != nil
+		fetcher.cleanupContext != nil &&
+		fetcher.newTicker != nil
 }
 
 func reportFetchStage(request FetchRequest, stage protocol.Stage) {
@@ -1029,52 +1050,110 @@ func nilDependency(value any) bool {
 	}
 }
 
-type cloneProgressWriter struct {
+// cloneHeartbeat 在 go-git 传输期间按固定间隔发出不带数值的 workspace.clone running 事件。
+//
+// go-git 的 sideband 文本集中在握手阶段涌入，传输 packfile 的最长阶段没有任何输出，
+// 因此脉冲不能按写入次数触发；这里只按时间报活。它同时充当 CloneOptions.Progress 的
+// io.Writer 以保持传输协商不变，但写入内容一律丢弃——那是外部自然语言，可能含 URL 与凭据。
+type cloneHeartbeat struct {
+	emit      progressEmitter
+	newTicker tickerFactory
+	interval  time.Duration
+	// abort 在协议输出失败时调用，用于取消传输；心跳自身不再继续发事件。
+	abort func()
+
+	// mu 保护 lastErr；goroutine 内写、stop 之后由调用方读。
 	mu      sync.Mutex
-	emit    progressEmitter
-	pulses  int
 	lastErr error
+
+	stopOnce sync.Once
+	quit     chan struct{}
+	done     chan struct{}
 }
 
-func newCloneProgressWriter(emit progressEmitter) *cloneProgressWriter {
-	return &cloneProgressWriter{emit: emit}
+func newCloneHeartbeat(
+	emit progressEmitter,
+	newTicker tickerFactory,
+	interval time.Duration,
+	abort func(),
+) *cloneHeartbeat {
+	return &cloneHeartbeat{
+		emit:      emit,
+		newTicker: newTicker,
+		interval:  interval,
+		abort:     abort,
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
+	}
 }
 
-func (w *cloneProgressWriter) Write(payload []byte) (int, error) {
-	if len(payload) == 0 {
-		return 0, nil
+// start 启动心跳 goroutine。退出条件：Stop 被调用，或一次协议输出失败；
+// 两条路径都会停止 ticker 并关闭 done。
+func (h *cloneHeartbeat) start() {
+	if h.emit == nil || h.newTicker == nil || h.interval <= 0 {
+		h.setErr(ErrInvalidFetcher)
+		close(h.done)
+		return
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.lastErr != nil {
-		return 0, w.lastErr
-	}
-	if w.pulses >= maxCloneProgressPulses {
-		return len(payload), nil
-	}
-	if w.emit == nil {
-		w.lastErr = ErrInvalidFetcher
-		return 0, w.lastErr
-	}
-	if err := w.emit(protocol.ProgressEvent{
-		Stage:   protocol.StageWorkspaceClone,
-		Status:  protocol.ProgressRunning,
-		Message: cloneProgressPulseMessage,
-	}); err != nil {
-		w.lastErr = fmt.Errorf("emit clone progress: %w", err)
-		return 0, w.lastErr
-	}
-	w.pulses++
+	ticks, stopTicker := h.newTicker(h.interval)
+	go func() {
+		defer close(h.done)
+		defer stopTicker()
+		for {
+			select {
+			case <-h.quit:
+				return
+			case <-ticks:
+				if err := h.emit(protocol.ProgressEvent{
+					Stage:   protocol.StageWorkspaceClone,
+					Status:  protocol.ProgressRunning,
+					Message: cloneProgressPulseMessage,
+				}); err != nil {
+					h.setErr(fmt.Errorf("emit clone progress: %w", err))
+					if h.abort != nil {
+						h.abort()
+					}
+					return
+				}
+			}
+		}
+	}()
+}
+
+// stop 通知心跳退出并阻塞到 goroutine 结束；可重复调用。
+// 调用方必须在发终态事件前调用它，否则无法保证事件顺序。
+func (h *cloneHeartbeat) stop() {
+	h.stopOnce.Do(func() { close(h.quit) })
+	<-h.done
+}
+
+// Write 满足 go-git 的 Progress 写入器契约：接受并丢弃 sideband 文本，不触发任何事件。
+func (h *cloneHeartbeat) Write(payload []byte) (int, error) {
 	return len(payload), nil
 }
 
-func (w *cloneProgressWriter) Err() error {
-	if w == nil {
+// Err 返回心跳期间发生的协议输出故障；应在 stop 之后读取。
+func (h *cloneHeartbeat) Err() error {
+	if h == nil {
 		return ErrInvalidFetcher
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.lastErr
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastErr
+}
+
+func (h *cloneHeartbeat) setErr(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lastErr == nil {
+		h.lastErr = err
+	}
+}
+
+// newTimeTicker 是生产用的 tickerFactory，直接包装 time.NewTicker。
+func newTimeTicker(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
 }
 
 type goGitClient struct {

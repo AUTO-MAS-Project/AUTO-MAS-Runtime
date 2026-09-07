@@ -51,6 +51,7 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 	layout := mustGitLayout(t)
 	caBundle := []byte("test-ca-bundle")
 	progress := &progressRecorder{}
+	ticker := newFakeTicker()
 
 	client := &fakeGitClient{
 		list: func(_ context.Context, sourceURL string, gotCA []byte) ([]*plumbing.Reference, error) {
@@ -97,6 +98,8 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 			if _, err := options.Progress.Write([]byte("remote: secret natural-language progress\n")); err != nil {
 				t.Fatalf("Progress.Write() error = %v", err)
 			}
+			// 脉冲来自时间心跳而非 sideband 写入：推进一个间隔以得到一条 running。
+			ticker.advance(cloneHeartbeatInterval)
 			return nil
 		},
 	}
@@ -125,6 +128,7 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 		verifier:     verifier,
 		emitProgress: progress.EmitProgress,
 		caBundle:     caBundle,
+		newTicker:    ticker.factory,
 	})
 
 	var stages []protocol.Stage
@@ -770,35 +774,348 @@ func TestFetcher_DirectoryLeaseCloseExhaustionPreservesTemporaryRepository(t *te
 	}
 }
 
-func TestCloneProgressWriter_DoesNotExposeOrParseGitText(t *testing.T) {
-	var events []protocol.ProgressEvent
-	writer := newCloneProgressWriter(func(event protocol.ProgressEvent) error {
-		events = append(events, event)
-		return nil
-	})
-	secret := []byte("remote: https://user:token@example.test/repo.git fatal: 99%\n")
+const heartbeatSecretSideband = "remote: https://user:token@example.test/repo.git fatal: 99%\n"
 
-	for i := 0; i < maxCloneProgressPulses+10; i++ {
-		written, err := writer.Write(secret)
+func TestCloneHeartbeat_WritesDoNotProducePulses(t *testing.T) {
+	recorder := &progressRecorder{}
+	ticker := newFakeTicker()
+	heartbeat := newCloneHeartbeat(recorder.EmitProgress, ticker.factory, cloneHeartbeatInterval, func() {})
+	heartbeat.start()
+
+	// 同一瞬间连续写入：假时钟不推进，sideband 的写入次数不得转成脉冲。
+	for range 74 {
+		written, err := heartbeat.Write([]byte(heartbeatSecretSideband))
 		if err != nil {
 			t.Fatalf("Write() error = %v", err)
 		}
-		if written != len(secret) {
-			t.Fatalf("Write() = %d, want %d", written, len(secret))
+		if written != len(heartbeatSecretSideband) {
+			t.Fatalf("Write() = %d, want %d", written, len(heartbeatSecretSideband))
 		}
 	}
-	if len(events) != maxCloneProgressPulses {
-		t.Fatalf("event count = %d, want bounded %d", len(events), maxCloneProgressPulses)
+	heartbeat.stop()
+
+	if pulses := countPulses(recorder.Events()); pulses > 1 {
+		t.Fatalf("pulses after 74 writes at the same instant = %d, want at most 1", pulses)
+	}
+	if err := heartbeat.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+func TestCloneHeartbeat_PulsesWhileSidebandSilent(t *testing.T) {
+	recorder := &progressRecorder{}
+	ticker := newFakeTicker()
+	heartbeat := newCloneHeartbeat(recorder.EmitProgress, ticker.factory, cloneHeartbeatInterval, func() {})
+	heartbeat.start()
+
+	// 无任何 sideband 写入，只推进时间：传输 packfile 的静默期也必须有心跳。
+	ticker.advance(5 * time.Second)
+	heartbeat.stop()
+
+	if pulses := countPulses(recorder.Events()); pulses < 4 {
+		t.Fatalf("pulses after 5s of silence = %d, want at least 4", pulses)
+	}
+	if !ticker.stopped() {
+		t.Fatal("ticker still running after stop(), want stopped")
+	}
+}
+
+func TestCloneHeartbeat_DoesNotExposeOrParseGitText(t *testing.T) {
+	recorder := &progressRecorder{}
+	ticker := newFakeTicker()
+	heartbeat := newCloneHeartbeat(recorder.EmitProgress, ticker.factory, cloneHeartbeatInterval, func() {})
+	heartbeat.start()
+
+	for range 3 {
+		if _, err := heartbeat.Write([]byte(heartbeatSecretSideband)); err != nil {
+			t.Fatalf("Write() error = %v", err)
+		}
+		ticker.advance(cloneHeartbeatInterval)
+	}
+	heartbeat.stop()
+
+	events := recorder.Events()
+	if len(events) == 0 {
+		t.Fatal("no heartbeat events recorded, want at least one")
 	}
 	for _, event := range events {
-		if event.Stage != protocol.StageWorkspaceClone || event.Status != protocol.ProgressRunning {
-			t.Fatalf("progress event = %#v, want workspace.clone/running", event)
+		assertHeartbeatPulse(t, event)
+	}
+}
+
+func TestCloneHeartbeat_OutputFailureStopsPulsing(t *testing.T) {
+	errOutput := errors.New("progress output failed")
+	recorder := &progressRecorder{}
+	var emitCalls int
+	var emitMu sync.Mutex
+	emit := func(event protocol.ProgressEvent) error {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		emitCalls++
+		if emitCalls == 1 {
+			return errOutput
 		}
-		if event.Message != cloneProgressPulseMessage {
-			t.Fatalf("progress message = %q, want fixed pulse", event.Message)
+		return recorder.EmitProgress(event)
+	}
+	aborted := make(chan struct{})
+	var abortOnce sync.Once
+	ticker := newFakeTicker()
+	heartbeat := newCloneHeartbeat(emit, ticker.factory, cloneHeartbeatInterval, func() {
+		abortOnce.Do(func() { close(aborted) })
+	})
+	heartbeat.start()
+
+	ticker.advance(3 * time.Second)
+	heartbeat.stop()
+
+	if err := heartbeat.Err(); !errors.Is(err, errOutput) {
+		t.Fatalf("Err() = %v, want %v", err, errOutput)
+	}
+	select {
+	case <-aborted:
+	default:
+		t.Fatal("abort callback not invoked after output failure")
+	}
+	emitMu.Lock()
+	calls := emitCalls
+	emitMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("emit calls after failure = %d, want 1 (no further pulses)", calls)
+	}
+	if !ticker.stopped() {
+		t.Fatal("ticker still running after output failure, want stopped")
+	}
+}
+
+func TestFetcher_HeartbeatStopsBeforeTerminalEvent(t *testing.T) {
+	tests := []struct {
+		name         string
+		cloneErr     error
+		wantCode     protocol.Code
+		wantTerminal protocol.ProgressStatus
+	}{
+		{
+			name:         "success",
+			wantTerminal: protocol.ProgressSucceeded,
+		},
+		{
+			name:         "clone failure",
+			cloneErr:     errTestClone,
+			wantCode:     protocol.CodeGitCloneFailed,
+			wantTerminal: protocol.ProgressFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := mustParseTarget(t, "v5.4.0")
+			ticker := newFakeTicker()
+			client := &fakeGitClient{
+				list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+					return targetBranchReferences(target), nil
+				},
+				clone: func(_ context.Context, _ string, options git.CloneOptions) error {
+					if _, err := options.Progress.Write([]byte(heartbeatSecretSideband)); err != nil {
+						return err
+					}
+					ticker.advance(3 * time.Second)
+					return tt.cloneErr
+				},
+			}
+			recorder := &progressRecorder{}
+			deps := successfulFetcherDependencies(t, client)
+			deps.emitProgress = recorder.EmitProgress
+			deps.newTicker = ticker.factory
+			fetcher := mustTestFetcher(t, deps)
+
+			_, err := fetcher.Fetch(t.Context(), FetchRequest{
+				Plan:        mustGitPlan(t, "cnb"),
+				Target:      target,
+				OperationID: "OPERATION-HEARTBEAT",
+			})
+			if tt.wantCode != "" {
+				assertGitrepoCode(t, err, tt.wantCode)
+			} else if err != nil {
+				t.Fatalf("Fetch() error = %v, want nil", err)
+			}
+			if !ticker.stopped() {
+				t.Fatal("ticker still running after Fetch() returned, want stopped")
+			}
+
+			events := recorder.Events()
+			if len(events) == 0 {
+				t.Fatal("no progress events recorded")
+			}
+			last := events[len(events)-1]
+			if last.Status != tt.wantTerminal {
+				t.Fatalf("last event = %#v, want status %q", last, tt.wantTerminal)
+			}
+			// 顺序断言：每个 attempt 的终态之后，除下一个 attempt 的 start 外不得再出现任何事件；
+			// 尤其不得出现心跳 goroutine 迟到的 running 脉冲。
+			pulsesSinceStart := 0
+			for i, event := range events {
+				assertClonePulseShape(t, event)
+				if event.Message == cloneProgressPulseMessage {
+					pulsesSinceStart++
+					continue
+				}
+				if event.Status != protocol.ProgressRunning {
+					if pulsesSinceStart == 0 {
+						t.Fatalf("event[%d] terminal %q arrived without any heartbeat pulse before it", i, event.Status)
+					}
+					pulsesSinceStart = 0
+					if i+1 < len(events) && events[i+1].Message != cloneProgressStartMessage {
+						t.Fatalf("event[%d] after terminal = %#v, want next attempt start", i+1, events[i+1])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestFetcher_HeartbeatOutputFailureMapsToOutputWriteFailed(t *testing.T) {
+	target := mustParseTarget(t, "v5.4.0")
+	errOutput := errors.New("progress output failed")
+	ticker := newFakeTicker()
+	cloneCtxCancelled := false
+	client := &fakeGitClient{
+		list: func(context.Context, string, []byte) ([]*plumbing.Reference, error) {
+			return targetBranchReferences(target), nil
+		},
+		clone: func(ctx context.Context, _ string, _ git.CloneOptions) error {
+			ticker.advance(2 * time.Second)
+			// 心跳输出失败后传输 context 必须已被取消，go-git 才会尽早退出。
+			cloneCtxCancelled = ctx.Err() != nil
+			return ctx.Err()
+		},
+	}
+	deps := successfulFetcherDependencies(t, client)
+	deps.newTicker = ticker.factory
+	deps.emitProgress = func(event protocol.ProgressEvent) error {
+		if event.Message == cloneProgressPulseMessage {
+			return errOutput
 		}
-		if strings.Contains(event.Message, "token") || strings.Contains(event.Message, "99%") || event.Percent != nil {
-			t.Fatalf("progress event exposes or interprets Git text: %#v", event)
+		return nil
+	}
+	fetcher := mustTestFetcher(t, deps)
+
+	_, err := fetcher.Fetch(t.Context(), FetchRequest{
+		Plan:        mustGitPlan(t, "cnb"),
+		Target:      target,
+		OperationID: "OPERATION-HEARTBEAT-OUTPUT",
+	})
+	assertGitrepoCode(t, err, protocol.CodeOutputWriteFailed)
+	if !errors.Is(err, errOutput) {
+		t.Fatalf("Fetch() error chain = %v, want to wrap %v", err, errOutput)
+	}
+	if !cloneCtxCancelled {
+		t.Fatal("clone context not cancelled after heartbeat output failure")
+	}
+}
+
+// assertHeartbeatPulse 断言事件是 workspace.clone 的固定文案心跳，且不含 Git 原文与任何数值字段。
+func assertHeartbeatPulse(t *testing.T, event protocol.ProgressEvent) {
+	t.Helper()
+	assertClonePulseShape(t, event)
+	if event.Status != protocol.ProgressRunning || event.Message != cloneProgressPulseMessage {
+		t.Fatalf("heartbeat event = %#v, want running/%q", event, cloneProgressPulseMessage)
+	}
+}
+
+// assertClonePulseShape 断言 workspace.clone 事件不外发 Git 原文，也不携带 current / total / percent。
+func assertClonePulseShape(t *testing.T, event protocol.ProgressEvent) {
+	t.Helper()
+	if event.Stage != protocol.StageWorkspaceClone {
+		t.Fatalf("event stage = %q, want %q", event.Stage, protocol.StageWorkspaceClone)
+	}
+	if strings.Contains(event.Message, "token") ||
+		strings.Contains(event.Message, "99%") ||
+		strings.Contains(event.Message, "remote:") {
+		t.Fatalf("progress event exposes Git text: %#v", event)
+	}
+	if event.Current != nil || event.Total != nil || event.Percent != nil {
+		t.Fatalf("progress event carries numeric progress: %#v, want none", event)
+	}
+}
+
+func countPulses(events []protocol.ProgressEvent) int {
+	count := 0
+	for _, event := range events {
+		if event.Message == cloneProgressPulseMessage {
+			count++
+		}
+	}
+	return count
+}
+
+// fakeTicker 是注入给心跳的假时钟工厂：每次 factory 调用产生一个独立的 ticker 实例（对应一次
+// attempt），advance 同步推进时间，每跨过一个 interval 就向最新实例投递一次 tick 并等待消费者取走；
+// 消费者已停止时丢弃剩余 tick，因此测试不依赖真实时间也不会挂起。
+type fakeTicker struct {
+	mu      sync.Mutex
+	now     time.Time
+	current *fakeTickerRun
+}
+
+type fakeTickerRun struct {
+	interval time.Duration
+	ticks    chan time.Time
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func newFakeTicker() *fakeTicker {
+	return &fakeTicker{now: time.Date(2026, time.September, 7, 12, 0, 0, 0, time.UTC)}
+}
+
+func (f *fakeTicker) factory(interval time.Duration) (<-chan time.Time, func()) {
+	run := &fakeTickerRun{
+		interval: interval,
+		ticks:    make(chan time.Time),
+		done:     make(chan struct{}),
+	}
+	f.mu.Lock()
+	f.current = run
+	f.mu.Unlock()
+	return run.ticks, run.stop
+}
+
+func (r *fakeTickerRun) stop() {
+	r.stopOnce.Do(func() { close(r.done) })
+}
+
+func (f *fakeTicker) latest() *fakeTickerRun {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.current
+}
+
+func (f *fakeTicker) stopped() bool {
+	run := f.latest()
+	if run == nil {
+		return false
+	}
+	select {
+	case <-run.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *fakeTicker) advance(d time.Duration) {
+	run := f.latest()
+	if run == nil || run.interval <= 0 {
+		return
+	}
+	for range int(d / run.interval) {
+		f.mu.Lock()
+		f.now = f.now.Add(run.interval)
+		now := f.now
+		f.mu.Unlock()
+		select {
+		case run.ticks <- now:
+		case <-run.done:
+			return
 		}
 	}
 }
