@@ -140,6 +140,57 @@ func TestBootstrap_DownloadProgressFailurePreservesCause(t *testing.T) {
 	}
 }
 
+func TestBootstrap_DownloadProgressFailureStopsRotation(t *testing.T) {
+	layout := newUVTestLayout(t)
+	archiveBytes := makeUVArchive(t)
+	artifact := testArtifact(string(archiveBytes))
+	downloader := &fakeDownloader{
+		payload: archiveBytes,
+		progress: []mirror.DownloadProgress{
+			{Received: 512, Total: 1024, Percent: 50},
+		},
+		wrapProgressFailure: true,
+		path:                mustDownloadPath(t, layout, artifact.Name),
+	}
+	// 必须用真实 Rotator：fakeRotationRunner 只调一次尝试且不看 Outcome.Kind，
+	// 区分不了 SwitchSource 与 TargetFailure，正是这个缺陷此前漏测的原因。
+	rotator, err := mirror.NewRotator()
+	if err != nil {
+		t.Fatalf("NewRotator() error = %v", err)
+	}
+	bootstrapper, err := NewBootstrapper(
+		layout,
+		WithArtifact(artifact),
+		WithDownloader(downloader),
+		WithVersionChecker(&fakeVersionChecker{}),
+		WithBootstrapRotator(rotator),
+		WithArchiveExtractor(&fakeExtractor{}),
+		WithPublisher(&fakePublisher{}),
+	)
+	if err != nil {
+		t.Fatalf("NewBootstrapper() error = %v", err)
+	}
+	wantErr := errors.New("injected progress failure")
+
+	_, err = bootstrapper.EnsureWithProgress(
+		t.Context(),
+		testOperationID,
+		testMirrorPolicy(t),
+		nil,
+		func(mirror.DownloadProgress) error { return wantErr },
+	)
+	if downloader.calls != 1 {
+		t.Fatalf("downloader calls = %d, want 1 (progress failure must stop rotation)", downloader.calls)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("EnsureWithProgress() error = %v, want cause %v", err, wantErr)
+	}
+	var rotationErr *mirror.RotationError
+	if errors.As(err, &rotationErr) {
+		t.Fatalf("EnsureWithProgress() error = %v, must not be *mirror.RotationError", err)
+	}
+}
+
 func TestBootstrap_RepairForwardsDownloadProgress(t *testing.T) {
 	layout := newUVTestLayout(t)
 	archiveBytes := makeUVArchive(t)
@@ -503,9 +554,12 @@ type fakeDownloader struct {
 	// Published 失败：downloader.go 在 PublishNoReplace 之后失败时同时返回
 	// 已填充的 DownloadResult 和 Published=true 的失败，此处必须保持一致。
 	failAfterWrite error
-	calls          int
-	request        mirror.DownloadRequest
-	path           string
+	// wrapProgressFailure 为真时按真实下载器的方式把进度回调错误包成
+	// Kind=FailureProgress 的 DownloadFailure，而不是原样返回。
+	wrapProgressFailure bool
+	calls               int
+	request             mirror.DownloadRequest
+	path                string
 }
 
 func (f *fakeDownloader) Download(
@@ -528,6 +582,9 @@ func (f *fakeDownloader) Download(
 			return mirror.DownloadResult{}, errors.New("test downloader progress callback is nil")
 		}
 		if err := request.Progress(progress); err != nil {
+			if f.wrapProgressFailure {
+				return mirror.DownloadResult{}, &mirror.DownloadFailure{Kind: mirror.FailureProgress, Err: err}
+			}
 			return mirror.DownloadResult{}, err
 		}
 	}

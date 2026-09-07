@@ -1592,3 +1592,72 @@ func (m5UnsupportedWorkspace) Check(context.Context) (gitrepo.CheckResult, error
 func (m5UnsupportedWorkspace) Sync(context.Context, gitrepo.SyncRequest) (gitrepo.SyncResult, error) {
 	return gitrepo.SyncResult{}, notImplementedError{stage: protocol.StageWorkspaceClone}
 }
+
+func TestUVDownloadProgress_OutputFailureStopsRotation(t *testing.T) {
+	root := t.TempDir()
+	layout := t59Layout(t, root, root)
+	downloader := &progressFailureWrappingDownloader{
+		progress: mirror.DownloadProgress{Received: 512, Total: 1024, Percent: 50},
+	}
+	// 用 NewBootstrapper 默认的真实 Rotator：假 rotator 区分不了 SwitchSource 与 TargetFailure。
+	bootstrapper, err := uv.NewBootstrapper(
+		layout,
+		uv.WithDownloader(downloader),
+		uv.WithVersionChecker(t59VersionChecker{}),
+	)
+	if err != nil {
+		t.Fatalf("uv.NewBootstrapper() error = %v", err)
+	}
+	writer := &measuredProgressFailingWriter{}
+	output, err := protocol.NewProcessOutput(writer)
+	if err != nil {
+		t.Fatalf("NewProcessOutput() error = %v", err)
+	}
+	emitter, err := output.NewEmitter("dev", "bootstrap", nil)
+	if err != nil {
+		t.Fatalf("NewEmitter() error = %v", err)
+	}
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+
+	_, err = bootstrapper.EnsureWithProgress(
+		context.Background(),
+		"01J00000000000000000000005",
+		policy,
+		nil,
+		uvDownloadProgress(emitter),
+	)
+	if err == nil {
+		t.Fatal("EnsureWithProgress() error = nil, want output write failure")
+	}
+	if downloader.calls != 1 {
+		t.Fatalf("downloader calls = %d, want 1 (progress failure must stop rotation)", downloader.calls)
+	}
+	code, stage, _, _ := classifyFailure(err, protocol.StageUVCheck)
+	if code != protocol.CodeOutputWriteFailed || stage != protocol.StageUVDownload {
+		t.Fatalf("classifyFailure() = %s/%s, want %s/%s", code, stage, protocol.CodeOutputWriteFailed, protocol.StageUVDownload)
+	}
+}
+
+// progressFailureWrappingDownloader 只回报一次进度，并按真实下载器的方式把
+// 回调错误包成 Kind=FailureProgress 的 DownloadFailure。
+type progressFailureWrappingDownloader struct {
+	progress mirror.DownloadProgress
+	calls    int
+}
+
+func (d *progressFailureWrappingDownloader) Download(
+	_ context.Context,
+	request mirror.DownloadRequest,
+) (mirror.DownloadResult, error) {
+	d.calls++
+	if request.Progress == nil {
+		return mirror.DownloadResult{}, errors.New("test downloader progress callback is nil")
+	}
+	if err := request.Progress(d.progress); err != nil {
+		return mirror.DownloadResult{}, &mirror.DownloadFailure{Kind: mirror.FailureProgress, Err: err}
+	}
+	return mirror.DownloadResult{}, errors.New("test downloader must fail on progress")
+}

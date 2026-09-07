@@ -566,6 +566,7 @@ func (b *Bootstrapper) download(
 		return mirror.DownloadResult{}, wrapBootstrapError(protocol.StageUVDownload, err)
 	}
 	var downloadedPath string
+	var progressErr error
 	rotationResult, rotationErr := b.rotator.Run(ctx, plan, target, func(
 		attemptContext context.Context,
 		attempt mirror.Attempt,
@@ -592,6 +593,16 @@ func (b *Bootstrapper) download(
 			downloadedPath = downloadResult.Path
 			return mirror.AttemptOutcome{Kind: mirror.OutcomeSucceeded}
 		}
+		// 进度回调失败意味着协议输出已经不可用，继续换源没有意义：
+		// TargetFailure 是 Rotator 唯一会立刻结束整轮的失败结局。
+		if isDownloadProgressFailure(downloadErr) {
+			progressErr = downloadErr
+			return mirror.AttemptOutcome{
+				Kind:        mirror.OutcomeTargetFailure,
+				FailureKind: mirror.FailureProgress,
+				Err:         downloadErr,
+			}
+		}
 		if isDownloadIntegrityFailure(downloadErr) {
 			return mirror.AttemptOutcome{
 				Kind:        mirror.OutcomeIntegrityFailure,
@@ -606,6 +617,11 @@ func (b *Bootstrapper) download(
 		}
 	})
 	if rotationErr != nil {
+		// 原样返回，不经 wrapBootstrapError：错误链要保留 OUTPUT_WRITE_FAILED，
+		// 包一层会把用户可见文案改成「uv 准备失败」。
+		if ctx.Err() == nil && progressErr != nil {
+			return mirror.DownloadResult{}, progressErr
+		}
 		if _, ok := rotationErr.(*mirror.IntegrityExhaustedError); ok {
 			return mirror.DownloadResult{}, newError(
 				protocol.CodeUVChecksumMismatch,
@@ -773,6 +789,13 @@ func committedBootstrapError(err error) error {
 func isDownloadIntegrityFailure(err error) bool {
 	var failure *mirror.DownloadFailure
 	return errors.As(err, &failure) && failure.Kind == mirror.FailureChecksumMismatch
+}
+
+// isDownloadProgressFailure 报告失败是否来自同步进度回调。
+// 回调失败代表协议输出通道已不可用，不应触发镜像轮换重试。
+func isDownloadProgressFailure(err error) bool {
+	var failure *mirror.DownloadFailure
+	return errors.As(err, &failure) && failure.Kind == mirror.FailureProgress
 }
 
 // isDownloadPublished 报告失败是否发生在成品已发布到最终位置之后。
