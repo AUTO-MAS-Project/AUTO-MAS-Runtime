@@ -30,7 +30,7 @@ const (
 
 	maxHealthBodyBytes          = 64 * 1024
 	defaultTotalTimeout         = 60 * time.Second
-	defaultPollInterval         = 500 * time.Millisecond
+	defaultPollInterval         = 200 * time.Millisecond
 	defaultRequestTimeout       = 2 * time.Second
 	defaultConsecutiveSuccesses = 2
 	// 探针错误连续这么多次才判失败。单次错误多半是过渡态——后端启动期的短命子进程

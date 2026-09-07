@@ -16,6 +16,56 @@ import (
 
 const testCommit = "0123456789abcdef0123456789abcdef01234567"
 
+func TestHealth_DefaultReadinessPolling(t *testing.T) {
+	clock := newManualClock()
+	rt := &sequenceTransport{responses: []transportResult{
+		{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))},
+		{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))},
+	}}
+	checker := NewChecker(Config{Clock: clock, Transport: rt})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	joined := make(chan struct{})
+	go func() {
+		defer close(joined)
+		done <- checker.Check(ctx, managedExpectation(), testProbe())
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-joined
+	})
+	for _, want := range []time.Duration{60 * time.Second, 2 * time.Second, 200 * time.Millisecond} {
+		select {
+		case got := <-clock.created:
+			if got != want {
+				t.Fatalf("timer duration = %s, want %s", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timer %s was not created", want)
+		}
+	}
+	if got := rt.calls(); got != 1 {
+		t.Fatalf("requests before polling timer = %d, want 1", got)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Check() returned after one success: %v, want pending", err)
+	default:
+	}
+	clock.Fire(200 * time.Millisecond)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Check() error = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Check() did not finish after two successes")
+	}
+	if got := rt.calls(); got != 2 {
+		t.Fatalf("requests at readiness = %d, want 2", got)
+	}
+}
+
 func TestHealth_RequiresAllNineConditions(t *testing.T) {
 	fields := []string{"ready", "backgroundStatus", "backgroundError", "protocol", "version", "commit"}
 	for _, field := range fields {
