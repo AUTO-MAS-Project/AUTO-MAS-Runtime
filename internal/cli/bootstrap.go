@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
@@ -212,6 +213,7 @@ func runBootstrap(
 			)
 			if loggerErr == nil {
 				binding.Set(logger)
+				deps.opLog.Set(logger)
 			}
 			return logger, loggerErr
 		},
@@ -254,7 +256,11 @@ func runBootstrap(
 			cause:   errors.New("workspace sync returned an empty revision"),
 		}
 	}
-	if ifNeeded && !workspaceResult.Changed && workspaceResult.Status == protocol.StateReadyToStart &&
+	// 就绪判据除了状态与版本，还要有文件系统实证：状态文件说 ready 不代表 venv 还在。
+	// 真机上出现过 venv 被删掉一半（pyvenv.cfg 没了、python.exe 还在）后，--if-needed
+	// 一路短路、supervise 拿到一个一启动就退出的解释器，用户重试多少次都不会重建。
+	venvIntact := filesystem.InspectVenv(deps.global.layout).Intact
+	if ifNeeded && venvIntact && !workspaceResult.Changed && workspaceResult.Status == protocol.StateReadyToStart &&
 		initial.Status == protocol.StateReadyToStart && initial.LastSuccessful.Version == revision.Version() && initial.LastSuccessful.Commit == revision.Commit() {
 		if err := rollbackM5Preparation(emitter, machine, protocol.StageBootstrap, "当前运行环境已就绪"); err != nil {
 			return sessionSuccess{}, err
