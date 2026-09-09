@@ -152,7 +152,7 @@ var errorDefinitions = []ErrorDefinition{
 	{Code: CodeEnvironmentRebuildFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRunDoctor, RemediationOpenLog}},
 	{Code: CodeBackendEntryNotFound, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationRetrySync, RemediationContactSupport}},
 	{Code: CodeBackendSpawnFailed, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRunDoctor, RemediationOpenLog}},
-	{Code: CodeBackendExitedBeforeReady, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
+	{Code: CodeBackendExitedBeforeReady, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationRebuildEnvironment, RemediationOpenLog}},
 	{Code: CodeBackendHealthTimeout, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
 	{Code: CodeBackendHealthInvalid, ExitCode: ExitCodeBackendFailure, Retryable: true, Remediation: []Remediation{RemediationRestartBackend, RemediationOpenLog}},
 	{Code: CodeBackendIdentityMismatch, ExitCode: ExitCodeBackendFailure, Retryable: false, Remediation: []Remediation{RemediationRetrySync, RemediationContactSupport}},
