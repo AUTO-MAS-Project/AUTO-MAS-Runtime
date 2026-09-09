@@ -393,3 +393,55 @@ func writeLockfile(t *testing.T, path string) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 }
+
+// codedTestError 模拟 filesystem 层带专属错误码的失败（如 UNSAFE_REPARSE_POINT）。
+type codedTestError struct{ code protocol.Code }
+
+func (e *codedTestError) Error() string       { return "coded failure" }
+func (e *codedTestError) Code() protocol.Code { return e.code }
+
+// TestDependencies_RebuildKeepsUnderlyingCodeAndPath 钉住「删除失败的真实原因不能被吞」：
+// venv 里有一个 reparse point 或一个被占用的文件，删除就整体中止，而 Rebuild 此前把任何
+// 原因都压成 ENVIRONMENT_REBUILD_FAILED，连是哪个文件都不说——用户和维护者都无从下手。
+func TestDependencies_RebuildKeepsUnderlyingCodeAndPath(t *testing.T) {
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	cause := &filesystem.FileError{
+		Operation: "remove",
+		Path:      filepath.Join(layout.VenvDir(), "Lib", "site-packages", "locked.pyd"),
+		Err:       &codedTestError{code: protocol.CodeUnsafeReparsePoint},
+	}
+	remover := &fakeTreeRemover{result: filesystem.DeleteResult{Partial: true}, err: cause}
+	service, err := NewDependenciesService(layout, &fakeDependenciesRunner{}, remover)
+	if err != nil {
+		t.Fatalf("NewDependenciesService() error = %v", err)
+	}
+
+	_, err = service.Rebuild(context.Background(), dependencyTestRequest(layout))
+	if err == nil {
+		t.Fatal("Rebuild() error = nil, want failure")
+	}
+	var coded interface {
+		Code() protocol.Code
+		Details() map[string]any
+	}
+	if !errors.As(err, &coded) {
+		t.Fatalf("Rebuild() error = %T, want a coded error with details", err)
+	}
+	if got := coded.Code(); got != protocol.CodeUnsafeReparsePoint {
+		t.Fatalf("code = %q, want %q", got, protocol.CodeUnsafeReparsePoint)
+	}
+	details := coded.Details()
+	if got := details["path"]; got != cause.Path {
+		t.Fatalf("details[path] = %v, want %v", got, cause.Path)
+	}
+	if got := details["operation"]; got != "remove" {
+		t.Fatalf("details[operation] = %v, want remove", got)
+	}
+	if details["partial"] != true {
+		t.Fatalf("details[partial] = %v, want true", details["partial"])
+	}
+}

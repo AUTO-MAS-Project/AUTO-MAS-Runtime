@@ -240,13 +240,7 @@ func (s *DependenciesService) Rebuild(
 		Reason:      "rebuild managed environment",
 	})
 	if err != nil {
-		return DependenciesResult{}, newError(
-			protocol.CodeEnvironmentRebuildFailed,
-			protocol.StageDependenciesRebuild,
-			"主项目环境重建失败",
-			map[string]any{"removed": result.Removed, "partial": result.Partial},
-			err,
-		)
+		return DependenciesResult{}, rebuildFailure(result, err)
 	}
 	return DependenciesResult{Rebuilt: result.Removed}, nil
 }
@@ -390,4 +384,38 @@ func containsNUL(value string) bool {
 		}
 	}
 	return false
+}
+
+// rebuildFailure 构造 venv 重建失败，保留删除层给出的真实原因。
+//
+// 删除失败的常见原因是「树里有 reparse point」和「文件被占用」，它们在 filesystem 层
+// 各自带着专属错误码与出事的路径；此前这里一律压成 ENVIRONMENT_REBUILD_FAILED 且只带
+// removed/partial，用户界面与 Runtime 日志都看不出是哪个文件挡住了，只能反复重试。
+// 现在底层错误码能透出就透出，并把操作与路径一并放进 details。
+func rebuildFailure(result filesystem.DeleteResult, cause error) error {
+	details := map[string]any{"removed": result.Removed, "partial": result.Partial}
+	code := protocol.CodeEnvironmentRebuildFailed
+	var coded interface{ Code() protocol.Code }
+	if errors.As(cause, &coded) {
+		if underlying := coded.Code(); underlying != "" {
+			code = underlying
+		}
+	}
+	var pathErr *filesystem.Error
+	var fileErr *filesystem.FileError
+	switch {
+	case errors.As(cause, &pathErr):
+		details["operation"] = pathErr.Operation
+		details["path"] = pathErr.Path
+	case errors.As(cause, &fileErr):
+		details["operation"] = fileErr.Operation
+		details["path"] = fileErr.Path
+	}
+	return newError(
+		code,
+		protocol.StageDependenciesRebuild,
+		"主项目环境重建失败",
+		details,
+		cause,
+	)
 }
