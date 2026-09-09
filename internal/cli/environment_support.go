@@ -349,6 +349,7 @@ func openM5Logger(ctx context.Context, deps *deps, command, operationID string) 
 	if logger == nil {
 		return nil, errors.New("m5 logger is unavailable")
 	}
+	deps.opLog.Set(logger)
 	return logger, nil
 }
 

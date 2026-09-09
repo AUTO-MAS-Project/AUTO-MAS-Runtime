@@ -1510,7 +1510,15 @@ func (s m5TestLease) Close() error {
 }
 
 type m5TestLog struct {
-	calls []string
+	calls   []string
+	records []m5LogRecord
+}
+
+// m5LogRecord 是操作日志的一条落盘快照，供断言失败是否真的被记录。
+type m5LogRecord struct {
+	level   logging.Level
+	message string
+	details map[string]any
 }
 
 func (s *m5TestLog) LogPath() string { return "" }
@@ -1518,7 +1526,13 @@ func (s *m5TestLog) Close() error {
 	s.calls = append(s.calls, "logger-close")
 	return nil
 }
-func (s *m5TestLog) Record(context.Context, logging.Level, string, map[string]any) (logging.WriteResult, error) {
+func (s *m5TestLog) Record(
+	_ context.Context,
+	level logging.Level,
+	message string,
+	details map[string]any,
+) (logging.WriteResult, error) {
+	s.records = append(s.records, m5LogRecord{level: level, message: message, details: details})
 	return logging.WriteResult{}, nil
 }
 
