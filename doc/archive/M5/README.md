@@ -22,6 +22,8 @@ M5 实现 `internal/uv` 的 uv bootstrap、统一执行器、受管 Python、锁
   `uv lock --check` 无条件离线；其中 package-index 覆盖结论已由 T5.11 修订；
 - [`设计-T5.11-锁文件-sources-语义.md`](./设计-T5.11-锁文件-sources-语义.md)：基于
   真实 uv 与新 EXE 黑盒，修复 check/sync 的锁 sources 覆盖和镜像错误分类。
+- [`设计-T5.12-隔离-Python-支持性检查.md`](./设计-T5.12-隔离-Python-支持性检查.md)：基于
+  AUTO-MAS b3 真机失败，隔离 uv 可下载目录查询与宿主 `PATH` 解释器并修正错误分类。
 
 ## 本轮冻结决策
 
