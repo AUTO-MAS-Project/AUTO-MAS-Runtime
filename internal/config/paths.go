@@ -20,6 +20,7 @@ type layoutPaths struct {
 	pythonExecutable     string
 	venvDir              string
 	venvPythonExecutable string
+	venvConfigFile       string
 	runtimeCacheDir      string
 	uvCacheDir           string
 	downloadCacheDir     string
@@ -60,6 +61,7 @@ func newLayoutPaths(root string) layoutPaths {
 		pythonExecutable:     filepath.Join(pythonDir, "python.exe"),
 		venvDir:              filepath.Join(environmentDir, "venv"),
 		venvPythonExecutable: filepath.Join(environmentDir, "venv", "Scripts", "python.exe"),
+		venvConfigFile:       filepath.Join(environmentDir, "venv", "pyvenv.cfg"),
 		runtimeCacheDir:      cacheDir,
 		uvCacheDir:           filepath.Join(cacheDir, "uv"),
 		downloadCacheDir:     filepath.Join(cacheDir, "downloads"),
@@ -126,6 +128,11 @@ func (l *Layout) VenvDir() string { return l.paths.venvDir }
 
 // VenvPythonExecutable 返回受管项目虚拟环境的 Python 解释器路径。
 func (l *Layout) VenvPythonExecutable() string { return l.paths.venvPythonExecutable }
+
+// VenvConfigFile 返回受管项目虚拟环境的 pyvenv.cfg 路径。
+// CPython 靠它算出 venv 的 home 与 base 解释器：文件缺失时 venv 内的 python.exe
+// 仍在，但一启动就以 `No pyvenv.cfg file` 退出，因此它是判断 venv 是否完整的必检项。
+func (l *Layout) VenvConfigFile() string { return l.paths.venvConfigFile }
 
 // RuntimeCacheDir 返回 Runtime 缓存根目录。
 func (l *Layout) RuntimeCacheDir() string { return l.paths.runtimeCacheDir }

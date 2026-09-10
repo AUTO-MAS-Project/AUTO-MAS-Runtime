@@ -499,6 +499,16 @@ func (b *workspaceLogBinding) Set(logger workspaceLogger) {
 	b.mu.Unlock()
 }
 
+// Get 返回当前绑定的操作日志器；尚未打开时返回 nil。
+func (b *workspaceLogBinding) Get() workspaceLogger {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.logger
+}
+
 func (b *workspaceLogBinding) RecordDeletion(
 	ctx context.Context,
 	record filesystem.DeleteAuditRecord,

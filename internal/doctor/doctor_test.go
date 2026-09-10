@@ -94,9 +94,10 @@ func healthyFixture(t *testing.T) (*config.Layout, string) {
 	}
 	writeJSONFile(t, layout.RepoVersionFile(), map[string]string{"version": "v5.4.0-beta.1"})
 	writeFile(t, filepath.Join(layout.PythonDir(), "python.exe"), nil)
-	if err := os.MkdirAll(layout.VenvDir(), 0o755); err != nil {
-		t.Fatalf("MkdirAll(venv) error = %v", err)
-	}
+	// 健康夹具必须铺出结构完整的 venv：pyvenv.cfg 缺失时 CPython 一启动就退出，
+	// 这种 venv 不该被算作健康。
+	writeFile(t, layout.VenvPythonExecutable(), nil)
+	writeFile(t, layout.VenvConfigFile(), nil)
 	uvDir, err := layout.UVVersionDir("0.8.0")
 	if err != nil {
 		t.Fatalf("UVVersionDir() error = %v", err)
@@ -706,5 +707,44 @@ func TestDoctor_ErrorDetailsUseStableKinds(t *testing.T) {
 		if !stable[kind] {
 			t.Errorf("check %q details.error = %q, want stable kind", check.ID, kind)
 		}
+	}
+}
+
+// TestDoctor_VenvDirectoryWithoutPyvenvCfgIsError 钉住真机上出现过的残骸：venv 目录
+// 与 Scripts\python.exe 都在，只有 pyvenv.cfg 被删掉。此前 venv 检查只判断目录是否
+// 存在，这种 venv 会被报成 ok，doctor 因此永远查不出「解释器一启动就退出」的原因。
+func TestDoctor_VenvDirectoryWithoutPyvenvCfgIsError(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	writeFile(t, layout.VenvPythonExecutable(), nil)
+
+	service := mustNewService(t, layout, testProbes())
+	report := runService(t, service)
+
+	if got := findCheck(t, report, "venv").Status; got != StatusError {
+		t.Fatalf("venv status = %q, want %q", got, StatusError)
+	}
+}
+
+// TestDoctor_CompleteVenvIsOK 是上一条的对照组：两个必需文件都在时仍报 ok。
+func TestDoctor_CompleteVenvIsOK(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	writeFile(t, layout.VenvPythonExecutable(), nil)
+	writeFile(t, layout.VenvConfigFile(), nil)
+
+	service := mustNewService(t, layout, testProbes())
+	report := runService(t, service)
+
+	if got := findCheck(t, report, "venv").Status; got != StatusOK {
+		t.Fatalf("venv status = %q, want %q", got, StatusOK)
 	}
 }

@@ -136,10 +136,14 @@ func applyOptions(values ...Option) (options, error) {
 
 // deps 保存单次 Execute 的执行状态；Execute 每次调用创建独立实例。
 type deps struct {
-	ctx      context.Context
-	io       IO
-	options  options
-	global   globalOptions
+	ctx     context.Context
+	io      IO
+	options options
+	global  globalOptions
+	// opLog 指向本次会话已打开的操作日志器（可能为 nil）。
+	// 失败落盘要用它：命令失败的唯一出口 emitFailure 在会话层，
+	// 拿不到各命令自己开的 logger，靠这个绑定把两者接起来。
+	opLog    *workspaceLogBinding
 	exitCode int
 }
 
@@ -154,7 +158,7 @@ func Execute(ctx context.Context, args []string, io IO, optionValues ...Option) 
 	if err != nil {
 		return diagnosticExit(io, err)
 	}
-	d := &deps{ctx: ctx, io: io, options: values}
+	d := &deps{ctx: ctx, io: io, options: values, opLog: &workspaceLogBinding{}}
 
 	// 解析：一次性预解析树只用于定位目标、判定输出模式与帮助，随后丢弃。
 	call, err := resolveInvocation(newRoot(d), args)

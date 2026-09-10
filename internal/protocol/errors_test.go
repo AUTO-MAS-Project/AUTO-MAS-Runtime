@@ -346,3 +346,25 @@ func documentedErrorDefinitions(t *testing.T) []protocol.ErrorDefinition {
 	}
 	return definitions
 }
+
+// TestErrorCatalog_BackendExitedBeforeReadyOffersRebuild 钉住「卡死的用户要有出路」：
+// 后端在就绪前退出最常见的成因之一是 venv 已经坏掉，而此前这个码只给
+// restart-backend 与 open-log——界面上只有「重试」，重试一万次也不会重建环境，
+// 真机上用户连点了 21 次。架构设计第 398 行的示例本来就写着 rebuild-environment，
+// 只是错误码表和实现没跟上。
+func TestErrorCatalog_BackendExitedBeforeReadyOffersRebuild(t *testing.T) {
+	descriptor, ok := protocol.LookupErrorDefinition(protocol.CodeBackendExitedBeforeReady)
+	if !ok {
+		t.Fatal("LookupErrorDefinition() missing BACKEND_EXITED_BEFORE_READY")
+	}
+	found := false
+	for _, remediation := range descriptor.Remediation {
+		if remediation == protocol.RemediationRebuildEnvironment {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("remediation = %v, want rebuild-environment", descriptor.Remediation)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
@@ -232,6 +233,7 @@ func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, su
 
 func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) (int, bool) {
 	code, stage, message, details := classifyFailure(err, fallbackStage)
+	recordOperationFailure(deps, code, stage, message, details)
 	errorEvent, eventErr := protocol.NewErrorEvent(code, stage, message, details)
 	if eventErr != nil {
 		writeDiagnostic(deps.io, eventErr)
@@ -407,4 +409,41 @@ func exitCodeFor(code protocol.Code) int {
 		return protocol.ExitCodeInvalidArgument
 	}
 	return definition.ExitCode
+}
+
+// recordOperationFailure 把命令失败写进操作日志。
+//
+// 操作日志此前只有 uv 输出透传与清理审计，全是 info：真机上取到 2468 行日志零 warn
+// 零 error，失败本身、错误码与 stage 一条都不落盘，用户报上来无从查起。这里在失败的
+// 唯一出口补一条 error 记录，字段与 wire 上已发出的 error 事件同源，不额外泄露内部串。
+//
+// 日志器尚未打开（如参数解析阶段失败）时静默跳过；写日志失败不改变命令结局。
+func recordOperationFailure(
+	deps *deps,
+	code protocol.Code,
+	stage protocol.Stage,
+	message string,
+	details map[string]any,
+) {
+	if deps == nil {
+		return
+	}
+	logger := deps.opLog.Get()
+	if logger == nil {
+		return
+	}
+	entry := make(map[string]any, len(details)+2)
+	for key, value := range details {
+		entry[key] = value
+	}
+	entry["code"] = string(code)
+	entry["stage"] = string(stage)
+	ctx := deps.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 取消导致的失败同样要落盘，所以剥掉取消信号再写。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m5TransactionCleanupTimeout)
+	defer cancel()
+	_, _ = logger.Record(ctx, logging.LevelError, message, entry)
 }

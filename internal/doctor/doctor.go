@@ -8,9 +8,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/lock"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
@@ -280,8 +283,24 @@ func (s *Service) checkAppRoot(context.Context) Check {
 	return specAppRoot.directory(s.layout.AppRoot())
 }
 
+// checkVenv 判断受管项目虚拟环境是否可用。
+//
+// 只查目录是否存在不够：真机上出现过「目录与 Scripts\python.exe 都在、只有 pyvenv.cfg
+// 被删掉」的残骸，CPython 因此一启动就以 `No pyvenv.cfg file` 退出，而 doctor 会报 ok，
+// 用户拿不到任何线索。目录整体不存在仍归 missing（尚未部署），目录在但结构不完整归 error。
 func (s *Service) checkVenv(context.Context) Check {
-	return specVenv.directory(s.layout.VenvDir())
+	if check := specVenv.directory(s.layout.VenvDir()); check.Status != StatusOK {
+		return check
+	}
+	report := filesystem.InspectVenv(s.layout)
+	if report.Intact {
+		return specVenv.ok("虚拟环境完整", nil)
+	}
+	names := make([]string, 0, len(report.Missing))
+	for _, path := range report.Missing {
+		names = append(names, filepath.Base(path))
+	}
+	return specVenv.failed("虚拟环境不完整，缺少 " + strings.Join(names, "、") + "，需要重建")
 }
 
 func (s *Service) checkLayout(context.Context) Check {
