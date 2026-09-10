@@ -215,6 +215,94 @@ func TestPython_ArrayTableIsNotProject(t *testing.T) {
 	}
 }
 
+func TestPython_SupportCheckScopesUVInventory(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	runner := &fakePythonRunner{
+		listOutput: `[{"version":"3.12.10"}]`,
+		findOutput: "C:/runtime/python/3.12.10/python.exe\n",
+	}
+	service, err := NewPythonService(layout, runner)
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	if _, err := service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir}); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	want := []string{
+		"python", "list", "3.12.10", "--only-downloads", "--managed-python", "--output-format", "json",
+	}
+	if got := runner.calls[0].args; !reflect.DeepEqual(got, want) {
+		t.Fatalf("support check args = %#v, want %#v", got, want)
+	}
+	if got := runner.calls[0].options.Environment[uvOfflineEnv]; got != "1" {
+		t.Fatalf("support check UV_OFFLINE = %q, want 1", got)
+	}
+}
+
+func TestPython_SupportCheckPreservesUVExecutionFailure(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	runner := &fakePythonRunner{
+		listResult: UVResult{ExitCode: 2},
+		listErr: newError(
+			protocol.CodeUVExecFailed,
+			protocol.StagePythonCheck,
+			"uv 执行失败",
+			map[string]any{"exitCode": 2},
+			errors.New("python search path inspection failed"),
+		),
+	}
+	service, err := NewPythonService(layout, runner)
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	_, err = service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir})
+	assertPythonCode(t, err, protocol.CodeUVExecFailed)
+}
+
+func TestPython_SupportCheckRejectsMalformedInventory(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	service, err := NewPythonService(layout, &fakePythonRunner{listOutput: "not-json"})
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	_, err = service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir})
+	assertPythonCode(t, err, protocol.CodeUVExecFailed)
+}
+
+func TestPython_SupportCheckReportsAbsentVersion(t *testing.T) {
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, filepath.Dir(root))
+	if err != nil {
+		t.Fatalf("NewLayout() error = %v", err)
+	}
+	service, err := NewPythonService(layout, &fakePythonRunner{listOutput: `[]`})
+	if err != nil {
+		t.Fatalf("NewPythonService() error = %v", err)
+	}
+	_, err = service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir})
+	assertPythonCode(t, err, protocol.CodePythonVersionUnsupported)
+}
+
 func TestPython_InstallArguments(t *testing.T) {
 	projectDir := t.TempDir()
 	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
@@ -365,6 +453,8 @@ type fakePythonCall struct {
 
 type fakePythonRunner struct {
 	listOutput     string
+	listResult     UVResult
+	listErr        error
 	findOutput     string
 	installResults []fakeRunnerResponse
 	calls          []fakePythonCall
@@ -374,7 +464,9 @@ func (r *fakePythonRunner) Run(_ context.Context, args []string, options RunOpti
 	r.calls = append(r.calls, fakePythonCall{args: append([]string(nil), args...), options: options})
 	switch args[1] {
 	case "list":
-		return UVResult{Stdout: r.listOutput}, nil
+		result := r.listResult
+		result.Stdout = r.listOutput
+		return result, r.listErr
 	case "install":
 		if len(r.installResults) == 0 {
 			return UVResult{}, nil

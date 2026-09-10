@@ -301,20 +301,35 @@ func (s *PythonService) checkSupported(
 	result, err := s.runner.Run(ctx, []string{
 		"python",
 		"list",
+		version.String(),
+		"--only-downloads",
 		"--managed-python",
 		"--output-format",
 		"json",
 	}, options)
-	if err != nil || result.ExitCode != 0 {
-		return pythonError(
-			protocol.CodePythonVersionUnsupported,
+	if err != nil {
+		return err
+	}
+	if result.ExitCode != 0 {
+		return newError(
+			protocol.CodeUVExecFailed,
 			protocol.StagePythonCheck,
-			"uv 不支持目标 Python 版本",
+			"uv 执行失败",
 			map[string]any{"pythonVersion": version.String(), "exitCode": result.ExitCode},
-			err,
+			errors.New("uv Python inventory command exited unsuccessfully"),
 		)
 	}
-	if !jsonContainsPythonVersion(result.Stdout, version.String()) {
+	contains, err := jsonContainsPythonVersion(result.Stdout, version.String())
+	if err != nil {
+		return newError(
+			protocol.CodeUVExecFailed,
+			protocol.StagePythonCheck,
+			"uv 执行失败",
+			map[string]any{"pythonVersion": version.String(), "exitCode": result.ExitCode},
+			fmt.Errorf("decode uv Python inventory: %w", err),
+		)
+	}
+	if !contains {
 		return pythonError(
 			protocol.CodePythonVersionUnsupported,
 			protocol.StagePythonCheck,
@@ -1057,27 +1072,27 @@ type pythonListEntry struct {
 	Version string `json:"version"`
 }
 
-func jsonContainsPythonVersion(raw, expected string) bool {
+func jsonContainsPythonVersion(raw, expected string) (bool, error) {
 	var entries []pythonListEntry
 	if json.Unmarshal([]byte(raw), &entries) == nil {
 		for _, entry := range entries {
 			if entry.Version == expected {
-				return true
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 	}
 	var envelope struct {
 		Installations []pythonListEntry `json:"installations"`
 		Versions      []pythonListEntry `json:"versions"`
 	}
-	if json.Unmarshal([]byte(raw), &envelope) != nil {
-		return false
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return false, err
 	}
 	for _, entry := range append(envelope.Installations, envelope.Versions...) {
 		if entry.Version == expected {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
