@@ -24,6 +24,7 @@ type layoutPaths struct {
 	runtimeCacheDir      string
 	uvCacheDir           string
 	downloadCacheDir     string
+	relayStagingDir      string
 	buildCacheDir        string
 	logsDir              string
 	runtimeLogDir        string
@@ -65,6 +66,7 @@ func newLayoutPaths(root string) layoutPaths {
 		runtimeCacheDir:      cacheDir,
 		uvCacheDir:           filepath.Join(cacheDir, "uv"),
 		downloadCacheDir:     filepath.Join(cacheDir, "downloads"),
+		relayStagingDir:      filepath.Join(cacheDir, "downloads", "relay"),
 		buildCacheDir:        filepath.Join(cacheDir, "build"),
 		logsDir:              logsDir,
 		runtimeLogDir:        filepath.Join(logsDir, "runtime"),
@@ -142,6 +144,12 @@ func (l *Layout) UVCacheDir() string { return l.paths.uvCacheDir }
 
 // DownloadCacheDir 返回下载缓存目录。
 func (l *Layout) DownloadCacheDir() string { return l.paths.downloadCacheDir }
+
+// RelayStagingDir 返回回环中继的暂存目录。
+//
+// 它位于下载缓存之下，属于可丢弃缓存：中继在操作期间独占、Close 时清空，
+// cleanup 随 DownloadCacheDir 一并删除，不需要单独分类。
+func (l *Layout) RelayStagingDir() string { return l.paths.relayStagingDir }
 
 // BuildCacheDir 返回构建缓存目录。
 func (l *Layout) BuildCacheDir() string { return l.paths.buildCacheDir }
