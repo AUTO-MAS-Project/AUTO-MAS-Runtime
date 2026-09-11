@@ -263,6 +263,33 @@ func TestRanker_WarmProbesRequestedKinds(t *testing.T) {
 	if err := ranker.Warm(context.Background(), policy, KindUV); err != nil || prober.probeCalls() != 2 {
 		t.Fatalf("second Warm re-probed: err = %v, probes = %d", err, prober.probeCalls())
 	}
+
+	rankedKinds := make([]Kind, 0, 2)
+	rankedErr := errors.New("ranked callback failed")
+	observed, err := NewRanker(rankerTestCatalog(t),
+		withRankerSourceProber(&fakeRankerProber{speeds: map[string]int64{"github": 1}}),
+		WithRankerRanked(func(kind Kind, ranked Plan, results []ProbeResult) error {
+			rankedKinds = append(rankedKinds, kind)
+			if len(results) != len(ranked.Sources()) {
+				t.Errorf("ranked callback results = %d, want %d", len(results), len(ranked.Sources()))
+			}
+			if kind == KindGit {
+				return rankedErr
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewRanker() error = %v", err)
+	}
+	observed.SetTarget(KindUV, ProbeTarget{Kind: KindUV, Path: "0.12.3/uv.zip", WindowBytes: 1024})
+	observed.SetTarget(KindGit, ProbeTarget{Kind: KindGit, Path: "info/refs?service=git-upload-pack"})
+	if err := observed.Warm(context.Background(), policy, KindUV, KindUV); err != nil || len(rankedKinds) != 1 {
+		t.Fatalf("ranked callback: err = %v, kinds = %v, want one uv callback", err, rankedKinds)
+	}
+	if err := observed.Warm(context.Background(), policy, KindGit); !errors.Is(err, rankedErr) {
+		t.Fatalf("ranked callback error = %v, want propagated", err)
+	}
 	if _, err := NewRanker(nil); err == nil {
 		t.Fatal("NewRanker(nil) error = nil, want error")
 	}

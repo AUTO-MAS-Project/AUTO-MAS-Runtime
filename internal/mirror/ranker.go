@@ -20,6 +20,10 @@ type sourceProber interface {
 // 返回错误会让本次排序失败并上抛（协议输出已断时没有必要继续）。
 type ProbeReportFunc func(kind Kind, result ProbeResult, completed, total int) error
 
+// RankedFunc 在某个 Kind 完成一轮探测并排好序后同步回调一次（缓存命中不回调），供发出 network.probe 的收口事件。
+// 返回错误会让本次排序失败并上抛。
+type RankedFunc func(kind Kind, ranked Plan, results []ProbeResult) error
+
 // Ranker 把 Prober、RankPlan 与 ProbeCache 组合成一个 PlanFunc（增补 2 C16）。
 //
 // 没有探针目标的 Kind 按目录顺序返回、不联网；探针失败（全部源失败、探测器出错）只会退回目录顺序，
@@ -29,6 +33,7 @@ type Ranker struct {
 	prober  sourceProber
 	cache   *ProbeCache
 	report  ProbeReportFunc
+	ranked  RankedFunc
 	logger  func(message string)
 
 	mu      sync.Mutex // 保护 targets、results 与 inflight
@@ -81,6 +86,17 @@ func WithRankerReport(report ProbeReportFunc) RankerOption {
 			return fmt.Errorf("%w: report", ErrInvalidRankerOption)
 		}
 		ranker.report = report
+		return nil
+	}
+}
+
+// WithRankerRanked 注入每轮探测排序完成后的回调（network.probe 收口事件的来源）。
+func WithRankerRanked(ranked RankedFunc) RankerOption {
+	return func(ranker *Ranker) error {
+		if ranked == nil {
+			return fmt.Errorf("%w: ranked callback", ErrInvalidRankerOption)
+		}
+		ranker.ranked = ranked
 		return nil
 	}
 }
@@ -224,6 +240,11 @@ func (r *Ranker) Plan(ctx context.Context, policy Policy, kind Kind) (Plan, erro
 	r.results[kind] = results
 	r.mu.Unlock()
 	r.cache.Store(kind, seal, ranked, results)
+	if r.ranked != nil {
+		if err := r.ranked(kind, ranked, append([]ProbeResult(nil), results...)); err != nil {
+			return Plan{}, err
+		}
+	}
 	return ranked, nil
 }
 
