@@ -28,6 +28,9 @@ M7 GitHub CI/CD 发布均已完成；设计和审查记录分别归档到
 - [T13.14 克隆传输期时间心跳](./M13/设计-T13.14-克隆传输期时间心跳.md)：
   `workspace.clone` 的 running 脉冲从「按 sideband 写入次数计数」改为注入 ticker 的时间心跳，
   覆盖 packfile 传输的静默期；仍不带数值、不解析 Git 原文。
+- [M14 网络源测速与回环中继](./M14/设计-M14-网络源测速与回环中继.md)（2026-09-11 立项，增补 2 C16~C19）：
+  `internal/mirror` 的并行测速与实测排序、`internal/relay` 回环中继（逐文件多源回退、大文件分片、先校验再交付）、
+  `internal/uv` 的锁规划器与字节进度、CLI 预热与 supervise 常驻、protocol 追加字段与 stage；设计与各任务计划合并为一份。
 
 任务完成后的处理规则：
 
