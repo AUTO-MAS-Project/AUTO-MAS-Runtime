@@ -316,6 +316,7 @@ func runBootstrap(
 		Commit:           revision.Commit(),
 		MirrorPolicy:     deps.global.mirrorPolicy,
 		Line:             uvLogLine(operationLogger),
+		Progress:         relayProgress(emitter, protocol.StagePythonInstall, "正在下载受管 Python"),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonSpec, operationLogger, machine, protocol.StagePythonInstall, err)
@@ -345,6 +346,7 @@ func runBootstrap(
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(operationLogger),
 		Attempt:       mirrorAttemptProgress(emitter),
+		Progress:      relayProgress(emitter, protocol.StageDependenciesSync, "正在下载锁定依赖"),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesSync, err)
@@ -369,26 +371,29 @@ func runBootstrap(
 	if err := transitionM5State(emitter, machine, protocol.StageDependenciesSync, protocol.StateReadyToStart, "运行环境已就绪"); err != nil {
 		return sessionSuccess{}, err
 	}
+	details := map[string]any{
+		"version":         revision.Version(),
+		"branch":          revision.Branch(),
+		"commit":          revision.Commit(),
+		"uvExecutable":    uvExecutable,
+		"uvVersion":       uv.FixedVersion,
+		"pythonVersion":   pythonResult.Spec.Version.String(),
+		"lockfileChecked": dependencyResult.LockfileChecked,
+		"synchronized":    dependencyResult.Synchronized,
+		// bootstrap 同样跑 uv sync，因此和 dependencies sync 一样报告本次
+		// 实际使用的镜像源（C10 第 7 条）；否则首装失败时调用方无从判断
+		// 装的是哪个源。
+		"sourceKind":    dependencyResult.SourceKind,
+		"source":        dependencyResult.Source,
+		"attemptCount":  dependencyResult.AttemptCount,
+		"lockRewritten": dependencyResult.LockRewritten,
+	}
+	details = withRelayDetails(details, "relay", dependencyResult.Relay)
+	details = withRelayDetails(details, "pythonRelay", pythonResult.Relay)
 	return sessionSuccess{
 		message: "运行环境准备完成",
 		status:  string(protocol.StateReadyToStart),
-		details: map[string]any{
-			"version":         revision.Version(),
-			"branch":          revision.Branch(),
-			"commit":          revision.Commit(),
-			"uvExecutable":    uvExecutable,
-			"uvVersion":       uv.FixedVersion,
-			"pythonVersion":   pythonResult.Spec.Version.String(),
-			"lockfileChecked": dependencyResult.LockfileChecked,
-			"synchronized":    dependencyResult.Synchronized,
-			// bootstrap 同样跑 uv sync，因此和 dependencies sync 一样报告本次
-			// 实际使用的镜像源（C10 第 7 条）；否则首装失败时调用方无从判断
-			// 装的是哪个源。
-			"sourceKind":    dependencyResult.SourceKind,
-			"source":        dependencyResult.Source,
-			"attemptCount":  dependencyResult.AttemptCount,
-			"lockRewritten": dependencyResult.LockRewritten,
-		},
+		details: details,
 	}, nil
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
@@ -759,3 +760,62 @@ func emitM5State(
 var _ filesystem.Auditor = (*workspaceLogBinding)(nil)
 var _ environmentService = (*uv.EnvironmentService)(nil)
 var _ environmentService = (*uv.ProductionEnvironment)(nil)
+
+// relayProgress 把中继的聚合字节进度映射为 stage 的 running 事件（增补 2 C18 第 3、4 条）。
+//
+// 总量来自锁文件声明或 Content-Length，不是推算；中继已按 200 ms 节流，这里只保证
+// 字节单调（分片重取时 Received 可能短暂回落）并在总量未知时不带数值。
+func relayProgress(emitter *protocol.Emitter, stage protocol.Stage, message string) func(relay.Progress) error {
+	if emitter == nil {
+		return nil
+	}
+	var highWater int64
+	return func(progress relay.Progress) error {
+		event := protocol.ProgressEvent{
+			Stage:   stage,
+			Status:  protocol.ProgressRunning,
+			Item:    filepath.Base(progress.Item),
+			Source:  progress.Source,
+			Message: message,
+		}
+		rate := progress.BytesPerSecond
+		event.BytesPerSecond = &rate
+		if progress.Total > 0 {
+			received := progress.Received
+			if received < highWater {
+				received = highWater
+			}
+			if received > progress.Total {
+				received = progress.Total
+			}
+			highWater = received
+			total := progress.Total
+			percent := float64(received) / float64(total) * 100
+			event.Current = &received
+			event.Total = &total
+			event.Percent = &percent
+		}
+		if err := emitter.EmitProgress(event); err != nil {
+			return &commandError{
+				code:    protocol.CodeOutputWriteFailed,
+				stage:   stage,
+				message: "协议输出失败",
+				details: map[string]any{},
+				cause:   err,
+			}
+		}
+		return nil
+	}
+}
+
+// withRelayDetails 把依赖同步或 Python 安装的中继摘要并入 details（增补 2 C18 第 7 条）；没有走中继时不写。
+func withRelayDetails(details map[string]any, key string, summary *relay.Summary) map[string]any {
+	if summary == nil {
+		return details
+	}
+	if details == nil {
+		details = map[string]any{}
+	}
+	details[key] = uv.RelaySummaryDetails(*summary)
+	return details
+}
