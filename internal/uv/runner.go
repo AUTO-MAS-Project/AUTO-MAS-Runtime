@@ -27,11 +27,20 @@ const (
 	uvColorEnv            = "UV_COLOR"
 	uvNoProgressEnv       = "UV_NO_PROGRESS"
 	uvNoSystemConfigEnv   = "UV_NO_SYSTEM_CONFIG"
-	autoMASUVExecutable   = "AUTO_MAS_UV_EXE"
-	autoMASProtocol       = "AUTO_MAS_RUNTIME_PROTOCOL"
-	autoMASVersion        = "AUTO_MAS_EXPECTED_VERSION"
-	autoMASCommit         = "AUTO_MAS_EXPECTED_COMMIT"
-	autoMASSupervised     = "AUTO_MAS_SUPERVISED"
+	// uvNoConfigEnv 让 uv 不去发现任何 uv.toml / pyproject [tool.uv] 设置层（增补 2 C20）：
+	// UV_NO_SYSTEM_CONFIG 只挡系统级，用户级 %APPDATA%\uv\uv.toml 与项目父目录里的配置
+	// 仍会把 index-url 之类塞进来，让 `uv lock --check` 对着别的索引判锁过期。
+	// 项目自身的 [tool.uv.sources] 等元数据不属于设置层，不受影响（uv 0.12.3 实测）。
+	uvNoConfigEnv = "UV_NO_CONFIG"
+	// noProxyEnv 是 Runtime 唯一会改写的宿主代理变量：uv（reqwest）会把发往 127.0.0.1 回环中继的
+	// 请求也送进 HTTP(S)_PROXY / ALL_PROXY，而 NO_PROXY=localhost 并不豁免 127.0.0.1（uv 0.12.3 实测），
+	// 所以宿主值原样保留、缺的回环项补齐后以规范大写键下发。
+	noProxyEnv          = "NO_PROXY"
+	autoMASUVExecutable = "AUTO_MAS_UV_EXE"
+	autoMASProtocol     = "AUTO_MAS_RUNTIME_PROTOCOL"
+	autoMASVersion      = "AUTO_MAS_EXPECTED_VERSION"
+	autoMASCommit       = "AUTO_MAS_EXPECTED_COMMIT"
+	autoMASSupervised   = "AUTO_MAS_SUPERVISED"
 	// 以下四个键按增补 1 C11 下发受管基础设施与有序镜像源，与上面五个身份键
 	// 同属受监督进程的环境契约：宿主同名变量被清除，调用方也不能经
 	// RunOptions.Environment 覆盖。
@@ -492,6 +501,7 @@ func buildEnvironmentWithSupervision(options resolvedRunOptions, supervision map
 		uvColorEnv:            "never",
 		uvNoProgressEnv:       "1",
 		uvNoSystemConfigEnv:   "1",
+		uvNoConfigEnv:         "1",
 	}
 	for key, value := range supervision {
 		controlled[key] = value
@@ -524,7 +534,7 @@ func buildEnvironmentWithSupervision(options resolvedRunOptions, supervision map
 		key, _, found := strings.Cut(entry, "=")
 		if found {
 			if isRuntimeOnlyEnvironmentKey(key) || isUVEnvironmentKey(key) || isSupervisionEnvironmentKey(key) || containsEnvironmentKey(reserved, key) ||
-				containsEnvironmentKeyMap(overrides, key) {
+				isIsolatedHostEnvironmentKey(key) || containsEnvironmentKeyMap(overrides, key) {
 				continue
 			}
 		}
@@ -545,7 +555,87 @@ func buildEnvironmentWithSupervision(options resolvedRunOptions, supervision map
 		}
 		values = append(values, key+"="+value)
 	}
-	return values
+	return ensureLoopbackNoProxy(values)
+}
+
+// loopbackNoProxyEntries 是 NO_PROXY 里必须出现的回环项：中继与受监督后端的本机端口都只用这两个名字。
+var loopbackNoProxyEntries = []string{"127.0.0.1", "localhost"}
+
+// ensureLoopbackNoProxy 把环境里所有大小写变体的 NO_PROXY 合并成唯一的规范键，并补上回环项；
+// 值为 "*" 时已经豁免一切，原样保留。宿主与 RunOptions 都没给时也会注入，因为代理可能来自
+// 系统设置而不是环境变量。
+func ensureLoopbackNoProxy(values []string) []string {
+	existing := ""
+	kept := make([]string, 0, len(values)+1)
+	for _, entry := range values {
+		key, value, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(key, noProxyEnv) {
+			// 后出现的是 RunOptions 覆盖值（宿主同名项已在前面被剔除），以它为准。
+			existing = value
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return append(kept, noProxyEnv+"="+withLoopbackNoProxy(existing))
+}
+
+func withLoopbackNoProxy(value string) string {
+	entries := make([]string, 0, 4)
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if item == "*" {
+			return "*"
+		}
+		entries = append(entries, item)
+	}
+	for _, loopback := range loopbackNoProxyEntries {
+		if !containsEnvironmentKey(entries, loopback) {
+			entries = append(entries, loopback)
+		}
+	}
+	return strings.Join(entries, ",")
+}
+
+// passthroughPythonEnvironmentKeys 是宿主 PYTHON* 变量里仅有的四个放行项：它们只影响编码、缓冲与
+// 字节码落盘，不改变解释器加载什么代码、以什么模式运行。
+var passthroughPythonEnvironmentKeys = []string{
+	"PYTHONIOENCODING",
+	"PYTHONUTF8",
+	"PYTHONUNBUFFERED",
+	"PYTHONDONTWRITEBYTECODE",
+}
+
+// isolatedHostEnvironmentKeys 列出 PYTHON* 之外同样不从宿主继承的变量：激活中的虚拟环境会让 uv 报警或
+// 选错解释器；FORCE_COLOR / CLICOLOR_FORCE 会压过 UV_COLOR=never 往诊断里塞 ANSI 序列；RUST_LOG 不加 -v
+// 也会让 uv 往 stderr 倾倒 TRACE 日志（uv 0.12.3 实测）。
+var isolatedHostEnvironmentKeys = []string{
+	"VIRTUAL_ENV",
+	"VIRTUAL_ENV_PROMPT",
+	"CONDA_PREFIX",
+	"CONDA_DEFAULT_ENV",
+	"__PYVENV_LAUNCHER__",
+	"FORCE_COLOR",
+	"CLICOLOR_FORCE",
+	"CLICOLOR",
+	"NO_COLOR",
+	"RUST_LOG",
+	"RUST_BACKTRACE",
+	"RUST_MIN_STACK",
+}
+
+// isIsolatedHostEnvironmentKey 报告宿主变量是否属于会改变 uv 自身或它拉起的 Python 解释器行为的那一类
+// （增补 2 C20）：PYTHONHOME 让解释器起不来、PYTHONPATH 让宿主的包盖住项目依赖、PYTHONSAFEPATH 让入口
+// 找不到 app、PYTHONWARNINGS=error 直接崩、PYTHONINSPECT 让进程退不出。名单只作用于 os.Environ()，
+// Runtime 自己经 RunOptions.Environment 显式注入的值不受影响。
+func isIsolatedHostEnvironmentKey(key string) bool {
+	if len(key) >= 6 && strings.EqualFold(key[:6], "PYTHON") {
+		// 按前缀整体拒绝而不是逐个列举 CPython 的变量：新版本解释器加的变量默认也不放行。
+		return !containsEnvironmentKey(passthroughPythonEnvironmentKeys, key)
+	}
+	return containsEnvironmentKey(isolatedHostEnvironmentKeys, key)
 }
 
 func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
