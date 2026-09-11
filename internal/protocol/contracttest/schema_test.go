@@ -617,3 +617,36 @@ func warningSummaryForContract(events []map[string]any) map[string]any {
 	details := lastObject(events)["details"].(map[string]any)
 	return details["warnings"].([]any)[0].(map[string]any)
 }
+
+// TestContract_ProgressDetailFieldsTyped 锁定增补 2 C18 追加的三个可选字段：缺失合法，存在时类型必须正确。
+func TestContract_ProgressDetailFieldsTyped(t *testing.T) {
+	t.Parallel()
+
+	t.Run("present and well typed", func(t *testing.T) {
+		t.Parallel()
+		progress := progressObjectForContract(2)
+		progress["item"] = "numpy-2.3.3-cp312-cp312-win_amd64.whl"
+		progress["source"] = "aliyun"
+		progress["bytesPerSecond"] = 3200000
+		_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, successWithMiddle(progress)))
+		requireNoIssues(t, issues)
+	})
+	for _, test := range []struct {
+		field string
+		value any
+		want  string
+	}{
+		{"item", 1, `progress field "item" must be a string when present`},
+		{"source", true, `progress field "source" must be a string when present`},
+		{"bytesPerSecond", "fast", `progress field "bytesPerSecond" must be an integer when present`},
+		{"bytesPerSecond", 1.5, `progress field "bytesPerSecond" must be an integer when present`},
+	} {
+		t.Run(test.field+" mistyped", func(t *testing.T) {
+			t.Parallel()
+			progress := progressObjectForContract(2)
+			progress[test.field] = test.value
+			_, issues := inspect(testCommand, TerminalSuccess, encodeTranscript(t, successWithMiddle(progress)))
+			requireIssue(t, issues, test.want)
+		})
+	}
+}

@@ -11,6 +11,7 @@ const (
 	StageBootstrap           Stage = "bootstrap"
 	StageRepair              Stage = "repair"
 	StageCleanup             Stage = "cleanup"
+	StageNetworkProbe        Stage = "network.probe"
 	StageUVCheck             Stage = "uv.check"
 	StageUVDownload          Stage = "uv.download"
 	StageUVVerify            Stage = "uv.verify"
@@ -38,6 +39,7 @@ var stages = []Stage{
 	StageBootstrap,
 	StageRepair,
 	StageCleanup,
+	StageNetworkProbe,
 	StageUVCheck,
 	StageUVDownload,
 	StageUVVerify,

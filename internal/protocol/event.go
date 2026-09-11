@@ -34,14 +34,21 @@ type HelloEvent struct {
 }
 
 // ProgressEvent 报告稳定 stage 的执行进度。
+//
+// Item、Source 与 BytesPerSecond 是增补 2 C18 追加的细目：当前条目（文件名或源 key）、
+// 当前字节来自的源 key、最近 1 秒窗口的整数吞吐。三者缺失即无信息，序列化时省略而不输出 null，
+// 只供调用方展示，不得驱动流程。
 type ProgressEvent struct {
 	Common
-	Stage   Stage          `json:"stage"`
-	Status  ProgressStatus `json:"status"`
-	Current *int64         `json:"current,omitempty"`
-	Total   *int64         `json:"total,omitempty"`
-	Percent *float64       `json:"percent,omitempty"`
-	Message string         `json:"message"`
+	Stage          Stage          `json:"stage"`
+	Status         ProgressStatus `json:"status"`
+	Current        *int64         `json:"current,omitempty"`
+	Total          *int64         `json:"total,omitempty"`
+	Percent        *float64       `json:"percent,omitempty"`
+	Item           string         `json:"item,omitempty"`
+	Source         string         `json:"source,omitempty"`
+	BytesPerSecond *int64         `json:"bytesPerSecond,omitempty"`
+	Message        string         `json:"message"`
 }
 
 // StateEvent 报告生命周期迁移或只读状态快照。

@@ -28,6 +28,9 @@ var progressSchema = []schemaRule{
 	{field: "current", description: "an integer when present", valid: isInteger, optional: true},
 	{field: "total", description: "an integer when present", valid: isInteger, optional: true},
 	{field: "percent", description: "a number when present", valid: isNumber, optional: true},
+	{field: "item", description: "a string when present", valid: isString, optional: true},
+	{field: "source", description: "a string when present", valid: isString, optional: true},
+	{field: "bytesPerSecond", description: "an integer when present", valid: isInteger, optional: true},
 	{field: "message", description: "a string", valid: isString},
 }
 
