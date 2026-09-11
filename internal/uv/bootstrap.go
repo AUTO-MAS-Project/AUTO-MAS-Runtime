@@ -589,6 +589,14 @@ func (b *Bootstrapper) download(
 		attempt mirror.Attempt,
 	) mirror.AttemptOutcome {
 		url := strings.TrimRight(attempt.Source.BaseURL(), "/") + "/" + spec.Version + "/" + spec.Name
+		var attemptProgress mirror.ProgressFunc
+		if progress != nil {
+			sourceKey := attempt.Source.Key()
+			attemptProgress = func(update mirror.DownloadProgress) error {
+				update.Source = sourceKey
+				return progress(update)
+			}
+		}
 		downloadResult, downloadErr := b.downloader.Download(attemptContext, mirror.DownloadRequest{
 			URL:              url,
 			FileName:         spec.Name,
@@ -596,7 +604,7 @@ func (b *Bootstrapper) download(
 			AllowUnknownSize: true,
 			MaxSize:          maxUVDownloadBytes,
 			ExpectedSHA256:   spec.SHA256,
-			Progress:         progress,
+			Progress:         attemptProgress,
 		})
 		if downloadErr == nil {
 			downloadedPath = downloadResult.Path

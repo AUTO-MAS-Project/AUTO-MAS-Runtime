@@ -693,22 +693,48 @@ func mirrorAttemptProgress(emitter *protocol.Emitter) uv.MirrorAttemptFunc {
 }
 
 // uvDownloadProgress 把下载器确认写入的真实字节进度映射为协议进度。
+//
+// item 固定为 uv 制品文件名，source 由 bootstrap 的轮换回调填入；吞吐按相邻两次回调的
+// 字节差与时钟差计算（下载器每 200 ms 报一次），第一次回调没有吞吐。
 func uvDownloadProgress(emitter *protocol.Emitter) mirror.ProgressFunc {
+	return uvDownloadProgressWithClock(emitter, time.Now)
+}
+
+func uvDownloadProgressWithClock(emitter *protocol.Emitter, clock func() time.Time) mirror.ProgressFunc {
 	if emitter == nil {
 		return nil
 	}
+	if clock == nil {
+		clock = time.Now
+	}
+	var (
+		lastAt       time.Time
+		lastReceived int64
+		hasLast      bool
+	)
 	return func(progress mirror.DownloadProgress) error {
 		current := progress.Received
 		total := progress.Total
 		percent := progress.Percent
-		if err := emitter.EmitProgress(protocol.ProgressEvent{
+		event := protocol.ProgressEvent{
 			Stage:   protocol.StageUVDownload,
 			Status:  protocol.ProgressRunning,
 			Current: &current,
 			Total:   &total,
 			Percent: &percent,
+			Item:    uv.WindowsX64Artifact,
+			Source:  progress.Source,
 			Message: "正在下载固定版本 uv",
-		}); err != nil {
+		}
+		now := clock()
+		if hasLast && current >= lastReceived {
+			if elapsed := now.Sub(lastAt); elapsed > 0 {
+				rate := int64(float64(current-lastReceived) / elapsed.Seconds())
+				event.BytesPerSecond = &rate
+			}
+		}
+		lastAt, lastReceived, hasLast = now, current, true
+		if err := emitter.EmitProgress(event); err != nil {
 			return &commandError{
 				code:    protocol.CodeOutputWriteFailed,
 				stage:   protocol.StageUVDownload,

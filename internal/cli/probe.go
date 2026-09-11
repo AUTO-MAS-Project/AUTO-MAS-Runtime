@@ -57,23 +57,27 @@ func newNetworkRanker(emitter *protocol.Emitter, opLog *workspaceLogBinding) (*m
 }
 
 // probeProgress 把单个源的探测结果报成 network.probe running：item 与 source 都是源 key，
-// bytesPerSecond 是实测吞吐（失败为 0），current/total 是已完成源数与源总数。
+// current/total 是已完成源数与源总数。bytesPerSecond 三态：正数为实测吞吐，0 为探测失败，
+// **缺失**表示探测成功但只测了首字节（git 类源没有吞吐可报）——调用方不得把缺失当失败。
 func probeProgress(emitter *protocol.Emitter) mirror.ProbeReportFunc {
 	return func(kind mirror.Kind, result mirror.ProbeResult, completed, total int) error {
 		current, totalCount := int64(completed), int64(total)
-		rate := result.BytesPerSecond
 		key := result.Source.Key()
 		message := fmt.Sprintf("测速 %s（%s）：%s", key, kind, formatProbeRate(result))
-		if err := emitter.EmitProgress(protocol.ProgressEvent{
-			Stage:          protocol.StageNetworkProbe,
-			Status:         protocol.ProgressRunning,
-			Current:        &current,
-			Total:          &totalCount,
-			Item:           key,
-			Source:         key,
-			BytesPerSecond: &rate,
-			Message:        message,
-		}); err != nil {
+		event := protocol.ProgressEvent{
+			Stage:   protocol.StageNetworkProbe,
+			Status:  protocol.ProgressRunning,
+			Current: &current,
+			Total:   &totalCount,
+			Item:    key,
+			Source:  key,
+			Message: message,
+		}
+		if !result.OK || result.Bytes > 0 {
+			rate := result.BytesPerSecond
+			event.BytesPerSecond = &rate
+		}
+		if err := emitter.EmitProgress(event); err != nil {
 			return &commandError{
 				code:    protocol.CodeOutputWriteFailed,
 				stage:   protocol.StageNetworkProbe,

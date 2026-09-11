@@ -69,6 +69,8 @@ type DownloadProgress struct {
 	Received int64
 	Total    int64
 	Percent  float64
+	// Source 是本次尝试的源 key，由轮换调用方在转发前填入；下载器自身不知道源。
+	Source string
 }
 
 // ProgressFunc 同步接收单调下载进度。
