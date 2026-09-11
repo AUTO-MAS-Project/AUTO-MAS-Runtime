@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 var errAllSourcesFailed = errors.New("relay: all sources failed")
@@ -38,6 +39,7 @@ type engine struct {
 
 	slots       chan struct{}
 	slotWaiting chan struct{}
+	clock       func() time.Time
 
 	mu        sync.Mutex // 保护 items、upstreams、strikes。
 	items     map[string]Item
@@ -63,6 +65,7 @@ func newEngine(
 		baseURL:     baseURL,
 		slots:       make(chan struct{}, cfg.MaxFiles),
 		slotWaiting: private.slotWaiting,
+		clock:       deps.Clock,
 		items:       make(map[string]Item, len(cfg.Items)),
 		upstreams:   make(map[Route][]Upstream, len(cfg.Upstreams)),
 		strikes:     make(map[Route]map[string]int, len(cfg.Upstreams)),
@@ -262,6 +265,27 @@ func (e *engine) nextUpstream(route Route, failed map[string]bool) (Upstream, bo
 	return Upstream{}, false
 }
 
+// demoteUpstream 把被判慢的源挪到该路由上游顺序的末位（本中继生命周期内），后续文件不再优先选它；
+// 不剔除：所有源都慢时它仍然可用。
+func (e *engine) demoteUpstream(route Route, key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	list := e.upstreams[route]
+	index := -1
+	for i, upstream := range list {
+		if upstream.Key == key {
+			index = i
+			break
+		}
+	}
+	if index < 0 || index == len(list)-1 {
+		return
+	}
+	demoted := list[index]
+	reordered := append(append(make([]Upstream, 0, len(list)), list[:index]...), list[index+1:]...)
+	e.upstreams[route] = append(reordered, demoted)
+}
+
 // strike 记一次哈希不符；同一源在本中继生命周期内第二次即从该路由剔除。
 func (e *engine) strike(route Route, key string) {
 	e.mu.Lock()
@@ -290,7 +314,7 @@ func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 	part := target + ".part"
 	e.staging.track(target)
 	e.staging.track(part)
-	plan := &chunkPlan{failed: make(map[string]bool), contributions: make(map[string]int64)}
+	plan := newChunkPlan(e.clock)
 	if e.tryChunked(ctx, spec, part, plan) {
 		if path, ok := e.publish(spec, part, target, plan.contributions); ok {
 			return path, nil

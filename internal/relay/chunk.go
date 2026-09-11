@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 )
 
 // chunk 是一段闭区间字节范围。
@@ -19,13 +20,183 @@ type chunk struct {
 
 func (c chunk) length() int64 { return c.end - c.start + 1 }
 
-// chunkPlan 是一次分片取回的共享状态：待取片栈、本文件失败源与各源贡献。
+// chunkPlan 是一次分片取回的共享状态：待取片栈、本文件失败源与各源贡献，
+// 以及慢源判定所需的进行中片进度（T14.8）。
 type chunkPlan struct {
 	mu            sync.Mutex // 保护以下全部字段。
 	pending       []chunk
 	failed        map[string]bool
 	attempts      []AttemptOutcome
 	contributions map[string]int64
+	// completed 是本文件已完成的片数；inflight 记录各 worker 正在取的片；slow 是本文件内被判为慢源、
+	// 不再分派新片的源。changed 在 pending / inflight 变化时关闭并换新，供等待方醒来。
+	completed int
+	inflight  map[string]*inflightChunk
+	slow      map[string]bool
+	changed   chan struct{}
+	clock     func() time.Time
+}
+
+// inflightChunk 是一个 worker 正在取的片：开始时刻、开始时的全局完成片数、已收字节与取消入口。
+type inflightChunk struct {
+	piece            chunk
+	startedAt        time.Time
+	startedCompleted int
+	received         int64
+	cancel           context.CancelFunc
+}
+
+const (
+	// slowSourceCompletedLead 是判慢的门槛：别的 worker 完成了这么多片、自己当前片还没过 slowSourceProgressLimit。
+	slowSourceCompletedLead = 2
+	// slowSourceProgressLimit 是判慢时自己当前片允许的最大进度（四分之一）。
+	slowSourceProgressLimit = 4
+	// tailLaggardProgressLimit 是收尾判慢的进度门槛（一半）：队列已空、别的 worker 至少完成一片而它还没过半。
+	tailLaggardProgressLimit = 2
+	// slowSourceMinAge 是判慢前该片至少要在飞的时长：首字节延迟、连接建立与调度抖动都不算慢，
+	// 只有持续落后才算——否则 TTFB 400 ms 的官方源会在快源起跑时被误判。
+	slowSourceMinAge = 1500 * time.Millisecond
+)
+
+func newChunkPlan(clock func() time.Time) *chunkPlan {
+	if clock == nil {
+		clock = time.Now
+	}
+	return &chunkPlan{
+		clock:         clock,
+		failed:        make(map[string]bool),
+		contributions: make(map[string]int64),
+		inflight:      make(map[string]*inflightChunk),
+		slow:          make(map[string]bool),
+		changed:       make(chan struct{}),
+	}
+}
+
+// notifyLocked 唤醒所有等待 pending / inflight 变化的 worker；调用方须持锁。
+func (p *chunkPlan) notifyLocked() {
+	close(p.changed)
+	p.changed = make(chan struct{})
+}
+
+// begin 登记 key 开始取 piece；返回可取消该片的 context。
+func (p *chunkPlan) begin(ctx context.Context, key string, piece chunk) context.Context {
+	chunkCtx, cancel := context.WithCancel(ctx)
+	p.mu.Lock()
+	p.inflight[key] = &inflightChunk{piece: piece, startedAt: p.clock(), startedCompleted: p.completed, cancel: cancel}
+	p.mu.Unlock()
+	return chunkCtx
+}
+
+// progress 记录 key 当前片新收到的字节。
+func (p *chunkPlan) progress(key string, count int64) {
+	p.mu.Lock()
+	if entry, ok := p.inflight[key]; ok {
+		entry.received += count
+	}
+	p.mu.Unlock()
+}
+
+// end 注销 key 的进行中片并释放取消入口。
+func (p *chunkPlan) end(key string) {
+	p.mu.Lock()
+	if entry, ok := p.inflight[key]; ok {
+		entry.cancel()
+		delete(p.inflight, key)
+	}
+	p.notifyLocked()
+	p.mu.Unlock()
+}
+
+// complete 记一片完成。
+func (p *chunkPlan) complete() {
+	p.mu.Lock()
+	p.completed++
+	p.mu.Unlock()
+}
+
+func (p *chunkPlan) isSlow(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.slow[key]
+}
+
+// demoteLaggards 由刚完成一片的 worker 调用：别的 worker 自它开始当前片以来已有 slowSourceCompletedLead 片完成、
+// 而它自己的片还不到 1/slowSourceProgressLimit，即判为慢源——取消它的片（剩余范围由它自己回队）并不再分派。
+// 返回被降级的源 key。
+func (p *chunkPlan) demoteLaggards(self string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.clock()
+	var demoted []string
+	for key, entry := range p.inflight {
+		if key == self || p.slow[key] {
+			continue
+		}
+		if p.completed-entry.startedCompleted < slowSourceCompletedLead {
+			continue
+		}
+		if entry.received*slowSourceProgressLimit >= entry.piece.length() {
+			continue
+		}
+		if now.Sub(entry.startedAt) < slowSourceMinAge {
+			continue
+		}
+		p.slow[key] = true
+		entry.cancel()
+		demoted = append(demoted, key)
+	}
+	return demoted
+}
+
+// demoteTailLaggard 由队列已空、准备退出的 worker 调用：若还有别的 worker 在取片、自本 worker 上一片开始后至少
+// 完成过一片、且对方进度未过半，则判对方为慢源并取消其片，让本 worker 接手剩余范围。返回是否降级了谁。
+func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) bool {
+	if !selfCompleted {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.clock()
+	for key, entry := range p.inflight {
+		if key == self || p.slow[key] {
+			continue
+		}
+		if entry.received*tailLaggardProgressLimit >= entry.piece.length() {
+			continue
+		}
+		if now.Sub(entry.startedAt) < slowSourceMinAge {
+			continue
+		}
+		p.slow[key] = true
+		entry.cancel()
+		return true
+	}
+	return false
+}
+
+// awaitChange 等待 pending / inflight 发生变化，或 ctx 结束；用于降级后等待慢源把剩余范围回队。
+func (p *chunkPlan) awaitChange(ctx context.Context) bool {
+	p.mu.Lock()
+	changed := p.changed
+	p.mu.Unlock()
+	select {
+	case <-changed:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// othersInflight 报告除 self 之外是否还有 worker 在取片。
+func (p *chunkPlan) othersInflight(self string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.inflight {
+		if key != self {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *chunkPlan) pop() (chunk, bool) {
@@ -43,6 +214,7 @@ func (p *chunkPlan) pop() (chunk, bool) {
 func (p *chunkPlan) push(piece chunk) {
 	p.mu.Lock()
 	p.pending = append(p.pending, piece)
+	p.notifyLocked()
 	p.mu.Unlock()
 }
 
@@ -65,13 +237,23 @@ func (p *chunkPlan) credit(key string, count int64) {
 	p.mu.Unlock()
 }
 
-// rangeSources 返回该路由中支持 Range 且本文件尚未失败的源。
-func (e *engine) rangeSources(route Route, failed map[string]bool) []Upstream {
-	var sources []Upstream
+// rangeSources 返回该路由中支持 Range 且本文件尚未失败的源；有非慢源时不再分派给本文件内已判慢的源。
+func (e *engine) rangeSources(route Route, plan *chunkPlan) []Upstream {
+	var sources, fast []Upstream
+	plan.mu.Lock()
+	failed, slow := plan.failed, plan.slow
 	for _, upstream := range e.snapshotUpstreams(route) {
-		if upstream.AcceptRange && !failed[upstream.Key] {
-			sources = append(sources, upstream)
+		if !upstream.AcceptRange || failed[upstream.Key] {
+			continue
 		}
+		sources = append(sources, upstream)
+		if !slow[upstream.Key] {
+			fast = append(fast, upstream)
+		}
+	}
+	plan.mu.Unlock()
+	if len(fast) > 0 {
+		return fast
 	}
 	return sources
 }
@@ -82,7 +264,7 @@ func (e *engine) tryChunked(ctx context.Context, spec fileSpec, part string, pla
 	if spec.size < e.cfg.ChunkThreshold || spec.size <= 0 {
 		return false
 	}
-	if len(e.rangeSources(spec.key.route, plan.failed)) < 2 {
+	if len(e.rangeSources(spec.key.route, plan)) < 2 {
 		return false
 	}
 	file, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
@@ -111,7 +293,7 @@ func (e *engine) tryChunked(ctx context.Context, spec fileSpec, part string, pla
 	}
 
 	for plan.remaining() > 0 && ctx.Err() == nil {
-		sources := e.rangeSources(spec.key.route, plan.failed)
+		sources := e.rangeSources(spec.key.route, plan)
 		if len(sources) == 0 {
 			break
 		}
@@ -153,6 +335,10 @@ func (e *engine) tryChunked(ctx context.Context, spec fileSpec, part string, pla
 }
 
 // chunkWorker 绑定一个源逐片取回；任一片失败即回队、标记该源失败并退出。
+//
+// 慢源处理（T14.8，限速 200 KB/s 一类的源）：每完成一片就检查别的 worker 是否明显落后，落后者被判慢、
+// 当前片被取消，它已写下的字节保留、剩余范围回队交给快源；队列空了但别人还在慢慢取时，快 worker
+// 同样可以接手对方剩余范围，而不是干等最后一片。
 func (e *engine) chunkWorker(
 	ctx context.Context,
 	spec fileSpec,
@@ -160,15 +346,45 @@ func (e *engine) chunkWorker(
 	file *os.File,
 	plan *chunkPlan,
 ) {
-	for {
+	selfCompleted := false
+	for ctx.Err() == nil {
 		piece, ok := plan.pop()
 		if !ok {
-			return
+			if plan.isSlow(upstream.Key) || !plan.othersInflight(upstream.Key) {
+				return
+			}
+			if !plan.demoteTailLaggard(upstream.Key, selfCompleted) {
+				return
+			}
+			// 被降级的 worker 会把剩余范围回队；等它回队（或退出）后再取。
+			if !plan.awaitChange(ctx) {
+				return
+			}
+			continue
 		}
-		received, outcome := e.fetchChunk(ctx, spec, upstream, piece, file)
+		chunkCtx := plan.begin(ctx, upstream.Key, piece)
+		received, outcome := e.fetchChunk(chunkCtx, spec, upstream, piece, file, plan)
+		plan.end(upstream.Key)
 		if outcome == "" {
 			plan.credit(upstream.Key, received)
+			plan.complete()
+			selfCompleted = true
+			for _, demoted := range plan.demoteLaggards(upstream.Key) {
+				e.demoteUpstream(spec.key.route, demoted)
+				e.log("info", "relay slow source demoted", map[string]any{
+					"route": spec.key.route.String(), "item": spec.name, "source": demoted, "by": upstream.Key,
+				})
+			}
 			continue
+		}
+		if plan.isSlow(upstream.Key) && ctx.Err() == nil {
+			// 被判慢：已写下的字节有效并计入贡献，剩余范围回队；本 worker 退出，不算失败。
+			plan.credit(upstream.Key, received)
+			if received < piece.length() {
+				plan.push(chunk{start: piece.start + received, end: piece.end})
+			}
+			e.demoteUpstream(spec.key.route, upstream.Key)
+			return
 		}
 		plan.push(piece)
 		e.tracker.discard(spec.key, upstream.Key, received)
@@ -188,6 +404,7 @@ func (e *engine) fetchChunk(
 	upstream Upstream,
 	piece chunk,
 	file *os.File,
+	plan *chunkPlan,
 ) (int64, Outcome) {
 	headers := map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", piece.start, piece.end)}
 	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+spec.key.path, headers)
@@ -205,6 +422,7 @@ func (e *engine) fetchChunk(
 	writer := io.NewOffsetWriter(file, piece.start)
 	received, outcome := e.readBody(ctx, handle, writer, piece.length(), func(count int64) {
 		e.tracker.add(spec.key, spec.name, upstream.Key, count)
+		plan.progress(upstream.Key, count)
 	})
 	if outcome != "" {
 		return received, outcome
