@@ -315,8 +315,10 @@ swap 前状态且**完全确定**（`repo`=旧、`update`=已校验目标、`pre
 （`cleanup` 阶段的 `repo` 已是目标版本，不适用），并在 `recoverSwap` 中让
 `repository.kind == recoveryPathIncomplete` 走「回滚到 swap 前」分支。
 
-**修复状态**：暂不修改。理由同 H-4：恢复分类的改动需要 Windows 上的真实
-句柄与 rename 语义验证，本环境不具备。已登记为后续任务。
+**修复状态**：已由 T4.9 `9fe260a` 修复并在 Windows 上完成定向重复、Git Recovery/Replacement
+组件矩阵、标准验证门和全仓 race。Recovery 只在 `workspace.swap` 阶段把可安全 pin、但 Git
+身份无效的旧 repo 视为 incomplete，并仅在目标 update 已验证且 previous 缺失时回滚到 swap
+前状态；其他不确定形状仍失败关闭。
 
 ### [High] H-6 version 命令把版本源失败伪装成协议输出失败
 
@@ -1041,4 +1043,3 @@ README 保留了每条被移出内容的**行为要点**而非细节，避免调
 
 同时把本文件登记进 `doc/README.md` 的「按用途浏览」——此前它不在任何索引里，
 从文档入口无法发现。没有新建目录，没有创建 `-v2`/`-new`/`-final` 变体。
-
