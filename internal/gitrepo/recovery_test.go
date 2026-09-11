@@ -47,7 +47,7 @@ func TestRecovery_ClassifyPathPinsRepositoryDuringReader(t *testing.T) {
 	}
 	resultCh := make(chan classifyResult, 1)
 	go func() {
-		classified, classifyErr := recovery.classifyPath(t.Context(), layout.RepoDir(), false)
+		classified, classifyErr := recovery.classifyPath(t.Context(), layout.RepoDir(), recoveryPathPolicy{})
 		resultCh <- classifyResult{path: classified, err: classifyErr}
 	}()
 	select {
@@ -482,6 +482,49 @@ func TestRecovery_SwapBeforeFirstRenameDiscardsCandidate(t *testing.T) {
 	if _, err := os.Lstat(update); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("update directory remains: %v", err)
 	}
+}
+
+func TestRecovery_SwapBeforeFirstRenameDamagedRepositoryDiscardsCandidate(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCH", protocol.StageWorkspaceSwap, "v5.4.0")
+	writeRecoveryRepository(t, layout.RepoDir(), "v5.3.0", "https://example.test/untrusted.git", "old")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, successfulRecoveryOperator(t), store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !result.Recovered || !result.MutationApplied || !result.TransactionRemoved || result.EnvironmentWritten {
+		t.Fatalf("Recover() result = %#v, want discarded candidate", result)
+	}
+	assertSwapMarker(t, filepath.Join(layout.RepoDir(), "marker-old"), "old")
+	if _, err := os.Lstat(update); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("update directory remains: %v", err)
+	}
+}
+
+func TestRecovery_SwapDamagedRepositoryWithPreviousHasNoSideEffects(t *testing.T) {
+	layout := mustGitLayout(t)
+	tx := newRecoveryTransaction(t, "01ARZ3NDEKTSV4RRFFQ69G5FCJ", protocol.StageWorkspaceSwap, "v5.4.0")
+	writeRecoveryRepository(t, layout.RepoDir(), "v5.3.0", "https://example.test/untrusted.git", "old")
+	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURL(t), "target")
+	previous := mustRepoPreviousDir(t, layout, tx.state.OperationID)
+	writeRecoveryRepository(t, previous, "v5.3.0", recoverySourceURL(t), "previous")
+	store := &fakeRecoveryStore{transaction: &tx}
+	recovery := mustTestRecovery(t, layout, noSideEffectRecoveryOperator(t), store)
+
+	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
+	assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+	if result.MutationApplied || result.EnvironmentWritten || result.TransactionRemoved || store.transactionRemoved {
+		t.Fatalf("Recover() result = %#v, want no side effects", result)
+	}
+	assertSwapMarker(t, filepath.Join(layout.RepoDir(), "marker-old"), "old")
+	assertSwapMarker(t, filepath.Join(update, "marker-target"), "target")
+	assertSwapMarker(t, filepath.Join(previous, "marker-previous"), "previous")
 }
 
 func TestRecovery_FirstInstallationPromotesTarget(t *testing.T) {

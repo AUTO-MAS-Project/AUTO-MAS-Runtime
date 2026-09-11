@@ -183,7 +183,9 @@ func (r *Recovery) Recover(
 		return RecoveryResult{}, recoveryInternalError(err)
 	}
 	if transaction.state.Command == "workspace stage" && (transaction.state.Stage == protocol.StageWorkspaceClone || transaction.state.Stage == protocol.StageWorkspaceVerify) {
-		update, err := r.classifyPath(ctx, paths.update, transaction.state.Stage == protocol.StageWorkspaceClone)
+		update, err := r.classifyPath(ctx, paths.update, recoveryPathPolicy{
+			allowUnreadable: transaction.state.Stage == protocol.StageWorkspaceClone,
+		})
 		if err != nil {
 			return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "staged_update_unknown", err)
 		}
@@ -200,16 +202,20 @@ func (r *Recovery) Recover(
 	}
 	allowIncompleteUpdate := transaction.state.Stage == protocol.StageWorkspaceClone
 	allowDamagedRepository := transaction.state.Stage == protocol.StageWorkspaceClone ||
-		transaction.state.Stage == protocol.StageWorkspaceVerify
-	repository, err := r.classifyPath(ctx, paths.repository, allowDamagedRepository)
+		transaction.state.Stage == protocol.StageWorkspaceVerify ||
+		transaction.state.Stage == protocol.StageWorkspaceSwap
+	repository, err := r.classifyPath(ctx, paths.repository, recoveryPathPolicy{
+		allowUnreadable:      allowDamagedRepository,
+		allowInvalidIdentity: transaction.state.Stage == protocol.StageWorkspaceSwap,
+	})
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "repository_unknown", err)
 	}
-	update, err := r.classifyPath(ctx, paths.update, allowIncompleteUpdate)
+	update, err := r.classifyPath(ctx, paths.update, recoveryPathPolicy{allowUnreadable: allowIncompleteUpdate})
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "update_unknown", err)
 	}
-	previous, err := r.classifyPath(ctx, paths.previous, false)
+	previous, err := r.classifyPath(ctx, paths.previous, recoveryPathPolicy{})
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "previous_unknown", err)
 	}
@@ -277,6 +283,11 @@ type recoveryPath struct {
 	directoryIdentity *filesystem.DirectoryIdentity
 }
 
+type recoveryPathPolicy struct {
+	allowUnreadable      bool
+	allowInvalidIdentity bool
+}
+
 func (p recoveryPath) exists() bool {
 	return p.kind != recoveryPathMissing
 }
@@ -288,7 +299,7 @@ func (p recoveryPath) isTarget(version string) bool {
 func (r *Recovery) classifyPath(
 	ctx context.Context,
 	path string,
-	allowIncomplete bool,
+	policy recoveryPathPolicy,
 ) (recoveryPath, error) {
 	if err := ctx.Err(); err != nil {
 		return recoveryPath{}, err
@@ -329,13 +340,18 @@ func (r *Recovery) classifyPath(
 		return recoveryPath{}, fmt.Errorf("close recovery path lease: %w", err)
 	}
 	if err != nil {
-		if allowIncomplete && !isCancellation(ctx, err) && !errors.Is(err, os.ErrPermission) {
+		if policy.allowUnreadable && !isCancellation(ctx, err) && !errors.Is(err, os.ErrPermission) {
 			return recoveryPath{kind: recoveryPathIncomplete, directoryIdentity: directoryIdentity}, nil
 		}
 		return recoveryPath{}, fmt.Errorf("inspect recovery repository: %w", err)
 	}
 	identity, err := repositoryIdentityFromSnapshot(snapshot)
 	if err != nil {
+		// swap 前失败的旧 repo 只会被原样保留；此处仅保留当前目录 token，
+		// 让恢复逻辑能够安全清理由 transaction 唯一标识的 update。
+		if policy.allowInvalidIdentity {
+			return recoveryPath{kind: recoveryPathIncomplete, directoryIdentity: directoryIdentity}, nil
+		}
 		return recoveryPath{}, err
 	}
 	return recoveryPath{
@@ -422,8 +438,7 @@ func (r *Recovery) recoverSwap(
 	update recoveryPath,
 	previous recoveryPath,
 ) (RecoveryResult, error) {
-	if repository.kind == recoveryPathIncomplete ||
-		update.kind == recoveryPathIncomplete ||
+	if update.kind == recoveryPathIncomplete ||
 		previous.kind == recoveryPathIncomplete {
 		return RecoveryResult{}, recoveryAmbiguousError(
 			transaction.state.Stage,
@@ -455,7 +470,7 @@ func (r *Recovery) recoverSwap(
 		}
 		return r.completeActiveTarget(ctx, request, transaction, paths, repository.identity, previous)
 
-	case repository.kind == recoveryPathValid:
+	case repository.kind == recoveryPathValid || repository.kind == recoveryPathIncomplete:
 		if isTarget(update) && previous.kind == recoveryPathMissing {
 			result := RecoveryResult{}
 			if err := r.removeRecoveryTree(
