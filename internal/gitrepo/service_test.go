@@ -41,7 +41,7 @@ func TestService_CheckIsReadOnly(t *testing.T) {
 			calledRuntime = true
 			return nil, nil
 		},
-		func(mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
+		func(context.Context, mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
 	)
 	if err != nil {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
@@ -87,7 +87,7 @@ func TestService_CheckPinsRepositoryDuringReader(t *testing.T) {
 			t.Fatal("Check() built mutation runtime")
 			return nil, nil
 		},
-		func(mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
+		func(context.Context, mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
 	)
 	if err != nil {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
@@ -159,7 +159,7 @@ func TestService_CheckRejectsReparseAncestor(t *testing.T) {
 			t.Fatal("Check() built runtime through a reparse ancestor")
 			return nil, nil
 		},
-		func(mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
+		func(context.Context, mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
 	)
 	if err != nil {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
@@ -286,7 +286,7 @@ func TestService_SyncRejectsRunningBackend(t *testing.T) {
 		func(context.Context, *config.Layout, SyncRequest, OperationLogger) (syncRuntime, error) {
 			return nil, errors.New("runtime must not be built")
 		},
-		func(mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
+		func(context.Context, mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
 	)
 	if err != nil {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
@@ -853,7 +853,7 @@ func newTestService(t *testing.T, layout *config.Layout, reader repositoryReader
 		func(context.Context, *config.Layout, SyncRequest, OperationLogger) (syncRuntime, error) {
 			return runtime, nil
 		},
-		func(mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
+		func(context.Context, mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
 	)
 	if err != nil {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
@@ -926,4 +926,33 @@ func directoryNames(t *testing.T, root string) []string {
 		result = append(result, entry.Name())
 	}
 	return result
+}
+
+// TestNewService_WithPlanBuilderInjectsRanking 锁定 NewService 的可注入尝试顺序：
+// 注入的构造函数替换目录默认顺序，nil 注入失败关闭。
+func TestNewService_WithPlanBuilderInjectsRanking(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatalf("config.NewLayout() error = %v", err)
+	}
+	called := false
+	service, err := NewService(layout, WithPlanBuilder(func(context.Context, mirror.Policy) (mirror.Plan, error) {
+		called = true
+		return mirror.Plan{}, nil
+	}))
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	if _, err := service.buildPlan(context.Background(), mirror.Policy{}); err != nil || !called {
+		t.Fatalf("injected plan builder not used: err = %v, called = %v", err, called)
+	}
+	if _, err := NewService(layout, WithPlanBuilder(nil)); err == nil {
+		t.Fatal("NewService(WithPlanBuilder(nil)) error = nil, want error")
+	}
+	if _, err := NewService(layout, nil); err == nil {
+		t.Fatal("NewService(nil option) error = nil, want error")
+	}
 }

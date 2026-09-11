@@ -24,7 +24,7 @@ func (s *Service) CheckRemote(ctx context.Context, policy mirror.Policy) (Remote
 	if err != nil {
 		return RemoteCheckResult{}, serviceCheckReadError(err)
 	}
-	plan, err := s.buildPlan(policy)
+	plan, err := s.buildPlan(ctx, policy)
 	if err != nil {
 		return RemoteCheckResult{}, servicePolicyArgumentError(err)
 	}

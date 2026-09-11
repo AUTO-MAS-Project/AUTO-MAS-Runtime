@@ -77,7 +77,7 @@ func TestService_SyncVersionDowngradeUsesSameFlow(t *testing.T) {
 				swapper:  swapper,
 			}, nil
 		},
-		func(mirror.Policy) (mirror.Plan, error) { return plan, nil },
+		func(context.Context, mirror.Policy) (mirror.Plan, error) { return plan, nil },
 	)
 	if err != nil {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
