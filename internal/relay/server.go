@@ -112,7 +112,7 @@ func start(
 	}
 	server.fetcher = private.fetcher
 	if server.fetcher == nil {
-		server.fetcher = newEngine(normalized, deps, private, server.staging, server.stop)
+		server.fetcher = newEngine(normalized, deps, private, server.staging, server.baseURL, server.stop)
 	}
 	server.http = &http.Server{
 		Handler:           server,
@@ -284,12 +284,18 @@ func (s *Server) runFetch(key string, route Route, path string, entry *fileEntry
 	close(entry.done)
 }
 
+// serveSimple 把请求 ctx 与中继 ctx 合并后交给引擎：请求方离开或 Close 都能打断索引取回。
 func (s *Server) serveSimple(writer http.ResponseWriter, request *http.Request, name string) {
-	if handler, ok := s.fetcher.(simpleFetcher); ok {
-		handler.serveSimple(writer, request, name)
+	handler, ok := s.fetcher.(simpleFetcher)
+	if !ok {
+		writeStatus(writer, http.StatusBadGateway, "relay: all sources failed")
 		return
 	}
-	writeStatus(writer, http.StatusBadGateway, "relay: all sources failed")
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	stop := context.AfterFunc(s.fetchCtx, cancel)
+	defer stop()
+	handler.serveSimple(ctx, writer, request, name)
 }
 
 func writeStatus(writer http.ResponseWriter, status int, message string) {
@@ -309,7 +315,7 @@ type summarizer interface {
 }
 
 type simpleFetcher interface {
-	serveSimple(writer http.ResponseWriter, request *http.Request, name string)
+	serveSimple(ctx context.Context, writer http.ResponseWriter, request *http.Request, name string)
 }
 
 // loggerWriter 把 http.Server 的内部诊断转给注入的 Logger，避免标准库落到 stderr 之外的任何地方。

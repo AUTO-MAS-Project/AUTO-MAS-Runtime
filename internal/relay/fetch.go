@@ -34,6 +34,7 @@ type engine struct {
 	staging *staging
 	tracker *tracker
 	ledger  *ledger
+	baseURL string
 
 	slots       chan struct{}
 	slotWaiting chan struct{}
@@ -49,6 +50,7 @@ func newEngine(
 	deps Deps,
 	private internals,
 	staging *staging,
+	baseURL string,
 	onStop func(),
 ) *engine {
 	e := &engine{
@@ -58,6 +60,7 @@ func newEngine(
 		logger:      deps.Logger,
 		staging:     staging,
 		ledger:      newLedger(),
+		baseURL:     baseURL,
 		slots:       make(chan struct{}, cfg.MaxFiles),
 		slotWaiting: private.slotWaiting,
 		items:       make(map[string]Item, len(cfg.Items)),

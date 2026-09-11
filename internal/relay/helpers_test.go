@@ -143,10 +143,11 @@ func (m *fakeMirror) handle(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(behavior.status)
 		return
 	}
+	contentType := behavior.contentType
 	if behavior.jsonBody != nil && strings.Contains(request.Header.Get("Accept"), "json") {
 		data = behavior.jsonBody
+		contentType = "application/vnd.pypi.simple.v1+json"
 	}
-	contentType := behavior.contentType
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
