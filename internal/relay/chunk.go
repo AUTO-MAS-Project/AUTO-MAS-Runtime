@@ -148,15 +148,18 @@ func (p *chunkPlan) demoteLaggards(self string) []string {
 	return demoted
 }
 
-// demoteTailLaggard 由队列已空、准备退出的 worker 调用：若还有别的 worker 在取片、自本 worker 上一片开始后至少
-// 完成过一片、且对方进度未过半，则判对方为慢源并取消其片，让本 worker 接手剩余范围。返回是否降级了谁。
-func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) bool {
+// demoteTailLaggard 由队列已空、准备退出的 worker 调用：若还有别的 worker 在取片、本 worker 至少完成过一片、
+// 且对方进度未过半，则判对方为慢源并取消其片，让本 worker 接手剩余范围。
+// 返回 (是否降级了谁, 再等多久)：候选存在但片龄还不够时返回距离最小在飞时长的剩余时间，调用方等够再来；
+// 没有候选（对方进度已过半或已判慢）时两者都为零值。
+func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) (bool, time.Duration) {
 	if !selfCompleted {
-		return false
+		return false, 0
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.clock()
+	var retryAfter time.Duration
 	for key, entry := range p.inflight {
 		if key == self || p.slow[key] {
 			continue
@@ -164,14 +167,17 @@ func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) bool {
 		if entry.received*tailLaggardProgressLimit >= entry.piece.length() {
 			continue
 		}
-		if now.Sub(entry.startedAt) < slowSourceMinAge {
+		if age := now.Sub(entry.startedAt); age < slowSourceMinAge {
+			if remaining := slowSourceMinAge - age; retryAfter == 0 || remaining < retryAfter {
+				retryAfter = remaining
+			}
 			continue
 		}
 		p.slow[key] = true
 		entry.cancel()
-		return true
+		return true, 0
 	}
-	return false
+	return false, retryAfter
 }
 
 // awaitChange 等待 pending / inflight 发生变化，或 ctx 结束；用于降级后等待慢源把剩余范围回队。
@@ -181,6 +187,22 @@ func (p *chunkPlan) awaitChange(ctx context.Context) bool {
 	p.mu.Unlock()
 	select {
 	case <-changed:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// awaitChangeOrTimeout 等待 pending / inflight 变化、定时器到期或 ctx 结束；ctx 结束返回 false。
+func (p *chunkPlan) awaitChangeOrTimeout(ctx context.Context, wait timer) bool {
+	p.mu.Lock()
+	changed := p.changed
+	p.mu.Unlock()
+	defer stopAndDrainTimer(wait)
+	select {
+	case <-changed:
+		return true
+	case <-wait.C():
 		return true
 	case <-ctx.Done():
 		return false
@@ -353,8 +375,16 @@ func (e *engine) chunkWorker(
 			if plan.isSlow(upstream.Key) || !plan.othersInflight(upstream.Key) {
 				return
 			}
-			if !plan.demoteTailLaggard(upstream.Key, selfCompleted) {
+			demoted, retryAfter := plan.demoteTailLaggard(upstream.Key, selfCompleted)
+			if !demoted && retryAfter <= 0 {
 				return
+			}
+			if !demoted {
+				// 落后者还太年轻：等到它够龄（或它先有变化）再判一次，而不是退出后干等它慢慢取完。
+				if !plan.awaitChangeOrTimeout(ctx, e.timers(retryAfter)) {
+					return
+				}
+				continue
 			}
 			// 被降级的 worker 会把剩余范围回队；等它回队（或退出）后再取。
 			if !plan.awaitChange(ctx) {

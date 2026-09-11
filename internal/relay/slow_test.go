@@ -131,8 +131,11 @@ func TestChunkPlan_MinimumAgeGatesDemotion(t *testing.T) {
 	if demoted := plan.demoteLaggards("b"); len(demoted) != 0 || ctx.Err() != nil {
 		t.Fatalf("demoted %v with age 0, want none", demoted)
 	}
-	if plan.demoteTailLaggard("b", true) || ctx.Err() != nil {
-		t.Fatal("tail demotion fired with age 0, want none")
+	if demoted, retryAfter := plan.demoteTailLaggard("b", true); demoted || ctx.Err() != nil || retryAfter <= 0 || retryAfter > slowSourceMinAge {
+		t.Fatalf("tail demotion with age 0 = (%v, %v), want (false, remaining age)", demoted, retryAfter)
+	}
+	if demoted, retryAfter := plan.demoteTailLaggard("b", false); demoted || retryAfter != 0 {
+		t.Fatalf("tail demotion without own completion = (%v, %v), want (false, 0)", demoted, retryAfter)
 	}
 	clock.advance(slowSourceMinAge)
 	if demoted := plan.demoteLaggards("b"); len(demoted) != 1 || demoted[0] != "a" || ctx.Err() == nil {
