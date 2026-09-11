@@ -205,6 +205,10 @@ func TestDefaultCatalog_ExactSourcesAndOrder(t *testing.T) {
 				official bool
 			}{
 				{
+					key:     "astral",
+					baseURL: "https://releases.astral.sh/github/python-build-standalone/releases/download",
+				},
+				{
 					key:     "gh-proxy",
 					baseURL: "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download",
 				},

@@ -184,7 +184,7 @@ func TestBuildPlan_PreferredKindsRemainIndependent(t *testing.T) {
 				"edgeone-gh-proxy",
 			},
 		},
-		{kind: KindPython, want: []string{"github", "gh-proxy"}},
+		{kind: KindPython, want: []string{"github", "astral", "gh-proxy"}},
 		{
 			kind: KindPackageIndex,
 			want: []string{"ustc", "aliyun", "tsinghua", "pypi"},
