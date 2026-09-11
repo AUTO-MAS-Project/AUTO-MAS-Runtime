@@ -1130,7 +1130,7 @@ func TestRotator_FailureKindDoesNotAffectTransitions(t *testing.T) {
 			"edgeone-gh-proxy",
 			"github",
 		},
-		KindPython:       {"gh-proxy", "github"},
+		KindPython:       {"astral", "gh-proxy", "github"},
 		KindPackageIndex: {"aliyun", "tsinghua", "ustc", "pypi"},
 	}
 
@@ -1467,7 +1467,7 @@ func TestRotator_SucceededOutcomeForEveryKind(t *testing.T) {
 		},
 		{
 			kind: KindPython,
-			keys: []string{"gh-proxy", "github"},
+			keys: []string{"astral", "gh-proxy", "github"},
 		},
 		{
 			kind: KindPackageIndex,

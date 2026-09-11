@@ -406,11 +406,11 @@ func TestPython_MirrorPolicyRotatesSources(t *testing.T) {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 	if got, want := runner.calls[1].options.Environment[uvPythonInstallMirrorEnv],
-		"https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"; got != want {
+		"https://releases.astral.sh/github/python-build-standalone/releases/download"; got != want {
 		t.Fatalf("first Python mirror = %q, want %q", got, want)
 	}
 	if got, want := runner.calls[2].options.Environment[uvPythonInstallMirrorEnv],
-		"https://github.com/astral-sh/python-build-standalone/releases/download"; got != want {
+		"https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"; got != want {
 		t.Fatalf("second Python mirror = %q, want %q", got, want)
 	}
 }
