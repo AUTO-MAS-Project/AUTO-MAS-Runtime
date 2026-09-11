@@ -36,9 +36,6 @@ const (
 // ErrInvalidConfig 表示 Config 或 Deps 无法用于启动中继。
 var ErrInvalidConfig = errors.New("relay config is invalid")
 
-// ErrClosed 表示中继已经关闭。
-var ErrClosed = errors.New("relay is closed")
-
 // Item 描述锁内已知的制品；Path 是 PyPI 原路径（"ab/cd/<hash>/x.whl"），SHA256 为十六进制。
 type Item struct {
 	Path   string
