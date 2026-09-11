@@ -112,7 +112,7 @@ func start(
 	}
 	server.fetcher = private.fetcher
 	if server.fetcher == nil {
-		server.fetcher = noFetcher{}
+		server.fetcher = newEngine(normalized, deps, private, server.staging, server.stop)
 	}
 	server.http = &http.Server{
 		Handler:           server,
@@ -141,6 +141,12 @@ func (s *Server) watch(ctx context.Context) {
 		go func() { _ = s.Close() }()
 	case <-s.closed:
 	}
+}
+
+// stop 在进度回调失败时把中继置为停止：进行中取回被取消，后续请求一律 502。
+func (s *Server) stop() {
+	s.stopped.Store(true)
+	s.cancelFetch()
 }
 
 // BaseURL 返回 "http://127.0.0.1:<port>"。
@@ -304,13 +310,6 @@ type summarizer interface {
 
 type simpleFetcher interface {
 	serveSimple(writer http.ResponseWriter, request *http.Request, name string)
-}
-
-// noFetcher 是尚未接入取回引擎时的失败关闭实现。
-type noFetcher struct{}
-
-func (noFetcher) fetch(context.Context, Route, string) (string, error) {
-	return "", errors.New("relay fetch engine is unavailable")
 }
 
 // loggerWriter 把 http.Server 的内部诊断转给注入的 Logger，避免标准库落到 stderr 之外的任何地方。
