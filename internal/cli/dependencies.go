@@ -369,6 +369,7 @@ func dependencyRequest(
 		Line:          line,
 		Attempt:       mirrorAttemptProgress(emitter),
 		Progress:      relayProgress(emitter, protocol.StageDependenciesSync, "正在下载锁定依赖"),
+		RelayLog:      relayLog(deps.opLog.Get()),
 	}
 }
 

@@ -28,6 +28,54 @@ func productionRelayStarter(ctx context.Context, cfg relay.Config, deps relay.De
 	return relay.Start(ctx, cfg, deps)
 }
 
+// relayDiagnostics 把中继与后台测速的诊断送进监督日志。
+//
+// 中继在后端 Logger 建立之前就要起来（spawn 之前），因此诊断先缓冲，Logger 一旦建立（每次监督尝试各建一个）
+// 就 attach 过来并冲刷；缓冲有上限，超出丢最旧的一条。
+type relayDiagnostics struct {
+	mu      sync.Mutex // 保护 logger 与 pending
+	logger  Logger
+	pending []string
+}
+
+const relayDiagnosticsBacklog = 64
+
+func (d *relayDiagnostics) record(ctx context.Context, message string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	logger := d.logger
+	if logger == nil {
+		if len(d.pending) >= relayDiagnosticsBacklog {
+			d.pending = d.pending[1:]
+		}
+		d.pending = append(d.pending, message)
+		d.mu.Unlock()
+		return
+	}
+	d.mu.Unlock()
+	_ = logger.Record(ctx, process.StreamRecord{Stream: "relay", Fragment: message, EndOfLine: true})
+}
+
+// attach 绑定当前监督尝试的 Logger 并冲刷缓冲；nil 表示解绑（尝试结束、Logger 已关闭）。
+func (d *relayDiagnostics) attach(ctx context.Context, logger Logger) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.logger = logger
+	pending := d.pending
+	d.pending = nil
+	d.mu.Unlock()
+	if logger == nil {
+		return
+	}
+	for _, message := range pending {
+		_ = logger.Record(ctx, process.StreamRecord{Stream: "relay", Fragment: message, EndOfLine: true})
+	}
+}
+
 // supervisedRelay 是一次监督期间的中继与后台测速状态。
 type supervisedRelay struct {
 	session RelaySession
@@ -40,7 +88,7 @@ type supervisedRelay struct {
 // 中继起不来只降级为今天的直连列表，不影响监督；返回的 infrastructure 已含回环首项。
 func (s *ManagedSupervisor) startSupervisedRelay(
 	ctx context.Context,
-	logger Logger,
+	diagnostics *relayDiagnostics,
 ) (*supervisedRelay, uv.SupervisionInfrastructure, error) {
 	infrastructure, err := supervisionInfrastructureWithPlan(ctx, s.layout, s.deps.MirrorPolicy, s.planFunc())
 	if err != nil {
@@ -61,18 +109,19 @@ func (s *ManagedSupervisor) startSupervisedRelay(
 	session, err := s.deps.Relay(ctx, relay.Config{
 		StagingDir: s.layout.RelayStagingDir(),
 		Upstreams:  upstreams,
-	}, relay.Deps{Logger: relayLogger(logger)})
+	}, relay.Deps{Logger: relayLogger(diagnostics)})
 	if err != nil {
-		relayDiagnostic(ctx, logger, "relay start failed, backend keeps direct mirror lists: "+err.Error())
+		diagnostics.record(ctx, "relay start failed, backend keeps direct mirror lists: "+err.Error())
 		return nil, infrastructure, nil
 	}
+	diagnostics.record(ctx, "relay listening at "+session.BaseURL())
 	infrastructure.RelayBaseURL = session.BaseURL()
 	managed := &supervisedRelay{session: session}
 	if ranker := s.deps.Ranker; ranker != nil {
 		managed.wait.Add(1)
 		go func() {
 			defer managed.wait.Done()
-			s.rankSupervisedRelay(ctx, ranker, session, logger)
+			s.rankSupervisedRelay(ctx, ranker, session, diagnostics)
 		}()
 	}
 	return managed, infrastructure, nil
@@ -83,7 +132,7 @@ func (s *ManagedSupervisor) rankSupervisedRelay(
 	ctx context.Context,
 	ranker *mirror.Ranker,
 	session RelaySession,
-	logger Logger,
+	diagnostics *relayDiagnostics,
 ) {
 	if target, ok := packageIndexProbeTarget(s.layout.UVLockFile(), s.layout.PythonVersionFile()); ok {
 		ranker.SetTarget(mirror.KindPackageIndex, target)
@@ -91,7 +140,7 @@ func (s *ManagedSupervisor) rankSupervisedRelay(
 	plan, err := buildPlanOrDefault(ctx, ranker.PlanFunc(), s.deps.MirrorPolicy, mirror.KindPackageIndex)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			relayDiagnostic(ctx, logger, "relay ranking failed, keeping catalog order: "+err.Error())
+			diagnostics.record(ctx, "relay ranking failed, keeping catalog order: "+err.Error())
 		}
 		return
 	}
@@ -99,8 +148,14 @@ func (s *ManagedSupervisor) rankSupervisedRelay(
 	for _, route := range []relay.Route{relay.RoutePackages, relay.RouteSimple} {
 		if list := upstreams[route]; len(list) > 0 {
 			if err := session.SetUpstreams(route, list); err != nil {
-				relayDiagnostic(ctx, logger, fmt.Sprintf("relay upstream update rejected for %s: %v", route, err))
+				diagnostics.record(ctx, fmt.Sprintf("relay upstream update rejected for %s: %v", route, err))
+				continue
 			}
+			keys := make([]string, 0, len(list))
+			for _, upstream := range list {
+				keys = append(keys, upstream.Key)
+			}
+			diagnostics.record(ctx, fmt.Sprintf("relay %s upstreams reordered by probe: %v", route, keys))
 		}
 	}
 }
@@ -176,22 +231,14 @@ func relayUpstreamsFromPlans(plans map[mirror.Kind]mirror.Plan, probes []mirror.
 	return upstreams
 }
 
-// relayLogger 把中继日志转成监督日志里的一条 relay 流记录；logger 为 nil 时丢弃。
-func relayLogger(logger Logger) func(level, message string, fields map[string]any) {
-	if logger == nil {
+// relayLogger 把中继引擎的日志转成监督日志里的 relay 流记录（经缓冲 sink）。
+func relayLogger(diagnostics *relayDiagnostics) func(level, message string, fields map[string]any) {
+	if diagnostics == nil {
 		return nil
 	}
 	return func(level, message string, fields map[string]any) {
-		relayDiagnostic(context.Background(), logger, fmt.Sprintf("[%s] %s %v", level, message, fields))
+		diagnostics.record(context.Background(), fmt.Sprintf("[%s] %s %v", level, message, fields))
 	}
-}
-
-// relayDiagnostic 用 relay 流记录一条 Runtime 自身诊断；写失败不影响监督。
-func relayDiagnostic(ctx context.Context, logger Logger, message string) {
-	if logger == nil {
-		return
-	}
-	_ = logger.Record(ctx, process.StreamRecord{Stream: "relay", Fragment: message, EndOfLine: true})
 }
 
 // planFunc 返回监督器使用的尝试顺序来源：有测速器用它，否则目录顺序。

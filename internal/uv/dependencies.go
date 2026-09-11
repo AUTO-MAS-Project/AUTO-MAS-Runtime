@@ -31,6 +31,8 @@ type DependenciesRequest struct {
 	Attempt MirrorAttemptFunc
 	// Progress 接收经中继下载时的聚合字节进度（增补 2 C18），可为 nil。
 	Progress func(relay.Progress) error
+	// RelayLog 接收中继的诊断（换源、哈希不符、剔除、收口失败），可为 nil；level 为 info / warning / error。
+	RelayLog func(level, message string, fields map[string]any)
 }
 
 // DependenciesResult 保存锁文件检查或同步后的稳定结果。

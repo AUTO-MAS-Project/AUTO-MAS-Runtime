@@ -214,3 +214,31 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/38/fc/certifi-2025.1.31-py3-none-any.whl", hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", size = 166393 },
 ]
 `
+
+// TestBackendSupervise_RelayDiagnosticsReachLogger 锁定中继诊断不再丢失：中继起不来的原因先进缓冲，
+// 后端 Logger 建立后冲刷成 relay 流记录。
+func TestBackendSupervise_RelayDiagnosticsReachLogger(t *testing.T) {
+	f := newBackendFixture(t)
+	f.uv.checkErr = nil
+	f.proc.keepAlive = true
+	starter, _ := fakeRelayStarter(nil, errors.New("bind: address in use"))
+	f.relay = starter
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, f.request()) }()
+	waitFor(t, f.emitter.running)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
+	}
+	f.logger.mu.Lock()
+	defer f.logger.mu.Unlock()
+	for _, record := range f.logger.records {
+		if record.Stream == "relay" && strings.Contains(record.Fragment, "bind: address in use") {
+			return
+		}
+	}
+	t.Fatalf("relay start failure never reached the backend logger; records = %+v", f.logger.records)
+}

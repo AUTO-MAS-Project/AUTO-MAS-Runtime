@@ -210,6 +210,7 @@ func runRepair(
 		Reinstall:        true,
 		Line:             uvLogLine(logger),
 		Progress:         relayProgress(emitter, protocol.StagePythonInstall, "正在下载受管 Python"),
+		RelayLog:         relayLog(logger),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(
@@ -244,6 +245,7 @@ func runRepair(
 		Line:          uvLogLine(logger),
 		Attempt:       mirrorAttemptProgress(emitter),
 		Progress:      relayProgress(emitter, protocol.StageDependenciesSync, "正在下载锁定依赖"),
+		RelayLog:      relayLog(logger),
 	}
 	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesRebuild); err != nil {
 		return sessionSuccess{}, err

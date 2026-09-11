@@ -317,6 +317,7 @@ func runBootstrap(
 		MirrorPolicy:     deps.global.mirrorPolicy,
 		Line:             uvLogLine(operationLogger),
 		Progress:         relayProgress(emitter, protocol.StagePythonInstall, "正在下载受管 Python"),
+		RelayLog:         relayLog(operationLogger),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonSpec, operationLogger, machine, protocol.StagePythonInstall, err)
@@ -347,6 +348,7 @@ func runBootstrap(
 		Line:          uvLogLine(operationLogger),
 		Attempt:       mirrorAttemptProgress(emitter),
 		Progress:      relayProgress(emitter, protocol.StageDependenciesSync, "正在下载锁定依赖"),
+		RelayLog:      relayLog(operationLogger),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesSync, err)

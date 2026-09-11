@@ -834,6 +834,29 @@ func relayProgress(emitter *protocol.Emitter, stage protocol.Stage, message stri
 	}
 }
 
+// relayLog 把中继诊断写进本次操作日志；logger 为 nil 时返回 nil（中继静默）。
+func relayLog(logger workspaceLogger) func(level, message string, fields map[string]any) {
+	if logger == nil {
+		return nil
+	}
+	return func(level, message string, fields map[string]any) {
+		mapped := logging.LevelInfo
+		switch level {
+		case "warning", "warn":
+			mapped = logging.LevelWarn
+		case "error":
+			mapped = logging.LevelError
+		}
+		details := make(map[string]any, len(fields)+1)
+		for key, value := range fields {
+			details[key] = value
+		}
+		details["component"] = "relay"
+		// 诊断写失败不影响操作结局。
+		_, _ = logger.Record(context.Background(), mapped, "relay: "+message, details)
+	}
+}
+
 // withRelayDetails 把依赖同步或 Python 安装的中继摘要并入 details（增补 2 C18 第 7 条）；没有走中继时不写。
 func withRelayDetails(details map[string]any, key string, summary *relay.Summary) map[string]any {
 	if summary == nil {

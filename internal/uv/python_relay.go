@@ -68,13 +68,16 @@ func (s *PythonService) installWithRelay(
 	session, err := s.relay(ctx, relay.Config{
 		StagingDir: s.layout.RelayStagingDir(),
 		Upstreams:  map[relay.Route][]relay.Upstream{relay.RoutePython: upstreams},
-	}, relay.Deps{Progress: request.Progress})
+	}, relay.Deps{Progress: request.Progress, Logger: request.RelayLog})
 	if err != nil {
+		relayLogf(request.RelayLog, "warning", "relay start failed, falling back to mirror rotation", map[string]any{"error": err.Error()})
 		return UVResult{}, relay.Summary{}, false, nil
 	}
 	defer func() {
-		// 中继收口失败不改变安装结局；uv 已退出，暂存目录归可丢弃缓存。
-		_ = session.Close()
+		// 中继收口失败不改变安装结局（uv 已退出，暂存目录归可丢弃缓存），但要留痕。
+		if closeErr := session.Close(); closeErr != nil {
+			relayLogf(request.RelayLog, "warning", "relay close failed", map[string]any{"error": closeErr.Error()})
+		}
 	}()
 	relayOptions := cloneRunOptions(options)
 	relayOptions.Environment[uvPythonInstallMirrorEnv] = session.BaseURL() + "/" + relay.RoutePython.String()

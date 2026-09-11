@@ -24,6 +24,8 @@ const cleanupTimeout = 30 * time.Second
 type ManagedSupervisor struct {
 	layout *config.Layout
 	deps   Dependencies
+	// relayDiagnostics 是本次监督的中继诊断 sink；Logger 建立后 attach，见 relay.go。
+	relayDiagnostics *relayDiagnostics
 	// infrastructure 是按增补 1 C11 下发给后端的受管基础设施。layout 与
 	// MirrorPolicy 在 supervisor 生命周期内不变，因此只在构造期解析一次，
 	// 首次启动与单次自动重启、managed 与 development 都读同一份值。
@@ -179,7 +181,9 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	}
 	request.Port = port
 	// 回环中继与实测顺序在任何 spawn 之前就位，并随本次监督整体存活（增补 2 C17 第 8 条）。
-	supervisedRelay, infrastructure, err := s.startSupervisedRelay(ctx, nil)
+	// 后端 Logger 此时还没建立，中继诊断先进缓冲，Logger 建立后 attach 冲刷。
+	s.relayDiagnostics = &relayDiagnostics{}
+	supervisedRelay, infrastructure, err := s.startSupervisedRelay(ctx, s.relayDiagnostics)
 	if err != nil {
 		return preferCancellation(ctx, err)
 	}
@@ -273,8 +277,10 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		failure := withFailureDetails(newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "后端日志初始化失败", map[string]any{"sink": "runtime_log"}, err), logger, nil)
 		return preferCancellation(ctx, failure)
 	}
+	s.relayDiagnostics.attach(ctx, logger)
 	loggerOwned := true
 	defer func() {
+		s.relayDiagnostics.attach(ctx, nil)
 		if loggerOwned {
 			returnErr = errors.Join(returnErr, mapLoggerCleanupError(logger.Close()))
 		}
@@ -895,6 +901,8 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		resourceCancel()
 	}
 	if logger != nil {
+		// 本次尝试的 Logger 即将关闭，中继诊断退回缓冲，等下一次尝试的 Logger 再 attach。
+		s.relayDiagnostics.attach(ctx, nil)
 		if err := logger.Close(); err != nil {
 			resultErr = errors.Join(resultErr, mapLoggerCleanupError(err))
 		}

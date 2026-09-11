@@ -55,6 +55,8 @@ type PythonRequest struct {
 	Line             LineFunc
 	// Progress 接收经中继下载分发包时的字节进度（增补 2 C18），可为 nil。
 	Progress func(relay.Progress) error
+	// RelayLog 接收中继的诊断，可为 nil；level 为 info / warning / error。
+	RelayLog func(level, message string, fields map[string]any)
 }
 
 // PythonResult 保存已验证的 Python 版本。
