@@ -257,16 +257,20 @@ func (e *engine) strike(route Route, key string) {
 	})
 }
 
-// download 逐源取回直到成功或源耗尽；成功文件从 .part 改名为最终暂存路径。
+// download 先尝试分片，再逐源单流取回直到成功或源耗尽；成功文件从 .part 改名为最终暂存路径。
 func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 	target := e.staging.pathFor(spec.key.route, spec.key.path)
 	part := target + ".part"
 	e.staging.track(target)
 	e.staging.track(part)
-	failed := make(map[string]bool)
-	var attempts []AttemptOutcome
-	for {
-		upstream, ok := e.nextUpstream(spec.key.route, failed)
+	plan := &chunkPlan{failed: make(map[string]bool), contributions: make(map[string]int64)}
+	if e.tryChunked(ctx, spec, part, plan) {
+		if path, ok := e.publish(spec, part, target, plan.contributions); ok {
+			return path, nil
+		}
+	}
+	for ctx.Err() == nil {
+		upstream, ok := e.nextUpstream(spec.key.route, plan.failed)
 		if !ok {
 			break
 		}
@@ -276,20 +280,12 @@ func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 			if spec.size == 0 {
 				spec.size = received
 			}
-			if err := os.Rename(part, target); err != nil {
-				outcome = OutcomeNetwork
-				e.log("warning", "relay staged file publish failed", map[string]any{
-					"item": spec.name, "error": err.Error(),
-				})
+			if path, ok := e.publish(spec, part, target, contributions); ok {
+				return path, nil
 			}
+			outcome = OutcomeNetwork
 		}
-		if outcome == "" {
-			e.ledger.delivered(spec.size, contributions)
-			e.tracker.complete(spec.key, spec.name, upstream.Key, spec.size)
-			return target, nil
-		}
-		attempts = append(attempts, AttemptOutcome{Source: upstream.Key, Outcome: outcome})
-		failed[upstream.Key] = true
+		plan.markFailed(upstream.Key, outcome)
 		e.tracker.reset(spec.key)
 		e.log("warning", "relay attempt failed", map[string]any{
 			"route": spec.key.route.String(), "item": spec.name,
@@ -303,8 +299,38 @@ func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 		}
 	}
 	e.tracker.fail(spec.key, spec.name)
-	e.ledger.failed(spec.name, attempts)
+	e.ledger.failed(spec.name, plan.attempts)
 	return "", errAllSourcesFailed
+}
+
+// publish 把完整的 part 改名为最终暂存路径并记账；改名失败时记日志并让调用方换源重来。
+func (e *engine) publish(
+	spec fileSpec,
+	part string,
+	target string,
+	contributions map[string]int64,
+) (string, bool) {
+	if err := os.Rename(part, target); err != nil {
+		e.log("warning", "relay staged file publish failed", map[string]any{
+			"item": spec.name, "error": err.Error(),
+		})
+		return "", false
+	}
+	e.ledger.delivered(spec.size, contributions)
+	e.tracker.complete(spec.key, spec.name, topSource(contributions), spec.size)
+	return target, true
+}
+
+// topSource 返回贡献字节最多的源；并列时取 key 字典序最小的，保证结果稳定。
+func topSource(contributions map[string]int64) string {
+	best := ""
+	var bestCount int64 = -1
+	for key, count := range contributions {
+		if count > bestCount || (count == bestCount && key < best) {
+			best, bestCount = key, count
+		}
+	}
+	return best
 }
 
 // singleStream 从一个源整文件 GET 到 part；contributions 记录该源实际贡献的字节。

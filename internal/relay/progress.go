@@ -29,6 +29,7 @@ type tracker struct {
 	total     int64
 	delivered int64
 	inflight  map[fileKey]int64
+	perSource map[fileKey]map[string]int64
 	current   Progress
 	samples   []sample
 	reported  bool
@@ -42,10 +43,11 @@ func newTracker(
 	onStop func(),
 ) *tracker {
 	return &tracker{
-		clock:    clock,
-		callback: callback,
-		onStop:   onStop,
-		inflight: make(map[fileKey]int64),
+		clock:     clock,
+		callback:  callback,
+		onStop:    onStop,
+		inflight:  make(map[fileKey]int64),
+		perSource: make(map[fileKey]map[string]int64),
 	}
 }
 
@@ -59,7 +61,7 @@ func (t *tracker) addTotal(size int64) {
 	t.mu.Unlock()
 }
 
-// add 记录某文件从某源新收到的字节。
+// add 记录某文件从某源新收到的字节；分片并行时当前源报贡献最多的那个。
 func (t *tracker) add(key fileKey, item, source string, count int64) {
 	if count <= 0 {
 		return
@@ -67,15 +69,35 @@ func (t *tracker) add(key fileKey, item, source string, count int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.inflight[key] += count
-	t.current = Progress{Route: key.route, Item: item, Source: source}
+	sources := t.perSource[key]
+	if sources == nil {
+		sources = make(map[string]int64)
+		t.perSource[key] = sources
+	}
+	sources[source] += count
+	t.current = Progress{Route: key.route, Item: item, Source: topSource(sources)}
 	t.samples = append(t.samples, sample{at: t.clock(), bytes: count})
 	t.report(false)
+}
+
+// discard 撤回某源一片失败前已计入的字节。
+func (t *tracker) discard(key fileKey, source string, count int64) {
+	if count <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.inflight[key] -= count
+	if sources := t.perSource[key]; sources != nil {
+		sources[source] -= count
+	}
 }
 
 // reset 在换源从头取时清掉该文件的进行中字节。
 func (t *tracker) reset(key fileKey) {
 	t.mu.Lock()
 	t.inflight[key] = 0
+	delete(t.perSource, key)
 	t.mu.Unlock()
 }
 
@@ -84,6 +106,7 @@ func (t *tracker) complete(key fileKey, item, source string, size int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.inflight, key)
+	delete(t.perSource, key)
 	t.delivered += size
 	t.current = Progress{Route: key.route, Item: item, Source: source}
 	t.report(true)
@@ -94,6 +117,7 @@ func (t *tracker) fail(key fileKey, item string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.inflight, key)
+	delete(t.perSource, key)
 	t.current = Progress{Route: key.route, Item: item, Source: t.current.Source}
 	t.report(true)
 }
