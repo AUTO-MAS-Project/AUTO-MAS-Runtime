@@ -716,3 +716,29 @@ func TestFakeUVProcess(t *testing.T) {
 	}
 	os.Exit(0)
 }
+
+// TestRunner_AllowsHTTPTimeoutOverride 锁定增补 2 C17 第 6 条：中继路径可以注入 UV_HTTP_TIMEOUT，
+// 但宿主环境里的同名变量仍被剔除，避免用户配置漂进受控调用。
+func TestRunner_AllowsHTTPTimeoutOverride(t *testing.T) {
+	t.Setenv(uvHTTPTimeoutEnv, "5")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{
+		"uv_http_timeout": "900",
+	}})
+	if got := environment[uvHTTPTimeoutEnv]; got != "900" {
+		t.Fatalf("environment[%q] = %q, want 900", uvHTTPTimeoutEnv, got)
+	}
+	if containsEnvironmentKeyMap(environment, "uv_http_timeout") && environment["uv_http_timeout"] != "" {
+		t.Fatalf("lowercase key survived, want canonical %q only", uvHTTPTimeoutEnv)
+	}
+}
+
+// TestRunner_StillStripsHostHTTPTimeout 锁定不传覆盖时宿主的 UV_HTTP_TIMEOUT 不进 uv。
+func TestRunner_StillStripsHostHTTPTimeout(t *testing.T) {
+	t.Setenv(uvHTTPTimeoutEnv, "5")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{}})
+	if containsEnvironmentKeyMap(environment, uvHTTPTimeoutEnv) {
+		t.Fatalf("environment contains %q = %q, want scrubbed", uvHTTPTimeoutEnv, environment[uvHTTPTimeoutEnv])
+	}
+}

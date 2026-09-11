@@ -504,3 +504,65 @@ func assertPythonCode(t *testing.T, err error, want protocol.Code) {
 		t.Fatalf("error code = %q, want %q", got, want)
 	}
 }
+
+// TestPython_ProbePathFromUVJSON 锁定增补 2 C16 的 python 探针路径来源：从 uv 的 JSON 清单里取
+// Windows x86_64 该版本的下载 URL，去掉官方 base（github 或 releases.astral.sh）得到相对路径。
+func TestPython_ProbePathFromUVJSON(t *testing.T) {
+	t.Parallel()
+
+	version := PythonVersion{Major: 3, Minor: 12, Patch: 13}
+	tests := []struct {
+		name    string
+		output  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "astral default url",
+			output: `[{"key":"cpython-3.12.13-windows-x86_64-none","version":"3.12.13","url":"https://releases.astral.sh/github/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz","os":"windows","arch":"x86_64"}]`,
+			want:   "20260807/cpython-3.12.13%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+		},
+		{
+			name:   "github url and other platforms first",
+			output: `[{"version":"3.12.13","url":"https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-aarch64-apple-darwin-install_only_stripped.tar.gz","os":"macos","arch":"aarch64"},{"version":"3.12.13","url":"https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz","os":"windows","arch":"x86_64"}]`,
+			want:   "20260807/cpython-3.12.13%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+		},
+		{
+			name:    "version missing",
+			output:  `[{"version":"3.12.12","url":"https://github.com/astral-sh/python-build-standalone/releases/download/x/y.tar.gz","os":"windows","arch":"x86_64"}]`,
+			wantErr: true,
+		},
+		{
+			name:    "foreign base",
+			output:  `[{"version":"3.12.13","url":"https://mirror.example/python/20260807/y.tar.gz","os":"windows","arch":"x86_64"}]`,
+			wantErr: true,
+		},
+		{
+			name:    "not json",
+			output:  `Downloading nothing`,
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &fakePythonRunner{listOutput: test.output}
+			got, err := pythonDownloadPath(context.Background(), runner, RunOptions{Stage: protocol.StagePythonInstall}, version)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("pythonDownloadPath() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("pythonDownloadPath() error = %v", err)
+			}
+			if got != test.want {
+				t.Errorf("pythonDownloadPath() = %q, want %q", got, test.want)
+			}
+			if len(runner.calls) != 1 || runner.calls[0].args[1] != "list" || runner.calls[0].options.Environment[uvOfflineEnv] != "1" {
+				t.Errorf("calls = %+v, want one offline python list", runner.calls)
+			}
+		})
+	}
+}
