@@ -209,6 +209,30 @@ func (e *engine) probeSize(ctx context.Context, spec *fileSpec) {
 	}
 }
 
+// setUpstreams 替换路由的上游顺序；已被剔除（两次哈希不符）的源保持剔除，AcceptRange 保留已探知的值。
+func (e *engine) setUpstreams(route Route, upstreams []Upstream) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	known := make(map[string]bool, len(e.upstreams[route]))
+	for _, upstream := range e.upstreams[route] {
+		known[upstream.Key] = upstream.AcceptRange
+	}
+	replaced := make([]Upstream, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		if e.strikes[route] != nil && e.strikes[route][upstream.Key] >= 2 {
+			continue
+		}
+		if known[upstream.Key] {
+			upstream.AcceptRange = true
+		}
+		replaced = append(replaced, upstream)
+	}
+	e.upstreams[route] = replaced
+	if e.strikes[route] == nil {
+		e.strikes[route] = make(map[string]int)
+	}
+}
+
 func (e *engine) snapshotUpstreams(route Route) []Upstream {
 	e.mu.Lock()
 	defer e.mu.Unlock()

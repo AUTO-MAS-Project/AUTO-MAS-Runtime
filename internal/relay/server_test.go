@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -213,5 +214,38 @@ func TestStart_RejectsInvalidConfig(t *testing.T) {
 				t.Fatalf("Start() error = %v, want ErrInvalidConfig", err)
 			}
 		})
+	}
+}
+
+// TestServer_SetUpstreamsReplacesOrder 锁定运行期替换上游顺序：替换后的新请求从新首位取，
+// 非法路由与非法上游被拒绝且不改变现有顺序。
+func TestServer_SetUpstreamsReplacesOrder(t *testing.T) {
+	content := testContent(50_000, 3)
+	first := newFakeMirror(t, false)
+	first.put(wheelPath, content)
+	second := newFakeMirror(t, false)
+	second.put(wheelPath, content)
+	fixture := startFixture(t, fixtureOptions{
+		cfg: packagesConfig([]Item{itemFor(wheelPath[len("packages/"):], content)}, first, second),
+	}, first, second)
+
+	if err := fixture.server.SetUpstreams(RoutePackages, []Upstream{packagesUpstream(second, "b"), packagesUpstream(first, "a")}); err != nil {
+		t.Fatalf("SetUpstreams() error = %v", err)
+	}
+	response, body := fixture.get(t, relayPath(wheelPath))
+	if response.StatusCode != http.StatusOK || !bytes.Equal(body, content) {
+		t.Fatalf("status = %d, body = %d bytes", response.StatusCode, len(body))
+	}
+	if got := second.count(wheelPath); got != 1 {
+		t.Errorf("second mirror requests = %d, want 1 after reorder", got)
+	}
+	if got := first.count(wheelPath); got != 0 {
+		t.Errorf("first mirror requests = %d, want 0 after reorder", got)
+	}
+	if err := fixture.server.SetUpstreams(Route("bogus"), nil); err == nil {
+		t.Error("SetUpstreams(bogus route) error = nil, want error")
+	}
+	if err := fixture.server.SetUpstreams(RoutePackages, []Upstream{{Key: "x", Base: "http://insecure.example/"}}); err == nil {
+		t.Error("SetUpstreams(http upstream) error = nil, want error")
 	}
 }

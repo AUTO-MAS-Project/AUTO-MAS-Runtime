@@ -241,6 +241,15 @@ func RelaySummaryDetails(summary relay.Summary) map[string]any {
 	}
 }
 
+// ParsePythonVersion 解析 "3.12.13" 形式的精确版本文本（允许首尾空白）；缺少 major/minor 或含非数字时报告 false。
+func ParsePythonVersion(text string) (PythonVersion, bool) {
+	version := parsePythonVersionLoose(text)
+	if version.Major == 0 {
+		return PythonVersion{}, false
+	}
+	return version, true
+}
+
 // parsePythonVersionLoose 把 "3.12.13" 形式的版本转成 PythonVersion；解析不了时返回零值（规划器仍能工作，
 // 只是 cp312 一类的匹配退化为 none-any 优先，方向仍是高估）。
 func parsePythonVersionLoose(value string) PythonVersion {

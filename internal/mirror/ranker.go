@@ -57,7 +57,26 @@ func WithRankerProber(prober *Prober) RankerOption {
 	}
 }
 
-// withRankerSourceProber 注入任意探测实现，测试替身用。
+// ProbeFunc 是可注入的探测实现，形态与 (*Prober).Probe 相同；供其它包的测试替换真实探测。
+type ProbeFunc func(ctx context.Context, plan Plan, target ProbeTarget, report func(ProbeResult)) ([]ProbeResult, error)
+
+// Probe 让 ProbeFunc 满足 Ranker 的探测依赖。
+func (f ProbeFunc) Probe(ctx context.Context, plan Plan, target ProbeTarget, report func(ProbeResult)) ([]ProbeResult, error) {
+	return f(ctx, plan, target, report)
+}
+
+// WithRankerProbeFunc 注入探测函数（测试替身）；nil 视为参数错误。
+func WithRankerProbeFunc(probe ProbeFunc) RankerOption {
+	return func(ranker *Ranker) error {
+		if probe == nil {
+			return fmt.Errorf("%w: probe func", ErrInvalidRankerOption)
+		}
+		ranker.prober = probe
+		return nil
+	}
+}
+
+// withRankerSourceProber 注入任意探测实现，包内测试替身用。
 func withRankerSourceProber(prober sourceProber) RankerOption {
 	return func(ranker *Ranker) error {
 		if prober == nil {

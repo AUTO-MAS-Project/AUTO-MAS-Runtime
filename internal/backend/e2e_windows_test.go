@@ -707,8 +707,6 @@ func assertE2EBackendInfrastructureEnvironment(t *testing.T, fixture *backendE2E
 	want := map[string]string{
 		"AUTO_MAS_UV_CACHE_DIR":          fixture.layout.UVCacheDir(),
 		"AUTO_MAS_UV_PYTHON_INSTALL_DIR": fixture.layout.PythonDir(),
-		"AUTO_MAS_MIRROR_PACKAGE_INDEX":  e2EMirrorSourceList(t, policy, mirror.KindPackageIndex),
-		"AUTO_MAS_MIRROR_PYTHON":         e2EMirrorSourceList(t, policy, mirror.KindPython),
 	}
 	for key, expected := range want {
 		got, ok := received[key]
@@ -717,6 +715,31 @@ func assertE2EBackendInfrastructureEnvironment(t *testing.T, fixture *backendE2E
 		}
 		if got != expected {
 			t.Fatalf("backend environment[%q] = %q, want %q", key, got, expected)
+		}
+	}
+	// 增补 2 C17 第 8 条：受监督期间中继常驻，两份列表以回环首项开头，其后是解析后的上游顺序
+	// （E2E 不做测速，因此余项就是目录顺序）。回环端口由系统分配，只断言形态。
+	for key, kind := range map[string]mirror.Kind{
+		"AUTO_MAS_MIRROR_PACKAGE_INDEX": mirror.KindPackageIndex,
+		"AUTO_MAS_MIRROR_PYTHON":        mirror.KindPython,
+	} {
+		got, ok := received[key]
+		if !ok {
+			t.Fatalf("backend environment is missing %q; got %#v", key, received)
+		}
+		first, rest, found := strings.Cut(got, ";")
+		if !found || !strings.HasPrefix(first, "http://127.0.0.1:") {
+			t.Fatalf("backend environment[%q] = %q, want a loopback relay entry first", key, got)
+		}
+		wantRoute := "/simple/"
+		if kind == mirror.KindPython {
+			wantRoute = "/python"
+		}
+		if !strings.HasSuffix(first, wantRoute) {
+			t.Fatalf("backend environment[%q] first entry = %q, want suffix %q", key, first, wantRoute)
+		}
+		if expected := e2EMirrorSourceList(t, policy, kind); rest != expected {
+			t.Fatalf("backend environment[%q] upstream list = %q, want %q", key, rest, expected)
 		}
 	}
 }

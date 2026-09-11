@@ -60,6 +60,8 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	if deps.UVPath == "" || deps.PythonPath == "" {
 		return nil, errors.New("backend process identity paths are incomplete")
 	}
+	// 构造期只按目录顺序解析一次（不联网），用于尽早拒绝非法的显式源选择；
+	// Supervise 开始时会按实测顺序与中继首项重新解析。
 	infrastructure, err := supervisionInfrastructure(layout, deps.MirrorPolicy)
 	if err != nil {
 		return nil, err
@@ -77,15 +79,28 @@ func supervisionInfrastructure(
 	layout *config.Layout,
 	policy mirror.Policy,
 ) (uv.SupervisionInfrastructure, error) {
-	catalog, err := mirror.DefaultCatalog()
-	if err != nil {
-		return uv.SupervisionInfrastructure{}, fmt.Errorf("build backend mirror catalog: %w", err)
+	return supervisionInfrastructureWithPlan(context.Background(), layout, policy, nil)
+}
+
+// supervisionInfrastructureWithPlan 按给定的尝试顺序来源解析下发列表；plan 为 nil 时按目录顺序。
+func supervisionInfrastructureWithPlan(
+	ctx context.Context,
+	layout *config.Layout,
+	policy mirror.Policy,
+	plan mirror.PlanFunc,
+) (uv.SupervisionInfrastructure, error) {
+	if plan == nil {
+		catalog, err := mirror.DefaultCatalog()
+		if err != nil {
+			return uv.SupervisionInfrastructure{}, fmt.Errorf("build backend mirror catalog: %w", err)
+		}
+		plan = mirror.CatalogPlanFunc(catalog)
 	}
-	packageIndex, err := mirrorSources(catalog, policy, mirror.KindPackageIndex)
+	packageIndex, err := mirrorSources(ctx, plan, policy, mirror.KindPackageIndex)
 	if err != nil {
 		return uv.SupervisionInfrastructure{}, err
 	}
-	python, err := mirrorSources(catalog, policy, mirror.KindPython)
+	python, err := mirrorSources(ctx, plan, policy, mirror.KindPython)
 	if err != nil {
 		return uv.SupervisionInfrastructure{}, err
 	}
@@ -102,29 +117,42 @@ func supervisionInfrastructure(
 // 失败语义与 internal/uv 的网络路径一致：ErrPolicyRejected 表示用户显式指定了一个
 // 选不出来的源，必须失败关闭（静默换源等于无视用户意图）；其他错误只说明 Policy
 // 本身没被配置（例如零值 Policy），退回目录默认顺序。
-func mirrorSources(catalog *mirror.Catalog, policy mirror.Policy, kind mirror.Kind) ([]string, error) {
-	plan, err := mirror.BuildPlan(catalog, policy, kind)
+func mirrorSources(ctx context.Context, plan mirror.PlanFunc, policy mirror.Policy, kind mirror.Kind) ([]string, error) {
+	built, err := buildPlanOrDefault(ctx, plan, policy, kind)
 	if err != nil {
-		if errors.Is(err, mirror.ErrPolicyRejected) {
-			return nil, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "镜像源选择无效", map[string]any{
-				"sourceKind": kind.String(),
-			}, err)
-		}
-		defaultPolicy, defaultErr := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
-		if defaultErr != nil {
-			return nil, fmt.Errorf("build default backend mirror policy: %w", defaultErr)
-		}
-		plan, defaultErr = mirror.BuildPlan(catalog, defaultPolicy, kind)
-		if defaultErr != nil {
-			return nil, fmt.Errorf("build backend mirror plan: %w", errors.Join(err, defaultErr))
-		}
+		return nil, err
 	}
-	sources := plan.Sources()
+	sources := built.Sources()
 	addresses := make([]string, 0, len(sources))
 	for _, source := range sources {
 		addresses = append(addresses, source.BaseURL())
 	}
 	return addresses, nil
+}
+
+// buildPlanOrDefault 按策略取顺序；显式源选不出来失败关闭，零值策略退回目录默认顺序，取消原样上抛。
+func buildPlanOrDefault(ctx context.Context, plan mirror.PlanFunc, policy mirror.Policy, kind mirror.Kind) (mirror.Plan, error) {
+	built, err := plan(ctx, policy, kind)
+	if err == nil {
+		return built, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return mirror.Plan{}, err
+	}
+	if errors.Is(err, mirror.ErrPolicyRejected) {
+		return mirror.Plan{}, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "镜像源选择无效", map[string]any{
+			"sourceKind": kind.String(),
+		}, err)
+	}
+	defaultPolicy, defaultErr := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
+	if defaultErr != nil {
+		return mirror.Plan{}, fmt.Errorf("build default backend mirror policy: %w", defaultErr)
+	}
+	built, defaultErr = plan(ctx, defaultPolicy, kind)
+	if defaultErr != nil {
+		return mirror.Plan{}, fmt.Errorf("build backend mirror plan: %w", errors.Join(err, defaultErr))
+	}
+	return built, nil
 }
 
 // Supervise 启动并长驻监督指定模式的后端，直到调用方取消或 Job 根进程退出。
@@ -150,6 +178,17 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		return err
 	}
 	request.Port = port
+	// 回环中继与实测顺序在任何 spawn 之前就位，并随本次监督整体存活（增补 2 C17 第 8 条）。
+	supervisedRelay, infrastructure, err := s.startSupervisedRelay(ctx, nil)
+	if err != nil {
+		return preferCancellation(ctx, err)
+	}
+	s.infrastructure = infrastructure
+	defer func() {
+		if closeErr := supervisedRelay.close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, closeErr)
+		}
+	}()
 	if mode == ModeDevelopment {
 		var err error
 		request, err = s.normalizeDevelopmentRequest(ctx, request)

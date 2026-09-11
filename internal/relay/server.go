@@ -159,6 +159,26 @@ func (s *Server) Register(items []Item) {
 	}
 }
 
+// SetUpstreams 在运行期替换某条路由的上游顺序（受监督时后台测速完成后调用）。
+// 已因两次哈希不符被剔除的源不会被重新加回；非法路由或上游返回错误且不改变现有顺序。
+func (s *Server) SetUpstreams(route Route, upstreams []Upstream) error {
+	if !route.Valid() {
+		return fmt.Errorf("%w: route %q", ErrInvalidConfig, route)
+	}
+	normalized := make([]Upstream, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		entry, err := normalizeUpstream(upstream)
+		if err != nil {
+			return err
+		}
+		normalized = append(normalized, entry)
+	}
+	if setter, ok := s.fetcher.(upstreamSetter); ok {
+		setter.setUpstreams(route, normalized)
+	}
+	return nil
+}
+
 // Summary 返回供 result.details.relay 使用的汇总快照。
 func (s *Server) Summary() Summary {
 	if summarizer, ok := s.fetcher.(summarizer); ok {
@@ -306,6 +326,10 @@ func writeStatus(writer http.ResponseWriter, status int, message string) {
 }
 
 // itemRegistrar / summarizer / simpleFetcher 是取回引擎按需实现的可选能力。
+type upstreamSetter interface {
+	setUpstreams(route Route, upstreams []Upstream)
+}
+
 type itemRegistrar interface {
 	register(items []Item)
 }
