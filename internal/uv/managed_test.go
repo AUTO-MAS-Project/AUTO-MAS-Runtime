@@ -696,3 +696,49 @@ func TestManaged_RejectsInvalidSupervisedPort(t *testing.T) {
 		})
 	}
 }
+
+// TestManaged_RelayIsFirstMirrorEntry 锁定增补 2 C17 第 8 条：RelayBaseURL 非空时两份列表以回环地址开头，
+// 其后仍是解析后的上游顺序。
+func TestManaged_RelayIsFirstMirrorEntry(t *testing.T) {
+	runner := newTestRunner(t)
+	packageIndex := []string{"https://mirrors.aliyun.com/pypi/simple/", "https://pypi.org/simple/"}
+	pythonSources := []string{"https://github.com/astral-sh/python-build-standalone/releases/download"}
+	recordPath := filepath.Join(t.TempDir(), "managed-relay-record.txt")
+	managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn, Environment: map[string]string{"FAKE_UV_RECORD": recordPath}},
+		Infrastructure: SupervisionInfrastructure{
+			UVCacheDir:          runner.CacheDir,
+			PythonInstallDir:    runner.PythonInstallDir,
+			PackageIndexSources: packageIndex,
+			PythonSources:       pythonSources,
+			RelayBaseURL:        "http://127.0.0.1:39170",
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StartManaged() error = %v", err)
+	}
+	waitManagedProcess(t, managed)
+	record := readTestRecord(t, recordPath)
+	if got, want := record[autoMASMirrorPackageIndex], "http://127.0.0.1:39170/simple/;"+strings.Join(packageIndex, ";"); got != want {
+		t.Errorf("package index list = %q, want %q", got, want)
+	}
+	if got, want := record[autoMASMirrorPython], "http://127.0.0.1:39170/python;"+strings.Join(pythonSources, ";"); got != want {
+		t.Errorf("python list = %q, want %q", got, want)
+	}
+}
+
+// TestManaged_RejectsNonLoopbackRelay 锁定 RelayBaseURL 只接受回环地址：其它主机会在 spawn 前失败关闭。
+func TestManaged_RejectsNonLoopbackRelay(t *testing.T) {
+	runner := newTestRunner(t)
+	_, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
+		Infrastructure: SupervisionInfrastructure{
+			UVCacheDir:       runner.CacheDir,
+			PythonInstallDir: runner.PythonInstallDir,
+			RelayBaseURL:     "http://relay.example:39170",
+		},
+	}, nil)
+	if err == nil {
+		t.Fatal("StartManaged() error = nil, want rejection of a non-loopback relay")
+	}
+}
