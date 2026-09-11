@@ -800,12 +800,15 @@ func TestRunner_ScrubsHostPythonEnvironment(t *testing.T) {
 	for key, value := range passthrough {
 		t.Setenv(key, value)
 	}
+	explicit := map[string]string{
+		"PYTHONPATH":  `D:\explicit`,
+		"VIRTUAL_ENV": `D:\explicit\venv`,
+		"FORCE_COLOR": "explicit",
+	}
 	runner := newTestRunner(t)
-	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{
-		"PYTHONPATH": `D:\explicit`,
-	}})
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: explicit})
 	for key := range scrubbed {
-		if key == "PYTHONPATH" {
+		if _, injected := explicit[key]; injected {
 			continue
 		}
 		if containsEnvironmentKeyMap(environment, key) {
@@ -817,8 +820,10 @@ func TestRunner_ScrubsHostPythonEnvironment(t *testing.T) {
 			t.Errorf("environment[%q] = %q, want host value %q", key, got, want)
 		}
 	}
-	if got := environment["PYTHONPATH"]; got != `D:\explicit` {
-		t.Errorf("explicit PYTHONPATH = %q, want RunOptions value kept", got)
+	for key, want := range explicit {
+		if got := environment[key]; got != want {
+			t.Errorf("explicit %s = %q, want RunOptions value %q kept", key, got, want)
+		}
 	}
 }
 
@@ -844,8 +849,13 @@ func TestRunner_LoopbackNeverProxied(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Setenv("HTTPS_PROXY", "http://proxy.example:8080")
 			t.Setenv("http_proxy", "http://proxy.example:8080")
-			t.Setenv("NO_PROXY", "")
-			os.Unsetenv("NO_PROXY")
+			// 宿主可能带任意大小写的 NO_PROXY（Linux 上大小写是两个变量），逐个清掉再布置用例。
+			for _, entry := range os.Environ() {
+				if key, _, found := strings.Cut(entry, "="); found && strings.EqualFold(key, "NO_PROXY") {
+					t.Setenv(key, "")
+					os.Unsetenv(key)
+				}
+			}
 			if testCase.hostKey != "" {
 				t.Setenv(testCase.hostKey, testCase.hostVal)
 			}
