@@ -43,6 +43,18 @@ type dependenciesOptions struct {
 	catalog        *mirror.Catalog
 	rotator        sourceRotator
 	stagingRemover TreeRemover
+	plan           mirror.PlanFunc
+}
+
+// WithDependenciesPlanner 注入包索引源尝试顺序的构造函数（增补 2 C16 的实测排序）；默认按目录顺序。
+func WithDependenciesPlanner(plan mirror.PlanFunc) DependenciesOption {
+	return func(options *dependenciesOptions) error {
+		if options == nil || plan == nil {
+			return errors.New("dependencies planner is invalid")
+		}
+		options.plan = plan
+		return nil
+	}
 }
 
 // WithDependenciesCatalog 注入包索引源目录。
@@ -115,7 +127,7 @@ func (s *DependenciesService) syncWithMirrors(
 	if err != nil {
 		return DependenciesResult{}, fmt.Errorf("build package index mirror target: %w", err)
 	}
-	plan, err := s.buildPackageIndexPlan(request.MirrorPolicy)
+	plan, err := s.buildPackageIndexPlan(ctx, request.MirrorPolicy)
 	if err != nil {
 		return DependenciesResult{}, err
 	}
@@ -147,10 +159,13 @@ func (s *DependenciesService) syncWithMirrors(
 // 显式 --mirror package-index=<key> 由 BuildPlan 排在最前（C10 的 2026-09-01 修订）。
 // 用户显式指定却选不出源时必须失败关闭，不能静默换成别的源；只有 Policy 自身结构
 // 不合法（例如零值 Policy）才退回目录默认顺序，与 internal/uv 其他网络路径一致。
-func (s *DependenciesService) buildPackageIndexPlan(policy mirror.Policy) (mirror.Plan, error) {
-	plan, err := mirror.BuildPlan(s.catalog, policy, mirror.KindPackageIndex)
+func (s *DependenciesService) buildPackageIndexPlan(ctx context.Context, policy mirror.Policy) (mirror.Plan, error) {
+	plan, err := s.plan(ctx, policy, mirror.KindPackageIndex)
 	if err == nil {
 		return plan, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return mirror.Plan{}, err
 	}
 	if errors.Is(err, mirror.ErrPolicyRejected) {
 		return mirror.Plan{}, newError(
@@ -165,7 +180,7 @@ func (s *DependenciesService) buildPackageIndexPlan(policy mirror.Policy) (mirro
 	if defaultErr != nil {
 		return mirror.Plan{}, fmt.Errorf("build default package index policy: %w", defaultErr)
 	}
-	plan, defaultErr = mirror.BuildPlan(s.catalog, defaultPolicy, mirror.KindPackageIndex)
+	plan, defaultErr = s.plan(ctx, defaultPolicy, mirror.KindPackageIndex)
 	if defaultErr != nil {
 		return mirror.Plan{}, fmt.Errorf("build package index mirror plan: %w", errors.Join(err, defaultErr))
 	}

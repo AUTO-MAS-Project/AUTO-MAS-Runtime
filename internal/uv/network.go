@@ -32,6 +32,8 @@ type sourceRotator interface {
 type networkExecutor struct {
 	catalog *mirror.Catalog
 	rotator sourceRotator
+	// plan 给出尝试顺序；默认目录顺序，增补 2 C16 起可注入实测排序。
+	plan mirror.PlanFunc
 }
 
 func newDefaultNetworkExecutor() (*networkExecutor, error) {
@@ -50,7 +52,15 @@ func newNetworkExecutor(catalog *mirror.Catalog, rotator sourceRotator) (*networ
 	if catalog == nil || rotator == nil {
 		return nil, errors.New("uv network dependencies are incomplete")
 	}
-	return &networkExecutor{catalog: catalog, rotator: rotator}, nil
+	return &networkExecutor{catalog: catalog, rotator: rotator, plan: mirror.CatalogPlanFunc(catalog)}, nil
+}
+
+// withPlanFunc 替换尝试顺序的来源；nil 保持默认。
+func (e *networkExecutor) withPlanFunc(plan mirror.PlanFunc) *networkExecutor {
+	if e != nil && plan != nil {
+		e.plan = plan
+	}
+	return e
 }
 
 func (e *networkExecutor) run(
@@ -66,7 +76,7 @@ func (e *networkExecutor) run(
 		!kind.Valid() || target.ValidateForKind(kind) != nil || len(args) == 0 {
 		return UVResult{}, errors.New("uv network request is invalid")
 	}
-	plan, err := e.plan(policy, kind)
+	plan, err := e.buildPlan(ctx, policy, kind)
 	if err != nil {
 		return UVResult{}, err
 	}
@@ -141,16 +151,19 @@ func (e *networkExecutor) run(
 	return lastResult, err
 }
 
-func (e *networkExecutor) plan(policy mirror.Policy, kind mirror.Kind) (mirror.Plan, error) {
-	plan, err := mirror.BuildPlan(e.catalog, policy, kind)
+func (e *networkExecutor) buildPlan(ctx context.Context, policy mirror.Policy, kind mirror.Kind) (mirror.Plan, error) {
+	plan, err := e.plan(ctx, policy, kind)
 	if err == nil {
 		return plan, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return mirror.Plan{}, err
 	}
 	defaultPolicy, defaultErr := mirror.NewPolicy(mirror.PolicySpec{Preferred: map[mirror.Kind]string{}})
 	if defaultErr != nil {
 		return mirror.Plan{}, fmt.Errorf("build default uv mirror policy: %w", defaultErr)
 	}
-	plan, defaultErr = mirror.BuildPlan(e.catalog, defaultPolicy, kind)
+	plan, defaultErr = e.plan(ctx, defaultPolicy, kind)
 	if defaultErr != nil {
 		return mirror.Plan{}, fmt.Errorf("build uv mirror plan: %w", errors.Join(err, defaultErr))
 	}

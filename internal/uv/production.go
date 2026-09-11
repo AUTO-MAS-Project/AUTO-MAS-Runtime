@@ -13,18 +13,51 @@ import (
 type ProductionEnvironment struct {
 	layout    *config.Layout
 	bootstrap *Bootstrapper
+	// plan 给出全部网络源的尝试顺序；nil 表示各服务各自按目录顺序。
+	plan mirror.PlanFunc
+}
+
+// ProductionOption 配置 ProductionEnvironment 的可注入依赖。
+type ProductionOption func(*productionOptions) error
+
+type productionOptions struct {
+	plan mirror.PlanFunc
+}
+
+// WithProductionPlanner 注入 uv / Python / 包索引三类源共用的尝试顺序构造函数（增补 2 C16 的实测排序）。
+func WithProductionPlanner(plan mirror.PlanFunc) ProductionOption {
+	return func(options *productionOptions) error {
+		if options == nil || plan == nil {
+			return errors.New("production planner is invalid")
+		}
+		options.plan = plan
+		return nil
+	}
 }
 
 // NewProductionEnvironment 创建 Windows 首版使用的受管环境适配器。
-func NewProductionEnvironment(layout *config.Layout) (*ProductionEnvironment, error) {
+func NewProductionEnvironment(layout *config.Layout, options ...ProductionOption) (*ProductionEnvironment, error) {
 	if layout == nil {
 		return nil, errors.New("production environment layout is invalid")
 	}
-	bootstrap, err := NewBootstrapper(layout)
+	var configured productionOptions
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("production option must not be nil")
+		}
+		if err := option(&configured); err != nil {
+			return nil, err
+		}
+	}
+	bootstrapOptions := make([]BootstrapOption, 0, 1)
+	if configured.plan != nil {
+		bootstrapOptions = append(bootstrapOptions, WithBootstrapPlanner(configured.plan))
+	}
+	bootstrap, err := NewBootstrapper(layout, bootstrapOptions...)
 	if err != nil {
 		return nil, err
 	}
-	return &ProductionEnvironment{layout: layout, bootstrap: bootstrap}, nil
+	return &ProductionEnvironment{layout: layout, bootstrap: bootstrap, plan: configured.plan}, nil
 }
 
 // Ensure 按固定顺序准备 uv、Python 和锁定依赖。
@@ -329,7 +362,13 @@ func (s *ProductionEnvironment) services(
 	if err != nil {
 		return nil, err
 	}
-	python, err := NewPythonService(s.layout, runner)
+	pythonOptions := make([]PythonOption, 0, 1)
+	dependenciesOptions := make([]DependenciesOption, 0, 1)
+	if s.plan != nil {
+		pythonOptions = append(pythonOptions, WithPythonPlanner(s.plan))
+		dependenciesOptions = append(dependenciesOptions, WithDependenciesPlanner(s.plan))
+	}
+	python, err := NewPythonService(s.layout, runner, pythonOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -337,6 +376,7 @@ func (s *ProductionEnvironment) services(
 		s.layout,
 		runner,
 		filesystemVersionRemover{layout: s.layout},
+		dependenciesOptions...,
 	)
 	if err != nil {
 		return nil, err

@@ -76,16 +76,43 @@ type PythonService struct {
 	network *networkExecutor
 }
 
+// PythonOption 配置 PythonService 的可注入依赖。
+type PythonOption func(*pythonOptions) error
+
+type pythonOptions struct {
+	plan mirror.PlanFunc
+}
+
+// WithPythonPlanner 注入 Python 分发源尝试顺序的构造函数（增补 2 C16 的实测排序）；默认按目录顺序。
+func WithPythonPlanner(plan mirror.PlanFunc) PythonOption {
+	return func(options *pythonOptions) error {
+		if options == nil || plan == nil {
+			return errors.New("python planner is invalid")
+		}
+		options.plan = plan
+		return nil
+	}
+}
+
 // NewPythonService 创建 Python 服务。
-func NewPythonService(layout *config.Layout, runner Runner) (*PythonService, error) {
+func NewPythonService(layout *config.Layout, runner Runner, options ...PythonOption) (*PythonService, error) {
 	if layout == nil || runner == nil {
 		return nil, errors.New("python service dependencies are incomplete")
+	}
+	var configured pythonOptions
+	for index, option := range options {
+		if option == nil {
+			return nil, fmt.Errorf("python option at index %d is nil", index)
+		}
+		if err := option(&configured); err != nil {
+			return nil, err
+		}
 	}
 	network, err := newDefaultNetworkExecutor()
 	if err != nil {
 		return nil, err
 	}
-	return &PythonService{layout: layout, runner: runner, network: network}, nil
+	return &PythonService{layout: layout, runner: runner, network: network.withPlanFunc(configured.plan)}, nil
 }
 
 // ReadSpec 只读取项目的版本文件和 pyproject.toml，不启动任何进程。

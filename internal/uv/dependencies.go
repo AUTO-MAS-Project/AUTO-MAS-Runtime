@@ -53,6 +53,8 @@ type DependenciesService struct {
 	catalog        *mirror.Catalog
 	rotator        sourceRotator
 	stagingRemover TreeRemover
+	// plan 给出包索引源的尝试顺序；默认目录顺序，增补 2 C16 起可注入实测排序。
+	plan mirror.PlanFunc
 }
 
 // NewDependenciesService 创建主项目依赖服务。
@@ -89,6 +91,9 @@ func NewDependenciesService(
 		}
 		configured.rotator = rotator
 	}
+	if configured.plan == nil {
+		configured.plan = mirror.CatalogPlanFunc(configured.catalog)
+	}
 	return &DependenciesService{
 		layout:         layout,
 		runner:         runner,
@@ -96,6 +101,7 @@ func NewDependenciesService(
 		catalog:        configured.catalog,
 		rotator:        configured.rotator,
 		stagingRemover: configured.stagingRemover,
+		plan:           configured.plan,
 	}, nil
 }
 
