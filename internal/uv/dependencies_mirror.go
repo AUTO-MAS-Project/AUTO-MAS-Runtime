@@ -44,6 +44,8 @@ type dependenciesOptions struct {
 	rotator        sourceRotator
 	stagingRemover TreeRemover
 	plan           mirror.PlanFunc
+	relay          RelayFactory
+	intel          sourceIntel
 }
 
 // WithDependenciesPlanner 注入包索引源尝试顺序的构造函数（增补 2 C16 的实测排序）；默认按目录顺序。
@@ -95,13 +97,11 @@ func WithDependenciesStagingRemover(remover TreeRemover) DependenciesOption {
 // 每个镜像源在受管临时项目目录里用改写后的锁副本执行 --frozen 安装；plan 末位的
 // 官方源改用 repo 原锁与 --locked，这就是 C10 的「全部镜像失败后回退原锁」。
 // --mirror-only 时 BuildPlan 本就不放官方源进 plan，因此不需要额外的分支来禁止回退。
-func (s *DependenciesService) syncWithMirrors(
-	ctx context.Context,
-	request DependenciesRequest,
-) (DependenciesResult, error) {
+// readSyncInputs 读取原锁与项目声明；两者都只读，任何改写只发生在临时项目目录的副本上。
+func (s *DependenciesService) readSyncInputs(request DependenciesRequest) (string, string, error) {
 	lock, err := readManagedRegularFile(s.lockfilePath(request.ProjectDir), maxUVLockFileBytes)
 	if err != nil {
-		return DependenciesResult{}, newError(
+		return "", "", newError(
 			protocol.CodeLockfileMissing,
 			protocol.StageDependenciesSync,
 			"项目锁文件不可读取",
@@ -114,7 +114,7 @@ func (s *DependenciesService) syncWithMirrors(
 		maxPyProjectFileBytes,
 	)
 	if err != nil {
-		return DependenciesResult{}, newError(
+		return "", "", newError(
 			protocol.CodeDependencySyncFailed,
 			protocol.StageDependenciesSync,
 			"项目声明文件不可读取",
@@ -122,6 +122,18 @@ func (s *DependenciesService) syncWithMirrors(
 			err,
 		)
 	}
+	return string(lock), string(projectFile), nil
+}
+
+func (s *DependenciesService) syncWithMirrors(
+	ctx context.Context,
+	request DependenciesRequest,
+) (DependenciesResult, error) {
+	lockText, projectText, err := s.readSyncInputs(request)
+	if err != nil {
+		return DependenciesResult{}, err
+	}
+	lock, projectFile := []byte(lockText), []byte(projectText)
 	digest := sha256.Sum256(lock)
 	target, err := mirror.NewTarget(mirror.TargetSpec{LockDigest: hex.EncodeToString(digest[:])})
 	if err != nil {
@@ -273,6 +285,18 @@ func (s *DependenciesService) runStagedSync(
 	rewrite mirror.PackageIndexRewrite,
 	lock string,
 	projectFile string,
+) (UVResult, error) {
+	return s.runStagedSyncWithEnvironment(ctx, request, rewrite, lock, projectFile, nil)
+}
+
+// runStagedSyncWithEnvironment 与 runStagedSync 相同，另把 extraEnvironment 合入本次 uv 调用（中继路径用它注入 UV_HTTP_TIMEOUT）。
+func (s *DependenciesService) runStagedSyncWithEnvironment(
+	ctx context.Context,
+	request DependenciesRequest,
+	rewrite mirror.PackageIndexRewrite,
+	lock string,
+	projectFile string,
+	extraEnvironment map[string]string,
 ) (result UVResult, returnErr error) {
 	stagingDir, err := s.layout.DependencySyncDir(request.OperationID)
 	if err != nil {
@@ -294,10 +318,17 @@ func (s *DependenciesService) runStagedSync(
 	if err := writeStagingProject(ctx, s.layout, stagingDir, projectFile, rewritten.Lock); err != nil {
 		return UVResult{}, err
 	}
+	options := s.runOptions(request, protocol.StageDependenciesSync)
+	if len(extraEnvironment) > 0 {
+		options = cloneRunOptions(options)
+		for key, value := range extraEnvironment {
+			options.Environment[key] = value
+		}
+	}
 	return s.runner.Run(
 		ctx,
 		mirrorSyncArguments(stagingDir, request.PythonVersion),
-		s.runOptions(request, protocol.StageDependenciesSync),
+		options,
 	)
 }
 

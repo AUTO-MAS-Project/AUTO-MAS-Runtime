@@ -3,6 +3,7 @@ package uv
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
@@ -209,4 +210,46 @@ func mustDefaultCatalog(t *testing.T) *mirror.Catalog {
 		t.Fatalf("DefaultCatalog() error = %v", err)
 	}
 	return catalog
+}
+
+// TestProductionEnvironment_RankerAndRelayPropagate 锁定生产适配器把测速器与中继工厂交给 Python 与依赖服务，
+// 且默认启用中继、WithProductionRelay(nil) 可关闭。
+func TestProductionEnvironment_RankerAndRelayPropagate(t *testing.T) {
+	t.Parallel()
+
+	layout := newUVTestLayout(t)
+	ranker, err := mirror.NewRanker(mustDefaultCatalog(t))
+	if err != nil {
+		t.Fatalf("NewRanker() error = %v", err)
+	}
+	environment, err := NewProductionEnvironment(layout, WithProductionRanker(ranker))
+	if err != nil {
+		t.Fatalf("NewProductionEnvironment() error = %v", err)
+	}
+	if environment.plan == nil || environment.intel == nil || environment.relay == nil {
+		t.Fatalf("environment = %+v, want plan, intel and default relay", environment)
+	}
+	service, err := environment.services(filepath.Join(layout.RuntimeDir(), "uv.exe"), EnvironmentRequest{})
+	if err != nil {
+		t.Fatalf("services() error = %v", err)
+	}
+	python, ok := service.python.(*PythonService)
+	if !ok || python.relay == nil || python.intel == nil || python.network.plan == nil {
+		t.Fatalf("python service = %+v, want relay, intel and planner", service.python)
+	}
+	dependencies, ok := service.dependencies.(*DependenciesService)
+	if !ok || dependencies.relay == nil || dependencies.intel == nil {
+		t.Fatalf("dependencies service = %+v, want relay and intel", service.dependencies)
+	}
+
+	disabled, err := NewProductionEnvironment(layout, WithProductionRelay(nil))
+	if err != nil {
+		t.Fatalf("NewProductionEnvironment(relay off) error = %v", err)
+	}
+	if disabled.relay != nil {
+		t.Fatal("WithProductionRelay(nil) did not disable the relay")
+	}
+	if _, err := NewProductionEnvironment(layout, WithProductionRanker(nil)); err == nil {
+		t.Fatal("WithProductionRanker(nil) error = nil, want error")
+	}
 }

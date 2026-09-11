@@ -16,6 +16,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
 )
 
 const (
@@ -52,11 +53,17 @@ type PythonRequest struct {
 	MirrorPolicy     mirror.Policy
 	Reinstall        bool
 	Line             LineFunc
+	// Progress 接收经中继下载分发包时的字节进度（增补 2 C18），可为 nil。
+	Progress func(relay.Progress) error
 }
 
 // PythonResult 保存已验证的 Python 版本。
 type PythonResult struct {
 	Spec PythonSpec
+	// Source 是实际提供分发包的源 key；缓存命中或未经中继时为空。
+	Source string
+	// Relay 是经中继下载时的摘要；没有走中继时为 nil。
+	Relay *relay.Summary
 }
 
 // PythonCheckResult 保存不改变磁盘的 Python 检查结果。
@@ -74,13 +81,19 @@ type PythonService struct {
 	layout  *config.Layout
 	runner  Runner
 	network *networkExecutor
+	// relay 非 nil 时分发包先经回环中继下载（增补 2 C17）；中继起不来退回环境变量轮换。
+	relay RelayFactory
+	// intel 为测速器，登记分发包探针目标并提供 Accept-Ranges 能力；可为 nil。
+	intel sourceIntel
 }
 
 // PythonOption 配置 PythonService 的可注入依赖。
 type PythonOption func(*pythonOptions) error
 
 type pythonOptions struct {
-	plan mirror.PlanFunc
+	plan  mirror.PlanFunc
+	relay RelayFactory
+	intel sourceIntel
 }
 
 // WithPythonPlanner 注入 Python 分发源尝试顺序的构造函数（增补 2 C16 的实测排序）；默认按目录顺序。
@@ -112,7 +125,13 @@ func NewPythonService(layout *config.Layout, runner Runner, options ...PythonOpt
 	if err != nil {
 		return nil, err
 	}
-	return &PythonService{layout: layout, runner: runner, network: network.withPlanFunc(configured.plan)}, nil
+	return &PythonService{
+		layout:  layout,
+		runner:  runner,
+		network: network.withPlanFunc(configured.plan),
+		relay:   configured.relay,
+		intel:   configured.intel,
+	}, nil
 }
 
 // ReadSpec 只读取项目的版本文件和 pyproject.toml，不启动任何进程。
@@ -223,7 +242,7 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 	if request.Reinstall {
 		installArgs = append(installArgs, "--reinstall")
 	}
-	installResult, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPython, target, installArgs, RunOptions{
+	installOptions := RunOptions{
 		Stage:            protocol.StagePythonInstall,
 		ProjectDir:       request.ProjectDir,
 		PythonInstallDir: request.PythonInstallDir,
@@ -233,18 +252,30 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 		Branch:           request.Branch,
 		Commit:           request.Commit,
 		Line:             request.Line,
-	})
-	if err != nil {
-		if isNetworkPolicyError(err) {
-			return PythonResult{}, err
+	}
+	var relaySummary *relay.Summary
+	relaySource := ""
+	if installResult, summary, handled, relayErr := s.installWithRelay(ctx, request, spec, installArgs, installOptions); handled {
+		if relayErr != nil {
+			return PythonResult{}, relayErr
 		}
-		return PythonResult{}, pythonError(
-			protocol.CodePythonInstallFailed,
-			protocol.StagePythonInstall,
-			"Python 安装失败",
-			map[string]any{"pythonVersion": spec.Version.String(), "exitCode": installResult.ExitCode},
-			err,
-		)
+		_ = installResult
+		relaySummary = &summary
+		relaySource = dominantSource(summary)
+	} else {
+		installResult, err := s.network.run(ctx, s.runner, request.MirrorPolicy, mirror.KindPython, target, installArgs, installOptions)
+		if err != nil {
+			if isNetworkPolicyError(err) {
+				return PythonResult{}, err
+			}
+			return PythonResult{}, pythonError(
+				protocol.CodePythonInstallFailed,
+				protocol.StagePythonInstall,
+				"Python 安装失败",
+				map[string]any{"pythonVersion": spec.Version.String(), "exitCode": installResult.ExitCode},
+				err,
+			)
+		}
 	}
 	findResult, err := s.runner.Run(ctx, []string{
 		"python",
@@ -272,7 +303,7 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 			err,
 		)
 	}
-	return PythonResult{Spec: spec}, nil
+	return PythonResult{Spec: spec, Source: relaySource, Relay: relaySummary}, nil
 }
 
 // Check 只验证项目约束、uv 清单和已安装的受管 Python，不执行安装。
