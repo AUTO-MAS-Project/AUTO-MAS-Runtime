@@ -48,6 +48,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
 | M12 遥测与错误观测（Sentry-only） | T12.1、T12.2、T12.4、T12.5、T12.7 已完成；T12.6 本地发布配置已提交，待 Repository secret 与授权后的远端验收；T12.3/Umami 已取消 |
 | M13 dev 基线接入配套 | 2026-08-31 按决策 D12 与 `doc/契约补充-v1-增补1.md`（C6~C11）立项；T13.1（后端工作目录）、T13.2（Job 允许显式脱离）、T13.3（关闭超时参数化，含优雅关闭误报修复）、T13.4（锁副本改写参与包索引镜像轮换，显式 package-index 排最前）**已完成**；T13.5 **已完成**（注入面 `020b3b9`：`AUTO_MAS_UV_CACHE_DIR` / `AUTO_MAS_UV_PYTHON_INSTALL_DIR` / `AUTO_MAS_MIRROR_PACKAGE_INDEX` / `AUTO_MAS_MIRROR_PYTHON`；池目录重新分类按设计关闭——Runtime 的 repair/cleanup 只处理自己的目录，池 venv 失效后由后端判定重建）；T13.6 ⏸ 未开始；2026-09-02 真机联调后按增补 1 **C12 / C13** 完成 T13.7（`f7d5edb`：`backend supervise --port`，缺省 managed 36163 / development 36164，注入 `AUTO_MAS_SUPERVISED_PORT`，健康/关闭地址与 `baseUrl` 由 `internal/health` 派生，E2E 改用空闲端口）与 T13.8（`41c51d3`，收尾 `23033f9`：`backend supervise` 的 stdin EOF / 读取出错视为隐式 shutdown，stdout 已断不影响 HTTP 优雅关闭，真实 exe 黑盒 E2E 锁定，宿主崩溃不再留孤儿）**已完成**；T13.9（`da710c4`，增补 1 C14：新 warning `BACKEND_ORPHANS_REAPED`，`BACKEND_FORCE_TERMINATED` 收窄为主进程被强杀）**已完成**；T13.10（`c46babf`，C13 第 4 条修订：协议日志转发失败不再回给 process 层，避免宿主崩溃时把正在优雅关闭的后端连同进程树杀掉）与 T13.11（`7fa56a1`，C15：Job 快照跳过正在消亡的成员、健康探针错误连续 3 次才判失败、根进程已退出时不再发 close）**已完成**；T13.14（`e8bc217`：克隆传输期脉冲由「按 sideband 写入次数计数、上限 64」改为固定间隔时间心跳，仍只发不带数值的 running）**已完成** |
+| M14 网络源测速与回环中继 | 2026-09-11 按用户需求与 `doc/契约补充-v1-增补2.md`（C16~C20）立项并当日完成：T14.1（契约与设计）、T14.2（测速排序，惰性触发）、T14.3（`internal/relay` 回环中继）、T14.4（uv 接线与锁规划）、T14.5（CLI、字节进度、supervise 常驻）、T14.6（protocol 字段与 `network.probe`）、T14.7（组件矩阵与三次真实镜像黑盒）、T14.8（分片取回的慢源判定）、T14.9（宿主配置与 Python 环境隔离：`UV_NO_CONFIG=1`、`PYTHON*` / 颜色 / Rust 调试变量剔除、`NO_PROXY` 必含回环）**已完成**；本地 `main` 领先 `origin/main` 未推送，发版与 AUTO-MAS 钉扎待用户授权 |
 
 代码现状：
 
@@ -79,12 +80,13 @@ Git：远端 `origin` = `git@github.com:AUTO-MAS-Project/AUTO-MAS-Runtime.git`�
 | [doc/架构设计.md](doc/架构设计.md) | 冻结的系统架构：边界、CLI 命令树、NDJSON 协议、错误码/退出码/stage/state 全集、Git 更新流程、uv 策略、目录安全、测试矩阵、验收标准 | 任何涉及对外契约的改动 |
 | [doc/契约补充-v1.md](doc/契约补充-v1.md) | 协议 v1 的 5 项定稿细节（C1~C5：后端端口（已由增补 1 C12 改为 Runtime 注入）、身份注入环境变量、`failed` 字面量、`AUTO_MAS_SUPERVISED=1`、development 检查边界） | 涉及后端启动/健康检查/环境变量 |
 | [doc/契约补充-v1-增补1.md](doc/契约补充-v1-增补1.md) | 对 v1 的增量修订（C6~C11：后端工作目录、受监督优先级扩展到端口、Job 逃逸、关闭预算参数化、依赖镜像改写轮换、运行池基础设施共享），并修订 C2 第 1 条与 C4 第 1 条 | 同上；**与 `契约补充-v1.md` 冲突时以本文件为准** |
+| [doc/契约补充-v1-增补2.md](doc/契约补充-v1-增补2.md) | 第二次增量修订（C16~C19：网络源测速排序、回环中继、进度事件字节字段与细目、Python 分发源增补），并修订增补 1 的 C10 第 3/7 条与 C11 第 3 条 | 涉及镜像、下载、进度事件；**与增补 1 冲突时以本文件为准** |
 | [doc/任务拆分.md](doc/任务拆分.md) | 逐任务清单、依赖、验收项、决策记录 D1~D12、待决项 D-open-*、AUTO-MAS 侧 TODO、变更记录 | **每次开工前**确认自己在做哪个任务 |
 | [doc/代码审查清单.md](doc/代码审查清单.md) | 自动化门禁覆盖不到的架构边界检查 | 提交前自查、审查他人代码 |
 | `doc/current/M*/` | 尚未完成任务的设计与实施计划 | 执行某个具体任务时 |
 | `doc/archive/M*/` | 已完成阶段仍有解释价值的设计与审查记录 | 追溯设计背景时 |
 
-**优先级：** 契约补充-v1-增补1（最新增量修订） > 契约补充-v1（更具体） > 架构设计（概括） > 任务拆分（派生清单）。
+**优先级：** 契约补充-v1-增补2（最新增量修订） > 契约补充-v1-增补1 > 契约补充-v1（更具体） > 架构设计（概括） > 任务拆分（派生清单）。
 
 ---
 

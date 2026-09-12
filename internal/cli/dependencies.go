@@ -290,7 +290,7 @@ func runMutatingDependencyAction(
 	return sessionSuccess{
 		message: "主项目依赖同步完成",
 		status:  string(protocol.StateReadyToStart),
-		details: map[string]any{
+		details: withRelayDetails(map[string]any{
 			"version":       check.Version,
 			"commit":        check.Commit,
 			"synchronized":  result.Synchronized,
@@ -298,7 +298,7 @@ func runMutatingDependencyAction(
 			"source":        result.Source,
 			"attemptCount":  result.AttemptCount,
 			"lockRewritten": result.LockRewritten,
-		},
+		}, "relay", result.Relay),
 	}, nil
 }
 
@@ -368,6 +368,8 @@ func dependencyRequest(
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          line,
 		Attempt:       mirrorAttemptProgress(emitter),
+		Progress:      relayProgress(emitter, protocol.StageDependenciesSync, "正在下载锁定依赖"),
+		RelayLog:      relayLog(deps.opLog.Get()),
 	}
 }
 

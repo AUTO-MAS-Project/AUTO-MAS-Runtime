@@ -76,6 +76,10 @@ type Dependencies struct {
 	// MirrorPolicy 是已解析的全局镜像策略，用于按增补 1 C11 生成下发给后端的
 	// 有序源列表。零值表示调用方未配置，按目录默认顺序处理。
 	MirrorPolicy mirror.Policy
+	// Ranker 是本进程的测速器（增补 2 C16）；nil 表示按目录顺序下发。
+	Ranker *mirror.Ranker
+	// Relay 启动受监督期间常驻的回环中继（增补 2 C17 第 8 条）；nil 表示不起中继。
+	Relay RelayStarter
 }
 
 // Timer 是可停止的重启等待计时器，避免 timer channel 在收口后泄漏。

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
@@ -29,6 +30,9 @@ type SupervisionInfrastructure struct {
 	PythonInstallDir    string
 	PackageIndexSources []string
 	PythonSources       []string
+	// RelayBaseURL 非空时（增补 2 C17 第 8 条），两份列表以回环中继的 simple / python 路由开头。
+	// 只接受 http://127.0.0.1:<port>。
+	RelayBaseURL string
 }
 
 // ManagedOptions 把通用 uv 选项与长驻监督身份策略分开，避免调用方直接拼受控环境键。
@@ -169,11 +173,22 @@ func resolveSupervisionInfrastructure(
 	if err != nil {
 		return nil, fmt.Errorf("resolve supervised python install directory: %w", err)
 	}
-	packageIndex, err := joinSupervisionMirrorSources(requested.PackageIndexSources)
+	packageIndexSources := requested.PackageIndexSources
+	pythonSources := requested.PythonSources
+	if requested.RelayBaseURL != "" {
+		rewrite, err := mirror.NewLoopbackRewrite(requested.RelayBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("resolve supervised relay base: %w", err)
+		}
+		loopback := strings.TrimSuffix(rewrite.SimpleBase(), "/simple")
+		packageIndexSources = append([]string{rewrite.SimpleBase() + "/"}, packageIndexSources...)
+		pythonSources = append([]string{loopback + "/python"}, pythonSources...)
+	}
+	packageIndex, err := joinSupervisionMirrorSources(packageIndexSources)
 	if err != nil {
 		return nil, fmt.Errorf("resolve supervised package index sources: %w", err)
 	}
-	python, err := joinSupervisionMirrorSources(requested.PythonSources)
+	python, err := joinSupervisionMirrorSources(pythonSources)
 	if err != nil {
 		return nil, fmt.Errorf("resolve supervised python sources: %w", err)
 	}

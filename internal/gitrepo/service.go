@@ -112,7 +112,28 @@ type MutationCoordinator interface {
 	Close() error
 }
 
-type planBuilder func(mirror.Policy) (mirror.Plan, error)
+// PlanBuilder 按策略给出 Git 源的尝试顺序；增补 2 C16 起由测速排序实现注入，默认按目录顺序。
+type PlanBuilder func(context.Context, mirror.Policy) (mirror.Plan, error)
+
+type planBuilder = PlanBuilder
+
+// ServiceOption 配置 NewService 的可注入依赖。
+type ServiceOption func(*serviceOptions) error
+
+type serviceOptions struct {
+	buildPlan planBuilder
+}
+
+// WithPlanBuilder 注入 Git 源尝试顺序的构造函数（例如 mirror.Ranker 的实测排序）。
+func WithPlanBuilder(build PlanBuilder) ServiceOption {
+	return func(options *serviceOptions) error {
+		if options == nil || build == nil {
+			return errors.New("plan builder must not be nil")
+		}
+		options.buildPlan = build
+		return nil
+	}
+}
 
 type runtimeFactory func(
 	context.Context,
@@ -136,13 +157,22 @@ type syncRuntime interface {
 }
 
 // NewService 创建使用生产 go-git、filesystem、state 和 Windows Mutex 的服务。
-func NewService(layout *config.Layout) (*Service, error) {
+func NewService(layout *config.Layout, options ...ServiceOption) (*Service, error) {
+	configured := serviceOptions{buildPlan: buildProductionPlan}
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("service option must not be nil")
+		}
+		if err := option(&configured); err != nil {
+			return nil, err
+		}
+	}
 	return newServiceWithDependencies(
 		layout,
 		goGitRepositoryReader{},
 		newProductionLocks,
 		newProductionRuntime,
-		buildProductionPlan,
+		configured.buildPlan,
 	)
 }
 
@@ -304,7 +334,7 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		}
 		return SyncResult{}, serviceInvalidArgumentError(err)
 	}
-	plan, err := s.buildPlan(request.Policy)
+	plan, err := s.buildPlan(ctx, request.Policy)
 	if err != nil {
 		if errors.Is(err, mirror.ErrPolicyRejected) {
 			return SyncResult{}, servicePolicyArgumentError(err)
@@ -863,7 +893,7 @@ func controlDetails(request SyncRequest) map[string]any {
 	return map[string]any{"controlCommandId": commandID}
 }
 
-func buildProductionPlan(policy mirror.Policy) (mirror.Plan, error) {
+func buildProductionPlan(_ context.Context, policy mirror.Policy) (mirror.Plan, error) {
 	catalog, err := mirror.DefaultCatalog()
 	if err != nil {
 		return mirror.Plan{}, err

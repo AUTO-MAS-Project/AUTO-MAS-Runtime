@@ -1253,6 +1253,8 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		}
 		return nil, withFailureDetails(newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "后端日志初始化失败", map[string]any{"sink": "runtime_log"}, err), logger, nil)
 	}
+	// 每次监督尝试各有一个 Logger；中继诊断跟着当前尝试走。
+	s.relayDiagnostics.attach(ctx, logger)
 	tx, err := s.deps.State.BeginBackendTransaction(ctx, TransactionInput{OperationID: request.OperationID, PID: request.RuntimePID, Version: revision.Version, Stage: protocol.StageBackendSpawn})
 	if err != nil || tx == nil {
 		var cleanupErr error

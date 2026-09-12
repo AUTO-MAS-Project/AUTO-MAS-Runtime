@@ -15,8 +15,8 @@ func TestStableValueSets(t *testing.T) {
 
 	wantStages := []protocol.Stage{
 		protocol.StageRuntimeHandshake, protocol.StageDoctor, protocol.StageBootstrap, protocol.StageRepair,
-		protocol.StageCleanup, protocol.StageUVCheck, protocol.StageUVDownload, protocol.StageUVVerify,
-		protocol.StageWorkspaceCheck, protocol.StageWorkspaceClone, protocol.StageWorkspaceVerify,
+		protocol.StageCleanup, protocol.StageNetworkProbe, protocol.StageUVCheck, protocol.StageUVDownload,
+		protocol.StageUVVerify, protocol.StageWorkspaceCheck, protocol.StageWorkspaceClone, protocol.StageWorkspaceVerify,
 		protocol.StageWorkspaceSwap, protocol.StageWorkspaceCleanup, protocol.StagePythonCheck,
 		protocol.StagePythonInstall, protocol.StageDependenciesCheck, protocol.StageDependenciesSync,
 		protocol.StageDependenciesRebuild, protocol.StageBackendSpawn, protocol.StageBackendHealth,
@@ -220,8 +220,8 @@ func documentedProtocolValues(t *testing.T) ([]protocol.Stage, []protocol.Progre
 		stateStatuses = append(stateStatuses, protocol.StateStatus(match[1]))
 	}
 
-	if len(stages) != 24 || len(progressStatuses) != 6 || len(stateStatuses) != 13 {
-		t.Fatalf("documented value counts = stages:%d progress:%d states:%d, want 24/6/13", len(stages), len(progressStatuses), len(stateStatuses))
+	if len(stages) != 25 || len(progressStatuses) != 6 || len(stateStatuses) != 13 {
+		t.Fatalf("documented value counts = stages:%d progress:%d states:%d, want 25/6/13", len(stages), len(progressStatuses), len(stateStatuses))
 	}
 	return stages, progressStatuses, stateStatuses
 }

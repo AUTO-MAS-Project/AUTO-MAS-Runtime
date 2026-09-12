@@ -17,6 +17,16 @@ import (
 
 // mirrorTestLock 是带两处官方前缀的锁夹具，便于断言改写确实发生。
 const mirrorTestLock = `version = 1
+revision = 3
+requires-python = "==3.12.*"
+
+[[package]]
+name = "auto-mas"
+version = "0.0.1"
+source = { virtual = "." }
+dependencies = [
+    { name = "certifi" },
+]
 
 [[package]]
 name = "certifi"

@@ -209,6 +209,8 @@ func runRepair(
 		MirrorPolicy:     deps.global.mirrorPolicy,
 		Reinstall:        true,
 		Line:             uvLogLine(logger),
+		Progress:         relayProgress(emitter, protocol.StagePythonInstall, "正在下载受管 Python"),
+		RelayLog:         relayLog(logger),
 	})
 	if err != nil {
 		return sessionSuccess{}, persistM5FailureWithLifecycle(
@@ -242,6 +244,8 @@ func runRepair(
 		MirrorPolicy:  deps.global.mirrorPolicy,
 		Line:          uvLogLine(logger),
 		Attempt:       mirrorAttemptProgress(emitter),
+		Progress:      relayProgress(emitter, protocol.StageDependenciesSync, "正在下载锁定依赖"),
+		RelayLog:      relayLog(logger),
 	}
 	if err := advanceM5Transaction(ctx, store, &transaction, protocol.StageDependenciesRebuild); err != nil {
 		return sessionSuccess{}, err
@@ -308,20 +312,23 @@ func runRepair(
 	if err := transitionM5State(emitter, machine, protocol.StageDependenciesSync, protocol.StateReadyToStart, "运行环境修复完成"); err != nil {
 		return sessionSuccess{}, err
 	}
+	details := map[string]any{
+		"uvExecutable":  uvExecutable,
+		"uvVersion":     uv.FixedVersion,
+		"pythonVersion": pythonResult.Spec.Version.String(),
+		"synchronized":  dependencyResult.Synchronized,
+		// repair 的最后一步同样是 uv sync，镜像源事实与 dependencies sync
+		// 同口径上报（C10 第 7 条）。
+		"sourceKind":    dependencyResult.SourceKind,
+		"source":        dependencyResult.Source,
+		"attemptCount":  dependencyResult.AttemptCount,
+		"lockRewritten": dependencyResult.LockRewritten,
+	}
+	details = withRelayDetails(details, "relay", dependencyResult.Relay)
+	details = withRelayDetails(details, "pythonRelay", pythonResult.Relay)
 	return sessionSuccess{
 		message: "运行环境修复完成",
 		status:  string(protocol.StateReadyToStart),
-		details: map[string]any{
-			"uvExecutable":  uvExecutable,
-			"uvVersion":     uv.FixedVersion,
-			"pythonVersion": pythonResult.Spec.Version.String(),
-			"synchronized":  dependencyResult.Synchronized,
-			// repair 的最后一步同样是 uv sync，镜像源事实与 dependencies sync
-			// 同口径上报（C10 第 7 条）。
-			"sourceKind":    dependencyResult.SourceKind,
-			"source":        dependencyResult.Source,
-			"attemptCount":  dependencyResult.AttemptCount,
-			"lockRewritten": dependencyResult.LockRewritten,
-		},
+		details: details,
 	}, nil
 }

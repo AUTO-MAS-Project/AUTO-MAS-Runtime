@@ -607,6 +607,8 @@ type backendFixture struct {
 	depsHTTP        HTTPCloser
 	shutdownTimeout time.Duration
 	mirrorPolicy    mirror.Policy
+	relay           RelayStarter
+	ranker          *mirror.Ranker
 }
 
 func newBackendFixture(t *testing.T) *backendFixture {
@@ -649,6 +651,8 @@ func (f *backendFixture) supervisor() *ManagedSupervisor {
 		PID:          f.pid,
 		NewTimer:     func(time.Duration) Timer { return immediateTimer{} },
 		MirrorPolicy: f.mirrorPolicy,
+		Relay:        f.relay,
+		Ranker:       f.ranker,
 	})
 	if err != nil {
 		f.t.Fatalf("NewManagedSupervisor() error = %v", err)

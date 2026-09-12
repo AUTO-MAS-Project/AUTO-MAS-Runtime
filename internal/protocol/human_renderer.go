@@ -70,6 +70,21 @@ func (r *HumanRenderer) RenderProgress(event ProgressEvent) error {
 		builder.WriteString(strconv.FormatFloat(math.Round(*event.Percent*100)/100, 'f', -1, 64))
 		builder.WriteByte('%')
 	}
+	if event.Item != "" {
+		builder.WriteString(" [")
+		builder.WriteString(humanScalar(event.Item))
+		builder.WriteByte(']')
+	}
+	if event.Source != "" {
+		builder.WriteString(" @")
+		builder.WriteString(humanScalar(event.Source))
+	}
+	if event.BytesPerSecond != nil {
+		// 吞吐只在渲染端换算成 MB/s；NDJSON 保持整数字节，避免两边各算一次出现分歧。
+		builder.WriteByte(' ')
+		builder.WriteString(strconv.FormatFloat(float64(*event.BytesPerSecond)/(1024*1024), 'f', 2, 64))
+		builder.WriteString(" MB/s")
+	}
 	prefix := builder.String()
 	appendHumanMessage(&builder, prefix, event.Message)
 	return r.stdout.write(builder.String())

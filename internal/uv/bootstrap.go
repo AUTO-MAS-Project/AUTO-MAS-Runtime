@@ -73,6 +73,7 @@ type bootstrapOptions struct {
 	catalog    *mirror.Catalog
 	rotator    rotationRunner
 	artifact   Artifact
+	plan       mirror.PlanFunc
 }
 
 type rotationRunner interface {
@@ -161,6 +162,17 @@ func WithBootstrapCatalog(catalog *mirror.Catalog) BootstrapOption {
 	}
 }
 
+// WithBootstrapPlanner 注入 uv 源尝试顺序的构造函数（增补 2 C16 的实测排序）；默认按目录顺序。
+func WithBootstrapPlanner(plan mirror.PlanFunc) BootstrapOption {
+	return func(options *bootstrapOptions) error {
+		if plan == nil {
+			return errors.New("uv bootstrap planner is invalid")
+		}
+		options.plan = plan
+		return nil
+	}
+}
+
 // WithBootstrapRotator 注入镜像轮换器。
 func WithBootstrapRotator(rotator rotationRunner) BootstrapOption {
 	return func(options *bootstrapOptions) error {
@@ -183,6 +195,7 @@ type Bootstrapper struct {
 	catalog    *mirror.Catalog
 	rotator    rotationRunner
 	artifact   Artifact
+	plan       mirror.PlanFunc
 }
 
 // NewBootstrapper 创建生产 bootstrap 服务。
@@ -229,6 +242,9 @@ func NewBootstrapper(
 		values.artifact.Version == "" {
 		return nil, errors.New("uv bootstrap dependencies are incomplete")
 	}
+	if values.plan == nil {
+		values.plan = mirror.CatalogPlanFunc(values.catalog)
+	}
 	return &Bootstrapper{
 		layout:     layout,
 		downloader: values.downloader,
@@ -239,6 +255,7 @@ func NewBootstrapper(
 		catalog:    values.catalog,
 		rotator:    values.rotator,
 		artifact:   values.artifact,
+		plan:       values.plan,
 	}, nil
 }
 
@@ -561,7 +578,7 @@ func (b *Bootstrapper) download(
 	if err != nil {
 		return mirror.DownloadResult{}, wrapBootstrapError(protocol.StageUVDownload, err)
 	}
-	plan, err := mirror.BuildPlan(b.catalog, policy, mirror.KindUV)
+	plan, err := b.plan(ctx, policy, mirror.KindUV)
 	if err != nil {
 		return mirror.DownloadResult{}, wrapBootstrapError(protocol.StageUVDownload, err)
 	}
@@ -572,6 +589,14 @@ func (b *Bootstrapper) download(
 		attempt mirror.Attempt,
 	) mirror.AttemptOutcome {
 		url := strings.TrimRight(attempt.Source.BaseURL(), "/") + "/" + spec.Version + "/" + spec.Name
+		var attemptProgress mirror.ProgressFunc
+		if progress != nil {
+			sourceKey := attempt.Source.Key()
+			attemptProgress = func(update mirror.DownloadProgress) error {
+				update.Source = sourceKey
+				return progress(update)
+			}
+		}
 		downloadResult, downloadErr := b.downloader.Download(attemptContext, mirror.DownloadRequest{
 			URL:              url,
 			FileName:         spec.Name,
@@ -579,7 +604,7 @@ func (b *Bootstrapper) download(
 			AllowUnknownSize: true,
 			MaxSize:          maxUVDownloadBytes,
 			ExpectedSHA256:   spec.SHA256,
-			Progress:         progress,
+			Progress:         attemptProgress,
 		})
 		if downloadErr == nil {
 			downloadedPath = downloadResult.Path

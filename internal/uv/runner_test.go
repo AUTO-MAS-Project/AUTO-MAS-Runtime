@@ -169,6 +169,8 @@ func TestRunner_InjectsManagedEnvironment(t *testing.T) {
 		uvPythonInstallBinEnv: "0",
 		uvColorEnv:            "never",
 		uvNoProgressEnv:       "1",
+		uvNoSystemConfigEnv:   "1",
+		uvNoConfigEnv:         "1",
 		uvPythonInstallDirEnv: runner.PythonInstallDir,
 		uvProjectEnvironment:  runner.ProjectEnvDir,
 		uvCacheDirEnv:         runner.CacheDir,
@@ -715,4 +717,167 @@ func TestFakeUVProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+// TestRunner_AllowsHTTPTimeoutOverride 锁定增补 2 C17 第 6 条：中继路径可以注入 UV_HTTP_TIMEOUT，
+// 但宿主环境里的同名变量仍被剔除，避免用户配置漂进受控调用。
+func TestRunner_AllowsHTTPTimeoutOverride(t *testing.T) {
+	t.Setenv(uvHTTPTimeoutEnv, "5")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{
+		"uv_http_timeout": "900",
+	}})
+	if got := environment[uvHTTPTimeoutEnv]; got != "900" {
+		t.Fatalf("environment[%q] = %q, want 900", uvHTTPTimeoutEnv, got)
+	}
+	if containsEnvironmentKeyMap(environment, "uv_http_timeout") && environment["uv_http_timeout"] != "" {
+		t.Fatalf("lowercase key survived, want canonical %q only", uvHTTPTimeoutEnv)
+	}
+}
+
+// TestRunner_StillStripsHostHTTPTimeout 锁定不传覆盖时宿主的 UV_HTTP_TIMEOUT 不进 uv。
+func TestRunner_StillStripsHostHTTPTimeout(t *testing.T) {
+	t.Setenv(uvHTTPTimeoutEnv, "5")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{}})
+	if containsEnvironmentKeyMap(environment, uvHTTPTimeoutEnv) {
+		t.Fatalf("environment contains %q = %q, want scrubbed", uvHTTPTimeoutEnv, environment[uvHTTPTimeoutEnv])
+	}
+}
+
+// TestRunner_InjectsNoConfig 锁定增补 2 C20：uv 子进程同时带 UV_NO_CONFIG=1 与 UV_NO_SYSTEM_CONFIG=1，
+// 用户级 %APPDATA%\uv\uv.toml、项目及其父目录里的 uv.toml / [tool.uv] 都不再参与；宿主与调用方都改不掉。
+func TestRunner_InjectsNoConfig(t *testing.T) {
+	t.Setenv(uvNoConfigEnv, "0")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{
+		uvNoConfigEnv:                  "0",
+		strings.ToLower(uvNoConfigEnv): "0",
+	}})
+	for key, want := range map[string]string{
+		uvNoConfigEnv:       "1",
+		uvNoSystemConfigEnv: "1",
+	} {
+		if got := environment[key]; got != want {
+			t.Fatalf("environment[%q] = %q, want %q", key, got, want)
+		}
+	}
+	if got := environment[strings.ToLower(uvNoConfigEnv)]; got != "" {
+		t.Fatalf("lowercase %q survived with %q", uvNoConfigEnv, got)
+	}
+}
+
+// TestRunner_ScrubsHostPythonEnvironment 锁定增补 2 C20 的宿主隔离名单：会改变解释器或 uv 自身行为的
+// PYTHON* / 虚拟环境 / 颜色 / Rust 调试变量不从宿主继承，只保留四个不改变「跑什么代码」的编码与缓冲变量；
+// Runtime 自己经 RunOptions.Environment 显式注入的值不受名单影响。
+func TestRunner_ScrubsHostPythonEnvironment(t *testing.T) {
+	scrubbed := map[string]string{
+		"PYTHONHOME":     `C:\bogus`,
+		"PYTHONPATH":     `C:\bogus\lib`,
+		"pythonsafepath": "1",
+		"PYTHONWARNINGS": "error",
+		"PYTHONOPTIMIZE": "2",
+		"PYTHONINSPECT":  "1",
+		"PYTHON_COLORS":  "1",
+		"VIRTUAL_ENV":    `C:\bogus\venv`,
+		"CONDA_PREFIX":   `C:\bogus\conda`,
+		"FORCE_COLOR":    "1",
+		"CLICOLOR_FORCE": "1",
+		"NO_COLOR":       "1",
+		"RUST_LOG":       "trace",
+		"RUST_MIN_STACK": "1",
+		"RUST_BACKTRACE": "full",
+	}
+	passthrough := map[string]string{
+		"PYTHONIOENCODING":        "utf-8",
+		"PYTHONUTF8":              "1",
+		"PYTHONUNBUFFERED":        "1",
+		"PYTHONDONTWRITEBYTECODE": "1",
+	}
+	for key, value := range scrubbed {
+		t.Setenv(key, value)
+	}
+	for key, value := range passthrough {
+		t.Setenv(key, value)
+	}
+	explicit := map[string]string{
+		"PYTHONPATH":  `D:\explicit`,
+		"VIRTUAL_ENV": `D:\explicit\venv`,
+		"FORCE_COLOR": "explicit",
+	}
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: explicit})
+	for key := range scrubbed {
+		if _, injected := explicit[key]; injected {
+			continue
+		}
+		if containsEnvironmentKeyMap(environment, key) {
+			t.Errorf("environment contains host %q = %q, want scrubbed", key, environment[key])
+		}
+	}
+	for key, want := range passthrough {
+		if got := environment[key]; got != want {
+			t.Errorf("environment[%q] = %q, want host value %q", key, got, want)
+		}
+	}
+	for key, want := range explicit {
+		if got := environment[key]; got != want {
+			t.Errorf("explicit %s = %q, want RunOptions value %q kept", key, got, want)
+		}
+	}
+}
+
+// TestRunner_LoopbackNeverProxied 锁定增补 2 C20：宿主代理变量原样继承，但 NO_PROXY 必含 127.0.0.1 与
+// localhost——uv（reqwest）会把回环中继的请求也送进 HTTP(S)_PROXY / ALL_PROXY，且 NO_PROXY=localhost
+// 并不豁免 127.0.0.1（uv 0.12.3 实测）。
+func TestRunner_LoopbackNeverProxied(t *testing.T) {
+	testCases := []struct {
+		name     string
+		hostKey  string
+		hostVal  string
+		override map[string]string
+		want     string
+	}{
+		{name: "absent", want: "127.0.0.1,localhost"},
+		{name: "host lowercase appended", hostKey: "no_proxy", hostVal: "intranet.example", want: "intranet.example,127.0.0.1,localhost"},
+		{name: "already present keeps order", hostKey: "NO_PROXY", hostVal: " localhost , 127.0.0.1 ,,", want: "localhost,127.0.0.1"},
+		{name: "case-insensitive dedupe", hostKey: "NO_PROXY", hostVal: "LOCALHOST", want: "LOCALHOST,127.0.0.1"},
+		{name: "wildcard untouched", hostKey: "NO_PROXY", hostVal: "*", want: "*"},
+		{name: "option override wins over host", hostKey: "NO_PROXY", hostVal: "host.example", override: map[string]string{"no_proxy": "option.example"}, want: "option.example,127.0.0.1,localhost"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("HTTPS_PROXY", "http://proxy.example:8080")
+			t.Setenv("http_proxy", "http://proxy.example:8080")
+			// 宿主可能带任意大小写的 NO_PROXY（Linux 上大小写是两个变量），逐个清掉再布置用例。
+			for _, entry := range os.Environ() {
+				if key, _, found := strings.Cut(entry, "="); found && strings.EqualFold(key, "NO_PROXY") {
+					t.Setenv(key, "")
+					os.Unsetenv(key)
+				}
+			}
+			if testCase.hostKey != "" {
+				t.Setenv(testCase.hostKey, testCase.hostVal)
+			}
+			runner := newTestRunner(t)
+			environment := runner.EnvironmentForTesting(RunOptions{Environment: testCase.override})
+			if got := environment["NO_PROXY"]; got != testCase.want {
+				t.Fatalf("environment[NO_PROXY] = %q, want %q (full: %v)", got, testCase.want, environment)
+			}
+			count := 0
+			for key := range environment {
+				if strings.EqualFold(key, "NO_PROXY") {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("NO_PROXY appears %d times, want exactly one canonical key", count)
+			}
+			for key, want := range map[string]string{"HTTPS_PROXY": "http://proxy.example:8080", "http_proxy": "http://proxy.example:8080"} {
+				if got := environment[key]; got != want {
+					t.Fatalf("environment[%q] = %q, want host proxy kept", key, got)
+				}
+			}
+		})
+	}
 }

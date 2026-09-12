@@ -3,6 +3,7 @@ module github.com/AUTO-MAS-Project/AUTO-MAS-Runtime
 go 1.26
 
 require (
+	github.com/BurntSushi/toml v1.5.0
 	github.com/getsentry/sentry-go v0.48.0
 	github.com/go-git/go-billy/v5 v5.9.0
 	github.com/go-git/go-git/v5 v5.19.2

@@ -554,3 +554,43 @@ func testHumanRendererFailureIsSticky(
 func float64Pointer(value float64) *float64 {
 	return &value
 }
+
+// TestHumanRenderer_FormatsItemSourceSpeed 锁定 human 模式对细目字段的渲染：
+// 条目放方括号、来源加 @ 前缀、吞吐按 MB/s 保留两位小数，且都只在字段存在时出现。
+func TestHumanRenderer_FormatsItemSourceSpeed(t *testing.T) {
+	rate := int64(3_355_443)
+	slow := int64(204_800)
+	tests := []struct {
+		name  string
+		event protocol.ProgressEvent
+		want  string
+	}{
+		{
+			"item only",
+			protocol.ProgressEvent{Stage: protocol.StageDependenciesSync, Status: protocol.ProgressRunning, Item: "numpy-2.3.3-cp312-cp312-win_amd64.whl", Message: "syncing"},
+			"PROGRESS [dependencies.sync] running [numpy-2.3.3-cp312-cp312-win_amd64.whl] — syncing\n",
+		},
+		{
+			"item source speed",
+			protocol.ProgressEvent{Stage: protocol.StageDependenciesSync, Status: protocol.ProgressRunning, Item: "numpy-2.3.3-cp312-cp312-win_amd64.whl", Source: "aliyun", BytesPerSecond: &rate, Message: "syncing"},
+			"PROGRESS [dependencies.sync] running [numpy-2.3.3-cp312-cp312-win_amd64.whl] @aliyun 3.20 MB/s — syncing\n",
+		},
+		{
+			"probe",
+			protocol.ProgressEvent{Stage: protocol.StageNetworkProbe, Status: protocol.ProgressRunning, Item: "tsinghua", Source: "tsinghua", BytesPerSecond: &slow, Message: "probe"},
+			"PROGRESS [network.probe] running [tsinghua] @tsinghua 0.20 MB/s — probe\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout, _, emitter := newHumanEmitter(t, "v1.0.0", "doctor", nil)
+			stdout.Reset()
+			if err := emitter.EmitProgress(test.event); err != nil {
+				t.Fatalf("EmitProgress() error = %v", err)
+			}
+			if got := stdout.String(); got != test.want {
+				t.Errorf("stdout = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

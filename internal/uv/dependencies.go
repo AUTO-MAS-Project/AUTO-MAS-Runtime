@@ -12,6 +12,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
 )
 
 const maxUVLockFileBytes = 16 << 20
@@ -28,6 +29,10 @@ type DependenciesRequest struct {
 	Line          LineFunc
 	// Attempt 在镜像轮换的每次尝试开始前报告当前源，可为 nil。
 	Attempt MirrorAttemptFunc
+	// Progress 接收经中继下载时的聚合字节进度（增补 2 C18），可为 nil。
+	Progress func(relay.Progress) error
+	// RelayLog 接收中继的诊断（换源、哈希不符、剔除、收口失败），可为 nil；level 为 info / warning / error。
+	RelayLog func(level, message string, fields map[string]any)
 }
 
 // DependenciesResult 保存锁文件检查或同步后的稳定结果。
@@ -43,6 +48,8 @@ type DependenciesResult struct {
 	AttemptCount int
 	// LockRewritten 报告成功那次是否用了改写后的锁副本。
 	LockRewritten bool
+	// Relay 是经中继同步时的下载摘要；没有走中继时为 nil。
+	Relay *relay.Summary
 }
 
 // DependenciesService 负责锁文件契约、项目模式同步和 managed venv 重建。
@@ -53,6 +60,12 @@ type DependenciesService struct {
 	catalog        *mirror.Catalog
 	rotator        sourceRotator
 	stagingRemover TreeRemover
+	// plan 给出包索引源的尝试顺序；默认目录顺序，增补 2 C16 起可注入实测排序。
+	plan mirror.PlanFunc
+	// relay 非 nil 时在线同步先经回环中继（增补 2 C17）；中继起不来退回逐源轮换。
+	relay RelayFactory
+	// intel 为测速器，登记包索引探针目标并提供 Accept-Ranges 能力；可为 nil。
+	intel sourceIntel
 }
 
 // NewDependenciesService 创建主项目依赖服务。
@@ -89,6 +102,9 @@ func NewDependenciesService(
 		}
 		configured.rotator = rotator
 	}
+	if configured.plan == nil {
+		configured.plan = mirror.CatalogPlanFunc(configured.catalog)
+	}
 	return &DependenciesService{
 		layout:         layout,
 		runner:         runner,
@@ -96,6 +112,9 @@ func NewDependenciesService(
 		catalog:        configured.catalog,
 		rotator:        configured.rotator,
 		stagingRemover: configured.stagingRemover,
+		plan:           configured.plan,
+		relay:          configured.relay,
+		intel:          configured.intel,
 	}, nil
 }
 
@@ -146,6 +165,13 @@ func (s *DependenciesService) Sync(
 	}
 	if request.MirrorPolicy.Offline() {
 		return s.syncOffline(ctx, request)
+	}
+	lock, projectFile, err := s.readSyncInputs(request)
+	if err != nil {
+		return DependenciesResult{}, err
+	}
+	if result, handled, err := s.syncWithRelay(ctx, request, lock, projectFile); handled {
+		return result, err
 	}
 	return s.syncWithMirrors(ctx, request)
 }

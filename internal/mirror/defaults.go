@@ -50,6 +50,13 @@ func DefaultCatalog() (*Catalog, error) {
 			official: true,
 		},
 		{
+			// uv 0.12.3 自己的默认分发地址（增补 2 C19）；进目录后由实测决定它排哪，
+			// 它不是官方位，github 仍是本 Kind 唯一的官方源。
+			kind:    KindPython,
+			key:     "astral",
+			baseURL: "https://releases.astral.sh/github/python-build-standalone/releases/download",
+		},
+		{
 			kind:    KindPython,
 			key:     "gh-proxy",
 			baseURL: "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download",

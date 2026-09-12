@@ -18,6 +18,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
@@ -1114,6 +1115,10 @@ type m5TestEnvironment struct {
 	pythonRequest          uv.PythonRequest
 	dependencyRequest      uv.DependenciesRequest
 	uvProgress             []mirror.DownloadProgress
+	// relayProgress 非空时 PreparePython 与 SyncDependencies 会把它逐条交给请求方的 Progress 回调，
+	// 模拟经中继下载时的字节进度；relaySummary 非 nil 时随结果返回。
+	relayProgress []relay.Progress
+	relaySummary  *relay.Summary
 }
 
 func (s *m5TestEnvironment) Ensure(context.Context, uv.EnvironmentRequest) (uv.EnvironmentResult, error) {
@@ -1203,7 +1208,14 @@ func (s *m5TestEnvironment) PreparePython(_ context.Context, request uv.PythonRe
 	if s.pythonErr != nil {
 		return uv.PythonResult{}, s.pythonErr
 	}
-	return uv.PythonResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, nil
+	if request.Progress != nil {
+		for _, progress := range s.relayProgress {
+			if err := request.Progress(progress); err != nil {
+				return uv.PythonResult{}, err
+			}
+		}
+	}
+	return uv.PythonResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}, Relay: s.relaySummary}, nil
 }
 
 func (s *m5TestEnvironment) CheckPython(context.Context, uv.PythonRequest) (uv.PythonCheckResult, error) {
@@ -1225,7 +1237,15 @@ func (s *m5TestEnvironment) SyncDependencies(ctx context.Context, request uv.Dep
 	if s.dependencyErr != nil {
 		return uv.DependenciesResult{}, s.dependencyErr
 	}
+	if request.Progress != nil {
+		for _, progress := range s.relayProgress {
+			if err := request.Progress(progress); err != nil {
+				return uv.DependenciesResult{}, err
+			}
+		}
+	}
 	return uv.DependenciesResult{
+		Relay:           s.relaySummary,
 		LockfileChecked: true,
 		Synchronized:    true,
 		SourceKind:      "package-index",

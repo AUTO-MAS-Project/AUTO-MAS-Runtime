@@ -30,11 +30,14 @@ type IO struct {
 }
 
 type options struct {
-	cwd                          string
-	clock                        func() time.Time
-	versionSource                versionSourceFunc
-	doctorFactory                doctorFactory
-	workspaceFactory             workspaceFactory
+	cwd              string
+	clock            func() time.Time
+	versionSource    versionSourceFunc
+	doctorFactory    doctorFactory
+	workspaceFactory workspaceFactory
+	// ranker 是本次 Execute 的测速器持有者：生产工厂从这里取实测顺序，
+	// 测试注入的工厂不看它。每次 Execute 新建，不跨进程调用共享。
+	ranker                       *rankerHolder
 	workspaceLoggerFactory       workspaceLoggerFactory
 	environmentFactory           environmentFactory
 	environmentStateStoreFactory environmentStateStoreFactory
@@ -69,14 +72,21 @@ func WithClock(clock func() time.Time) Option {
 }
 
 func applyOptions(values ...Option) (options, error) {
+	holder := &rankerHolder{}
 	result := options{
 		cwd:           mustGetwd(),
 		clock:         time.Now,
 		versionSource: version.Load,
+		ranker:        holder,
 		doctorFactory: func(layout *config.Layout, probes doctor.Probes) (doctorService, error) {
 			return doctor.New(layout, probes)
 		},
 		workspaceFactory: func(layout *config.Layout) (workspaceService, error) {
+			if plan := holder.planFunc(); plan != nil {
+				return gitrepo.NewService(layout, gitrepo.WithPlanBuilder(func(ctx context.Context, policy mirror.Policy) (mirror.Plan, error) {
+					return plan(ctx, policy, mirror.KindGit)
+				}))
+			}
 			return gitrepo.NewService(layout)
 		},
 		workspaceLoggerFactory: func(
@@ -97,6 +107,9 @@ func applyOptions(values ...Option) (options, error) {
 			)
 		},
 		environmentFactory: func(layout *config.Layout) (environmentService, error) {
+			if ranker := holder.get(); ranker != nil {
+				return uv.NewProductionEnvironment(layout, uv.WithProductionRanker(ranker))
+			}
 			return uv.NewProductionEnvironment(layout)
 		},
 		environmentStateStoreFactory: func(
@@ -119,7 +132,7 @@ func applyOptions(values ...Option) (options, error) {
 			clock func() time.Time,
 			mirrorPolicy mirror.Policy,
 		) (backendService, error) {
-			return backend.NewProductionManagedSupervisor(ctx, layout, stderr, clock, mirrorPolicy)
+			return backend.NewProductionManagedSupervisor(ctx, layout, stderr, clock, mirrorPolicy, backend.WithRanker(holder.get()))
 		},
 		telemetryFactory: telemetry.New,
 	}

@@ -101,8 +101,11 @@ func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
 		t.Fatalf("progress events = %#v, want %#v", got, want)
 	}
 	for index := range want {
-		if got[index] != want[index] {
-			t.Errorf("progress[%d] = %#v, want %#v", index, got[index], want[index])
+		// 轮换回调把本次尝试的源 key 填进 Source（增补 2 C18 第 5 条），目录首位是 agentsmirror。
+		expected := want[index]
+		expected.Source = "agentsmirror"
+		if got[index] != expected {
+			t.Errorf("progress[%d] = %#v, want %#v", index, got[index], expected)
 		}
 	}
 }
@@ -224,6 +227,7 @@ func TestBootstrap_RepairForwardsDownloadProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RepairWithProgress() error = %v", err)
 	}
+	want.Source = "agentsmirror"
 	if got != want {
 		t.Fatalf("repair progress = %#v, want %#v", got, want)
 	}

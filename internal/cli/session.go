@@ -105,6 +105,10 @@ func runOperationSession(
 		return sessionSetupFailure(deps, err)
 	}
 	telemetryState.sessionStarted = true
+	// 测速器随会话建立：生产工厂从 holder 取实测顺序；建不出来只降级为目录顺序。
+	if ranker, rankerErr := newNetworkRanker(emitter, deps.opLog); rankerErr == nil {
+		deps.options.ranker.set(ranker)
+	}
 	if err := ctx.Err(); err != nil {
 		telemetryState.operationErr = err
 		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
@@ -173,6 +177,9 @@ func runOperationSession(
 		}
 		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
 		return exitCode
+	}
+	if probe := networkProbeDetails(deps.options.ranker.get()); probe != nil {
+		success.details = withNetworkProbeDetails(success.details, probe)
 	}
 	exitCode, telemetryState.terminalWritten = emitSuccess(deps, emitter, stage, success)
 	if exitCode != protocol.ExitCodeSuccess {

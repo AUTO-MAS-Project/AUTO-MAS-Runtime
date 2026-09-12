@@ -24,9 +24,17 @@ func NewProductionManagedSupervisor(
 	stderr io.Writer,
 	clock func() time.Time,
 	mirrorPolicy mirror.Policy,
+	options ...SupervisorOption,
 ) (*ManagedSupervisor, error) {
 	if ctx == nil || layout == nil || stderr == nil {
 		return nil, errors.New("production backend arguments are invalid")
+	}
+	var configured supervisorOptions
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("production backend option must not be nil")
+		}
+		option(&configured)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -80,6 +88,22 @@ func NewProductionManagedSupervisor(
 		PythonPaths:  []string{layout.VenvPythonExecutable(), layout.PythonExecutable()},
 		PID:          state.NewSystemPIDProbe(),
 		MirrorPolicy: mirrorPolicy,
+		Ranker:       configured.ranker,
+		Relay:        productionRelayStarter,
 	}
 	return NewManagedSupervisor(layout, deps)
+}
+
+// SupervisorOption 配置生产监督器的可选依赖。
+type SupervisorOption func(*supervisorOptions)
+
+type supervisorOptions struct {
+	ranker *mirror.Ranker
+}
+
+// WithRanker 注入本进程的测速器；nil 表示按目录顺序（调用方无需自己判空）。
+func WithRanker(ranker *mirror.Ranker) SupervisorOption {
+	return func(options *supervisorOptions) {
+		options.ranker = ranker
+	}
 }

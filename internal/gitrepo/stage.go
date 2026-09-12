@@ -99,7 +99,7 @@ func (s *Service) Stage(ctx context.Context, request StageRequest) (result Stage
 	} else if !errors.Is(err, state.ErrNotFound) {
 		return StageResult{}, serviceStateWriteError(protocol.StageWorkspaceCheck, err)
 	}
-	plan, err := s.buildPlan(request.Policy)
+	plan, err := s.buildPlan(ctx, request.Policy)
 	if err != nil {
 		return StageResult{}, servicePolicyArgumentError(err)
 	}
