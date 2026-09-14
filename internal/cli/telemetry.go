@@ -82,17 +82,23 @@ func recordSessionTelemetry(
 		}
 	}
 	stage := fallbackStage
-	internalError := false
+	code := protocol.CodeOK
+	reason := ""
 	if operationErr != nil {
-		code, classifiedStage, _, _ := classifyFailure(operationErr, fallbackStage)
+		classifiedCode, classifiedStage, _, details := classifyFailure(operationErr, fallbackStage)
+		code = classifiedCode
 		stage = classifiedStage
-		internalError = code == protocol.CodeInternalError
+		reason = telemetryReason(details)
 	}
-	if internalError || panicked {
+	if panicked {
+		code = protocol.CodeInternalError
+	}
+	if code != protocol.CodeOK && code != protocol.CodeOperationCancelled {
 		safeTelemetryCaptureInternal(recorder, telemetry.InternalObservation{
 			Command:         command,
 			Stage:           string(stage),
-			Code:            string(protocol.CodeInternalError),
+			Code:            string(code),
+			Reason:          reason,
 			RuntimeVersion:  runtimeVersion,
 			ProtocolVersion: protocol.Version,
 			Platform:        runtime.GOOS + "/" + runtime.GOARCH,
@@ -101,6 +107,20 @@ func recordSessionTelemetry(
 		})
 	}
 	safeTelemetryClose(recorder)
+}
+
+func telemetryReason(details map[string]any) string {
+	reason, _ := details["reason"].(string)
+	if reason == "" || len(reason) > 64 {
+		return ""
+	}
+	for _, character := range reason {
+		if !((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') ||
+			character == '.' || character == '-' || character == '_') {
+			return ""
+		}
+	}
+	return reason
 }
 
 func newSessionTelemetryState(

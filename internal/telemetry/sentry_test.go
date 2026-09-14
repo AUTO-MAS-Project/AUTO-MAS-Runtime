@@ -13,6 +13,8 @@ import (
 	"time"
 
 	sentry "github.com/getsentry/sentry-go"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 type recordingSentryTransport struct {
@@ -131,6 +133,42 @@ func TestSentry_CapturesOnlyInternalError(t *testing.T) {
 	}
 }
 
+func TestSentry_CapturesExpectedFailureWithReason(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = string(protocol.CodeUpdateStateAmbiguous)
+	observation.Reason = "repository_unknown"
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 || events[0].Tags["reason"] != "repository_unknown" {
+		t.Fatalf("events = %#v, want expected failure reason", events)
+	}
+}
+
+func TestSentry_BeforeSendRejectsCancelledAndMismatchedFailureKinds(t *testing.T) {
+	_, transport := newSentryTestProvider(t)
+	options, _, _, _ := transport.snapshot()
+	tests := []struct {
+		name string
+		kind string
+		code string
+	}{
+		{name: "cancelled", kind: sentryObservationFailure, code: string(protocol.CodeOperationCancelled)},
+		{name: "success", kind: sentryObservationFailure, code: string(protocol.CodeOK)},
+		{name: "internal as ordinary", kind: sentryObservationFailure, code: string(protocol.CodeInternalError)},
+		{name: "ordinary as internal", kind: sentryObservationInternal, code: string(protocol.CodeNetworkUnavailable)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event := sentry.NewEvent()
+			event.Tags = map[string]string{sentryObservationTag: test.kind, "code": test.code}
+			if got := options.BeforeSend(event, nil); got != nil {
+				t.Fatalf("BeforeSend() = %#v, want nil", got)
+			}
+		})
+	}
+}
+
 func TestSentry_CapturesUnexpectedPanicWithoutPanicValue(t *testing.T) {
 	provider, transport := newSentryTestProvider(t)
 	provider.captureInternal(validSentryObservation(true))
@@ -164,6 +202,7 @@ func TestSentry_BeforeSendRemovesPIIAndRawText(t *testing.T) {
 	event := sentry.NewEvent()
 	event.Tags = map[string]string{
 		sentryObservationTag: "internal_error",
+		"code":               string(protocol.CodeInternalError),
 		"command":            rawPath,
 		"stage":              "backend_spawn",
 		"hostname":           "alice-pc",
@@ -209,7 +248,7 @@ func TestSentry_BeforeSendRemovesPIIAndRawText(t *testing.T) {
 
 func TestSentry_SanitizesStackFramePaths(t *testing.T) {
 	event := sentry.NewEvent()
-	event.Tags = map[string]string{sentryObservationTag: sentryObservationInternal}
+	event.Tags = map[string]string{sentryObservationTag: sentryObservationInternal, "code": string(protocol.CodeInternalError)}
 	event.Exception = []sentry.Exception{{Stacktrace: &sentry.Stacktrace{Frames: []sentry.Frame{
 		{Function: "safeFunction", Module: "github.com/example/runtime", Filename: `C:\Users\alice\main.go`, AbsPath: `C:\Users\alice\main.go`, Lineno: 7},
 		{Function: `C:\Users\alice\privateFunction`, Module: `/Users/alice/private`, Filename: `/Users/alice/main.go`, AbsPath: `/Users/alice/main.go`, Lineno: 8},

@@ -11,11 +11,12 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
-// InternalObservation 是允许发送到 Sentry 的内部错误分类。
+// InternalObservation 是允许发送到 Sentry 的失败分类。
 type InternalObservation struct {
 	Command         string
 	Stage           string
 	Code            string
+	Reason          string
 	RuntimeVersion  string
 	ProtocolVersion int
 	Platform        string
@@ -107,7 +108,7 @@ func safeProviderFactory(factory providerFactory, config Config) (candidate prov
 	return factory(config)
 }
 
-// CaptureInternal 记录允许上报的内部错误分类，不携带原始错误文本。
+// CaptureInternal 记录允许上报的失败分类；名称为既有内部接口，不携带原始错误文本。
 func (o *Observer) CaptureInternal(ctx context.Context, observation InternalObservation) {
 	if o == nil || ctx == nil || ctx.Err() != nil || !validInternalObservation(observation) {
 		return
@@ -181,9 +182,19 @@ func validInternalObservation(observation InternalObservation) bool {
 			return false
 		}
 	}
+	code := protocol.Code(observation.Code)
+	definition, known := protocol.LookupErrorDefinition(code)
+	if !known || definition.ExitCode == protocol.ExitCodeSuccess || code == protocol.CodeOperationCancelled {
+		return false
+	}
+	if observation.Panic && code != protocol.CodeInternalError {
+		return false
+	}
+	if observation.Reason != "" && !validStableToken(observation.Reason, 64, true) {
+		return false
+	}
 	return validCommand(observation.Command) &&
 		protocol.IsKnownStage(protocol.Stage(observation.Stage)) &&
-		observation.Code == string(protocol.CodeInternalError) &&
 		validRuntimeVersion(observation.RuntimeVersion) && validPlatform(observation.Platform) &&
 		observation.ProtocolVersion == protocol.Version
 }

@@ -21,14 +21,16 @@ const (
 
 	sentryObservationTag      = "_auto_mas_observation"
 	sentryObservationInternal = "internal_error"
+	sentryObservationFailure  = "failure"
 	sentryObservationPanic    = "panic"
 
 	sentryInternalMessage = "runtime internal error"
+	sentryFailureMessage  = "runtime operation failed"
 	sentryPanicMessage    = "runtime panic"
 	sentryExceptionType   = "auto_mas_runtime"
 )
 
-// sentryProvider 将稳定的内部错误分类转换为经净化的 Sentry 事件。
+// sentryProvider 将稳定的失败分类转换为经净化的 Sentry 事件。
 type sentryProvider struct {
 	client       *sentry.Client
 	hub          *sentry.Hub
@@ -124,6 +126,9 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 		kind = sentryObservationPanic
 		level = sentry.LevelFatal
 		message = sentryPanicMessage
+	} else if observation.Code != string(protocol.CodeInternalError) {
+		kind = sentryObservationFailure
+		message = sentryFailureMessage
 	}
 
 	event := sentry.NewEvent()
@@ -137,6 +142,9 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 		"runtime_version":    observation.RuntimeVersion,
 		"protocol_version":   strconv.Itoa(observation.ProtocolVersion),
 		"platform":           observation.Platform,
+	}
+	if observation.Reason != "" {
+		event.Tags["reason"] = observation.Reason
 	}
 	stacktrace := sentry.NewStacktrace()
 	if len(observation.PanicFrames) > 0 {
@@ -208,7 +216,15 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		return nil
 	}
 	kind, ok := event.Tags[sentryObservationTag]
-	if !ok || (kind != sentryObservationInternal && kind != sentryObservationPanic) {
+	if !ok || (kind != sentryObservationInternal && kind != sentryObservationFailure && kind != sentryObservationPanic) {
+		return nil
+	}
+	code := protocol.Code(event.Tags["code"])
+	definition, known := protocol.LookupErrorDefinition(code)
+	if !known || definition.ExitCode == protocol.ExitCodeSuccess || code == protocol.CodeOperationCancelled ||
+		(kind == sentryObservationInternal && code != protocol.CodeInternalError) ||
+		(kind == sentryObservationPanic && code != protocol.CodeInternalError) ||
+		(kind == sentryObservationFailure && code == protocol.CodeInternalError) {
 		return nil
 	}
 	if release == "" {
@@ -221,6 +237,9 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 	message := sentryInternalMessage
 	level := sentry.LevelError
 	mechanism := (*sentry.Mechanism)(nil)
+	if kind == sentryObservationFailure {
+		message = sentryFailureMessage
+	}
 	if kind == sentryObservationPanic {
 		message = sentryPanicMessage
 		level = sentry.LevelFatal
@@ -250,7 +269,7 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 }
 
 func sanitizeSentryTags(tags map[string]string) map[string]string {
-	allowed := [...]string{"command", "stage", "code", "runtime_version", "protocol_version", "platform"}
+	allowed := [...]string{"command", "stage", "code", "reason", "runtime_version", "protocol_version", "platform"}
 	clean := make(map[string]string, len(allowed))
 	for _, key := range allowed {
 		value := strings.TrimSpace(tags[key])
@@ -272,6 +291,8 @@ func validSentryTag(key, value string) bool {
 		return protocol.IsKnownStage(protocol.Stage(value))
 	case "code":
 		return value == codeNone || protocol.IsKnownCode(protocol.Code(value))
+	case "reason":
+		return validStableToken(value, 64, true)
 	case "runtime_version":
 		return validRuntimeVersion(value)
 	case "platform":

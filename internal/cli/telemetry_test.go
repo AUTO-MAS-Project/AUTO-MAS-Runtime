@@ -177,13 +177,13 @@ func TestRunOperation_InternalErrorReportsSentryOnly(t *testing.T) {
 	}
 }
 
-func TestRunOperation_ExpectedFailureDoesNotReportSentry(t *testing.T) {
+func TestRunOperation_ExpectedFailureReportsSentry(t *testing.T) {
 	recorder := &telemetryRecorderSpy{}
 	var stdout bytes.Buffer
 	code := executeWithTelemetry(t, []string{"--output", "ndjson", "doctor"}, recorder, &stdout,
 		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
 			return fakeDoctorService{run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
-				return doctor.Report{}, doctor.NewError(protocol.CodeNetworkUnavailable, protocol.StageDoctor, "网络不可用", map[string]any{}, errors.New("expected failure"))
+				return doctor.Report{}, doctor.NewError(protocol.CodeNetworkUnavailable, protocol.StageDoctor, "网络不可用", map[string]any{"reason": "probe_failed"}, errors.New("expected failure"))
 			}}, nil
 		}),
 	)
@@ -191,8 +191,28 @@ func TestRunOperation_ExpectedFailureDoesNotReportSentry(t *testing.T) {
 		t.Fatalf("exit code = %d, want %d", code, protocol.ExitCodeNetworkFailure)
 	}
 	internal, _, _ := recorder.snapshot()
-	if len(internal) != 0 {
-		t.Fatalf("internal observations = %#v, want none", internal)
+	if len(internal) != 1 || internal[0].Code != string(protocol.CodeNetworkUnavailable) || internal[0].Reason != "probe_failed" {
+		t.Fatalf("internal observations = %#v, want one sanitized expected failure", internal)
+	}
+}
+
+func TestTelemetryReason_RejectsUnboundedDetails(t *testing.T) {
+	tests := []struct {
+		name    string
+		details map[string]any
+		want    string
+	}{
+		{name: "safe", details: map[string]any{"reason": "repository_unknown"}, want: "repository_unknown"},
+		{name: "path", details: map[string]any{"reason": `C:\\Users\\secret`}},
+		{name: "free text", details: map[string]any{"reason": "repository unknown"}},
+		{name: "non string", details: map[string]any{"reason": 42}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := telemetryReason(test.details); got != test.want {
+				t.Fatalf("telemetryReason() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
