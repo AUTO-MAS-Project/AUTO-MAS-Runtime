@@ -2,7 +2,9 @@ package uv
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -222,6 +224,36 @@ func TestRunner_ForwardsLinesAndExitCode(t *testing.T) {
 	}
 	if len(lines) != 4 {
 		t.Fatalf("forwarded lines = %#v, want 4 lines", lines)
+	}
+}
+
+func TestRunner_FailureDetailsExcludeCapturedOutput(t *testing.T) {
+	runner := newTestRunner(t)
+	result, err := runner.Run(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, RunOptions{
+		Stage: protocol.StageDependenciesSync,
+		Environment: map[string]string{
+			"FAKE_UV_STDOUT": "stdout-secret",
+			"FAKE_UV_STDERR": "stderr-secret",
+			"FAKE_UV_EXIT":   "7",
+		},
+	})
+	var operationErr *Error
+	if !errors.As(err, &operationErr) {
+		t.Fatalf("Run() error = %T %v, want uv Error", err, err)
+	}
+	details := operationErr.Details()
+	if details["failureKind"] != "nonzero_exit" || details["exitCode"] != 7 {
+		t.Fatalf("failure details = %#v, want nonzero_exit and exitCode 7", details)
+	}
+	if details["capturedStdoutBytes"] != len(result.Stdout) || details["capturedStderrBytes"] != len(result.Stderr) {
+		t.Fatalf("failure byte counts = %#v, want stdout=%d stderr=%d", details, len(result.Stdout), len(result.Stderr))
+	}
+	encoded, marshalErr := json.Marshal(details)
+	if marshalErr != nil {
+		t.Fatalf("json.Marshal() error = %v", marshalErr)
+	}
+	if bytes.Contains(encoded, []byte("stdout-secret")) || bytes.Contains(encoded, []byte("stderr-secret")) {
+		t.Fatalf("failure details contain captured output: %s", encoded)
 	}
 }
 

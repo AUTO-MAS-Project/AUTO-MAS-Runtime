@@ -13,15 +13,16 @@ import (
 
 // InternalObservation 是允许发送到 Sentry 的失败分类。
 type InternalObservation struct {
-	Command         string
-	Stage           string
-	Code            string
-	Reason          string
-	RuntimeVersion  string
-	ProtocolVersion int
-	Platform        string
-	Panic           bool
-	PanicFrames     []StackFrame
+	Command           string
+	Stage             string
+	Code              string
+	Reason            string
+	DiagnosticDetails map[string]any
+	RuntimeVersion    string
+	ProtocolVersion   int
+	Platform          string
+	Panic             bool
+	PanicFrames       []StackFrame
 }
 
 // StackFrame 是允许附带到 panic 观测的最小栈帧；不包含源文件路径或局部变量。
@@ -183,8 +184,7 @@ func validInternalObservation(observation InternalObservation) bool {
 		}
 	}
 	code := protocol.Code(observation.Code)
-	definition, known := protocol.LookupErrorDefinition(code)
-	if !known || definition.ExitCode == protocol.ExitCodeSuccess || code == protocol.CodeOperationCancelled {
+	if !IsReportableFailure(code) {
 		return false
 	}
 	if observation.Panic && code != protocol.CodeInternalError {

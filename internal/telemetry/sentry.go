@@ -146,6 +146,11 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 	if observation.Reason != "" {
 		event.Tags["reason"] = observation.Reason
 	}
+	if kind == sentryObservationFailure && len(observation.DiagnosticDetails) > 0 {
+		event.Contexts = map[string]sentry.Context{"diagnostics": {
+			"details": observation.DiagnosticDetails,
+		}}
+	}
 	stacktrace := sentry.NewStacktrace()
 	if len(observation.PanicFrames) > 0 {
 		frames := make([]sentry.Frame, 0, len(observation.PanicFrames))
@@ -220,8 +225,7 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		return nil
 	}
 	code := protocol.Code(event.Tags["code"])
-	definition, known := protocol.LookupErrorDefinition(code)
-	if !known || definition.ExitCode == protocol.ExitCodeSuccess || code == protocol.CodeOperationCancelled ||
+	if !IsReportableFailure(code) ||
 		(kind == sentryObservationInternal && code != protocol.CodeInternalError) ||
 		(kind == sentryObservationPanic && code != protocol.CodeInternalError) ||
 		(kind == sentryObservationFailure && code == protocol.CodeInternalError) {
@@ -265,7 +269,25 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 			Mechanism:  mechanism,
 		}},
 	}
+	if kind == sentryObservationFailure {
+		if diagnostics := sanitizeSentryDiagnostics(event.Contexts); diagnostics != nil {
+			sanitized.Contexts = map[string]sentry.Context{"diagnostics": diagnostics}
+		}
+	}
 	return sanitized
+}
+
+func sanitizeSentryDiagnostics(contexts map[string]sentry.Context) sentry.Context {
+	raw, ok := contexts["diagnostics"]
+	if !ok {
+		return nil
+	}
+	details, _ := raw["details"].(map[string]any)
+	details = SanitizeDiagnostics(details)
+	if len(details) == 0 {
+		return nil
+	}
+	return map[string]any{"details": details}
 }
 
 func sanitizeSentryTags(tags map[string]string) map[string]string {

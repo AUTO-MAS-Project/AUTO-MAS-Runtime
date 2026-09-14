@@ -150,7 +150,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			map[string]any{"failureKind": "request_invalid"},
 			errors.New("uv runner context is nil"),
 		)
 	}
@@ -159,7 +159,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			map[string]any{"failureKind": "request_invalid"},
 			errors.New("uv runner request is invalid"),
 		)
 	}
@@ -172,7 +172,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			map[string]any{"failureKind": "path_invalid"},
 			err,
 		)
 	}
@@ -193,7 +193,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			map[string]any{"failureKind": "pipe_open_failed"},
 			err,
 		)
 	}
@@ -205,7 +205,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			map[string]any{"failureKind": "pipe_open_failed"},
 			err,
 		)
 	}
@@ -236,7 +236,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			map[string]any{},
+			map[string]any{"failureKind": "pipe_close_failed"},
 			closeWriteErr,
 		)
 	}
@@ -248,7 +248,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUnsupportedMode,
 			options.Stage,
 			"当前平台尚不支持 uv 进程树监督",
-			map[string]any{},
+			map[string]any{"failureKind": "process_isolation_unsupported"},
 			jobErr,
 		)
 	}
@@ -259,7 +259,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 进程隔离失败",
-			map[string]any{},
+			map[string]any{"failureKind": "process_isolation_failed"},
 			jobErr,
 		)
 	}
@@ -272,7 +272,7 @@ func (r *UVRunner) Run(
 				protocol.CodeUVExecFailed,
 				options.Stage,
 				"uv 进程隔离失败",
-				map[string]any{},
+				map[string]any{"failureKind": "process_isolation_failed"},
 				err,
 			)
 		}
@@ -345,7 +345,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 输出读取失败",
-			runnerDetails(result, resolved),
+			runnerFailureDetails(result, resolved, "output_read_failed"),
 			streamErr,
 		)
 	}
@@ -354,9 +354,7 @@ func (r *UVRunner) Run(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 执行失败",
-			mergeDetails(runnerDetails(result, resolved), map[string]any{
-				"exitCode": result.ExitCode,
-			}),
+			runnerFailureDetails(result, resolved, "nonzero_exit"),
 			waitErr,
 		)
 	}
@@ -830,16 +828,25 @@ func exitCode(err error) int {
 
 func runnerDetails(result UVResult, options resolvedRunOptions) map[string]any {
 	return map[string]any{
-		"exitCode":      result.ExitCode,
-		"durationMs":    result.Duration.Milliseconds(),
-		"pythonVersion": options.PythonVersion,
-		"branch":        options.Branch,
-		"commit":        options.Commit,
+		"exitCode":            result.ExitCode,
+		"durationMs":          result.Duration.Milliseconds(),
+		"capturedStdoutBytes": len(result.Stdout),
+		"capturedStderrBytes": len(result.Stderr),
+		"pythonVersion":       options.PythonVersion,
+		"branch":              options.Branch,
+		"commit":              options.Commit,
 	}
+}
+
+func runnerFailureDetails(result UVResult, options resolvedRunOptions, failureKind string) map[string]any {
+	details := runnerDetails(result, options)
+	details["failureKind"] = failureKind
+	return details
 }
 
 func startFailureDetails(options resolvedRunOptions, err error) map[string]any {
 	details := map[string]any{
+		"failureKind":      "start_failed",
 		"operation":        "start",
 		"projectDir":       filepath.Clean(options.ProjectDir),
 		"projectEnvDir":    filepath.Clean(options.ProjectEnvDir),

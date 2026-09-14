@@ -2,10 +2,12 @@ package uv
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -85,6 +87,44 @@ func TestDependencies_CheckDetectsUnsynchronizedEnvironment(t *testing.T) {
 	}
 	if got, want := runner.calls[1].options.Stage, protocol.StageDependenciesCheck; got != want {
 		t.Fatalf("check sync stage = %q, want %q", got, want)
+	}
+}
+
+func TestDependenciesService_FailureDetailsIdentifyUVPhase(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantFailure string
+	}{
+		{
+			name:        "dependency sync",
+			err:         dependencySyncError(UVResult{ExitCode: 7, Stdout: "secret-out", Stderr: "secret-err"}, errors.New("failed")),
+			wantFailure: "dependency_sync_nonzero",
+		},
+		{
+			name:        "dependency check",
+			err:         dependencyCheckError(UVResult{ExitCode: 8, Stdout: "secret-out", Stderr: "secret-err"}, errors.New("failed")),
+			wantFailure: "dependency_check_nonzero",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var operationErr *Error
+			if !errors.As(test.err, &operationErr) {
+				t.Fatalf("error = %T %v, want uv Error", test.err, test.err)
+			}
+			details := operationErr.Details()
+			if details["failureKind"] != test.wantFailure {
+				t.Fatalf("details[failureKind] = %#v, want %q", details["failureKind"], test.wantFailure)
+			}
+			encoded, err := json.Marshal(details)
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			if strings.Contains(string(encoded), "secret-out") || strings.Contains(string(encoded), "secret-err") {
+				t.Fatalf("details contain uv output: %s", encoded)
+			}
+		})
 	}
 }
 

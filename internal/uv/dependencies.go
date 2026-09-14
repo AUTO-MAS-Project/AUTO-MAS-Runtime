@@ -193,11 +193,10 @@ func (s *DependenciesService) syncOffline(
 			protocol.CodeNetworkUnavailable,
 			protocol.StageDependenciesSync,
 			"离线缓存不足，操作需要网络",
-			map[string]any{
+			mergeDetails(uvFailureDetails(result, "offline_cache_miss"), map[string]any{
 				"sourceKind":   mirror.KindPackageIndex.String(),
-				"exitCode":     result.ExitCode,
 				"attemptCount": 1,
-			},
+			}),
 			nonNilRunError(err),
 		)
 	}
@@ -233,7 +232,7 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 				protocol.CodeLockfileOutdated,
 				protocol.StageDependenciesCheck,
 				"项目锁文件已过期",
-				map[string]any{"exitCode": result.ExitCode},
+				uvFailureDetails(result, "lock_check_nonzero"),
 				err,
 			)
 		}
@@ -244,7 +243,7 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 			protocol.CodeLockfileOutdated,
 			protocol.StageDependenciesCheck,
 			"项目锁文件已过期",
-			map[string]any{"exitCode": result.ExitCode},
+			uvFailureDetails(result, "lock_check_nonzero"),
 			nil,
 		)
 	}
@@ -385,7 +384,7 @@ func dependencySyncError(result UVResult, cause error) error {
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesSync,
 		"Python 依赖同步失败",
-		map[string]any{"exitCode": result.ExitCode},
+		uvFailureDetails(result, "dependency_sync_nonzero"),
 		cause,
 	)
 }
@@ -398,9 +397,19 @@ func dependencyCheckError(result UVResult, cause error) error {
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesCheck,
 		"主项目依赖环境未同步",
-		map[string]any{"exitCode": result.ExitCode},
+		uvFailureDetails(result, "dependency_check_nonzero"),
 		cause,
 	)
+}
+
+func uvFailureDetails(result UVResult, failureKind string) map[string]any {
+	return map[string]any{
+		"failureKind":         failureKind,
+		"exitCode":            result.ExitCode,
+		"durationMs":          result.Duration.Milliseconds(),
+		"capturedStdoutBytes": len(result.Stdout),
+		"capturedStderrBytes": len(result.Stderr),
+	}
 }
 
 func containsNUL(value string) bool {

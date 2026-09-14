@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 type fakeProvider struct {
@@ -158,6 +160,30 @@ func TestObserver_NonPanicFramesAreRejected(t *testing.T) {
 	observer.CaptureInternal(context.Background(), observation)
 	if fake.internalCalls != 0 {
 		t.Fatalf("internal calls = %d, want 0", fake.internalCalls)
+	}
+}
+
+func TestFailureReportability_ExplicitPolicyForEveryFailureCode(t *testing.T) {
+	nonReportable := map[protocol.Code]bool{
+		protocol.CodeInvalidArgument:       true,
+		protocol.CodeInvalidVersion:        true,
+		protocol.CodeOperationCancelled:    true,
+		protocol.CodeMutationInProgress:    true,
+		protocol.CodeBackendAlreadyRunning: true,
+		protocol.CodeBackendStillRunning:   true,
+	}
+	for _, definition := range protocol.AllErrorDefinitions() {
+		want := definition.ExitCode != protocol.ExitCodeSuccess && !nonReportable[definition.Code]
+		classified, ok := failureReportability[definition.Code]
+		if definition.ExitCode != protocol.ExitCodeSuccess && !ok {
+			t.Fatalf("failureReportability[%q] is missing, want explicit policy", definition.Code)
+		}
+		if got := IsReportableFailure(definition.Code); got != want || (ok && classified != want) {
+			t.Fatalf("IsReportableFailure(%q) = %v, policy = %v/%v, want %v", definition.Code, got, classified, ok, want)
+		}
+	}
+	if IsReportableFailure(protocol.Code("FUTURE_FAILURE")) {
+		t.Fatal("unknown failure code is reportable, want fail-closed")
 	}
 }
 

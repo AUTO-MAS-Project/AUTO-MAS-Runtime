@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -213,6 +214,93 @@ func TestTelemetryReason_RejectsUnboundedDetails(t *testing.T) {
 				t.Fatalf("telemetryReason() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRunOperation_ExpectedFailureReportsSanitizedDiagnostics(t *testing.T) {
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	secret := `Authorization: Basic super-secret C:\Users\alice\runtime\update.json`
+	code := executeWithTelemetry(t, []string{"--output", "ndjson", "doctor"}, recorder, &stdout,
+		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
+			return fakeDoctorService{run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
+				return doctor.Report{}, doctor.NewError(protocol.CodeUpdateStateAmbiguous, protocol.StageDoctor, "现场异常", map[string]any{
+					"path": secret,
+					"attempts": []map[string]any{{
+						"source": "official", "outcome": "failed", "failureKind": "repository_invalid",
+					}},
+					"password": "do-not-upload",
+				}, errors.New(secret))
+			}}, nil
+		}),
+	)
+	if code != protocol.ExitCodeOperationConflict {
+		t.Fatalf("exit code = %d, want %d", code, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 {
+		t.Fatalf("observations = %#v, want one", observations)
+	}
+	if len(observations[0].DiagnosticDetails) == 0 {
+		t.Fatalf("diagnostics = %#v, want useful structured payload", observations[0].DiagnosticDetails)
+	}
+	encoded, err := json.Marshal(observations[0])
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	for _, forbidden := range []string{"alice", "super-secret", "do-not-upload", "Authorization", `C:\\Users`} {
+		if bytes.Contains(encoded, []byte(forbidden)) {
+			t.Fatalf("sanitized observation contains %q: %s", forbidden, encoded)
+		}
+	}
+	if !bytes.Contains(encoded, []byte("repository_invalid")) {
+		t.Fatalf("sanitized observation = %s, want stable failureKind", encoded)
+	}
+}
+
+func TestRunOperation_UnreportableFailureDoesNotReportSentry(t *testing.T) {
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	code := executeWithTelemetry(t, []string{"--output", "ndjson", "doctor"}, recorder, &stdout,
+		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
+			return fakeDoctorService{run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
+				return doctor.Report{}, doctor.NewError(protocol.CodeInvalidArgument, protocol.StageDoctor, "参数无效", map[string]any{}, errors.New("bad input"))
+			}}, nil
+		}),
+	)
+	if code != protocol.ExitCodeInvalidArgument {
+		t.Fatalf("exit code = %d, want %d", code, protocol.ExitCodeInvalidArgument)
+	}
+	observations, closes, _ := recorder.snapshot()
+	if len(observations) != 0 || closes != 1 {
+		t.Fatalf("telemetry = observations:%d close:%d, want 0/1", len(observations), closes)
+	}
+}
+
+func TestRunOperation_ExpectedFailureNeverUploadsRawError(t *testing.T) {
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	secret := `api_key=super-secret D:\private\repo`
+	code := executeWithTelemetry(t, []string{"--output", "ndjson", "doctor"}, recorder, &stdout,
+		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
+			return fakeDoctorService{run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
+				return doctor.Report{}, doctor.NewError(protocol.CodeUpdateStateAmbiguous, protocol.StageDoctor, "现场异常", map[string]any{"failureKind": "repository_unknown"}, errors.New(secret))
+			}}, nil
+		}),
+	)
+	if code != protocol.ExitCodeOperationConflict {
+		t.Fatalf("exit code = %d, want %d", code, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 {
+		t.Fatalf("observations = %#v, want one", observations)
+	}
+	encoded, err := json.Marshal(observations[0])
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if bytes.Contains(encoded, []byte("super-secret")) || bytes.Contains(encoded, []byte(`D:\\private`)) {
+		t.Fatalf("observation contains raw error: %s", encoded)
 	}
 }
 

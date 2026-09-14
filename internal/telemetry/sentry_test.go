@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -138,10 +139,111 @@ func TestSentry_CapturesExpectedFailureWithReason(t *testing.T) {
 	observation := validSentryObservation(false)
 	observation.Code = string(protocol.CodeUpdateStateAmbiguous)
 	observation.Reason = "repository_unknown"
+	observation.DiagnosticDetails = map[string]any{
+		"path":     `C:\Users\alice\repo`,
+		"attempts": []map[string]any{{"source": "github", "outcome": "failed", "failureKind": "network"}},
+		"password": "secret",
+	}
 	provider.captureInternal(observation)
 	_, events, _, _ := transport.snapshot()
 	if len(events) != 1 || events[0].Tags["reason"] != "repository_unknown" {
 		t.Fatalf("events = %#v, want expected failure reason", events)
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !bytes.Contains(encoded, []byte("repo")) || !bytes.Contains(encoded, []byte("failureKind")) ||
+		bytes.Contains(encoded, []byte("alice")) || bytes.Contains(encoded, []byte(`token=secret`)) {
+		t.Fatalf("diagnostic context = %s, want useful redacted data", encoded)
+	}
+}
+
+func TestSentry_BeforeSendRejectsUnreportableFailure(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = string(protocol.CodeInvalidArgument)
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 0 {
+		t.Fatalf("captured events = %d, want 0 for routine input failure", len(events))
+	}
+}
+
+func TestSentry_BeforeSendRejectsEncodedSecretDiagnosticFields(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = string(protocol.CodeUpdateStateAmbiguous)
+	observation.DiagnosticDetails = map[string]any{
+		"source":      `%22token%22%3A%22super-secret%22`,
+		"failureKind": `\{\"token\":\"super-secret\"\}`,
+		"bySource":    map[string]any{"access_token-super-secret": int64(1)},
+	}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("captured events = %d, want 1", len(events))
+	}
+	encoded, err := json.Marshal(events[0])
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if bytes.Contains(encoded, []byte("super-secret")) {
+		t.Fatalf("Sentry event contains encoded diagnostic secret: %s", encoded)
+	}
+}
+
+func TestSentry_BeforeSendDropsFreeTextDiagnosticChannel(t *testing.T) {
+	_, transport := newSentryTestProvider(t)
+	options, _, _, _ := transport.snapshot()
+	event := sentry.NewEvent()
+	event.Tags = map[string]string{
+		sentryObservationTag: sentryObservationFailure,
+		"code":               string(protocol.CodeUpdateStateAmbiguous),
+	}
+	event.Contexts = map[string]sentry.Context{"diagnostics": {
+		"error":   `\{\"token\":\"super-secret\"\}`,
+		"details": map[string]any{"failureKind": "repository_unknown"},
+	}}
+	sanitized := options.BeforeSend(event, nil)
+	if sanitized == nil {
+		t.Fatal("BeforeSend unexpectedly dropped reportable failure")
+	}
+	diagnostics := sanitized.Contexts["diagnostics"]
+	encoded, err := json.Marshal(diagnostics)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if bytes.Contains(encoded, []byte("super-secret")) {
+		t.Fatalf("Sentry event contains free-text diagnostic channel: %s", encoded)
+	}
+	if _, ok := diagnostics["error"]; ok {
+		t.Fatalf("Sentry diagnostics retained free-text error field: %#v", diagnostics)
+	}
+}
+
+func TestSentry_InternalAndPanicDropFailureDiagnostics(t *testing.T) {
+	tests := []struct {
+		name  string
+		panic bool
+	}{
+		{name: "internal"},
+		{name: "panic", panic: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider, transport := newSentryTestProvider(t)
+			observation := validSentryObservation(test.panic)
+			observation.DiagnosticDetails = map[string]any{"password": "secret", "exitCode": 7}
+			provider.captureInternal(observation)
+			_, events, _, _ := transport.snapshot()
+			if len(events) != 1 {
+				t.Fatalf("captured events = %d, want 1", len(events))
+			}
+			if _, ok := events[0].Contexts["diagnostics"]; ok {
+				t.Fatalf("internal/panic diagnostics = %#v, want absent", events[0].Contexts["diagnostics"])
+			}
+		})
 	}
 }
 
@@ -157,6 +259,7 @@ func TestSentry_BeforeSendRejectsCancelledAndMismatchedFailureKinds(t *testing.T
 		{name: "success", kind: sentryObservationFailure, code: string(protocol.CodeOK)},
 		{name: "internal as ordinary", kind: sentryObservationFailure, code: string(protocol.CodeInternalError)},
 		{name: "ordinary as internal", kind: sentryObservationInternal, code: string(protocol.CodeNetworkUnavailable)},
+		{name: "routine input failure", kind: sentryObservationFailure, code: string(protocol.CodeInvalidArgument)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

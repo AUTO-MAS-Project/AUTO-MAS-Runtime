@@ -84,26 +84,32 @@ func recordSessionTelemetry(
 	stage := fallbackStage
 	code := protocol.CodeOK
 	reason := ""
+	diagnosticDetails := map[string]any{}
 	if operationErr != nil {
 		classifiedCode, classifiedStage, _, details := classifyFailure(operationErr, fallbackStage)
 		code = classifiedCode
 		stage = classifiedStage
 		reason = telemetryReason(details)
+		if telemetry.IsReportableFailure(code) && code != protocol.CodeInternalError {
+			diagnosticDetails = telemetry.SanitizeDiagnostics(details)
+		}
 	}
 	if panicked {
 		code = protocol.CodeInternalError
+		diagnosticDetails = map[string]any{}
 	}
-	if code != protocol.CodeOK && code != protocol.CodeOperationCancelled {
+	if telemetry.IsReportableFailure(code) {
 		safeTelemetryCaptureInternal(recorder, telemetry.InternalObservation{
-			Command:         command,
-			Stage:           string(stage),
-			Code:            string(code),
-			Reason:          reason,
-			RuntimeVersion:  runtimeVersion,
-			ProtocolVersion: protocol.Version,
-			Platform:        runtime.GOOS + "/" + runtime.GOARCH,
-			Panic:           panicked,
-			PanicFrames:     append([]telemetry.StackFrame(nil), panicFrames...),
+			Command:           command,
+			Stage:             string(stage),
+			Code:              string(code),
+			Reason:            reason,
+			DiagnosticDetails: diagnosticDetails,
+			RuntimeVersion:    runtimeVersion,
+			ProtocolVersion:   protocol.Version,
+			Platform:          runtime.GOOS + "/" + runtime.GOARCH,
+			Panic:             panicked,
+			PanicFrames:       append([]telemetry.StackFrame(nil), panicFrames...),
 		})
 	}
 	safeTelemetryClose(recorder)
