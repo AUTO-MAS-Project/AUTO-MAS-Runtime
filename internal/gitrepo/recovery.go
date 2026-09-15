@@ -215,7 +215,11 @@ func (r *Recovery) Recover(
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "update_unknown", err)
 	}
-	previous, err := r.classifyPath(ctx, paths.previous, recoveryPathPolicy{})
+	allowIncompletePrevious := transaction.state.Stage == protocol.StageWorkspaceCleanup
+	previous, err := r.classifyPath(ctx, paths.previous, recoveryPathPolicy{
+		allowUnreadable:      allowIncompletePrevious,
+		allowInvalidIdentity: allowIncompletePrevious,
+	})
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "previous_unknown", err)
 	}
@@ -347,8 +351,9 @@ func (r *Recovery) classifyPath(
 	}
 	identity, err := repositoryIdentityFromSnapshot(snapshot)
 	if err != nil {
-		// swap 前失败的旧 repo 只会被原样保留；此处仅保留当前目录 token，
-		// 让恢复逻辑能够安全清理由 transaction 唯一标识的 update。
+		// swap 前失败的旧 repo 只会被原样保留；cleanup 阶段的 previous
+		// 已经失去回滚资格。两种情况都只保留当前目录 token，由恢复形状
+		// 决定是清理 transaction 的 update，还是继续删除 retired 残留。
 		if policy.allowInvalidIdentity {
 			return recoveryPath{kind: recoveryPathIncomplete, directoryIdentity: directoryIdentity}, nil
 		}
@@ -438,8 +443,7 @@ func (r *Recovery) recoverSwap(
 	update recoveryPath,
 	previous recoveryPath,
 ) (RecoveryResult, error) {
-	if update.kind == recoveryPathIncomplete ||
-		previous.kind == recoveryPathIncomplete {
+	if update.kind == recoveryPathIncomplete {
 		return RecoveryResult{}, recoveryAmbiguousError(
 			transaction.state.Stage,
 			"swap_incomplete",
@@ -458,10 +462,22 @@ func (r *Recovery) recoverSwap(
 	isTarget := func(path recoveryPath) bool {
 		return path.isTarget(targetVersion) && (transaction.state.TargetCommit == "" || path.identity.commit == transaction.state.TargetCommit)
 	}
+	completeIncompletePrevious := transaction.state.Stage == protocol.StageWorkspaceCleanup &&
+		transaction.state.TargetCommit != "" &&
+		isTarget(repository) &&
+		update.kind == recoveryPathMissing &&
+		previous.kind == recoveryPathIncomplete
+	if previous.kind == recoveryPathIncomplete && !completeIncompletePrevious {
+		return RecoveryResult{}, recoveryAmbiguousError(
+			transaction.state.Stage,
+			"swap_incomplete",
+			errRecoveryIdentityUnknown,
+		)
+	}
 	switch {
 	case isTarget(repository):
 		if update.kind != recoveryPathMissing ||
-			previous.kind != recoveryPathMissing && previous.kind != recoveryPathValid {
+			previous.kind != recoveryPathMissing && previous.kind != recoveryPathValid && !completeIncompletePrevious {
 			return RecoveryResult{}, recoveryAmbiguousError(
 				transaction.state.Stage,
 				"active_target_shape",
