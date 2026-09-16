@@ -15,7 +15,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 )
 
-const serviceCleanupTimeout = 30 * time.Second
+const serviceCleanupTimeout = 60 * time.Second
 
 var (
 	errInvalidService        = errors.New("workspace service is invalid")

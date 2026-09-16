@@ -28,7 +28,7 @@ const (
 	// 1 秒足以让 Electron 的不定进度动画感知到「还活着」，更密只增加 NDJSON 噪声，
 	// 更疏在慢网下会让用户误以为卡死；心跳只报活，不携带任何数值。
 	cloneHeartbeatInterval = time.Second
-	cloneCleanupTimeout    = 30 * time.Second
+	cloneCleanupTimeout    = 60 * time.Second
 	directoryCloseAttempts = 3
 
 	cloneProgressStartMessage     = "正在获取后端仓库"

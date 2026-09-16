@@ -15,7 +15,7 @@ import (
 const (
 	swapRenameReason   = "git-repository-swap"
 	swapCleanupReason  = "git-repository-retired"
-	swapCleanupTimeout = 30 * time.Second
+	swapCleanupTimeout = 60 * time.Second
 )
 
 var (

@@ -17,7 +17,7 @@ const (
 	recoveryUpdateCleanupReason   = "git-recovery-update"
 	recoveryPreviousCleanupReason = "git-recovery-previous"
 	recoveryRenameReason          = "git-recovery-rename"
-	recoveryCleanupTimeout        = 30 * time.Second
+	recoveryCleanupTimeout        = 60 * time.Second
 )
 
 var (

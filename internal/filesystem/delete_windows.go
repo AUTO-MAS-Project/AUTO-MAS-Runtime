@@ -14,6 +14,11 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
+const (
+	deleteRetryCount = 3
+	deleteRetryDelay = 10 * time.Second
+)
+
 // New 创建受管删除与原子重命名操作器。
 func New(
 	ctx context.Context,
@@ -436,6 +441,14 @@ func (o *Operator) RemoveTree(
 	request DeleteRequest,
 ) (DeleteResult, error) {
 	authorized, err := o.authorizeDeleteRequest(ctx, request)
+	retryCount := 0
+	for retryCount < deleteRetryCount && isTransientDeleteError(err) {
+		if waitErr := o.wait(ctx, deleteRetryDelay); waitErr != nil {
+			return DeleteResult{}, errors.Join(err, waitErr)
+		}
+		retryCount++
+		authorized, err = o.authorizeDeleteRequest(ctx, request)
+	}
 	if err != nil {
 		return DeleteResult{}, err
 	}
@@ -448,6 +461,14 @@ func (o *Operator) RemoveTree(
 	resultName := "not_found"
 	if authorized.exists {
 		operationErr = o.removePinnedTree(ctx, authorized.root, &state)
+		for retryCount < deleteRetryCount && isTransientDeleteError(operationErr) {
+			if waitErr := o.wait(ctx, deleteRetryDelay); waitErr != nil {
+				operationErr = errors.Join(operationErr, waitErr)
+				break
+			}
+			retryCount++
+			operationErr = o.removePinnedTree(ctx, authorized.root, &state)
+		}
 		if operationErr == nil {
 			resultName = "succeeded"
 		} else if errors.Is(operationErr, context.Canceled) ||
@@ -579,4 +600,10 @@ func recursiveDeleteSpec(directory bool) openSpec {
 		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		directory: false,
 	}
+}
+
+func isTransientDeleteError(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) ||
+		errors.Is(err, windows.ERROR_LOCK_VIOLATION) ||
+		errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }

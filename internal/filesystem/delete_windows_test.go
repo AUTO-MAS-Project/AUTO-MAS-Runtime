@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows"
 
@@ -73,6 +74,45 @@ func TestRemoveTree_RemovesReadOnlyFileByPinnedHandle(t *testing.T) {
 		t.Fatalf("target tree still exists: %v", err)
 	}
 	assertAuditPhases(t, auditor.records, "succeeded")
+}
+
+func TestRemoveTree_RetriesTransientDeleteFailureThreeTimes(t *testing.T) {
+	operator, layout, _ := newRemoveTreeFixture(t)
+	target := filepath.Join(layout.BuildCacheDir(), "file")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	setDisposition := operator.api.setDisposition
+	calls := 0
+	operator.api.setDisposition = func(handle windows.Handle) error {
+		calls++
+		if calls <= deleteRetryCount {
+			return windows.ERROR_SHARING_VIOLATION
+		}
+		return setDisposition(handle)
+	}
+	var waits []time.Duration
+	operator.wait = func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}
+
+	result, err := operator.RemoveTree(t.Context(), buildCacheDeleteRequest(layout))
+	if err != nil || !result.Removed || result.Partial {
+		t.Fatalf("RemoveTree() = %#v, %v", result, err)
+	}
+	if calls != deleteRetryCount+2 {
+		t.Fatalf("delete calls = %d, want %d", calls, deleteRetryCount+2)
+	}
+	if len(waits) != deleteRetryCount {
+		t.Fatalf("waits = %v, want %d waits", waits, deleteRetryCount)
+	}
+	for index, delay := range waits {
+		if delay != deleteRetryDelay {
+			t.Fatalf("wait[%d] = %v, want %v", index, delay, deleteRetryDelay)
+		}
+	}
 }
 
 func TestDeleteDispositionFlags_IgnoreReadOnlyWithoutPOSIX(t *testing.T) {
