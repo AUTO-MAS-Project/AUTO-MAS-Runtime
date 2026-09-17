@@ -1,0 +1,49 @@
+#   AUTO-MAS Runtime: Windows 本机运行时管理程序
+#   Copyright © 2025-2026 AUTO-MAS Team
+#
+#   This file incorporates work covered by the following copyright and
+#   permission notice:
+#
+#       git-sync Copyright © 2024-present cnb.cool
+#       https://cnb.cool/cnb/plugins/tencentcom/git-sync
+
+name: Sync to CNB
+
+# GitHub 是唯一权威源，本工作流把全部分支与 Tag 只读镜像到 CNB。
+# 不叠加 create 事件触发器：同一次新 Tag 的 push 会与 create 双触发。
+# GITHUB_TOKEN 发起的 push 不会触发工作流（GitHub 官方限制），对代码同步无害：
+# 发版链路的 Tag 由用户本机推送，Release 部分由 release.yml 的 publish-cnb 处理。
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-cnb-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Mirror refs to CNB
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.repository == 'AUTO-MAS-Project/AUTO-MAS-Runtime'
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sync to CNB repository
+        uses: docker://tencentcom/git-sync@sha256:b7c4672616ddea5b89948dcd034610b29d37d8430e74b4bc83b421c963c25f77
+        env:
+          PLUGIN_TARGET_URL: "https://cnb.cool/AUTO-MAS-Project/AUTO-MAS-Runtime.git"
+          PLUGIN_AUTH_TYPE: "https"
+          PLUGIN_USERNAME: "cnb"
+          PLUGIN_PASSWORD: ${{ secrets.GIT_PASSWORD }}
+          PLUGIN_PUSH_TAGS: "true"
+          PLUGIN_FORCE: "true"

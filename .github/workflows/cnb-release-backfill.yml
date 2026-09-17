@@ -1,0 +1,141 @@
+#   AUTO-MAS Runtime: Windows 本机运行时管理程序
+#   Copyright © 2025-2026 AUTO-MAS Team
+
+name: Backfill CNB releases
+
+# 把已发布的 GitHub Release 回填到 CNB。仅手动触发：
+# - tag 填精确 Tag（如 v0.1.10）做单版本试点；
+# - tag 填 all 按创建时间从旧到新回填全部 Release。
+# GitHub 无 Release 的 Tag（如 V0.1.8）只随 sync-cnb 同步 Git ref，不凭空创建 Release。
+# 幂等：CNB 已存在且一致的 Release 视为成功；不一致立即失败，绝不覆盖。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Exact release tag (e.g. v0.1.10) or 'all'"
+        required: true
+        default: all
+      dry_run:
+        description: "Report differences without touching CNB"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cnb-release-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Backfill CNB release
+    runs-on: windows-latest
+    timeout-minutes: 60
+    if: github.repository == 'AUTO-MAS-Project/AUTO-MAS-Runtime'
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve target tags
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_INPUT: ${{ github.event.inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:TAG_INPUT)) {
+            throw "tag input is required"
+          }
+          if ($env:TAG_INPUT -eq "all") {
+            $tags = @()
+            for ($page = 1; ; $page++) {
+              $listPath = "repos/$($env:REPOSITORY)/releases?per_page=100&page=$page"
+              $response = & gh api $listPath --method GET 2>$null
+              if ($LASTEXITCODE -ne 0) {
+                throw "unable to list GitHub releases on page $page"
+              }
+              $releases = $response | ConvertFrom-Json -ErrorAction Stop
+              if ($releases.Count -eq 0) { break }
+              foreach ($release in $releases) {
+                if ($release.draft) { continue }
+                $tags += [string]$release.tag_name
+              }
+            }
+            if ($tags.Count -eq 0) {
+              throw "GitHub has no published releases to backfill"
+            }
+          }
+          else {
+            $tagBytes = [Text.Encoding]::UTF8.GetByteCount($env:TAG_INPUT)
+            if ($tagBytes -lt 2 -or $tagBytes -gt 128 -or $env:TAG_INPUT -cnotmatch '^v[A-Za-z0-9._-]+$') {
+              throw "tag input is not a valid runtime version"
+            }
+            $tags = @($env:TAG_INPUT)
+          }
+          $serialized = ($tags -join "`n")
+          "tags<<EOF_MARKER" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8NoBOM
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value $serialized -Encoding utf8NoBOM
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "EOF_MARKER" -Encoding utf8NoBOM
+
+      - name: Backfill each release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          API_URL: ${{ github.api_url }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.tags }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TEMP "cnb-backfill"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          foreach ($tag in ($env:RELEASE_TAG -split "`n")) {
+            if ([string]::IsNullOrWhiteSpace($tag)) { continue }
+            Write-Host "==> Backfilling $tag"
+            $assetsDir = Join-Path $root $tag
+            New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null
+            $arguments = @(
+              "-GitHubToken", $env:GH_TOKEN,
+              "-GitHubApiUrl", $env:API_URL,
+              "-GitHubRepository", $env:REPOSITORY,
+              "-CnbToken", $env:CNB_TOKEN,
+              "-CnbRepository", "AUTO-MAS-Project/AUTO-MAS-Runtime",
+              "-Tag", $tag,
+              "-AssetsDir", $assetsDir
+            )
+            if ($env:DRY_RUN -eq "true") {
+              $arguments += "-DryRun"
+            }
+            & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE "scripts/publish-cnb-release.ps1") @arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "backfill for $tag failed (exit $LASTEXITCODE)"
+            }
+          }
+
+      - name: Summarize
+        if: always()
+        env:
+          TAG_INPUT: ${{ github.event.inputs.tag }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # GITHUB_STEP_SUMMARY 本身就是文件路径，直接写入。
+          $summary = $env:GITHUB_STEP_SUMMARY
+          "## CNB backfill" | Set-Content -LiteralPath $summary -Encoding utf8NoBOM
+          "- tag input: $env:TAG_INPUT" | Add-Content -LiteralPath $summary -Encoding utf8NoBOM
+          "- dry run: $env:DRY_RUN_INPUT" | Add-Content -LiteralPath $summary -Encoding utf8NoBOM
+          "- outcome: $env:JOB_STATUS" | Add-Content -LiteralPath $summary -Encoding utf8NoBOM

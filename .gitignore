@@ -26,3 +26,5 @@ Thumbs.db
 Desktop.ini
 
 *.ps1
+# Release 工作流依赖 scripts/ 下的 PowerShell 脚本，必须随仓库分发（T7.7）。
+!scripts/*.ps1
