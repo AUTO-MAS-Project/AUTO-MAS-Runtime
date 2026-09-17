@@ -434,3 +434,65 @@ jobs:
           if ($results[0].success -ne $true) {
             throw "doctor smoke result was not successful"
           }
+
+  publish-cnb:
+    name: Publish CNB release
+    needs:
+      - package
+      - publish
+      - smoke
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assetsDir = Join-Path $env:RUNNER_TEMP "cnb-release-assets"
+          New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null
+          & gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --dir $assetsDir --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "unable to download published release assets for CNB"
+          }
+          $assets = @(Get-ChildItem -LiteralPath $assetsDir -File)
+          if ($assets.Count -lt 2) {
+            throw "published release assets are incomplete for CNB publishing"
+          }
+
+      - name: Publish to CNB
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.package.outputs.source_commit }}
+          REPOSITORY: ${{ github.repository }}
+          API_URL: ${{ github.api_url }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE "scripts/publish-cnb-release.ps1") `
+            -GitHubToken $env:GH_TOKEN `
+            -GitHubApiUrl $env:API_URL `
+            -GitHubRepository $env:REPOSITORY `
+            -CnbToken $env:CNB_TOKEN `
+            -CnbRepository "AUTO-MAS-Project/AUTO-MAS-Runtime" `
+            -Tag $env:RELEASE_TAG `
+            -ExpectedCommit $env:SOURCE_COMMIT `
+            -AssetsDir (Join-Path $env:RUNNER_TEMP "cnb-release-assets")
+          if ($LASTEXITCODE -ne 0) {
+            throw "CNB release publishing failed (exit $LASTEXITCODE)"
+          }
