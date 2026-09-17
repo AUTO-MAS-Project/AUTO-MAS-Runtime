@@ -183,13 +183,146 @@ func TestReleaseWorkflow_VersionedExecutableName(t *testing.T) {
 	}
 }
 
+func TestSyncCnbWorkflow_MirrorContract(t *testing.T) {
+	source := readWorkflowSource(t, "sync-cnb.yml")
+	required := []struct {
+		name    string
+		snippet string
+	}{
+		{name: "push trigger", snippet: "on:\n  push:\n  workflow_dispatch:"},
+		{name: "formal repository guard", snippet: "if: github.repository == 'AUTO-MAS-Project/AUTO-MAS-Runtime'"},
+		{name: "read-only permission", snippet: "permissions:\n  contents: read"},
+		{name: "full history checkout", snippet: "fetch-depth: 0"},
+		{name: "no persisted credentials", snippet: "persist-credentials: false"},
+		{name: "pinned git-sync digest", snippet: "uses: docker://tencentcom/git-sync@sha256:b7c4672616ddea5b89948dcd034610b29d37d8430e74b4bc83b421c963c25f77"},
+		{name: "CNB target repository", snippet: "PLUGIN_TARGET_URL: \"https://cnb.cool/AUTO-MAS-Project/AUTO-MAS-Runtime.git\""},
+		{name: "https auth", snippet: "PLUGIN_AUTH_TYPE: \"https\""},
+		{name: "fixed username", snippet: "PLUGIN_USERNAME: \"cnb\""},
+		{name: "git password secret", snippet: "PLUGIN_PASSWORD: ${{ secrets.GIT_PASSWORD }}"},
+		{name: "push tags", snippet: "PLUGIN_PUSH_TAGS: \"true\""},
+		{name: "forced mirror", snippet: "PLUGIN_FORCE: \"true\""},
+		{name: "per-ref concurrency", snippet: "group: sync-cnb-${{ github.ref }}"},
+	}
+	for _, test := range required {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(source, test.snippet) {
+				t.Fatalf("sync-cnb workflow missing %s snippet %q", test.name, test.snippet)
+			}
+		})
+	}
+	if strings.Contains(source, "create:") {
+		t.Fatal("sync-cnb workflow must not double-trigger on tag creation")
+	}
+	if strings.Contains(source, "cnb.cool/AUTO-MAS-Project/AUTO-MAS.git") {
+		t.Fatal("sync-cnb workflow targets the AUTO-MAS repository instead of the runtime repository")
+	}
+}
+
+func TestReleaseWorkflow_PublishCnbJobContract(t *testing.T) {
+	source := releaseWorkflowSource(t)
+	required := []struct {
+		name    string
+		snippet string
+	}{
+		{name: "job id", snippet: "publish-cnb:"},
+		{name: "after smoke", snippet: "needs:\n      - package\n      - publish\n      - smoke"},
+		{name: "windows runner", snippet: "runs-on: windows-latest"},
+		{name: "read-only permission", snippet: "permissions:\n      contents: read"},
+		{name: "repository checkout", snippet: "persist-credentials: false"},
+		{name: "publisher script", snippet: "scripts/publish-cnb-release.ps1"},
+		{name: "CNB token secret", snippet: "CNB_TOKEN: ${{ secrets.CNB_TOKEN }}"},
+		{name: "download from published release", snippet: "gh release download $env:RELEASE_TAG"},
+	}
+	for _, test := range required {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(source, test.snippet) {
+				t.Fatalf("release workflow missing %s snippet %q", test.name, test.snippet)
+			}
+		})
+	}
+	if got := strings.Count(source, "contents: write"); got != 1 {
+		t.Fatalf("contents: write count = %d, want 1 publish-only permission", got)
+	}
+	if !strings.Contains(source, "name: Publish CNB release") {
+		t.Fatal("release workflow missing the CNB publish job display name")
+	}
+}
+
+func TestBackfillWorkflow_ManualOnlyContract(t *testing.T) {
+	source := readWorkflowSource(t, "cnb-release-backfill.yml")
+	required := []struct {
+		name    string
+		snippet string
+	}{
+		{name: "dispatch only trigger", snippet: "on:\n  workflow_dispatch:"},
+		{name: "tag input", snippet: "tag:"},
+		{name: "formal repository guard", snippet: "if: github.repository == 'AUTO-MAS-Project/AUTO-MAS-Runtime'"},
+		{name: "read-only permission", snippet: "permissions:\n  contents: read"},
+		{name: "publisher script", snippet: "scripts/publish-cnb-release.ps1"},
+		{name: "CNB token secret", snippet: "CNB_TOKEN: ${{ secrets.CNB_TOKEN }}"},
+		{name: "single-flight concurrency", snippet: "group: cnb-release-backfill"},
+	}
+	for _, test := range required {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(source, test.snippet) {
+				t.Fatalf("backfill workflow missing %s snippet %q", test.name, test.snippet)
+			}
+		})
+	}
+	if strings.Contains(source, "push:") || strings.Contains(source, "schedule:") {
+		t.Fatal("backfill workflow must only run via workflow_dispatch")
+	}
+}
+
+func TestPublishCnbScript_SafetyContract(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller() did not return the test file")
+	}
+	path := filepath.Join(filepath.Dir(file), "..", "..", "scripts", "publish-cnb-release.ps1")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	source := strings.ReplaceAll(string(data), "\r\n", "\n")
+	required := []struct {
+		name    string
+		snippet string
+	}{
+		{name: "no asset overwrite", snippet: "overwrite  = $false"},
+		{name: "commit inequality check", snippet: "-cne"},
+		{name: "refuse draft release", snippet: "draft"},
+		{name: "upload without auth header", snippet: "upload_url"},
+		{name: "sha256 verification", snippet: "SHA256"},
+		{name: "bearer prefix", snippet: "Bearer"},
+	}
+	for _, test := range required {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(source, test.snippet) {
+				t.Fatalf("publish script missing %s snippet %q", test.name, test.snippet)
+			}
+		})
+	}
+	for _, forbidden := range []string{"overwrite = $true", "--insecure", "-SkipCertificateCheck"} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("publish script contains forbidden snippet %q", forbidden)
+		}
+	}
+}
+
 func releaseWorkflowSource(t *testing.T) string {
+	t.Helper()
+	return readWorkflowSource(t, "release.yml")
+}
+
+// readWorkflowSource 读取 .github/workflows 下的工作流源码并统一换行符，便于子串断言。
+func readWorkflowSource(t *testing.T, name string) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller() did not return the test file")
 	}
-	path := filepath.Join(filepath.Dir(file), "..", "..", ".github", "workflows", "release.yml")
+	path := filepath.Join(filepath.Dir(file), "..", "..", ".github", "workflows", name)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(%q) error = %v", path, err)
