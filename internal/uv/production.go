@@ -420,10 +420,12 @@ func (s *ProductionEnvironment) services(
 	if err != nil {
 		return nil, err
 	}
+	// 依赖服务的删除器只用于重建时删受管 venv；uv 版本目录删除器会先按 uv 版本校验，
+	// 删 venv 的请求不带版本，接错就让 rebuild / repair 必然失败（T13.19）。
 	dependencies, err := NewDependenciesService(
 		s.layout,
 		runner,
-		filesystemVersionRemover{layout: s.layout},
+		filesystemDependencyRemover{layout: s.layout, command: "dependencies-rebuild"},
 		dependenciesOptions...,
 	)
 	if err != nil {

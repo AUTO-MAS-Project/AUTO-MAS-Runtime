@@ -502,17 +502,21 @@ func writeStagingFile(stagingDir, name, contents string) (returnErr error) {
 	return err
 }
 
-// filesystemDependencyRemover 用受控删除移除依赖同步的临时项目目录。
-type filesystemDependencyRemover struct{ layout *config.Layout }
+// filesystemDependencyRemover 用受控删除移除依赖服务管理的目录（同步用的临时项目目录、
+// 重建时的受管 venv），审计写入 command 对应的操作日志。
+type filesystemDependencyRemover struct {
+	layout  *config.Layout
+	command string
+}
 
 func (r filesystemDependencyRemover) RemoveTree(
 	ctx context.Context,
 	request filesystem.DeleteRequest,
 ) (filesystem.DeleteResult, error) {
-	if r.layout == nil {
-		return filesystem.DeleteResult{}, errors.New("dependency staging remover layout is invalid")
+	if r.layout == nil || r.command == "" {
+		return filesystem.DeleteResult{}, errors.New("dependency remover is invalid")
 	}
-	logger, err := logging.New(ctx, r.layout, io.Discard, "dependencies-sync", request.OperationID)
+	logger, err := logging.New(ctx, r.layout, io.Discard, r.command, request.OperationID)
 	if err != nil {
 		return filesystem.DeleteResult{}, err
 	}

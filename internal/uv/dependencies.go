@@ -78,7 +78,9 @@ func NewDependenciesService(
 	if layout == nil || runner == nil || remover == nil {
 		return nil, errors.New("dependencies service dependencies are incomplete")
 	}
-	configured := dependenciesOptions{stagingRemover: filesystemDependencyRemover{layout: layout}}
+	configured := dependenciesOptions{
+		stagingRemover: filesystemDependencyRemover{layout: layout, command: "dependencies-sync"},
+	}
 	for index, option := range options {
 		if option == nil {
 			return nil, fmt.Errorf("dependencies option at index %d is nil", index)
