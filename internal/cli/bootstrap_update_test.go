@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -174,5 +175,32 @@ func TestBootstrap_FailureIsRecordedInOperationLog(t *testing.T) {
 	}
 	if failure.details["code"] == nil || failure.details["stage"] == nil {
 		t.Fatalf("failure record details = %+v, want code and stage", failure.details)
+	}
+}
+
+func TestRecordOperationFailure_StateWriteCauseStaysInLocalLog(t *testing.T) {
+	log := &m5TestLog{}
+	binding := &workspaceLogBinding{}
+	binding.Set(log)
+	deps := &deps{ctx: t.Context(), opLog: binding}
+	cause := stateStoreError(protocol.StageBootstrap,
+		errors.Join(filesystem.ErrPOSIXUnlinkUnsupported, errors.New("probe rejected")))
+	recordOperationFailure(deps, protocol.CodeStateWriteFailed, protocol.StageBootstrap,
+		"环境状态写入失败", map[string]any{}, cause)
+	if len(log.records) != 1 || !strings.Contains(log.records[0].details["cause"].(string),
+		"filesystem POSIX unlink is unsupported") {
+		t.Fatalf("state failure log records = %+v, want filesystem cause", log.records)
+	}
+}
+
+func TestRecordOperationFailure_EarlyStateFailureWritesCauseToStderr(t *testing.T) {
+	var stderr bytes.Buffer
+	deps := &deps{ctx: t.Context(), io: IO{Err: &stderr}, opLog: &workspaceLogBinding{}}
+	cause := stateStoreError(protocol.StageBootstrap,
+		errors.Join(filesystem.ErrPOSIXUnlinkUnsupported, errors.New("probe rejected")))
+	recordOperationFailure(deps, protocol.CodeStateWriteFailed, protocol.StageBootstrap,
+		"环境状态写入失败", map[string]any{}, cause)
+	if !strings.Contains(stderr.String(), "filesystem POSIX unlink is unsupported") {
+		t.Fatalf("stderr = %q, want underlying filesystem cause", stderr.String())
 	}
 }

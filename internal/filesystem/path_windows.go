@@ -1183,6 +1183,20 @@ func setStateDispositionWindows(
 		unsafe.Pointer(&information),
 		uintptr(unsafe.Sizeof(information)),
 	); err != nil {
+		if spec.flags == deleteDispositionFlags() &&
+			(errors.Is(err, windows.ERROR_INVALID_PARAMETER) ||
+				errors.Is(err, windows.ERROR_NOT_SUPPORTED)) {
+			legacy := fileDispositionInfo{deleteFile: 1}
+			if legacyErr := setFileInformationWindows(
+				handle,
+				fileDispositionInfoClass,
+				unsafe.Pointer(&legacy),
+				uintptr(unsafe.Sizeof(legacy)),
+			); legacyErr != nil {
+				return fmt.Errorf("set state disposition: %w", legacyErr)
+			}
+			return nil
+		}
 		return fmt.Errorf("set state disposition ex: %w", err)
 	}
 	return nil

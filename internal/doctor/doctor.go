@@ -93,6 +93,7 @@ type Probes struct {
 	UVVersion           func(ctx context.Context, exePath string) (string, error)
 	UVVersionWithLayout func(ctx context.Context, layout *config.Layout, exePath string) (string, error)
 	DiskFree            func(ctx context.Context, path string) (uint64, error)
+	FileSystem          func(ctx context.Context, path string) (string, error)
 }
 
 // Service 组合布局与探针执行全部检查。
@@ -507,7 +508,23 @@ func (s *Service) checkDisk(ctx context.Context) Check {
 	if err != nil {
 		return specDisk.failedBecause("磁盘探测失败", err)
 	}
-	return specDisk.ok("磁盘剩余空间可用", map[string]any{"freeBytes": free})
+	details := map[string]any{"freeBytes": free}
+	if s.probes.FileSystem != nil {
+		format, err := s.probes.FileSystem(ctx, s.layout.AppRoot())
+		if err != nil {
+			return specDisk.failedBecause("文件系统探测失败", err)
+		}
+		details["fileSystem"] = format
+		if strings.EqualFold(format, "exFAT") || strings.EqualFold(format, "FAT32") ||
+			strings.EqualFold(format, "FAT") {
+			details["stateUnlinkMode"] = "classic"
+			return specDisk.result(StatusError,
+				"当前卷使用 "+format+"，状态文件会降级为传统删除；建议迁移到 NTFS 卷",
+				details,
+			)
+		}
+	}
+	return specDisk.ok("磁盘剩余空间可用", details)
 }
 
 // errorKind 把底层错误映射为 doctor 检查项 details 的稳定分类词。

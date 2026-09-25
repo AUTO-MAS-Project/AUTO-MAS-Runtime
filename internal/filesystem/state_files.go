@@ -67,7 +67,7 @@ type stateFileOwner struct {
 
 // StateFiles 表示受管状态目录能力。
 type StateFiles struct {
-	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed 与操作/关闭的句柄生命周期。
+	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed、classicUnlink 与操作/关闭的句柄生命周期。
 
 	layout              *config.Layout
 	api                 pathAPI
@@ -77,6 +77,7 @@ type StateFiles struct {
 	owner               *stateFileOwner
 	pins                [2]pinnedObject
 	probePassed         map[StateFileKind]bool
+	classicUnlink       bool
 	closed              bool
 	closeErr            error
 }

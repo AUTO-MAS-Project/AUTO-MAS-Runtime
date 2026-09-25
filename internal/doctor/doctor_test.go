@@ -457,6 +457,25 @@ func TestDoctor_DiskProbeInjected(t *testing.T) {
 	})
 }
 
+func TestDoctor_FATVolumeExplainsStateUnlinkDegradation(t *testing.T) {
+	for _, format := range []string{"exFAT", "FAT32"} {
+		t.Run(format, func(t *testing.T) {
+			layout, _ := healthyFixture(t)
+			probes := testProbes()
+			probes.FileSystem = func(context.Context, string) (string, error) {
+				return format, nil
+			}
+			report := runService(t, mustNewService(t, layout, probes))
+			check := findCheck(t, report, "disk")
+			if check.Status != StatusError || check.Details["fileSystem"] != format ||
+				check.Details["stateUnlinkMode"] != "classic" ||
+				!strings.Contains(check.Message, "NTFS") {
+				t.Fatalf("disk check = %+v, want actionable FAT degradation", check)
+			}
+		})
+	}
+}
+
 func TestDoctor_MutexProbeReportsOccupancy(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

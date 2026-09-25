@@ -361,7 +361,7 @@ func (f *StateFiles) WriteAtomic(
 			nil,
 		)
 	}
-	if err := f.ensurePOSIXUnlinkCapability(ctx, kind); err != nil {
+	if err := f.ensureStateUnlinkCapability(ctx, kind); err != nil {
 		closeErr := f.closeStateObject(&guard)
 		return stateWriteFailure(
 			StateWritePhaseRecover,
@@ -449,7 +449,7 @@ func (f *StateFiles) removeStateLocked(
 				f.closeStateObject(&guard),
 			)
 		}
-		if err := f.ensurePOSIXUnlinkCapability(ctx, snapshot.kind); err != nil {
+		if err := f.ensureStateUnlinkCapability(ctx, snapshot.kind); err != nil {
 			return stateRemoveFailure(true, err, f.closeStateObject(&guard))
 		}
 		if err := f.recoverStateNamespace(ctx, snapshot.kind); err != nil {
@@ -493,7 +493,7 @@ func (f *StateFiles) removeStateLocked(
 		}
 		return StateRemoveResult{}, err
 	}
-	if err := f.ensurePOSIXUnlinkCapability(ctx, snapshot.kind); err != nil {
+	if err := f.ensureStateUnlinkCapability(ctx, snapshot.kind); err != nil {
 		closeErr := errors.Join(
 			f.closeCandidate(&destination),
 			f.closeStateObject(&guard),
@@ -1696,7 +1696,7 @@ func proofIdentityValue(identity objectIdentity) stateIdentityProof {
 	}
 }
 
-func (f *StateFiles) ensurePOSIXUnlinkCapability(
+func (f *StateFiles) ensureStateUnlinkCapability(
 	ctx context.Context,
 	kind StateFileKind,
 ) error {
@@ -1753,6 +1753,18 @@ func (f *StateFiles) ensurePOSIXUnlinkCapability(
 			Digest:             sha256.Sum256(marker),
 		}
 		probeErr = f.unlinkStateObject(ctx, leaf, &object, &proof)
+		var mutationErr *stateUnlinkMutationError
+		if errors.As(probeErr, &mutationErr) &&
+			mutationErr.closeErr == nil &&
+			(errors.Is(mutationErr.dispositionErr, windows.ERROR_INVALID_PARAMETER) ||
+				errors.Is(mutationErr.dispositionErr, windows.ERROR_NOT_SUPPORTED) ||
+				errors.Is(mutationErr.dispositionErr, windows.ERROR_INVALID_FUNCTION)) {
+			f.classicUnlink = true
+			probeErr = f.unlinkStateObject(ctx, leaf, &object, &proof)
+			if probeErr != nil {
+				f.classicUnlink = false
+			}
+		}
 	}
 	closeErr := f.closeStateObject(&object)
 	absenceErr := f.requireStateLeafAbsent(context.WithoutCancel(ctx), leaf)
@@ -1770,6 +1782,13 @@ func statePOSIXDispositionSpec() stateDispositionSpec {
 	return stateDispositionSpec{
 		informationClass: fileDispositionExClass,
 		flags:            fileDispositionDelete | fileDispositionPOSIX,
+	}
+}
+
+func stateClassicDispositionSpec() stateDispositionSpec {
+	return stateDispositionSpec{
+		informationClass: fileDispositionExClass,
+		flags:            deleteDispositionFlags(),
 	}
 }
 
@@ -1850,13 +1869,25 @@ func (f *StateFiles) unlinkStateObject(
 			f.closeStateObject(&unlink),
 		)
 	}
-	dispositionErr := f.api.setStateDisposition(unlink.handle, statePOSIXDispositionSpec())
-	closeErr := f.closeStateObject(&unlink)
+	objectPath := object.path.String()
+	disposition := statePOSIXDispositionSpec()
+	operation := "posix-unlink"
+	if f.classicUnlink {
+		disposition = stateClassicDispositionSpec()
+		operation = "classic-unlink"
+	}
+	dispositionErr := f.api.setStateDisposition(unlink.handle, disposition)
+	var anchorCloseErr error
+	if dispositionErr == nil && f.classicUnlink {
+		// 传统删除直到所有句柄关闭才移除名称；U 固定对象身份，先关 A 再关 U。
+		anchorCloseErr = f.closeStateObject(object)
+	}
+	closeErr := errors.Join(anchorCloseErr, f.closeStateObject(&unlink))
 	if dispositionErr != nil || closeErr != nil {
 		return &stateUnlinkMutationError{
 			dispositionErr: wrapFileError(
-				"posix-unlink",
-				object.path.String(),
+				operation,
+				objectPath,
 				dispositionErr,
 			),
 			closeErr: closeErr,
@@ -1865,8 +1896,10 @@ func (f *StateFiles) unlinkStateObject(
 	if err := f.requireStateLeafAbsent(ctx, leaf); err != nil {
 		return err
 	}
-	if err := f.verifyStateAnchorReadable(ctx, object, expected); err != nil {
-		return err
+	if !f.classicUnlink {
+		if err := f.verifyStateAnchorReadable(ctx, object, expected); err != nil {
+			return err
+		}
 	}
 	if f.afterUnlinkVerified != nil {
 		f.afterUnlinkVerified(leaf)

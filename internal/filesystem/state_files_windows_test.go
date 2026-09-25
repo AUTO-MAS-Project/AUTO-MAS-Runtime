@@ -2737,6 +2737,71 @@ func TestStateFiles_ConditionalRemoveRecoversOrRefusesIntent(t *testing.T) {
 	})
 }
 
+func TestStateFiles_UnsupportedPOSIXUsesClassicUnlink(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	setDisposition := files.api.setStateDisposition
+	posixAttempts := 0
+	classicAttempts := 0
+	files.api.setStateDisposition = func(handle windows.Handle, spec stateDispositionSpec) error {
+		if spec == statePOSIXDispositionSpec() {
+			posixAttempts++
+			return windows.ERROR_INVALID_PARAMETER
+		}
+		classicAttempts++
+		return setDisposition(handle, spec)
+	}
+	for _, payload := range [][]byte{[]byte("first"), []byte("second")} {
+		result, err := files.WriteAtomic(t.Context(), StateBackend, payload)
+		if err != nil || !result.MutationApplied {
+			t.Fatalf("WriteAtomic(%q) = %#v, %v", payload, result, err)
+		}
+		got, err := os.ReadFile(layout.BackendStateFile())
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("state after write = %q, %v, want %q", got, err, payload)
+		}
+	}
+	snapshot, err := files.Read(t.Context(), StateBackend, MaxStateFileBytes)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot)
+	if err != nil || !result.MutationApplied {
+		t.Fatalf("RemoveTransactionIfUnchanged() = %#v, %v", result, err)
+	}
+	if _, err := os.Stat(layout.BackendStateFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state after remove error = %v, want not-exist", err)
+	}
+	if posixAttempts != 1 || classicAttempts < 4 {
+		t.Fatalf("disposition attempts = posix %d, classic %d", posixAttempts, classicAttempts)
+	}
+}
+
+func TestStateFiles_ClassicProbeFailureLeavesStateUntouched(t *testing.T) {
+	files, layout := newStateFilesFixture(t)
+	files.api.setStateDisposition = func(_ windows.Handle, spec stateDispositionSpec) error {
+		if spec == statePOSIXDispositionSpec() {
+			return windows.ERROR_INVALID_PARAMETER
+		}
+		return windows.ERROR_ACCESS_DENIED
+	}
+	result, err := files.WriteAtomic(t.Context(), StateBackend, []byte("payload"))
+	if err == nil || result.MutationApplied {
+		t.Fatalf("WriteAtomic() = %#v, %v, want failed before mutation", result, err)
+	}
+	if _, err := os.Stat(layout.BackendStateFile()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state after failed probe error = %v, want not-exist", err)
+	}
+	entries, err := os.ReadDir(layout.StateDir())
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".temp-") || strings.Contains(entry.Name(), ".intent-") {
+			t.Fatalf("probe failure left transaction leaf %q", entry.Name())
+		}
+	}
+}
+
 func TestStateFiles_MissingRemoveDoesNotRequirePOSIXUnlink(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -3019,6 +3084,41 @@ func TestWindows_StateGuardReleasedAtEveryCrashCutpoint(t *testing.T) {
 	}
 }
 
+func TestWindows_ClassicStateUnlinkCrashCutpoints(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	for _, leafKind := range []string{"backup", "destination"} {
+		for _, point := range []string{"before-disposition", "after-disposition", "after-anchor-verification"} {
+			t.Run(leafKind+"/"+point, func(t *testing.T) {
+				layout := newStateFilesTestLayout(t)
+				command := exec.Command(executable,
+					"-test.run=^TestWindows_StateGuardReleasedAtEveryCrashCutpoint$")
+				command.Env = append(os.Environ(),
+					"AUTO_MAS_STATE_CRASH_POINT="+point,
+					"AUTO_MAS_STATE_CRASH_LEAF="+leafKind,
+					"AUTO_MAS_STATE_CRASH_ROOT="+layout.AppRoot(),
+					"AUTO_MAS_STATE_CRASH_CLASSIC=1",
+				)
+				output, err := command.CombinedOutput()
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != stateCrashExitCode {
+					t.Fatalf("classic crash child error = %v, output = %s", err, output)
+				}
+				_, statErr := os.Stat(stateCrashLeafPath(layout, leafKind))
+				wantMissing := point != "before-disposition"
+				if wantMissing && !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("classic state leaf after %s error = %v, want not-exist", point, statErr)
+				}
+				if !wantMissing && statErr != nil {
+					t.Fatalf("classic state leaf after %s error = %v, want present", point, statErr)
+				}
+			})
+		}
+	}
+}
+
 const stateCrashNonce = "00112233445566778899aabbccddeeff"
 
 func stateCrashLeafPath(layout *config.Layout, leafKind string) string {
@@ -3126,6 +3226,9 @@ func runStateRemoveCrashChild(t *testing.T, point string) {
 		t.Fatalf("NewStateFiles() error = %v", err)
 	}
 	snapshot := writeAndReadStateSnapshot(t, files, StateBackend, []byte("payload"))
+	if os.Getenv("AUTO_MAS_STATE_CRASH_CLASSIC") == "1" {
+		files.classicUnlink = true
+	}
 
 	openRelative := files.api.openRelative
 	setDisposition := files.api.setStateDisposition
@@ -3181,8 +3284,11 @@ func runStateLeafUnlinkCrashChild(t *testing.T, leafKind, point string) {
 	if err != nil {
 		t.Fatalf("acquireStateGuard() error = %v", err)
 	}
-	if err := files.ensurePOSIXUnlinkCapability(t.Context(), StateBackend); err != nil {
-		t.Fatalf("ensurePOSIXUnlinkCapability() error = %v", err)
+	if err := files.ensureStateUnlinkCapability(t.Context(), StateBackend); err != nil {
+		t.Fatalf("ensureStateUnlinkCapability() error = %v", err)
+	}
+	if os.Getenv("AUTO_MAS_STATE_CRASH_CLASSIC") == "1" {
+		files.classicUnlink = true
 	}
 	leaf := filepath.Base(stateCrashLeafPath(layout, leafKind))
 	anchor, err := files.createStateLeaf(t.Context(), leaf)

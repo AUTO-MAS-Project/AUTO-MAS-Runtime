@@ -12,7 +12,7 @@ import (
 func TestProbeDiskFree_Production(t *testing.T) {
 	t.Parallel()
 	probes := ProductionProbes()
-	if probes.UVVersion == nil || probes.DiskFree == nil {
+	if probes.UVVersion == nil || probes.DiskFree == nil || probes.FileSystem == nil {
 		t.Fatal("ProductionProbes() returned nil probe functions")
 	}
 	free, err := probes.DiskFree(context.Background(), t.TempDir())
@@ -21,6 +21,10 @@ func TestProbeDiskFree_Production(t *testing.T) {
 	}
 	if free == 0 {
 		t.Error("DiskFree() = 0, want positive free bytes")
+	}
+	format, err := probes.FileSystem(t.Context(), t.TempDir())
+	if err != nil || format == "" {
+		t.Fatalf("FileSystem() = %q, %v, want nonempty format", format, err)
 	}
 }
 

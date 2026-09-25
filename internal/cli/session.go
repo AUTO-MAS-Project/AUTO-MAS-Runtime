@@ -240,7 +240,7 @@ func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, su
 
 func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) (int, bool) {
 	code, stage, message, details := classifyFailure(err, fallbackStage)
-	recordOperationFailure(deps, code, stage, message, details)
+	recordOperationFailure(deps, code, stage, message, details, err)
 	errorEvent, eventErr := protocol.NewErrorEvent(code, stage, message, details)
 	if eventErr != nil {
 		writeDiagnostic(deps.io, eventErr)
@@ -422,21 +422,27 @@ func exitCodeFor(code protocol.Code) int {
 //
 // 操作日志此前只有 uv 输出透传与清理审计，全是 info：真机上取到 2468 行日志零 warn
 // 零 error，失败本身、错误码与 stage 一条都不落盘，用户报上来无从查起。这里在失败的
-// 唯一出口补一条 error 记录，字段与 wire 上已发出的 error 事件同源，不额外泄露内部串。
+// 唯一出口补一条 error 记录。状态写入失败另在本地日志保留底层 cause，
+// 以便区分文件系统能力、占用与权限；协议事件仍只含稳定字段。
 //
-// 日志器尚未打开（如参数解析阶段失败）时静默跳过；写日志失败不改变命令结局。
+// 日志器尚未打开时，状态写入失败把 cause 写到 stderr，其余失败静默跳过；
+// 写日志失败不改变命令结局。
 func recordOperationFailure(
 	deps *deps,
 	code protocol.Code,
 	stage protocol.Stage,
 	message string,
 	details map[string]any,
+	cause error,
 ) {
 	if deps == nil {
 		return
 	}
 	logger := deps.opLog.Get()
 	if logger == nil {
+		if code == protocol.CodeStateWriteFailed && cause != nil {
+			writeDiagnostic(deps.io, cause)
+		}
 		return
 	}
 	entry := make(map[string]any, len(details)+2)
@@ -445,6 +451,12 @@ func recordOperationFailure(
 	}
 	entry["code"] = string(code)
 	entry["stage"] = string(stage)
+	if code == protocol.CodeStateWriteFailed {
+		var commandErr *commandError
+		if errors.As(cause, &commandErr) && commandErr.cause != nil {
+			entry["cause"] = commandErr.cause.Error()
+		}
+	}
 	ctx := deps.ctx
 	if ctx == nil {
 		ctx = context.Background()
