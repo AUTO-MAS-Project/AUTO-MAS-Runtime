@@ -117,9 +117,13 @@ func workspaceStageCommand(deps *deps) *cobra.Command {
 					if err != nil {
 						return sessionSuccess{}, err
 					}
-					return sessionSuccess{message: "后端更新已准备完成", details: map[string]any{
+					details := map[string]any{
 						"version": result.Revision.Version(), "branch": result.Revision.Branch(), "commit": result.Revision.Commit(), "staged": result.Staged,
-					}}, nil
+					}
+					if result.Staged && result.CommitMessage != "" {
+						details["commitMessage"] = result.CommitMessage
+					}
+					return sessionSuccess{message: "后端更新已准备完成", details: details}, nil
 				},
 			)
 			return nil

@@ -28,7 +28,20 @@ func (s stagingContractService) Stage(ctx context.Context, _ gitrepo.StageReques
 	if err != nil {
 		return gitrepo.StageResult{}, err
 	}
-	return gitrepo.StageResult{Revision: revision, Staged: s.err == nil}, s.err
+	return gitrepo.StageResult{Revision: revision, Staged: s.err == nil, CommitMessage: "修复后台更新提示"}, s.err
+}
+
+func TestWorkspaceStage_CommitMessageInResult(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--output", "ndjson", "workspace", "stage", "--version", "v1.0.0"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(t.TempDir()),
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return stagingContractService{}, nil }), WithWorkspaceLoggerFactory(workspaceTestLoggerFactory))
+	if code != protocol.ExitCodeSuccess {
+		t.Fatalf("exit = %d, want success: %s", code, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `"commitMessage":"修复后台更新提示"`) {
+		t.Fatalf("stage result has no commit message: %s", stdout.String())
+	}
 }
 
 func (s stagingContractService) CheckRemote(context.Context, mirror.Policy) (gitrepo.RemoteCheckResult, error) {

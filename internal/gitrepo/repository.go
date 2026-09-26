@@ -106,6 +106,7 @@ type repositorySnapshot struct {
 	headSymbolic   bool
 	headTarget     string
 	commit         string
+	commitMessage  string
 	shallow        []string
 	tags           []string
 	versionMode    filemode.FileMode
@@ -245,6 +246,7 @@ func (goGitRepositoryReader) Inspect(
 	if err != nil {
 		return repositorySnapshot{}, fmt.Errorf("read repository HEAD commit: %w", err)
 	}
+	snapshot.commitMessage = commit.Message
 
 	if err := ctx.Err(); err != nil {
 		return repositorySnapshot{}, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -109,8 +110,11 @@ func TestService_StageAndActivateOffline(t *testing.T) {
 	if !prepared.Staged || prepared.Revision.Commit() == current.Commit {
 		t.Fatalf("Stage = %+v, want new commit", prepared)
 	}
+	if prepared.CommitMessage != "second release commit" {
+		t.Fatalf("Stage commit message = %q, want latest commit message", prepared.CommitMessage)
+	}
 	again, err := s.Stage(t.Context(), req)
-	if err != nil || again.Revision != prepared.Revision || *calls != 1 {
+	if err != nil || again.Revision != prepared.Revision || again.CommitMessage != prepared.CommitMessage || *calls != 1 {
 		t.Fatalf("repeated Stage = %+v, %v, fetches=%d", again, err, *calls)
 	}
 	unchanged, err := s.Check(t.Context())
@@ -133,6 +137,24 @@ func TestService_StageAndActivateOffline(t *testing.T) {
 		t.Fatalf("Sync = %+v, fetches=%d, want prepared commit without fetch", result, *calls)
 	}
 	assertNoComponentTemporaryDirectories(t, layout)
+}
+
+func TestStagedCommitMessage_BoundsDisplayText(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+		want    string
+	}{
+		{name: "subject and body", message: "  修复启动\n\n详细说明  ", want: "修复启动\n\n详细说明"},
+		{name: "empty", message: " \n ", want: ""},
+		{name: "long unicode", message: strings.Repeat("更", 1001), want: strings.Repeat("更", 1000) + "…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stagedCommitMessage(tc.message); got != tc.want {
+				t.Fatalf("stagedCommitMessage() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestService_StageConflictDoesNotWriteTransactions(t *testing.T) {

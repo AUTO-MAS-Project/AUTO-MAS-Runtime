@@ -3,6 +3,7 @@ package gitrepo
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -15,9 +16,12 @@ type StageRequest = SyncRequest
 
 // StageResult 只有已完整校验且不同于当前仓库时才报告 Staged。
 type StageResult struct {
-	Revision Revision
-	Staged   bool
+	Revision      Revision
+	Staged        bool
+	CommitMessage string
 }
+
+const maxStagedCommitMessageRunes = 1000
 
 type stagingLockSet interface {
 	AcquireStaging(context.Context) (mutationLease, error)
@@ -91,7 +95,7 @@ func (s *Service) Stage(ctx context.Context, request StageRequest) (result Stage
 			if err != nil {
 				return StageResult{}, err
 			}
-			return StageResult{Revision: fetched.Revision, Staged: fetched.Revision.Commit() != current.Commit}, nil
+			return StageResult{Revision: fetched.Revision, Staged: fetched.Revision.Commit() != current.Commit, CommitMessage: fetched.CommitMessage}, nil
 		}
 		if _, err := runtime.Recover(ctx, RecoveryRequest{LogPath: logger.LogPath(), DiscardStaged: true}); err != nil {
 			return StageResult{}, err
@@ -130,7 +134,11 @@ func (s *Service) Stage(ctx context.Context, request StageRequest) (result Stage
 	if err := runtime.WriteTransaction(ctx, state.TransactionUpdate, tx); err != nil {
 		return StageResult{}, serviceStateWriteError(protocol.StageWorkspaceVerify, err)
 	}
-	return StageResult{Revision: fetched.Revision, Staged: true}, nil
+	prepared, err := s.readPreparedFetch(ctx, tx, request.Target)
+	if err != nil {
+		return StageResult{}, err
+	}
+	return StageResult{Revision: prepared.Revision, Staged: true, CommitMessage: prepared.CommitMessage}, nil
 }
 
 func (s *Service) readPreparedFetch(ctx context.Context, transaction state.TransactionState, target Target) (FetchResult, error) {
@@ -162,5 +170,17 @@ func (s *Service) readPreparedFetch(ctx context.Context, transaction state.Trans
 	if err != nil {
 		return FetchResult{}, serviceAmbiguousError(protocol.StageWorkspaceVerify, "prepared_update_revision", err)
 	}
-	return FetchResult{RepositoryPath: path, Revision: revision, DirectoryIdentity: identityToken}, nil
+	return FetchResult{RepositoryPath: path, Revision: revision, DirectoryIdentity: identityToken, CommitMessage: stagedCommitMessage(snapshot.commitMessage)}, nil
+}
+
+func stagedCommitMessage(message string) string {
+	message = strings.TrimSpace(message)
+	count := 0
+	for index := range message {
+		if count == maxStagedCommitMessageRunes {
+			return message[:index] + "…"
+		}
+		count++
+	}
+	return message
 }

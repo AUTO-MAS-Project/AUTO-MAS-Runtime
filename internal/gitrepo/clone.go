@@ -67,6 +67,7 @@ type FetchResult struct {
 	RepositoryPath    string
 	Revision          Revision
 	DirectoryIdentity *filesystem.DirectoryIdentity
+	CommitMessage     string
 }
 
 type rotationRunner interface {
