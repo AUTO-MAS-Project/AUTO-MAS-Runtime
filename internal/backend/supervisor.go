@@ -476,7 +476,15 @@ func (s *ManagedSupervisor) recoverStaleTransaction(ctx context.Context) error {
 		if probeErr != nil {
 			return newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端事务进程状态不可确认", nil, probeErr)
 		}
-		if !alive {
+		stale := !alive
+		if alive {
+			createdAt, creationErr := s.deps.PID.CreatedAt(ctx, tx.PID)
+			if creationErr != nil {
+				return newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端事务进程身份不可确认", nil, creationErr)
+			}
+			stale = !tx.StartedAt.IsZero() && createdAt.After(tx.StartedAt)
+		}
+		if stale {
 			if removeErr := s.deps.State.RemoveBackendTransaction(ctx, tx.Handle); removeErr != nil {
 				return newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端陈旧事务清理失败", nil, removeErr)
 			}

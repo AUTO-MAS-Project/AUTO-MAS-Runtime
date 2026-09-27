@@ -245,7 +245,7 @@ func TestBackendManaged_StartupLogsFlushAfterStarting(t *testing.T) {
 
 func TestBackendManaged_LiveTransactionPIDIsInconsistent(t *testing.T) {
 	f := newBackendFixture(t)
-	f.state.transaction = &Transaction{PID: 7331, Handle: &fakeTransaction{}}
+	f.state.transaction = &Transaction{PID: 7331, StartedAt: time.Date(2026, 9, 27, 7, 0, 0, 0, time.UTC), Handle: &fakeTransaction{}}
 	f.pid = &fakePID{alive: true}
 	err := f.supervisor().Supervise(t.Context(), f.request())
 	assertBackendCode(t, err, protocol.CodeUpdateStateAmbiguous)
@@ -255,6 +255,58 @@ func TestBackendManaged_LiveTransactionPIDIsInconsistent(t *testing.T) {
 	}
 	if f.uv.startCalls != 0 {
 		t.Fatalf("StartManaged calls = %d, want 0", f.uv.startCalls)
+	}
+}
+
+func TestBackendManaged_ReusedTransactionPIDRecovers(t *testing.T) {
+	f := newBackendFixture(t)
+	startedAt := time.Date(2026, 9, 27, 7, 0, 0, 0, time.UTC)
+	f.state.transaction = &Transaction{PID: 7331, StartedAt: startedAt, Handle: &fakeTransaction{}}
+	f.pid = &fakePID{alive: true, createdAt: startedAt.Add(time.Hour)}
+	f.proc.keepAlive = true
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, f.request()) }()
+	waitFor(t, f.emitter.running)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
+	}
+	if f.state.removeCalls != 2 || f.uv.startCalls != 1 {
+		t.Fatalf("remove/start calls = %d/%d, want 2/1", f.state.removeCalls, f.uv.startCalls)
+	}
+}
+
+func TestBackendManaged_ReusedTransactionPIDRecoveryFailsClosed(t *testing.T) {
+	startedAt := time.Date(2026, 9, 27, 7, 0, 0, 0, time.UTC)
+	queryErr := errors.New("query process creation failed")
+	removeErr := errors.New("conditional remove failed")
+	tests := []struct {
+		name       string
+		createdAt  time.Time
+		createdErr error
+		removeErr  error
+		wantCode   protocol.Code
+		wantRemove int
+	}{
+		{name: "original process", createdAt: startedAt.Add(-time.Minute), wantCode: protocol.CodeUpdateStateAmbiguous},
+		{name: "equal creation time", createdAt: startedAt, wantCode: protocol.CodeUpdateStateAmbiguous},
+		{name: "creation query failed", createdErr: queryErr, wantCode: protocol.CodeStateWriteFailed},
+		{name: "conditional removal failed", createdAt: startedAt.Add(time.Hour), removeErr: removeErr, wantCode: protocol.CodeStateWriteFailed, wantRemove: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			f.state.transaction = &Transaction{PID: 7331, StartedAt: startedAt, Handle: &fakeTransaction{}}
+			f.state.removeErr = test.removeErr
+			f.pid = &fakePID{alive: true, createdAt: test.createdAt, createdErr: test.createdErr}
+			err := f.supervisor().recoverStaleTransaction(t.Context())
+			assertBackendCode(t, err, test.wantCode)
+			if f.state.removeCalls != test.wantRemove {
+				t.Fatalf("RemoveBackendTransaction calls = %d, want %d", f.state.removeCalls, test.wantRemove)
+			}
+		})
 	}
 }
 
@@ -1229,9 +1281,16 @@ func (p *fakeProcess) orderSnapshot() []string {
 	return append([]string(nil), p.order...)
 }
 
-type fakePID struct{ alive bool }
+type fakePID struct {
+	alive      bool
+	createdAt  time.Time
+	createdErr error
+}
 
 func (p *fakePID) Alive(context.Context, uint32) (bool, error) { return p.alive, nil }
+func (p *fakePID) CreatedAt(context.Context, uint32) (time.Time, error) {
+	return p.createdAt, p.createdErr
+}
 
 type fakeCodeError struct{ code protocol.Code }
 

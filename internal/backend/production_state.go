@@ -62,10 +62,11 @@ func (s *lazyStateStore) ReadBackendTransaction(ctx context.Context) (Transactio
 	}
 	value := snapshot.State()
 	return Transaction{
-		PID:     value.PID,
-		Version: value.TargetVersion,
-		Stage:   value.Stage,
-		Handle:  &productionTransaction{snapshot: snapshot, snapshotValid: true, value: value},
+		PID:       value.PID,
+		StartedAt: value.StartedAt,
+		Version:   value.TargetVersion,
+		Stage:     value.Stage,
+		Handle:    &productionTransaction{snapshot: snapshot, snapshotValid: true, value: value},
 	}, nil
 }
 

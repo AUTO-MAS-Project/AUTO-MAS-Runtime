@@ -55,6 +55,47 @@ func TestSystemPIDProbe_CurrentProcessIsAlive(t *testing.T) {
 	}
 }
 
+func TestSystemPIDProbe_CreationTime(t *testing.T) {
+	probe := NewSystemPIDProbe()
+	createdAt, err := probe.CreatedAt(t.Context(), uint32(os.Getpid()))
+	if err != nil {
+		t.Fatalf("CreatedAt() error = %v", err)
+	}
+	if createdAt.IsZero() || createdAt.After(time.Now()) {
+		t.Fatalf("CreatedAt() = %v, want past nonzero time", createdAt)
+	}
+}
+
+func TestSystemPIDProbe_CreationTimeFailureClosesHandle(t *testing.T) {
+	queryCause := errors.New("get process times failed")
+	closeCause := errors.New("close handle failed")
+	closeCalls := 0
+	api := completeFakeProcessAPI()
+	api.openProcess = func(access uint32, inherit bool, pid uint32) (windows.Handle, error) {
+		if access != windows.PROCESS_QUERY_LIMITED_INFORMATION || inherit || pid != 4242 {
+			t.Fatalf("OpenProcess access/inherit/pid = %#x/%t/%d", access, inherit, pid)
+		}
+		return fakeProcessHandle, nil
+	}
+	api.getProcessTimes = func(windows.Handle, *windows.Filetime, *windows.Filetime, *windows.Filetime, *windows.Filetime) error {
+		return queryCause
+	}
+	api.closeHandle = func(handle windows.Handle) error {
+		closeCalls++
+		if handle != fakeProcessHandle {
+			t.Fatalf("CloseHandle handle = %#x, want %#x", handle, fakeProcessHandle)
+		}
+		return closeCause
+	}
+	createdAt, err := newSystemPIDProbeWith(api).CreatedAt(t.Context(), 4242)
+	if !createdAt.IsZero() || !errors.Is(err, queryCause) || !errors.Is(err, closeCause) {
+		t.Fatalf("CreatedAt() = %v, %v, want zero with query/close causes", createdAt, err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("CloseHandle calls = %d, want 1", closeCalls)
+	}
+}
+
 func TestSystemPIDProbe_ExitedHelperIsDead(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

@@ -116,10 +116,11 @@ type StateStore interface {
 
 // Transaction 描述已有 backend 事务的最小事实。
 type Transaction struct {
-	PID     uint32
-	Version string
-	Stage   protocol.Stage
-	Handle  TransactionHandle
+	PID       uint32
+	StartedAt time.Time
+	Version   string
+	Stage     protocol.Stage
+	Handle    TransactionHandle
 }
 
 // TransactionInput 描述新建 backend 事务的业务身份。
@@ -136,6 +137,7 @@ type TransactionHandle interface{}
 // PIDProbe 判断事务记录对应的旧监督进程是否仍存活。
 type PIDProbe interface {
 	Alive(context.Context, uint32) (bool, error)
+	CreatedAt(context.Context, uint32) (time.Time, error)
 }
 
 // ErrTransactionNotFound 表示当前没有 backend 事务。

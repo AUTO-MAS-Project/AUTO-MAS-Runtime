@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -22,7 +23,8 @@ type processAPI struct {
 		handle windows.Handle,
 		milliseconds uint32,
 	) (uint32, error)
-	closeHandle func(handle windows.Handle) error
+	closeHandle     func(handle windows.Handle) error
+	getProcessTimes func(handle windows.Handle, creationTime, exitTime, kernelTime, userTime *windows.Filetime) error
 }
 
 // SystemPIDProbe 通过 SYNCHRONIZE handle 查询一个指定 PID；零值可用。
@@ -131,6 +133,44 @@ func (p *SystemPIDProbe) Alive(
 	return alive, nil
 }
 
+// CreatedAt 查询指定 PID 当前进程的 Windows 创建时间，用于排除 PID 复用。
+func (p *SystemPIDProbe) CreatedAt(ctx context.Context, pid uint32) (time.Time, error) {
+	if ctx == nil {
+		return time.Time{}, validationError("ctx")
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	if pid == 0 {
+		return time.Time{}, ErrInvalidPID
+	}
+	api := p.processAPI()
+	if api.openProcess == nil || api.getProcessTimes == nil || api.closeHandle == nil {
+		return time.Time{}, &PIDProbeError{Operation: "get-process-times", PID: pid, Cause: errInvalidValue}
+	}
+	handle, err := api.openProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return time.Time{}, joinProbeErrors(ctx.Err(), &PIDProbeError{Operation: "open-process", PID: pid, Cause: err})
+	}
+	var created, exited, kernel, user windows.Filetime
+	queryErr := api.getProcessTimes(handle, &created, &exited, &kernel, &user)
+	closeErr := api.closeHandle(handle)
+	var resultErr error
+	if queryErr != nil {
+		resultErr = &PIDProbeError{Operation: "get-process-times", PID: pid, Cause: queryErr}
+	}
+	if closeErr != nil {
+		resultErr = joinProbeErrors(resultErr, &PIDProbeError{Operation: "close-handle", PID: pid, Cause: closeErr})
+	}
+	if err := joinProbeErrors(resultErr, ctx.Err()); err != nil {
+		return time.Time{}, err
+	}
+	if created.LowDateTime == 0 && created.HighDateTime == 0 {
+		return time.Time{}, &PIDProbeError{Operation: "get-process-times", PID: pid, Cause: errInvalidValue}
+	}
+	return time.Unix(0, created.Nanoseconds()).UTC(), nil
+}
+
 func (p *SystemPIDProbe) processAPI() processAPI {
 	if p != nil && p.api != nil {
 		return *p.api
@@ -139,6 +179,7 @@ func (p *SystemPIDProbe) processAPI() processAPI {
 		openProcess:         windows.OpenProcess,
 		waitForSingleObject: windows.WaitForSingleObject,
 		closeHandle:         windows.CloseHandle,
+		getProcessTimes:     windows.GetProcessTimes,
 	}
 }
 
