@@ -437,7 +437,7 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 	pending, pendingErr := runtime.ReadTransaction(ctx, state.TransactionUpdate)
 	if pendingErr == nil && pending.State().Command == "workspace stage" {
 		pendingState = pending.State()
-		if pendingState.TargetVersion != request.Target.Version() || !check.Healthy || pendingState.BaseCommit != check.Commit || pendingState.TargetCommit == check.Commit {
+		if pendingState.TargetVersion != request.Target.Version() || !check.Healthy || check.Branch != request.Target.Branch() || pendingState.BaseCommit != check.Commit || pendingState.TargetCommit == check.Commit {
 			if _, err := runtime.Recover(ctx, RecoveryRequest{LogPath: logger.LogPath(), DiscardStaged: true}); err != nil {
 				return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 			}

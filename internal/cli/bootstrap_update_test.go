@@ -19,6 +19,61 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 )
 
+func TestBootstrap_AlphaStartupAndExplicitUpdate(t *testing.T) {
+	for _, startup := range []bool{true, false} {
+		name := "explicit update"
+		if startup {
+			name = "startup"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			log := &m5TestLog{}
+			environment := &m5TestEnvironment{calls: &log.calls}
+			layout, err := config.NewLayout(root, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeBootstrapFile(t, layout.VenvConfigFile())
+			writeBootstrapFile(t, layout.VenvPythonExecutable())
+			version := "v5.6.0-alpha.123"
+			commit := strings.Repeat("a", 40)
+			store := &m5TestStateStore{calls: &log.calls, initial: state.EnvironmentState{
+				Status: protocol.StateReadyToStart, LastSuccessful: state.Revision{Version: version, Commit: commit},
+			}}
+			called := false
+			workspace := workspaceTestService{sync: func(_ context.Context, req gitrepo.SyncRequest) (gitrepo.SyncResult, error) {
+				called = true
+				if req.UseCurrent != startup || req.Target.Branch() != "dev" {
+					t.Fatalf("alpha bootstrap UseCurrent=%t, branch=%q, want %t/dev", req.UseCurrent, req.Target.Branch(), startup)
+				}
+				revision, err := gitrepo.NewRevision(version, "dev", commit, "github")
+				return gitrepo.SyncResult{Revision: revision, Status: protocol.StateReadyToStart}, err
+			}}
+			args := []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", version}
+			if startup {
+				args = append(args, "--if-needed")
+			}
+			var stdout, stderr bytes.Buffer
+			code := Execute(t.Context(), args, IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(root),
+				WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+				WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
+				WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+					return store, nil
+				}),
+				WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+					return &m5TestCoordinator{calls: &log.calls}, nil
+				}),
+				WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+					return log, nil
+				}),
+			)
+			if code != 0 || !called {
+				t.Fatalf("alpha bootstrap exit=%d, called=%t, output=%s, stderr=%s", code, called, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestBootstrap_IfNeededSkipsOnlyUnchangedReadyEnvironment(t *testing.T) {
 	for _, changed := range []bool{false, true} {
 		name := "unchanged"

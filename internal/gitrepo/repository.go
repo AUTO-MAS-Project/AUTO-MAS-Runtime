@@ -38,7 +38,7 @@ type Revision struct {
 // 应用层测试替身和跨包编排只能通过该构造器取得 Revision，不能伪造内部字段。
 func NewRevision(version, branch, commit, sourceKey string) (Revision, error) {
 	target, err := ParseTarget(version)
-	if err != nil || target.Branch() != branch || !validCommit(commit) || !validRevisionSourceKey(sourceKey) {
+	if err != nil || (target.Branch() != branch && branch != releasePrefix+version) || !validCommit(commit) || !validRevisionSourceKey(sourceKey) {
 		return Revision{}, errInvalidRevision
 	}
 	return Revision{
@@ -86,7 +86,7 @@ func (r Revision) SourceKey() string {
 func (r Revision) validate() error {
 	target, err := ParseTarget(r.version)
 	if err != nil ||
-		target.Branch() != r.branch ||
+		(target.Branch() != r.branch && r.branch != releasePrefix+r.version) ||
 		!validCommit(r.commit) ||
 		!validRevisionSourceKey(r.sourceKey) {
 		return errInvalidRevision
@@ -111,6 +111,7 @@ type repositorySnapshot struct {
 	tags           []string
 	versionMode    filemode.FileMode
 	versionPayload []byte
+	alphaBinding   *alphaBinding
 }
 
 type repositoryIdentity struct {
@@ -146,6 +147,19 @@ func repositoryIdentityFromSnapshot(snapshot repositorySnapshot) (repositoryIden
 		return repositoryIdentity{}, fmt.Errorf("%w: version document: %w", errInvalidRepositoryID, err)
 	}
 	target, err := ParseTarget(version)
+	if snapshot.headTarget == "refs/heads/dev" {
+		binding := snapshot.alphaBinding
+		if binding == nil || binding.commit != snapshot.commit || binding.sourceVersion != version {
+			return repositoryIdentity{}, errInvalidRepositoryID
+		}
+		target, err = ParseTarget(binding.version)
+		if err != nil || target.Branch() != "dev" || !validVersion(version) {
+			return repositoryIdentity{}, errInvalidRepositoryID
+		}
+	} else if err == nil {
+		// 历史 alpha release 仍可检查和恢复；新的同步目标固定为 dev。
+		target.branch = releasePrefix + version
+	}
 	if err != nil || snapshot.headTarget != plumbing.NewBranchReferenceName(target.Branch()).String() {
 		return repositoryIdentity{}, errInvalidRepositoryID
 	}
@@ -242,6 +256,16 @@ func (goGitRepositoryReader) Inspect(
 		return repositorySnapshot{}, errors.New("repository HEAD type is invalid")
 	}
 	snapshot.commit = commitHash.String()
+	if snapshot.headTarget == "refs/heads/dev" {
+		cfg, err := repository.Config()
+		if err != nil {
+			return repositorySnapshot{}, fmt.Errorf("read alpha config: %w", err)
+		}
+		snapshot.alphaBinding, err = readAlphaBinding(cfg.Raw)
+		if err != nil {
+			return repositorySnapshot{}, err
+		}
+	}
 	commit, err := repository.CommitObject(commitHash)
 	if err != nil {
 		return repositorySnapshot{}, fmt.Errorf("read repository HEAD commit: %w", err)

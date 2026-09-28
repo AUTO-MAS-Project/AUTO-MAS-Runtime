@@ -253,6 +253,23 @@ func (r *fakeRepositoryReader) Inspect(context.Context, string) (repositorySnaps
 	return cloneRepositorySnapshot(r.snapshot), r.err
 }
 
+func TestVerifier_AlphaSourceVersion(t *testing.T) {
+	_, req, snapshot := validVerifierFixture(t)
+	req.Target = mustParseTarget(t, "v5.6.0-alpha.123")
+	snapshot.headTarget = "refs/heads/dev"
+	for _, sourceVersion := range []string{"v5.6.0", "v5.7.0-beta.2"} {
+		snapshot.versionPayload = []byte(`{"version":"` + sourceVersion + `"}`)
+		revision, err := mustVerifierWithSnapshot(t, snapshot, nil).Verify(t.Context(), req)
+		if err != nil || revision.Version() != req.Target.Version() || revision.Branch() != "dev" {
+			t.Fatalf("Verify(%q) = %+v, %v, want alpha/dev", sourceVersion, revision, err)
+		}
+	}
+	snapshot.versionPayload = []byte(`{"version":"dev"}`)
+	if _, err := mustVerifierWithSnapshot(t, snapshot, nil).Verify(t.Context(), req); err == nil {
+		t.Fatal("Verify accepted invalid source version")
+	}
+}
+
 func validVerifierFixture(t *testing.T) (Target, VerificationRequest, repositorySnapshot) {
 	t.Helper()
 	target := mustParseTarget(t, "v5.4.0")

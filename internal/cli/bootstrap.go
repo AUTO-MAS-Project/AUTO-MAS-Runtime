@@ -195,7 +195,7 @@ func runBootstrap(
 	control := workspaceControlFromContext(ctx)
 	binding := &workspaceLogBinding{}
 	workspaceResult, err := workspace.Sync(ctx, gitrepo.SyncRequest{
-		UseCurrent:    true,
+		UseCurrent:    target.Branch() != "dev" || ifNeeded,
 		Target:        target,
 		Policy:        deps.global.mirrorPolicy,
 		OperationID:   emitter.OperationID(),

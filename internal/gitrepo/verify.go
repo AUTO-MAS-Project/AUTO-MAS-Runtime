@@ -89,7 +89,10 @@ func (v *Verifier) Verify(
 	if err != nil {
 		return Revision{}, invalidRepositoryError("version_invalid", err)
 	}
-	if version != request.Target.Version() {
+	if !validVersion(version) {
+		return Revision{}, invalidRepositoryError("version_invalid", errInvalidVersionDocument)
+	}
+	if request.Target.Branch() != "dev" && version != request.Target.Version() {
 		return Revision{}, newError(
 			protocol.CodeGitVersionMismatch,
 			protocol.StageWorkspaceVerify,
@@ -97,6 +100,9 @@ func (v *Verifier) Verify(
 			map[string]any{"reason": "version_mismatch"},
 			errors.New("repository version differs from target"),
 		)
+	}
+	if binding := snapshot.alphaBinding; binding != nil && (binding.version != request.Target.Version() || binding.commit != snapshot.commit || binding.sourceVersion != version) {
+		return Revision{}, invalidRepositoryError("version_mismatch", errInvalidRepositoryID)
 	}
 	revision, err := newRevision(request.Target, snapshot.commit, request.Source)
 	if err != nil {

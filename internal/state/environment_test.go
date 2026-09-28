@@ -16,6 +16,20 @@ const (
 	testNewCommit = "0123456789abcdef0123456789abcdef01234567"
 )
 
+func TestStore_AlphaBrokenEnvironment(t *testing.T) {
+	store := newTestStore(t, completeFakeStateFiles(), fixedStateTime)
+	broken := validRepositoryChanged(store)
+	broken.TargetVersion = "v5.6.0-alpha.123"
+	broken.Branch = "dev"
+	if _, err := store.NewBrokenEnvironment(validLastSuccessful(), broken); err != nil {
+		t.Fatalf("NewBrokenEnvironment(alpha/dev) = %v, want nil", err)
+	}
+	broken.TargetVersion = "v5.6.0"
+	if _, err := store.NewBrokenEnvironment(validLastSuccessful(), broken); err == nil {
+		t.Fatal("NewBrokenEnvironment accepted stable/dev")
+	}
+}
+
 func validLastSuccessful() Revision {
 	return Revision{Version: "v5.3.0", Commit: testOldCommit}
 }

@@ -25,8 +25,25 @@ func (r stagedTestRuntime) Fetch(ctx context.Context, req FetchRequest) (FetchRe
 
 func stagingFixture(t *testing.T, sameCommit ...bool) (*Service, *config.Layout, SyncRequest, *int) {
 	t.Helper()
+	return stagingFixtureForVersion(t, "v1.0.0", sameCommit...)
+}
+
+func stagingFixtureForVersion(t *testing.T, version string, sameCommit ...bool) (*Service, *config.Layout, SyncRequest, *int) {
+	t.Helper()
+	return stagingFixtureWithLegacy(t, version, false, sameCommit...)
+}
+
+func stagingFixtureWithLegacy(t *testing.T, version string, legacy bool, sameCommit ...bool) (*Service, *config.Layout, SyncRequest, *int) {
+	t.Helper()
 	layout := componentLayout(t)
-	writeRecoveryRepository(t, layout.RepoDir(), "v1.0.0", recoverySourceURL(t), "old")
+	sourceVersion := "v1.0.0"
+	if legacy {
+		sourceVersion = version
+	}
+	writeRecoveryRepository(t, layout.RepoDir(), sourceVersion, recoverySourceURL(t), "old")
+	if !legacy && mustParseTarget(t, version).Branch() == "dev" {
+		bindAlphaFixture(t, layout.RepoDir(), version)
+	}
 	service, err := NewService(layout)
 	if err != nil {
 		t.Fatal(err)
@@ -46,10 +63,17 @@ func stagingFixture(t *testing.T, sameCommit ...bool) (*Service, *config.Layout,
 			if err != nil {
 				return FetchResult{}, err
 			}
+			sourceVersion := fetch.Target.Version()
+			if fetch.Target.Branch() == "dev" {
+				sourceVersion = "v5.7.0-beta.1"
+			}
 			if len(sameCommit) > 0 && sameCommit[0] {
-				writeRecoveryRepository(t, path, fetch.Target.Version(), recoverySourceURL(t), "new")
+				writeRecoveryRepository(t, path, sourceVersion, recoverySourceURL(t), "new")
 			} else {
-				writeRecoveryRepositoryWithExtraCommit(t, path, fetch.Target.Version(), recoverySourceURL(t), "new")
+				writeRecoveryRepositoryWithExtraCommit(t, path, sourceVersion, recoverySourceURL(t), "new")
+			}
+			if fetch.Target.Branch() == "dev" {
+				bindAlphaFixture(t, path, fetch.Target.Version())
 			}
 			return service.readPreparedFetch(ctx, state.TransactionState{OperationID: fetch.OperationID}, fetch.Target)
 		}}, nil
@@ -76,7 +100,7 @@ func stagingFixture(t *testing.T, sameCommit ...bool) (*Service, *config.Layout,
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := componentServiceSyncRequest(layout, componentTarget(t, "v1.0.0"), policy, componentOperationID(70), &recordingServiceEmitter{})
+	req := componentServiceSyncRequest(layout, componentTarget(t, version), policy, componentOperationID(70), &recordingServiceEmitter{})
 	return service, layout, req, calls
 }
 
@@ -308,9 +332,18 @@ func TestService_StagedCommitMismatchFailsClosed(t *testing.T) {
 }
 
 func TestRecovery_StagedSameVersionSwapWindows(t *testing.T) {
+	runStagedRecoveryMatrix(t, "v1.0.0")
+}
+
+func TestRecovery_AlphaStagedSwapWindows(t *testing.T) {
+	runStagedRecoveryMatrix(t, "v5.6.0-alpha.123")
+}
+
+func runStagedRecoveryMatrix(t *testing.T, version string) {
+	t.Helper()
 	for _, phase := range []string{"before-rename", "between-renames", "after-activation", "wrong-base"} {
 		t.Run(phase, func(t *testing.T) {
-			s, layout, req, _ := stagingFixture(t)
+			s, layout, req, _ := stagingFixtureForVersion(t, version)
 			old, err := s.Check(t.Context())
 			if err != nil {
 				t.Fatal(err)

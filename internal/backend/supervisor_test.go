@@ -140,6 +140,34 @@ func TestBackendManaged_UsesExactUVArgsAndEnvironment(t *testing.T) {
 	}
 }
 
+func TestBackendManaged_AlphaIdentity(t *testing.T) {
+	f := newBackendFixture(t)
+	f.repository.Version = "v5.6.0-alpha.123"
+	f.state.environment.LastSuccessful.Version = f.repository.Version
+	f.proc.keepAlive = true
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, f.request()) }()
+	waitFor(t, f.emitter.running)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Supervise(alpha) = %v, want cancelled", err)
+	}
+	if f.uv.options.Identity == nil || f.uv.options.Identity.Version != f.repository.Version ||
+		f.uv.options.Identity.Commit != f.repository.Commit {
+		t.Fatalf("injected alpha identity = %+v", f.uv.options.Identity)
+	}
+	if len(f.health.expectations) == 0 {
+		t.Fatal("no alpha health probes")
+	}
+	for _, expected := range f.health.expectations {
+		if expected.Version != f.repository.Version || expected.Commit != f.repository.Commit {
+			t.Fatalf("health expected = %+v, want alpha and current commit", expected)
+		}
+	}
+}
+
 func TestBackendManaged_SpawnFailure(t *testing.T) {
 	f := newBackendFixture(t)
 	f.uv.startErr = errors.New("spawn failed")

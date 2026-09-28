@@ -5,6 +5,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
 
 // Revision 标识一个已验证的产品版本和 Git Commit。
@@ -164,7 +165,7 @@ func validateBrokenEnvironment(
 	if err := validateProductVersion(value.TargetVersion); err != nil {
 		return validationError("targetVersion")
 	}
-	if value.Branch != "release/"+value.TargetVersion ||
+	if (value.Branch != version.ProductBranch(value.TargetVersion) && value.Branch != "release/"+value.TargetVersion) ||
 		containsControl(value.Branch) {
 		return validationError("branch")
 	}

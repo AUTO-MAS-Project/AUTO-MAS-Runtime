@@ -139,6 +139,7 @@ type fetcherDependencies struct {
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
 	newTicker      tickerFactory
+	bindRevision   func(context.Context, string, Revision) error
 }
 
 // Fetcher 获取并验证一个固定目标分支，不负责激活仓库目录。
@@ -153,6 +154,7 @@ type Fetcher struct {
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
 	newTicker      tickerFactory
+	bindRevision   func(context.Context, string, Revision) error
 }
 
 // NewFetcher 创建使用 go-git 传输和真实静态校验器的仓库获取器。
@@ -178,6 +180,9 @@ func NewFetcher(
 }
 
 func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, error) {
+	if dependencies.bindRevision == nil {
+		dependencies.bindRevision = bindAlphaRevision
+	}
 	if dependencies.cleanupContext == nil {
 		dependencies.cleanupContext = newCloneCleanupContext
 	}
@@ -211,6 +216,7 @@ func newFetcherWithDependencies(dependencies fetcherDependencies) (*Fetcher, err
 		caBundle:       append([]byte(nil), dependencies.caBundle...),
 		cleanupContext: dependencies.cleanupContext,
 		newTicker:      dependencies.newTicker,
+		bindRevision:   dependencies.bindRevision,
 	}, nil
 }
 
@@ -570,6 +576,10 @@ func (f *Fetcher) fetchAttempt(
 			true,
 			lease,
 		)
+	}
+	if err := f.bindRevision(ctx, repositoryPath, verification); err != nil {
+		return f.finishFailedAttempt(ctx, request, repositoryPath, mirror.OutcomeTargetFailure,
+			failureRepositoryInvalid, invalidRepositoryError("version_mismatch", err), true, lease)
 	}
 	var directoryIdentity *filesystem.DirectoryIdentity
 	if lease != nil {

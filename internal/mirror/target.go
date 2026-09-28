@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
 
 var errInvalidTarget = errors.New("mirror target is invalid")
@@ -84,7 +86,7 @@ func (t Target) ValidateForKind(kind Kind) error {
 	switch kind {
 	case KindGit:
 		if t.productVersion == "" ||
-			t.releaseBranch != "release/"+t.productVersion {
+			t.releaseBranch != version.ProductBranch(t.productVersion) {
 			return fmt.Errorf("%w: git target", errInvalidTarget)
 		}
 	case KindUV:
@@ -124,11 +126,11 @@ func normalizeTargetSpec(spec TargetSpec) (TargetSpec, error) {
 		return TargetSpec{}, fmt.Errorf("%w: product version", errInvalidTarget)
 	}
 	if spec.ReleaseBranch != "" {
-		if !strings.HasPrefix(spec.ReleaseBranch, "release/") {
+		if spec.ReleaseBranch != "dev" && !strings.HasPrefix(spec.ReleaseBranch, "release/") {
 			return TargetSpec{}, fmt.Errorf("%w: release branch", errInvalidTarget)
 		}
-		version := strings.TrimPrefix(spec.ReleaseBranch, "release/")
-		if !validVersionValue(version) || !strings.HasPrefix(version, "v") {
+		branchVersion := strings.TrimPrefix(spec.ReleaseBranch, "release/")
+		if spec.ReleaseBranch != "dev" && (!validVersionValue(branchVersion) || !strings.HasPrefix(branchVersion, "v")) {
 			return TargetSpec{}, fmt.Errorf("%w: release branch", errInvalidTarget)
 		}
 	}

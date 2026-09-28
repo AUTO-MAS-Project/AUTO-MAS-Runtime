@@ -8,6 +8,22 @@ import (
 	"testing"
 )
 
+func TestTarget_AlphaDev(t *testing.T) {
+	target, err := NewTarget(TargetSpec{ProductVersion: "v5.6.0-alpha.123", ReleaseBranch: "dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ValidateForKind(KindGit); err != nil {
+		t.Fatalf("ValidateForKind(git) = %v, want nil", err)
+	}
+	for _, version := range []string{"v5.6.0", "v5.7.0-beta.1", "v5.6.0-alpha.fake"} {
+		target, err := NewTarget(TargetSpec{ProductVersion: version, ReleaseBranch: "dev"})
+		if err == nil && target.ValidateForKind(KindGit) == nil {
+			t.Fatalf("git dev target accepted %q", version)
+		}
+	}
+}
+
 func TestNewTarget_NormalizesFieldsAndFingerprint(t *testing.T) {
 	digest := strings.Repeat("A1", 32)
 	baseSpec := TargetSpec{

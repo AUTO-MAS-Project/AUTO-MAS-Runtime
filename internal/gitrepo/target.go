@@ -3,6 +3,8 @@ package gitrepo
 import (
 	"errors"
 	"strings"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
 
 const (
@@ -21,13 +23,13 @@ type Target struct {
 }
 
 // ParseTarget 校验产品版本并按固定模板创建目标。
-func ParseTarget(version string) (Target, error) {
-	if !validVersion(version) {
+func ParseTarget(productVersion string) (Target, error) {
+	if !validVersion(productVersion) {
 		return Target{}, ErrInvalidVersion
 	}
 	return Target{
-		version: version,
-		branch:  releasePrefix + version,
+		version: productVersion,
+		branch:  version.ProductBranch(productVersion),
 	}, nil
 }
 

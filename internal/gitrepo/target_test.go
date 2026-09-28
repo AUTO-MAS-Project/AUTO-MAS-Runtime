@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+func TestParseTarget_AlphaUsesDev(t *testing.T) {
+	for _, version := range []string{"v5.6.0-alpha.123", "v9.9.9-alpha.1"} {
+		target, err := ParseTarget(version)
+		if err != nil || target.Branch() != "dev" {
+			t.Fatalf("ParseTarget(%q) = %+v, %v, want dev", version, target, err)
+		}
+	}
+}
+
 func TestParseTarget_ValidVersions(t *testing.T) {
 	tests := []struct {
 		name    string
