@@ -73,6 +73,7 @@ func runVersion(
 			"commit":          info.Commit,
 			"buildDate":       info.BuildDate,
 			"goVersion":       info.GoVersion,
+			"alphaBackend":    "dev",
 		},
 	}, nil
 }

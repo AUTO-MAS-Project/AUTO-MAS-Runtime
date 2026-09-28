@@ -55,6 +55,9 @@ func TestVersionCommand_NDJSONDetails(t *testing.T) {
 	if got := details["runtimeVersion"]; got != "dev" {
 		t.Errorf("details.runtimeVersion = %v, want dev", got)
 	}
+	if got := details["alphaBackend"]; got != "dev" {
+		t.Errorf("details.alphaBackend = %v, want dev", got)
+	}
 	if got := details["protocolVersion"]; got != float64(protocol.Version) {
 		t.Errorf("details.protocolVersion = %v, want %d", got, protocol.Version)
 	}
