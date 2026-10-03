@@ -17,32 +17,20 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 	}{
 		{name: "tag trigger", snippet: "on:\n  push:\n    tags:\n      - \"v*\""},
 		{name: "Windows runner", snippet: "runs-on: windows-latest"},
-		{name: "checkout", snippet: "uses: actions/checkout@v6"},
-		{name: "setup Go", snippet: "uses: actions/setup-go@v6"},
-		{name: "Go version file", snippet: "go-version-file: go.mod"},
-		{name: "test command", snippet: "& go test ./..."},
-		{name: "test exit check", snippet: "throw \"release tests failed\""},
-		{name: "Windows target", snippet: "$env:GOOS = \"windows\""},
-		{name: "amd64 target", snippet: "$env:GOARCH = \"amd64\""},
-		{name: "trimpath build", snippet: "& go build -trimpath -buildvcs=false -ldflags $ldflags"},
-		{name: "version ldflag", snippet: "internal/version.Version=$($env:RELEASE_TAG)"},
-		{name: "commit ldflag", snippet: "internal/version.Commit=$($env:SOURCE_COMMIT)"},
-		{name: "build date ldflag", snippet: "internal/version.BuildDate=$($env:BUILD_DATE)"},
+		{name: "checkout", snippet: "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"},
 		{name: "telemetry disabled during release tests", snippet: "AUTO_MAS_TELEMETRY: disabled"},
-		{name: "optional Sentry secret", snippet: "AUTO_MAS_SENTRY_DSN: ${{ secrets.AUTO_MAS_SENTRY_DSN }}"},
-		{name: "Sentry DSN ldflag", snippet: "internal/telemetry.BuildSentryDSN=$($env:AUTO_MAS_SENTRY_DSN)"},
 		{name: "peeled source commit", snippet: "git rev-parse --verify \"HEAD^{commit}\""},
 		{name: "source commit output", snippet: "source_commit=$sourceCommit"},
 		{name: "versioned executable name", snippet: "$binaryName = \"auto-mas-runtime-$($env:RELEASE_TAG).exe\""},
 		{name: "direct executable checksum", snippet: "Get-FileHash -LiteralPath $binary -Algorithm SHA256"},
 		{name: "direct executable upload", snippet: "dist/${{ steps.metadata.outputs.binary_name }}"},
 		{name: "direct executable release", snippet: "release-assets/${{ needs.package.outputs.binary_name }}"},
-		{name: "upload action", snippet: "uses: actions/upload-artifact@v7"},
-		{name: "download action", snippet: "uses: actions/download-artifact@v8"},
-		{name: "release action", snippet: "uses: softprops/action-gh-release@v3"},
+		{name: "upload action", snippet: "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"},
+		{name: "download action", snippet: "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"},
+		{name: "release action", snippet: "uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64"},
 		{name: "unmatched asset guard", snippet: "fail_on_unmatched_files: true"},
 		{name: "generated notes", snippet: "generate_release_notes: true"},
-		{name: "unsigned policy", snippet: "The executable is intentionally unsigned"},
+		{name: "signed policy", snippet: "The executable is Authenticode signed"},
 	}
 	for _, test := range required {
 		t.Run(test.name, func(t *testing.T) {
@@ -169,8 +157,8 @@ func TestReleaseWorkflow_VersionedExecutableName(t *testing.T) {
 			}
 		})
 	}
-	if got := strings.Count(source, "$binary = Join-Path $dist $env:BINARY_NAME"); got != 2 {
-		t.Fatalf("dynamic build and checksum path count = %d, want 2", got)
+	if got := strings.Count(source, "$binary = Join-Path $dist $env:BINARY_NAME"); got != 1 {
+		t.Fatalf("dynamic signed checksum path count = %d, want 1", got)
 	}
 	for _, fixed := range []string{
 		"$binaryName = \"auto-mas-runtime.exe\"",

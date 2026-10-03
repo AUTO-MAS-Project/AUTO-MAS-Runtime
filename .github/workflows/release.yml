@@ -17,7 +17,8 @@ jobs:
   package:
     name: Build release executable
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
+    if: github.repository == 'AUTO-MAS-Project/AUTO-MAS-Runtime'
     env:
       AUTO_MAS_TELEMETRY: disabled
     outputs:
@@ -25,22 +26,17 @@ jobs:
       source_commit: ${{ steps.metadata.outputs.source_commit }}
       binary_name: ${{ steps.metadata.outputs.binary_name }}
       prerelease: ${{ steps.metadata.outputs.prerelease }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
     defaults:
       run:
         shell: pwsh
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
 
       - name: Validate release metadata
         id: metadata
@@ -83,46 +79,48 @@ jobs:
             "build_date=$buildDate"
           ) | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8NoBOM
 
-      - name: Test
-        run: |
-          $ErrorActionPreference = "Stop"
-          & go test ./...
-          if ($LASTEXITCODE -ne 0) {
-            throw "release tests failed"
-          }
-
-      - name: Build Windows x64 executable
+      - name: Request main repository build and signing
+        id: signing
         env:
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
-          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
           SOURCE_COMMIT: ${{ steps.metadata.outputs.source_commit }}
-          BINARY_NAME: ${{ steps.metadata.outputs.binary_name }}
-          AUTO_MAS_SENTRY_DSN: ${{ secrets.AUTO_MAS_SENTRY_DSN }}
+          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
+          AUTO_MAS_SIGNING_TOKEN: ${{ secrets.AUTO_MAS_SIGNING_TOKEN }}
+          CERTIFICATE_THUMBPRINT: ${{ vars.RUNTIME_SIGNING_CERTIFICATE_THUMBPRINT }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $env:GOOS = "windows"
-          $env:GOARCH = "amd64"
-          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
-          New-Item -ItemType Directory -Path $dist -Force | Out-Null
-          $binary = Join-Path $dist $env:BINARY_NAME
-          $ldflagValues = @(
-            "-s"
-            "-w"
-            "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Version=$($env:RELEASE_TAG)"
-            "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.Commit=$($env:SOURCE_COMMIT)"
-            "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version.BuildDate=$($env:BUILD_DATE)"
-          )
-          if (-not [string]::IsNullOrWhiteSpace($env:AUTO_MAS_SENTRY_DSN)) {
-            $ldflagValues += "-X github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry.BuildSentryDSN=$($env:AUTO_MAS_SENTRY_DSN)"
+          $ErrorActionPreference = 'Stop'
+          if ($env:CERTIFICATE_THUMBPRINT -cnotmatch '^[0-9A-Fa-f]{40}$') {
+            throw 'missing RUNTIME_SIGNING_CERTIFICATE_THUMBPRINT'
           }
-          $ldflags = $ldflagValues -join " "
-          & go build -trimpath -buildvcs=false -ldflags $ldflags -o $binary ./cmd/auto-mas-runtime
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows x64 build failed"
-          }
-          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-            throw "Windows x64 build did not produce $($env:BINARY_NAME)"
-          }
+          & ./scripts/request-runtime-signing.ps1 -Tag $env:RELEASE_TAG -SourceCommit $env:SOURCE_COMMIT `
+            -BuildDate $env:BUILD_DATE -RequestID "$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)" -OutputPath $env:GITHUB_OUTPUT
+
+      - name: Download exact signed artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ secrets.AUTO_MAS_SIGNING_TOKEN }}
+          repository: AUTO-MAS-Project/AUTO-MAS
+          run-id: ${{ steps.signing.outputs.run_id }}
+          artifact-ids: ${{ steps.signing.outputs.artifact_id }}
+          path: dist
+          merge-multiple: true
+
+      - name: Verify returned signed executable
+        env:
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.metadata.outputs.source_commit }}
+          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
+          BINARY_NAME: ${{ steps.metadata.outputs.binary_name }}
+          SIGNING_RUN_ID: ${{ steps.signing.outputs.run_id }}
+          SIGNING_RUN_ATTEMPT: ${{ steps.signing.outputs.run_attempt }}
+          CERTIFICATE_THUMBPRINT: ${{ vars.RUNTIME_SIGNING_CERTIFICATE_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/verify-runtime-release.ps1 -BinaryPath (Join-Path 'dist' $env:BINARY_NAME) `
+            -Tag $env:RELEASE_TAG -SourceCommit $env:SOURCE_COMMIT -BuildDate $env:BUILD_DATE `
+            -RequireSignature -CertificateThumbprint $env:CERTIFICATE_THUMBPRINT `
+            -ManifestPath 'dist/signing-manifest.json' -RequestID "$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)" `
+            -SigningRunID $env:SIGNING_RUN_ID -SigningRunAttempt $env:SIGNING_RUN_ATTEMPT
 
       - name: Assemble executable and checksums
         env:
@@ -143,7 +141,7 @@ jobs:
           }
 
       - name: Upload release assets for publishing
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-release-assets
           path: |
@@ -164,11 +162,29 @@ jobs:
         shell: pwsh
 
     steps:
+      - name: Check out release verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download release assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: runtime-release-assets
           path: release-assets
+
+      - name: Verify signed release assets before publication
+        env:
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.package.outputs.source_commit }}
+          BUILD_DATE: ${{ needs.package.outputs.build_date }}
+          BINARY_NAME: ${{ needs.package.outputs.binary_name }}
+          CERTIFICATE_THUMBPRINT: ${{ vars.RUNTIME_SIGNING_CERTIFICATE_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/verify-runtime-release.ps1 -BinaryPath (Join-Path 'release-assets' $env:BINARY_NAME) `
+            -Tag $env:RELEASE_TAG -SourceCommit $env:SOURCE_COMMIT -BuildDate $env:BUILD_DATE `
+            -RequireSignature -CertificateThumbprint $env:CERTIFICATE_THUMBPRINT -ChecksumsPath 'release-assets/SHA256SUMS.txt'
 
       - name: Reject forced or duplicate release
         env:
@@ -259,7 +275,7 @@ jobs:
           }
 
       - name: Publish release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ needs.package.outputs.tag }}
           name: AUTO-MAS Runtime ${{ needs.package.outputs.tag }}
@@ -270,7 +286,7 @@ jobs:
           prerelease: ${{ needs.package.outputs.prerelease }}
           generate_release_notes: true
           body: |
-            Windows x64 build. The executable is intentionally unsigned per the release policy.
+            Windows x64 build. The executable is Authenticode signed.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -290,17 +306,25 @@ jobs:
         shell: pwsh
 
     steps:
+      - name: Check out release verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download published executable
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.package.outputs.tag }}
           BINARY_NAME: ${{ needs.package.outputs.binary_name }}
+          SOURCE_COMMIT: ${{ needs.package.outputs.source_commit }}
+          BUILD_DATE: ${{ needs.package.outputs.build_date }}
+          CERTIFICATE_THUMBPRINT: ${{ vars.RUNTIME_SIGNING_CERTIFICATE_THUMBPRINT }}
           REPOSITORY: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
           $downloadDir = Join-Path $env:RUNNER_TEMP "runtime-release-download"
           New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-          & gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --pattern $env:BINARY_NAME --dir $downloadDir --clobber
+          & gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --pattern $env:BINARY_NAME --pattern SHA256SUMS.txt --dir $downloadDir --clobber
           if ($LASTEXITCODE -ne 0) {
             throw "unable to download published release executable"
           }
@@ -308,6 +332,10 @@ jobs:
           if ($binaries.Count -ne 1 -or $binaries[0].Name -ne $env:BINARY_NAME) {
             throw "published release executable set is unexpected"
           }
+          & ./scripts/verify-runtime-release.ps1 -BinaryPath $binaries[0].FullName `
+            -Tag $env:RELEASE_TAG -SourceCommit $env:SOURCE_COMMIT -BuildDate $env:BUILD_DATE `
+            -RequireSignature -CertificateThumbprint $env:CERTIFICATE_THUMBPRINT `
+            -ChecksumsPath (Join-Path $downloadDir 'SHA256SUMS.txt')
           "BINARY_PATH=$($binaries[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8NoBOM
 
       - name: Run version command
@@ -452,7 +480,7 @@ jobs:
       CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1

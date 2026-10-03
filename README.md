@@ -6,6 +6,18 @@ AUTO-MAS Runtime 是 AUTO-MAS 的 Windows 本机运行时管理程序。它负�
 Runtime 不代理业务 HTTP/WebSocket，不管理 Python 插件依赖，也不负责自身更新。
 正式发布首版只支持 Windows；实现进度以 [任务拆分](doc/任务拆分.md) 为准。
 
+## Code signing policy
+
+后续 Windows Release 由 AUTO-MAS 主仓库构建并提交 SignPath 签名，Runtime 仓库验证
+Authenticode、版本和源 Commit 后发布 `auto-mas-runtime-<tag>.exe` 与覆盖签名后 EXE 的
+`SHA256SUMS.txt`。历史未签名资产不改写。接入状态与配置前提见
+[T7.5 设计](doc/current/M7/设计-T7.5-主仓库构建与签名.md)。
+
+免费代码签名由 [SignPath.io](https://signpath.io/) 提供，证书由
+[SignPath Foundation](https://signpath.org/) 提供；提交、审查与签名审批沿用
+[AUTO-MAS 项目的代码签名策略](https://github.com/AUTO-MAS-Project/AUTO-MAS#code-signing-policy)。
+错误观测的隐私边界见 [Sentry-only 策略](doc/current/M12/设计-T12.1-遥测与错误观测.md)。
+
 ## 快速开始
 
 ### 直接运行已构建的 EXE
