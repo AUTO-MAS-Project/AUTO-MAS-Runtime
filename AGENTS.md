@@ -42,7 +42,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 | M4 工作区同步 | T4.0~T4.7 **已完成**（含三轮对抗性审查与组件矩阵） |
 | M5 uv、Python 与依赖 | T5.1~T5.8 **已完成**（复审修复收口于 `8deb9d7`，含官方 uv 资产、完整组件矩阵与 race 验证） |
 | M6 后端监督 | T6.1~T6.7 **已完成**（真实 Windows Job/health/control/restart/development/E2E 与对抗复审收口于 `ea886f8`） |
-| M7 GitHub CI/CD 发布 | T7.1~T7.4 **已完成**（beta.2 Release run `31407585577`、三 job 全绿、独立资产/NDJSON 验收通过）；T7.5 按 D3 延后；T7.7 CNB 代码与发行版同步 **已完成**（2026-09-17：`sync-cnb.yml` 镜像 + `publish-cnb` job + backfill 工作流 + `scripts/publish-cnb-release.ps1`；双侧 22 refs 一致、18 个 Release 全部回填、36/36 资产黑盒哈希一致；设计见 `doc/current/M7/设计-T7.7-CNB代码与发行版同步.md`；自动双发布待下次发版观察） |
+| M7 GitHub CI/CD 发布 | T7.1~T7.4 **已完成**（beta.2 Release run `31407585577`、三 job 全绿、独立资产/NDJSON 验收通过）；T7.5 于 2026-10-03 启动主仓库构建签名接入，配置与远端验收待完成；T7.7 CNB 代码与发行版同步 **已完成**（2026-09-17：`sync-cnb.yml` 镜像 + `publish-cnb` job + backfill 工作流 + `scripts/publish-cnb-release.ps1`；双侧 22 refs 一致、18 个 Release 全部回填、36/36 资产黑盒哈希一致；设计见 `doc/current/M7/设计-T7.7-CNB代码与发行版同步.md`；自动双发布待下次发版观察） |
 | M9 联调与首版验收 | T9.1 development 真后端联调 **已完成**（2026-09-02，`ba27db3` 构建对 AUTO-MAS 集成树 `integ/runtime-20260901` 跑通启动→就绪→优雅关闭）；T9.2 managed 全链路 **已完成**（2026-09-02，用本地 HTTPS smart-git 模拟 `release/*` 分支：bootstrap → supervise → 升级 → 降级 → 关 stdin 隐式关闭，真实发布分支复跑待 push 后）；T9.3 Electron 接入 🚧（`off` 六场景与 `development` 一轮桌面 E2E 完成，复跑进行中，未宣布通过）；T9.4 首版验收清单核对 **已完成**（2026-09-03，[`doc/首版验收记录.md`](doc/首版验收记录.md)：标准第 1~11 条满足，第 12/14 条不满足、第 13 条未验证，均属 AUTO-MAS 侧发布动作并附解除条件）；M9 整体待真实 `release/*` 复跑与阶段 0/5/6 收口后勾选 |
 | M10 工程可维护性收敛 | T10.1 文档信息架构已完成；后续阶段见维护设计 |
 | M11 跨平台适配（Linux/macOS） | 规划中（决策 D7，2026-08-04 立项）；仅 T11.1 设计任务可执行 |
@@ -60,7 +60,7 @@ Vue/Electron/Python 的改写、CI/CD 发布流程本身。
 - `internal/cli` 已按架构命令树注册全部命令，`version`/`doctor`/`cleanup`、workspace 和
   M5 environment/bootstrap/dependencies/repair 以及 M6 `backend supervise` 为真实实现；尚未实现的
   模式仍失败关闭并返回 `UNSUPPORTED_MODE`；
-- `.github/workflows/release.yml` 已实现 Windows x64 测试、版本注入、未签名 EXE/SHA-256 直接发布与
+- `.github/workflows/release.yml` 已实现 Windows x64 版本化 EXE/SHA-256 直接发布与
   Release 资产冒烟验证，并使用原生 Node.js 24 的 upload v7/download v8/release v3 action；
   beta.2 测试 Release 已完成远端验收；
 - `cmd/auto-mas-runtime/main.go` 是唯一持有 `os.Stdout` 的入口。
@@ -479,4 +479,4 @@ Go 测试惯例（[Go Code Review Comments](https://go.dev/wiki/CodeReviewCommen
 - **改协议前先看 `doc/契约补充-v1.md` 和 `doc/契约补充-v1-增补1.md`**：架构设计里的概括描述常被它们进一步收紧；
   增补 1 还修订了 C2 第 1 条（`protocol` 由后端自报而非回显）与 C4 第 1 条（受监督但非管理员时记 warning 并继续运行）。
 - **决策已冻结的事项不要重开**：D1~D12 与 C1~C11 是用户已确认的结论（D2/D4/D8/D9/D10 已被后续决策取代，原文只作追溯）；
-  当前仍待决的是 D-open-4、D-open-5、D-open-7、D-open-10。
+  D-open-7 已于 2026-10-03 启动 T7.5；配置与远端验收待完成。其余待决项以任务拆分为准。
