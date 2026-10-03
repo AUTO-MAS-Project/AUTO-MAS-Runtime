@@ -1,7 +1,8 @@
 # M7 实现说明
 
 M7 建立了 Windows x64 的 GitHub Release 流水线：受保护的 `v*` tag 触发
-`package → publish → smoke` 三个 job，构建期注入版本、Commit 和 UTC 构建时间，发布未签名
+`package → publish → smoke → publish-cnb` 四个 job。T7.5 起由主仓库构建签名，
+构建期注入版本、Commit 和 UTC 构建时间，发布已签名
 `auto-mas-runtime-<version>.exe` 与 SHA-256 校验资产，并从真实 Release 直接下载 EXE 执行
 严格 NDJSON 冒烟。Electron 打包时仍将其落盘为 `auto-mas-runtime.exe`。
 
@@ -11,8 +12,9 @@ M7 建立了 Windows x64 的 GitHub Release 流水线：受保护的 `v*` tag �
   不可变 tag 门禁和验收边界。
 - [`设计-T7.6-发布成品版本命名.md`](./设计-T7.6-发布成品版本命名.md)：版本化 Release EXE 名称、
   动态 `binary_name` 数据流和稳定安装名边界。
+- [`设计-T7.5-主仓库构建与签名.md`](./设计-T7.5-主仓库构建与签名.md)：主仓库 SignPath 签名、准确产物回传和验签发布。
 
-已执行的 T7.1～T7.3、T7.6 实施计划不在工作树长期保留，可通过 Git 历史按任务编号检索。
+已执行的 T7.1～T7.3、T7.5、T7.6 实施计划不在工作树长期保留，可通过 Git 历史按任务编号检索。
 
 ## 发布验收事实
 
@@ -25,7 +27,9 @@ M7 建立了 Windows x64 的 GitHub Release 流水线：受保护的 `v*` tag �
 - zip 根目录恰含 `auto-mas-runtime.exe`、`LICENSE`、`README.md`；二进制为 Windows x64、
   Authenticode 状态为 `NotSigned`；`version` 和 `doctor --output ndjson` 均以退出码 0 完成，
   严格 JSON 事件序列均为唯一首 `hello` 和末 `result`。
-- T7.4 按没有已确认的 CNB 仓库、凭据和外发授权跳过；T7.5 按 D3 保持延后，见根文档的
-  `D-open-7`。
+- T7.4 当时按没有已确认的 CNB 仓库、凭据和外发授权跳过；T7.7 后续实现 CNB 同步。
+- T7.5 于 2026-10-03 完成 `v0.1.16` 远端验收：主仓库 run `37112502613` 构建与签名成功，
+  Runtime run `37112487076` 四 job 全绿；独立下载 GitHub/CNB 的 EXE 签名为 `Valid`，
+  两侧双资产哈希相同，version/doctor 严格 NDJSON 通过。
 
 权威进度和最终提交证据仍以 `doc/任务拆分.md`、`AGENTS.md` 和架构文档为准。
