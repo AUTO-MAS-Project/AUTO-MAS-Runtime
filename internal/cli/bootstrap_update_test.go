@@ -15,8 +15,10 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
 
 func TestBootstrap_AlphaStartupAndExplicitUpdate(t *testing.T) {
@@ -28,7 +30,7 @@ func TestBootstrap_AlphaStartupAndExplicitUpdate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			log := &m5TestLog{}
-			environment := &m5TestEnvironment{calls: &log.calls}
+			environment := &m5TestEnvironment{calls: &log.calls, dependencyCheckEnabled: true}
 			layout, err := config.NewLayout(root, root)
 			if err != nil {
 				t.Fatal(err)
@@ -83,7 +85,7 @@ func TestBootstrap_IfNeededSkipsOnlyUnchangedReadyEnvironment(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			log := &m5TestLog{}
-			environment := &m5TestEnvironment{calls: &log.calls}
+			environment := &m5TestEnvironment{calls: &log.calls, dependencyCheckEnabled: true}
 			// 「环境已就绪」现在还要求磁盘上真有一个结构完整的 venv，夹具据此补齐。
 			readyLayout, layoutErr := config.NewLayout(root, root)
 			if layoutErr != nil {
@@ -177,6 +179,135 @@ func TestBootstrap_IfNeededRebuildsWhenVenvIsBroken(t *testing.T) {
 	if !strings.Contains(strings.Join(log.calls, ","), "dependencies") {
 		t.Fatalf("calls=%v, want dependency sync because the venv is incomplete", log.calls)
 	}
+}
+
+func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
+	unsynchronized := &commandError{
+		code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesCheck,
+		message: "主项目依赖环境未同步", details: map[string]any{"exitCode": 1},
+	}
+	interpreterMissing := &commandError{
+		code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesCheck,
+		details: map[string]any{"exitCode": 103},
+		cause:   &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StageDependenciesCheck, details: map[string]any{"failureKind": "nonzero_exit"}},
+	}
+	tests := []struct {
+		name     string
+		result   uv.DependenciesResult
+		err      error
+		offline  bool
+		wantSync bool
+		wantCode protocol.Code
+	}{
+		{name: "healthy", result: uv.DependenciesResult{LockfileChecked: true, Synchronized: true}},
+		{name: "healthy offline", result: uv.DependenciesResult{LockfileChecked: true, Synchronized: true}, offline: true},
+		{name: "base interpreter missing", err: interpreterMissing, wantSync: true},
+		{name: "packages missing", err: unsynchronized, wantSync: true},
+		{name: "packages missing offline", err: unsynchronized, offline: true, wantSync: true},
+		{name: "unknown check result", wantSync: true},
+		{name: "cancelled", err: context.Canceled, wantCode: protocol.CodeOperationCancelled},
+		{name: "uv spawn failed", err: &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StageDependenciesCheck}, wantCode: protocol.CodeUVExecFailed},
+		{name: "output failed", err: &commandError{code: protocol.CodeOutputWriteFailed, stage: protocol.StageDependenciesCheck}, wantCode: protocol.CodeOutputWriteFailed},
+		{name: "wrapped output failed", err: &commandError{
+			code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesCheck, details: map[string]any{"exitCode": 1},
+			cause: &commandError{code: protocol.CodeOutputWriteFailed, stage: protocol.StageDependenciesCheck},
+		}, wantCode: protocol.CodeOutputWriteFailed},
+		{name: "wrapped stream failure", err: &commandError{
+			code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesCheck, details: map[string]any{"exitCode": 1},
+			cause: &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StageDependenciesCheck, details: map[string]any{"failureKind": "output_read_failed"}},
+		}, wantCode: protocol.CodeDependencySyncFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			layout, err := config.NewLayout(root, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeBootstrapFile(t, layout.VenvConfigFile())
+			writeBootstrapFile(t, layout.VenvPythonExecutable())
+			log := &m5TestLog{}
+			base := &m5TestEnvironment{calls: &log.calls}
+			environment := &bootstrapReadinessEnvironment{m5TestEnvironment: base}
+			commit := strings.Repeat("a", 40)
+			checked := false
+			environment.check = func(_ context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
+				checked = true
+				if !request.MirrorPolicy.Offline() || request.ProjectDir != layout.RepoDir() || request.ProjectEnvDir != layout.VenvDir() ||
+					request.PythonVersion != "3.12.10" || request.Commit != commit || request.Branch != "release/v5.4.0" || request.OperationID == "" || request.Line == nil {
+					t.Fatalf("check request = %+v, want offline managed identity and operation log", request)
+				}
+				return test.result, test.err
+			}
+			store := &m5TestStateStore{calls: &log.calls, initial: state.EnvironmentState{
+				Status: protocol.StateReadyToStart, LastSuccessful: state.Revision{Version: "v5.4.0", Commit: commit},
+			}}
+			workspace := workspaceTestService{sync: func(context.Context, gitrepo.SyncRequest) (gitrepo.SyncResult, error) {
+				revision, err := gitrepo.NewRevision("v5.4.0", "release/v5.4.0", commit, "github")
+				return gitrepo.SyncResult{Revision: revision, Status: protocol.StateReadyToStart}, err
+			}}
+			args := []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0", "--if-needed"}
+			if test.offline {
+				args = append([]string{"--offline"}, args...)
+			} else {
+				args = append([]string{"--mirror", "package-index=aliyun"}, args...)
+			}
+			var stdout, stderr bytes.Buffer
+			code := Execute(t.Context(), args, IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(root),
+				WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
+				WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
+				WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
+					return store, nil
+				}),
+				WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+					return &m5TestCoordinator{calls: &log.calls}, nil
+				}),
+				WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
+					return log, nil
+				}),
+			)
+			if !checked {
+				t.Fatal("dependency check was not called")
+			}
+			if test.wantCode != "" {
+				events := parseNDJSON(t, stdout.String())
+				last := events[len(events)-1]
+				if code == 0 || last.object["code"] != string(test.wantCode) {
+					t.Fatalf("exit=%d, result=%v, want %s; stderr=%s", code, last.object, test.wantCode, stderr.String())
+				}
+			} else if code != 0 {
+				t.Fatalf("exit=%d, output=%s, stderr=%s", code, stdout.String(), stderr.String())
+			}
+			if got := base.syncCalls > 0; got != test.wantSync {
+				t.Fatalf("sync calls=%d, want sync=%t", base.syncCalls, test.wantSync)
+			}
+			if !test.wantSync && (base.pythonPrepareCalls != 0 || len(store.writes) != 0) {
+				t.Fatalf("python calls=%d, state writes=%v, want no preparation", base.pythonPrepareCalls, store.writes)
+			}
+			if test.wantSync {
+				if base.pythonPrepareCalls != 1 || len(store.writes) != 1 || store.writes[0].Status != protocol.StateReadyToStart {
+					t.Fatalf("python calls=%d, writes=%v, want prepared ready environment", base.pythonPrepareCalls, store.writes)
+				}
+				if base.dependencyRequest.MirrorPolicy.Offline() != test.offline {
+					t.Fatal("sync did not preserve original offline policy")
+				}
+				if !test.offline {
+					if preferred, ok := base.dependencyRequest.MirrorPolicy.Preferred(mirror.KindPackageIndex); !ok || preferred != "aliyun" {
+						t.Fatal("sync did not preserve mirror preference")
+					}
+				}
+			}
+		})
+	}
+}
+
+type bootstrapReadinessEnvironment struct {
+	*m5TestEnvironment
+	check func(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error)
+}
+
+func (s *bootstrapReadinessEnvironment) CheckDependencies(ctx context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
+	return s.check(ctx, request)
 }
 
 func writeBootstrapFile(t *testing.T, path string) {

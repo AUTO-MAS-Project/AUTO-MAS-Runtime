@@ -63,6 +63,7 @@ func TestDependencies_CheckDetectsUnsynchronizedEnvironment(t *testing.T) {
 	writeLockfile(t, layout.UVLockFile())
 	runner := &fakeDependenciesRunner{responses: []fakeRunnerResponse{
 		{},
+		{},
 		{result: UVResult{ExitCode: 1}, err: errors.New("environment is not synchronized")},
 	}}
 	service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
@@ -72,21 +73,72 @@ func TestDependencies_CheckDetectsUnsynchronizedEnvironment(t *testing.T) {
 
 	_, err = service.Check(t.Context(), dependencyTestRequest(layout))
 	assertPythonCode(t, err, protocol.CodeDependencySyncFailed)
-	if got, want := len(runner.calls), 2; got != want {
+	if got, want := len(runner.calls), 3; got != want {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
 	want := []string{
 		"sync", "--project", layout.RepoDir(), "--python", "3.12.10", "--check",
 		"--locked", "--no-default-groups", "--no-install-workspace",
 	}
-	if got := runner.calls[1].args; !reflect.DeepEqual(got, want) {
+	if got := runner.calls[2].args; !reflect.DeepEqual(got, want) {
 		t.Fatalf("check sync args = %#v, want %#v", got, want)
 	}
-	if got := runner.calls[1].options.Environment[uvOfflineEnv]; got != "1" {
+	if got := runner.calls[2].options.Environment[uvOfflineEnv]; got != "1" {
 		t.Fatalf("check sync offline environment = %q, want 1", got)
 	}
-	if got, want := runner.calls[1].options.Stage, protocol.StageDependenciesCheck; got != want {
+	if got, want := runner.calls[2].options.Stage, protocol.StageDependenciesCheck; got != want {
 		t.Fatalf("check sync stage = %q, want %q", got, want)
+	}
+}
+
+func TestDependencies_CheckVerifiesVenvInterpreter(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		exitCode int
+		err      error
+	}{
+		{name: "healthy"},
+		{name: "missing base", exitCode: 103},
+		{name: "version mismatch", exitCode: 1},
+		{name: "cancelled", err: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			layout, err := config.NewLayout(root, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeLockfile(t, layout.UVLockFile())
+			runner := &fakeDependenciesRunner{responses: []fakeRunnerResponse{{}, {result: UVResult{ExitCode: test.exitCode}, err: test.err}}}
+			service, err := NewDependenciesService(layout, runner, &fakeTreeRemover{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.Check(t.Context(), dependencyTestRequest(layout))
+			if errors.Is(test.err, context.Canceled) {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("error=%v, want cancelled", err)
+				}
+			} else if test.exitCode != 0 {
+				assertPythonCode(t, err, protocol.CodeDependencySyncFailed)
+			} else if err != nil || !result.Synchronized {
+				t.Fatalf("result=%v, error=%v, want synchronized", result, err)
+			}
+			wantCalls := 2
+			if test.exitCode == 0 && test.err == nil {
+				wantCalls = 3
+			}
+			if len(runner.calls) != wantCalls {
+				t.Fatalf("calls=%v, want %d", runner.calls, wantCalls)
+			}
+			wantArgs := []string{"run", "--no-project", "--no-python-downloads", "--python", layout.VenvPythonExecutable(), layout.VenvPythonExecutable(), "-I", "-S", "-c", "import sys; sys.exit('.'.join(map(str, sys.version_info[:3])) != sys.argv[1])", "3.12.10"}
+			if !reflect.DeepEqual(runner.calls[1].args, wantArgs) {
+				t.Fatalf("interpreter args=%v, want %v", runner.calls[1].args, wantArgs)
+			}
+			if runner.calls[1].options.Environment[uvOfflineEnv] != "1" {
+				t.Fatal("interpreter check must be offline")
+			}
+		})
 	}
 }
 

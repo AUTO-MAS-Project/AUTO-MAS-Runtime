@@ -553,6 +553,9 @@ func writeM5ComponentFakeUVConfig(t *testing.T, layout *config.Layout) string {
 			},
 			{"argumentsPrefix": []string{"lock"}},
 			{
+				"argumentsPrefix": []string{"run", "--no-project", "--no-python-downloads", "--python", layout.VenvPythonExecutable(), layout.VenvPythonExecutable()},
+			},
+			{
 				"argumentsPrefix":   []string{"sync"},
 				"createDirectories": []string{layout.VenvDir()},
 			},
@@ -667,12 +670,13 @@ func assertM5ComponentFakeUVInvocations(t *testing.T, path string) {
 		}
 	}()
 	wants := map[string]bool{
-		"--version":      false,
-		"python list":    false,
-		"python install": false,
-		"python find":    false,
-		"lock":           false,
-		"sync":           false,
+		"--version":                              false,
+		"python list":                            false,
+		"python install":                         false,
+		"python find":                            false,
+		"lock":                                   false,
+		"sync":                                   false,
+		"run --no-project --no-python-downloads": false,
 	}
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {

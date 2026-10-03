@@ -9,6 +9,7 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
@@ -256,18 +257,23 @@ func runBootstrap(
 			cause:   errors.New("workspace sync returned an empty revision"),
 		}
 	}
-	// 就绪判据除了状态与版本，还要有文件系统实证：状态文件说 ready 不代表 venv 还在。
-	// 真机上出现过 venv 被删掉一半（pyvenv.cfg 没了、python.exe 还在）后，--if-needed
-	// 一路短路、supervise 拿到一个一启动就退出的解释器，用户重试多少次都不会重建。
+	// 结构完整仍可能指向失效的基础 Python，或已被重建成缺包的空环境；
+	// 交给 --no-sync 启动之前必须让 uv 复验实际解释器与锁定依赖。
 	venvIntact := filesystem.InspectVenv(deps.global.layout).Intact
 	if ifNeeded && venvIntact && !workspaceResult.Changed && workspaceResult.Status == protocol.StateReadyToStart &&
 		initial.Status == protocol.StateReadyToStart && initial.LastSuccessful.Version == revision.Version() && initial.LastSuccessful.Commit == revision.Commit() {
-		if err := rollbackM5Preparation(emitter, machine, protocol.StageBootstrap, "当前运行环境已就绪"); err != nil {
-			return sessionSuccess{}, err
+		ready, err := checkBootstrapReadiness(ctx, deps, service, emitter, revision, operationLogger)
+		if err != nil {
+			return sessionSuccess{}, errors.Join(err, rollbackM5Preparation(emitter, machine, protocol.StageDependenciesCheck, "运行环境检查未完成"))
 		}
-		return sessionSuccess{message: "当前运行环境已就绪", status: string(protocol.StateReadyToStart), details: map[string]any{
-			"version": revision.Version(), "branch": revision.Branch(), "commit": revision.Commit(), "unchanged": true,
-		}}, nil
+		if ready {
+			if err := rollbackM5Preparation(emitter, machine, protocol.StageBootstrap, "当前运行环境已就绪"); err != nil {
+				return sessionSuccess{}, err
+			}
+			return sessionSuccess{message: "当前运行环境已就绪", status: string(protocol.StateReadyToStart), details: map[string]any{
+				"version": revision.Version(), "branch": revision.Branch(), "commit": revision.Commit(), "unchanged": true,
+			}}, nil
+		}
 	}
 	if err := transitionM5State(emitter, machine, protocol.StagePythonCheck, protocol.StatePreparingPython, "正在准备受管 Python"); err != nil {
 		return sessionSuccess{}, err
@@ -397,6 +403,56 @@ func runBootstrap(
 		status:  string(protocol.StateReadyToStart),
 		details: details,
 	}, nil
+}
+
+func checkBootstrapReadiness(
+	ctx context.Context,
+	deps *deps,
+	service environmentService,
+	emitter *protocol.Emitter,
+	revision gitrepo.Revision,
+	logger workspaceLogger,
+) (bool, error) {
+	if err := emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressRunning, "正在检查当前运行环境"); err != nil {
+		return false, err
+	}
+	spec, err := service.ReadPythonSpec(ctx, deps.global.layout.RepoDir())
+	if err != nil {
+		return false, err
+	}
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Offline: true})
+	if err != nil {
+		return false, err
+	}
+	result, err := service.CheckDependencies(ctx, uv.DependenciesRequest{
+		ProjectDir: deps.global.layout.RepoDir(), ProjectEnvDir: deps.global.layout.VenvDir(),
+		PythonVersion: spec.Version.String(), OperationID: emitter.OperationID(),
+		Branch: revision.Branch(), Commit: revision.Commit(), MirrorPolicy: policy,
+		Line: uvLogLine(logger),
+	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	if err != nil {
+		// 只有已完成的 uv 检查报告未同步才进入准备流程；读取管道、
+		// 启动进程或日志出口失败不能被依赖层的外包装掩盖。
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+			findOperationErrorCode(err, protocol.CodeOutputWriteFailed) != nil {
+			return false, err
+		}
+		if executionErr := findOperationErrorCode(err, protocol.CodeUVExecFailed); executionErr != nil && executionErr.Details()["failureKind"] != "nonzero_exit" {
+			return false, err
+		}
+		failure := findOperationErrorCode(err, protocol.CodeDependencySyncFailed)
+		if failure == nil || detailsExitCode(failure.Details()) <= 0 {
+			return false, err
+		}
+		return false, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressFailed, "当前运行环境未同步，正在重新准备")
+	}
+	if !result.LockfileChecked || !result.Synchronized {
+		return false, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressFailed, "未确认运行环境就绪，正在重新准备")
+	}
+	return true, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressSucceeded, "当前运行环境检查通过")
 }
 
 type directWorkspaceEmitter struct {

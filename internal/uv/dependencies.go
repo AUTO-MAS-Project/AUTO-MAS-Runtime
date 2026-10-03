@@ -131,6 +131,21 @@ func (s *DependenciesService) Check(
 	if err := s.checkLockfile(ctx, request); err != nil {
 		return DependenciesResult{}, err
 	}
+	// sync --check 只校验包记录，基础解释器消失时仍可能退出 0。
+	// 显式执行 venv 内解释器，禁止项目发现与下载，避免 uv 隐式重建环境。
+	pythonExecutable := config.PythonExecutableInVenv(request.ProjectEnvDir)
+	interpreterResult, err := s.runner.Run(ctx, []string{
+		"run", "--no-project", "--no-python-downloads", "--python", pythonExecutable,
+		pythonExecutable, "-I", "-S", "-c",
+		"import sys; sys.exit('.'.join(map(str, sys.version_info[:3])) != sys.argv[1])",
+		request.PythonVersion,
+	}, withOfflineUV(s.runOptions(request, protocol.StageDependenciesCheck)))
+	if err != nil || interpreterResult.ExitCode != 0 {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return DependenciesResult{}, err
+		}
+		return DependenciesResult{}, dependencyCheckError(interpreterResult, err)
+	}
 	result, err := s.runner.Run(ctx, []string{
 		"sync",
 		"--project",
