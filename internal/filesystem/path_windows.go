@@ -944,8 +944,12 @@ type fileCaseSensitiveInfo struct {
 }
 
 func identityWindows(handle windows.Handle) (objectIdentity, error) {
+	return identityWindowsWith(handle, newIdentityAPI())
+}
+
+func identityWindowsWith(handle windows.Handle, api identityAPI) (objectIdentity, error) {
 	var basic fileBasicInfo
-	if err := getFileInformationWindows(
+	if err := api.information(
 		handle,
 		fileBasicInfoClass,
 		unsafe.Pointer(&basic),
@@ -954,7 +958,7 @@ func identityWindows(handle windows.Handle) (objectIdentity, error) {
 		return objectIdentity{}, fmt.Errorf("read basic file info: %w", err)
 	}
 	var standard fileStandardInfo
-	if err := getFileInformationWindows(
+	if err := api.information(
 		handle,
 		fileStandardInfoClass,
 		unsafe.Pointer(&standard),
@@ -963,13 +967,16 @@ func identityWindows(handle windows.Handle) (objectIdentity, error) {
 		return objectIdentity{}, fmt.Errorf("read standard file info: %w", err)
 	}
 	var id fileIDInfo
-	if err := getFileInformationWindows(
+	if err := api.information(
 		handle,
 		fileIDInfoClass,
 		unsafe.Pointer(&id),
 		unsafe.Sizeof(id),
 	); err != nil {
-		return objectIdentity{}, fmt.Errorf("read file id info: %w", err)
+		id, err = legacyExFATIdentityWith(handle, basic, standard, err, api)
+		if err != nil {
+			return objectIdentity{}, fmt.Errorf("read file id info: %w", err)
+		}
 	}
 	return objectIdentity{
 		volumeSerial:  id.volumeSerial,
@@ -1003,13 +1010,24 @@ func getFileInformationWindows(
 }
 
 func caseSensitiveWindows(handle windows.Handle) (bool, error) {
+	return caseSensitiveWindowsWith(handle, newIdentityAPI())
+}
+
+func caseSensitiveWindowsWith(handle windows.Handle, api identityAPI) (bool, error) {
 	var information fileCaseSensitiveInfo
-	if err := getFileInformationWindows(
+	if err := api.information(
 		handle,
 		fileCaseSensitiveClass,
 		unsafe.Pointer(&information),
 		unsafe.Sizeof(information),
 	); err != nil {
+		flags, fallbackErr := exFATVolumeWith(handle, err, api)
+		if fallbackErr == nil && flags&windows.FILE_CASE_SENSITIVE_SEARCH == 0 {
+			return false, nil
+		}
+		if fallbackErr != nil {
+			err = fallbackErr
+		}
 		return false, fmt.Errorf("read case-sensitive info: %w", err)
 	}
 	return information.flags&fileCaseSensitiveDir != 0, nil

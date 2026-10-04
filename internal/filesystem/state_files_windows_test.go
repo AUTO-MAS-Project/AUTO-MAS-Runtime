@@ -3856,3 +3856,93 @@ func (tContextWithoutFailure) Value(any) any               { return nil }
 
 var _ context.Context = tContextWithoutFailure{}
 var _ = sync.Mutex{}
+
+func TestStateFiles_ExFATIdentityLifecycle(t *testing.T) {
+	api := newProductionPathAPI()
+	identityAPI := simulatedExFATIdentityAPI()
+	api.identity = func(h windows.Handle) (objectIdentity, error) { return identityWindowsWith(h, identityAPI) }
+	api.caseSensitive = func(h windows.Handle) (bool, error) { return caseSensitiveWindowsWith(h, identityAPI) }
+	setDisposition := api.setStateDisposition
+	api.setStateDisposition = func(h windows.Handle, spec stateDispositionSpec) error {
+		if spec == statePOSIXDispositionSpec() {
+			return windows.ERROR_INVALID_PARAMETER
+		}
+		return setDisposition(h, spec)
+	}
+	verifyExFATStateLifecycle(t, t.TempDir(), api)
+}
+
+func verifyExFATStateLifecycle(t *testing.T, root string, api pathAPI) {
+	t.Helper()
+	layout, err := config.NewLayout(filepath.Join(root, "app"), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(layout.AppRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dependencies := stateFileDependencies{api: api, waitGate: defaultStateGateWait, fillNonce: fillCryptoNonce}
+	files, err := newStateFilesWithDependencies(t.Context(), layout, dependencies)
+	if err != nil {
+		t.Fatalf("NewStateFiles() = %v", err)
+	}
+	defer func() {
+		if err := files.Close(); err != nil {
+			t.Errorf("close state files: %v", err)
+		}
+	}()
+	for _, kind := range []StateFileKind{StateBackend, StateMutation, StateUpdate, StateEnvironment} {
+		if _, err := files.WriteAtomic(t.Context(), kind, []byte("old")); err != nil {
+			t.Fatal(err)
+		}
+		old, err := files.Read(t.Context(), kind, MaxStateFileBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := files.WriteAtomic(t.Context(), kind, []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		if kind != StateEnvironment {
+			if result, err := files.RemoveTransactionIfUnchanged(t.Context(), old); !errors.Is(err, ErrIdentityChanged) || result.MutationApplied {
+				t.Fatalf("stale remove = %#v, %v, want identity rejection", result, err)
+			}
+		}
+		if err := files.Close(); err != nil {
+			t.Fatal(err)
+		}
+		files, err = newStateFilesWithDependencies(t.Context(), layout, dependencies)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := files.Read(t.Context(), kind, MaxStateFileBytes)
+		if err != nil || string(snapshot.Bytes()) != "new" {
+			t.Fatalf("read after reopen = %#v, %v", snapshot, err)
+		}
+		if kind != StateEnvironment {
+			if result, err := files.RemoveTransactionIfUnchanged(t.Context(), snapshot); err != nil || !result.MutationApplied {
+				t.Fatalf("conditional remove = %#v, %v", result, err)
+			}
+		}
+	}
+	// 只逐个删除随机测试布局的普通文件与空目录，不递归遍历外部路径。
+	if err := files.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{layout.StateDir(), layout.AppRoot()} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+				t.Fatalf("unexpected test entry %s", entry.Name())
+			}
+			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+				t.Fatal(fmt.Errorf("remove test file: %w", err))
+			}
+		}
+		if err := os.Remove(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
