@@ -915,6 +915,29 @@ func TestHealth_BackgroundBudgetConfigOverrides(t *testing.T) {
 	}
 }
 
+// TestHealth_ValidResponseNeverShortensDeadline 证明后台初始化总预算按 TotalTimeout 兜底：
+// 配置成 TotalTimeout 大于 BackgroundTimeout 时，有效应答不得把截止时间从第一段提前。
+func TestHealth_ValidResponseNeverShortensDeadline(t *testing.T) {
+	clock := newVirtualClock(200 * time.Millisecond)
+	transport := newTimelineTransport(clock, 2*time.Second, func(elapsed time.Duration) backendPhase {
+		if elapsed < 5*time.Second {
+			return phaseRefused
+		}
+		return phaseRunning
+	})
+	checker := NewChecker(Config{
+		Transport:         transport,
+		Clock:             clock,
+		TotalTimeout:      200 * time.Second,
+		BackgroundTimeout: 150 * time.Second,
+	})
+	elapsed, err := runTimeline(t, checker, clock, &fakeProbe{exited: transport.exited, healthy: true})
+	assertHealthCode(t, err, protocol.CodeBackendHealthTimeout)
+	if want := 200 * time.Second; elapsed != want {
+		t.Fatalf("Check() returned at %s, want %s", elapsed, want)
+	}
+}
+
 func runningUntil(last time.Duration, after backendPhase) func(time.Duration) backendPhase {
 	return func(elapsed time.Duration) backendPhase {
 		if elapsed <= last {

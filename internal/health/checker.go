@@ -118,6 +118,7 @@ type Config struct {
 	// TotalTimeout 是从开始检查起拿到第一次有效应答的期限（增补 2 C21 第一段），缺省 60 秒。
 	TotalTimeout time.Duration
 	// BackgroundTimeout 是拿到过有效应答后、从开始检查起算的后台初始化总预算（C21），缺省 150 秒。
+	// 解析值小于 TotalTimeout 时按 TotalTimeout 取，有效应答不会让截止时间早于第一段。
 	BackgroundTimeout time.Duration
 	// SilenceTimeout 是拿到过有效应答后距最后一次有效应答的最长间隔（C21 失联兜底）；
 	// 为零时取 TotalTimeout——两者是同一条「60 秒内必须见到有效应答」规则的两个起点。
@@ -157,6 +158,7 @@ func NewChecker(config Config) *Checker {
 	if backgroundTimeout <= 0 {
 		backgroundTimeout = defaultBackgroundTimeout
 	}
+	backgroundTimeout = max(backgroundTimeout, totalTimeout)
 	silenceTimeout := config.SilenceTimeout
 	if silenceTimeout <= 0 {
 		silenceTimeout = totalTimeout
