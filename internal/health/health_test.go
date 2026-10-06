@@ -771,6 +771,329 @@ func TestHealth_RequestURLFollowsExpectationPort(t *testing.T) {
 	}
 }
 
+// TestHealth_BackgroundBudgetTimeline 锁定增补 2 C21：60 秒内必须拿到第一次有效应答；
+// 之后截止时间为 min(开始 + 150 秒, 最后一次有效应答 + 60 秒)，其余立即失败路径不变。
+// 全部用默认配置（60s / 150s / 60s / 2s / 200ms）在虚拟时钟上逐步推演，断言精确的收口时刻。
+func TestHealth_BackgroundBudgetTimeline(t *testing.T) {
+	tests := []struct {
+		name        string
+		phase       func(elapsed time.Duration) backendPhase
+		wantCode    protocol.Code // 为空表示就绪成功
+		wantElapsed time.Duration
+	}{
+		{
+			name:        "a_never_reachable_times_out_at_60s",
+			phase:       func(time.Duration) backendPhase { return phaseRefused },
+			wantCode:    protocol.CodeBackendHealthTimeout,
+			wantElapsed: 60 * time.Second,
+		},
+		{
+			name:        "a_requests_never_answer_time_out_at_60s",
+			phase:       func(time.Duration) backendPhase { return phaseHang },
+			wantCode:    protocol.CodeBackendHealthTimeout,
+			wantElapsed: 60 * time.Second,
+		},
+		{
+			name: "b_running_from_5s_ready_at_90s_succeeds",
+			phase: func(elapsed time.Duration) backendPhase {
+				switch {
+				case elapsed < 5*time.Second:
+					return phaseRefused
+				case elapsed < 90*time.Second:
+					return phaseRunning
+				default:
+					return phaseReady
+				}
+			},
+			wantElapsed: 90*time.Second + 200*time.Millisecond,
+		},
+		{
+			name:        "c_running_forever_times_out_at_150s",
+			phase:       func(time.Duration) backendPhase { return phaseRunning },
+			wantCode:    protocol.CodeBackendHealthTimeout,
+			wantElapsed: 150 * time.Second,
+		},
+		{
+			name:        "d_unreachable_after_10s_running_times_out_at_70s",
+			phase:       runningUntil(10*time.Second, phaseRefused),
+			wantCode:    protocol.CodeBackendHealthTimeout,
+			wantElapsed: 70 * time.Second,
+		},
+		{
+			name: "e_process_exit_during_extension_is_immediate",
+			phase: func(elapsed time.Duration) backendPhase {
+				if elapsed < 100*time.Second {
+					return phaseRunning
+				}
+				return phaseExit
+			},
+			wantCode:    protocol.CodeBackendExitedBeforeReady,
+			wantElapsed: 100 * time.Second,
+		},
+		{
+			name: "f_background_failed_during_extension_is_immediate",
+			phase: func(elapsed time.Duration) backendPhase {
+				if elapsed < 100*time.Second {
+					return phaseRunning
+				}
+				return phaseFailed
+			},
+			wantCode:    protocol.CodeBackendHealthInvalid,
+			wantElapsed: 100 * time.Second,
+		},
+		{
+			// 每次挂起的请求耗满 2 秒单请求超时；截止时间 70 秒落在一次挂起中途，必须恰好在 70 秒收口。
+			name:        "g_hung_requests_after_10s_time_out_at_70s",
+			phase:       runningUntil(10*time.Second, phaseHang),
+			wantCode:    protocol.CodeBackendHealthTimeout,
+			wantElapsed: 70 * time.Second,
+		},
+		{
+			// 58.6 秒发出的请求挂起跨过 60 秒：第一段的截止时间不得截断它；恢复应答后重新延长直到就绪。
+			name: "g_hung_requests_across_60s_then_ready_succeeds",
+			phase: func(elapsed time.Duration) backendPhase {
+				switch {
+				case elapsed <= 10*time.Second:
+					return phaseRunning
+				case elapsed < 60*time.Second:
+					return phaseHang
+				case elapsed < 120*time.Second:
+					return phaseRunning
+				default:
+					return phaseReady
+				}
+			},
+			wantElapsed: 120*time.Second + 200*time.Millisecond,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newVirtualClock(200 * time.Millisecond)
+			transport := newTimelineTransport(clock, 2*time.Second, test.phase)
+			checker := NewChecker(Config{Transport: transport, Clock: clock})
+			elapsed, err := runTimeline(t, checker, clock, &fakeProbe{exited: transport.exited, healthy: true})
+			if test.wantCode == "" {
+				if err != nil {
+					t.Fatalf("Check() error = %v at %s, want nil", err, elapsed)
+				}
+			} else {
+				assertHealthCode(t, err, test.wantCode)
+			}
+			if elapsed != test.wantElapsed {
+				t.Fatalf("Check() returned at %s, want %s", elapsed, test.wantElapsed)
+			}
+		})
+	}
+}
+
+// TestHealth_BackgroundBudgetConfigOverrides 证明两个新时长可经 Config 覆盖（仅供测试使用）。
+func TestHealth_BackgroundBudgetConfigOverrides(t *testing.T) {
+	tests := []struct {
+		name        string
+		phase       func(elapsed time.Duration) backendPhase
+		wantElapsed time.Duration
+	}{
+		{name: "silence_window", phase: runningUntil(30*time.Second, phaseRefused), wantElapsed: 75 * time.Second},
+		{name: "background_budget", phase: func(time.Duration) backendPhase { return phaseRunning }, wantElapsed: 100 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newVirtualClock(200 * time.Millisecond)
+			transport := newTimelineTransport(clock, 2*time.Second, test.phase)
+			checker := NewChecker(Config{
+				Transport:         transport,
+				Clock:             clock,
+				BackgroundTimeout: 100 * time.Second,
+				SilenceTimeout:    45 * time.Second,
+			})
+			elapsed, err := runTimeline(t, checker, clock, &fakeProbe{exited: transport.exited, healthy: true})
+			assertHealthCode(t, err, protocol.CodeBackendHealthTimeout)
+			if elapsed != test.wantElapsed {
+				t.Fatalf("Check() returned at %s, want %s", elapsed, test.wantElapsed)
+			}
+		})
+	}
+}
+
+func runningUntil(last time.Duration, after backendPhase) func(time.Duration) backendPhase {
+	return func(elapsed time.Duration) backendPhase {
+		if elapsed <= last {
+			return phaseRunning
+		}
+		return after
+	}
+}
+
+// runTimeline 在虚拟时钟上跑完一次 Check，返回收口时的虚拟耗时。
+func runTimeline(t *testing.T, checker *Checker, clock *virtualClock, probe Probe) (time.Duration, error) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- checker.Check(t.Context(), managedExpectation(), probe) }()
+	select {
+	case err := <-result:
+		return clock.elapsed(), err
+	case <-time.After(30 * time.Second):
+		t.Fatalf("Check() did not finish on the virtual timeline, stuck at %s", clock.elapsed())
+		return 0, nil
+	}
+}
+
+// backendPhase 是时间线夹具在某一虚拟时刻对健康请求的应答方式。
+type backendPhase uint8
+
+const (
+	phaseRefused backendPhase = iota
+	phaseHang
+	phaseRunning
+	phaseReady
+	phaseFailed
+	phaseExit
+)
+
+// timelineTransport 按发出请求时的虚拟耗时决定应答：挂起的请求让虚拟时间前进一个单请求超时，
+// 再等待检查器取消它；phaseExit 关闭进程退出信号并以连接失败应答。
+type timelineTransport struct {
+	clock          *virtualClock
+	requestTimeout time.Duration
+	phase          func(elapsed time.Duration) backendPhase
+	exited         chan struct{}
+	exitOnce       sync.Once
+}
+
+func newTimelineTransport(clock *virtualClock, requestTimeout time.Duration, phase func(time.Duration) backendPhase) *timelineTransport {
+	return &timelineTransport{clock: clock, requestTimeout: requestTimeout, phase: phase, exited: make(chan struct{})}
+}
+
+func (t *timelineTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	switch t.phase(t.clock.elapsed()) {
+	case phaseHang:
+		t.clock.advanceAfterTimer(t.requestTimeout)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	case phaseRunning:
+		return jsonResponse(healthBody("running", "", 1, "v5.4.0", testCommit)), nil
+	case phaseReady:
+		return jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit)), nil
+	case phaseFailed:
+		return jsonResponse(healthBody("failed", "", 1, "v5.4.0", testCommit)), nil
+	case phaseExit:
+		t.exitOnce.Do(func() { close(t.exited) })
+		return nil, errors.New("connection refused")
+	default:
+		return nil, errors.New("connection refused")
+	}
+}
+
+// virtualEpoch 是虚拟时间线的起点（取自 issue #1227 的 supervise 时刻，仅为可读）。
+var virtualEpoch = time.Date(2026, 10, 6, 15, 43, 26, 0, time.UTC)
+
+// virtualClock 是只在两种时刻前进的假时钟：检查器创建轮询计时器时（等待即时间流逝），
+// 以及挂起的请求让时间走过一个单请求超时时。前进途中只触发最早到期的一个计时器
+// （同时到期取先创建者），并停在它的到期时刻，因此收口时刻可以精确断言。
+type virtualClock struct {
+	mu sync.Mutex
+	// created 在每次创建计时器时广播，与 mu 配对。
+	created *sync.Cond
+	// 以下字段由 mu 保护。
+	now    time.Time
+	poll   time.Duration
+	timers []*virtualTimer
+}
+
+func newVirtualClock(poll time.Duration) *virtualClock {
+	clock := &virtualClock{now: virtualEpoch, poll: poll}
+	clock.created = sync.NewCond(&clock.mu)
+	return clock
+}
+
+func (c *virtualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *virtualClock) elapsed() time.Duration {
+	return c.Now().Sub(virtualEpoch)
+}
+
+func (c *virtualClock) NewTimer(duration time.Duration) Timer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &virtualTimer{clock: c, deadline: c.now.Add(duration), channel: make(chan time.Time, 1)}
+	live := c.timers[:0]
+	for _, existing := range c.timers {
+		if !existing.done {
+			live = append(live, existing)
+		}
+	}
+	c.timers = append(live, timer)
+	if duration == c.poll {
+		c.advanceLocked(duration)
+	}
+	c.created.Broadcast()
+	return timer
+}
+
+// advanceAfterTimer 先等检查器为当前请求建好单请求计时器，再让时间前进 duration。
+func (c *virtualClock) advanceAfterTimer(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	want := c.now.Add(duration)
+	for !c.hasLiveTimerAtLocked(want) {
+		c.created.Wait()
+	}
+	c.advanceLocked(duration)
+}
+
+func (c *virtualClock) hasLiveTimerAtLocked(deadline time.Time) bool {
+	for _, timer := range c.timers {
+		if !timer.done && timer.deadline.Equal(deadline) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *virtualClock) advanceLocked(duration time.Duration) {
+	target := c.now.Add(duration)
+	var due *virtualTimer
+	for _, timer := range c.timers {
+		if timer.done || timer.deadline.After(target) {
+			continue
+		}
+		if due == nil || timer.deadline.Before(due.deadline) {
+			due = timer
+		}
+	}
+	if due == nil {
+		c.now = target
+		return
+	}
+	if due.deadline.After(c.now) {
+		c.now = due.deadline
+	}
+	due.done = true
+	due.channel <- c.now
+}
+
+type virtualTimer struct {
+	clock    *virtualClock
+	deadline time.Time
+	channel  chan time.Time
+	// done 由 clock.mu 保护：已触发或已停止的计时器不再参与前进。
+	done bool
+}
+
+func (t *virtualTimer) C() <-chan time.Time { return t.channel }
+
+func (t *virtualTimer) Stop() bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	wasLive := !t.done
+	t.done = true
+	return wasLive
+}
+
 // TestHealth_RejectsOutOfRangePort 证明越界端口在发出任何请求之前失败关闭。
 func TestHealth_RejectsOutOfRangePort(t *testing.T) {
 	for _, port := range []int{1023, 65536, -1} {
