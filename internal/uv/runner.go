@@ -179,6 +179,7 @@ func (r *UVRunner) Run(
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	command := exec.CommandContext(runContext, r.Executable, args...)
+	configureUVCommand(command)
 	command.Dir = resolved.WorkingDir
 	command.Env = buildEnvironment(resolved)
 	// 不使用 command.StdoutPipe/StderrPipe：那两者返回的读端归 exec 所有，
