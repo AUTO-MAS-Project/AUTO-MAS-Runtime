@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -473,14 +474,18 @@ func (s *ManagedSupervisor) recoverStaleTransaction(ctx context.Context) error {
 	}
 	if s.deps.PID != nil {
 		alive, probeErr := s.deps.PID.Alive(ctx, tx.PID)
-		if probeErr != nil {
+		var pidErr *state.PIDProbeError
+		// 打开等待句柄被拒绝不代表旧身份仍存活；低权限时间查询仍可能证明 PID 已复用。
+		queryIdentity := ctx.Err() == nil && errors.As(probeErr, &pidErr) &&
+			pidErr.Operation == "open-process" && errors.Is(probeErr, fs.ErrPermission)
+		if probeErr != nil && !queryIdentity {
 			return newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端事务进程状态不可确认", nil, probeErr)
 		}
 		stale := !alive
-		if alive {
+		if alive || queryIdentity {
 			createdAt, creationErr := s.deps.PID.CreatedAt(ctx, tx.PID)
 			if creationErr != nil {
-				return newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端事务进程身份不可确认", nil, creationErr)
+				return newError(protocol.CodeStateWriteFailed, protocol.StageBackendSpawn, "后端事务进程身份不可确认", nil, errors.Join(probeErr, creationErr))
 			}
 			stale = !tx.StartedAt.IsZero() && createdAt.After(tx.StartedAt)
 		}

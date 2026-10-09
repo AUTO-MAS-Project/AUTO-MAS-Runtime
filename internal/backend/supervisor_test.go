@@ -306,6 +306,96 @@ func TestBackendManaged_ReusedTransactionPIDRecovers(t *testing.T) {
 	}
 }
 
+func TestBackendManaged_TransactionPIDAccessDeniedFallback(t *testing.T) {
+	startedAt := time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)
+	denied := &state.PIDProbeError{Operation: "open-process", PID: 7331, Cause: os.ErrPermission}
+	queryErr := errors.New("creation query unavailable")
+	removeErr := errors.New("conditional removal unavailable")
+	tests := []struct {
+		name       string
+		probeErr   error
+		createdAt  time.Time
+		createdErr error
+		removeErr  error
+		zeroStart  bool
+		cancel     bool
+		wantCode   protocol.Code
+		wantQuery  int
+		wantRemove int
+	}{
+		{name: "reused PID", probeErr: denied, createdAt: startedAt.Add(time.Hour), wantQuery: 1, wantRemove: 1},
+		{name: "original process", probeErr: denied, createdAt: startedAt.Add(-time.Minute), wantQuery: 1, wantCode: protocol.CodeUpdateStateAmbiguous},
+		{name: "equal time", probeErr: denied, createdAt: startedAt, wantQuery: 1, wantCode: protocol.CodeUpdateStateAmbiguous},
+		{name: "missing transaction time", probeErr: denied, createdAt: startedAt.Add(time.Hour), zeroStart: true, wantQuery: 1, wantCode: protocol.CodeUpdateStateAmbiguous},
+		{name: "creation query failed", probeErr: denied, createdErr: queryErr, wantQuery: 1, wantCode: protocol.CodeStateWriteFailed},
+		{name: "remove failed", probeErr: denied, createdAt: startedAt.Add(time.Hour), removeErr: removeErr, wantQuery: 1, wantRemove: 1, wantCode: protocol.CodeStateWriteFailed},
+		{name: "other open error", probeErr: &state.PIDProbeError{Operation: "open-process", PID: 7331, Cause: queryErr}, wantCode: protocol.CodeStateWriteFailed},
+		{name: "wait denied", probeErr: &state.PIDProbeError{Operation: "wait-process", PID: 7331, Cause: os.ErrPermission}, wantCode: protocol.CodeStateWriteFailed},
+		{name: "close denied", probeErr: &state.PIDProbeError{Operation: "close-handle", PID: 7331, Cause: os.ErrPermission}, wantCode: protocol.CodeStateWriteFailed},
+		{name: "untyped denied", probeErr: os.ErrPermission, wantCode: protocol.CodeStateWriteFailed},
+		{name: "cancelled", probeErr: denied, cancel: true, wantCode: protocol.CodeStateWriteFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			f.state.transaction = &Transaction{PID: 7331, StartedAt: startedAt, Handle: &fakeTransaction{}}
+			if test.zeroStart {
+				f.state.transaction.StartedAt = time.Time{}
+			}
+			f.state.removeErr = test.removeErr
+			f.pid = &fakePID{aliveErr: test.probeErr, createdAt: test.createdAt, createdErr: test.createdErr}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if test.cancel {
+				cancel()
+			}
+			err := f.supervisor().recoverStaleTransaction(ctx)
+			if test.wantCode == "" {
+				if err != nil {
+					t.Fatalf("recoverStaleTransaction() = %v, want nil", err)
+				}
+			} else {
+				assertBackendCode(t, err, test.wantCode)
+			}
+			if f.pid.creationCalls != test.wantQuery || f.state.removeCalls != test.wantRemove {
+				t.Fatalf("query/remove calls = %d/%d, want %d/%d", f.pid.creationCalls, f.state.removeCalls, test.wantQuery, test.wantRemove)
+			}
+			if test.createdErr != nil && (!errors.Is(err, queryErr) || !errors.Is(err, os.ErrPermission)) {
+				t.Fatalf("error = %v, want both probe causes", err)
+			}
+			if f.uv.startCalls != 0 {
+				t.Fatalf("start calls = %d, want 0", f.uv.startCalls)
+			}
+		})
+	}
+}
+
+func TestBackendManaged_AccessDeniedReusedPIDSupervise(t *testing.T) {
+	f := newBackendFixture(t)
+	startedAt := time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)
+	f.state.transaction = &Transaction{PID: 7331, StartedAt: startedAt, Handle: &fakeTransaction{}}
+	f.pid = &fakePID{aliveErr: &state.PIDProbeError{Operation: "open-process", PID: 7331, Cause: os.ErrPermission}, createdAt: startedAt.Add(time.Hour)}
+	f.proc.keepAlive = true
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.supervisor().Supervise(ctx, f.request()) }()
+	select {
+	case <-f.emitter.running:
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("Supervise() = %v, want cancelled", err)
+		}
+	case err := <-done:
+		t.Fatalf("Supervise() = %v, want running", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Supervise() did not reach running")
+	}
+	if f.state.removeCalls != 2 || f.uv.startCalls != 1 {
+		t.Fatalf("remove/start calls = %d/%d, want 2/1", f.state.removeCalls, f.uv.startCalls)
+	}
+}
+
 func TestBackendManaged_ReusedTransactionPIDRecoveryFailsClosed(t *testing.T) {
 	startedAt := time.Date(2026, 9, 27, 7, 0, 0, 0, time.UTC)
 	queryErr := errors.New("query process creation failed")
@@ -1310,13 +1400,16 @@ func (p *fakeProcess) orderSnapshot() []string {
 }
 
 type fakePID struct {
-	alive      bool
-	createdAt  time.Time
-	createdErr error
+	alive         bool
+	aliveErr      error
+	createdAt     time.Time
+	createdErr    error
+	creationCalls int
 }
 
-func (p *fakePID) Alive(context.Context, uint32) (bool, error) { return p.alive, nil }
+func (p *fakePID) Alive(context.Context, uint32) (bool, error) { return p.alive, p.aliveErr }
 func (p *fakePID) CreatedAt(context.Context, uint32) (time.Time, error) {
+	p.creationCalls++
 	return p.createdAt, p.createdErr
 }
 
