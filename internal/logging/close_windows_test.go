@@ -61,7 +61,7 @@ func TestLoggerWindows_CloseReleasesRuntimeLogHandles(t *testing.T) {
 
 	for _, path := range []string{
 		layout.RuntimeLogDir(),
-		layout.LogsDir(),
+		layout.DebugDir(),
 		layout.AppRoot(),
 	} {
 		assertRenameBlocked(t, path)
@@ -71,7 +71,7 @@ func TestLoggerWindows_CloseReleasesRuntimeLogHandles(t *testing.T) {
 	}
 	for _, path := range []string{
 		layout.RuntimeLogDir(),
-		layout.LogsDir(),
+		layout.DebugDir(),
 		layout.AppRoot(),
 	} {
 		assertRenameRoundTrip(t, path)

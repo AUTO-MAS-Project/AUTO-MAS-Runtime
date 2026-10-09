@@ -20,7 +20,7 @@ func TestNewRuntimeLogFiles_CreatesAndPinsLayoutDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuntimeLogFiles() error = %v", err)
 	}
-	for _, path := range []string{layout.LogsDir(), layout.RuntimeLogDir()} {
+	for _, path := range []string{layout.DebugDir(), layout.RuntimeLogDir()} {
 		information, err := os.Stat(path)
 		if err != nil || !information.IsDir() {
 			t.Fatalf("os.Stat(%q) = %v, error = %v, want directory", path, information, err)
@@ -35,7 +35,7 @@ func TestNewRuntimeLogFiles_CreatesAndPinsLayoutDirectories(t *testing.T) {
 func TestNewRuntimeLogFiles_RejectsReparseAncestors(t *testing.T) {
 	layout := newRuntimeLogTestLayout(t)
 	external := t.TempDir()
-	if err := os.Symlink(external, layout.LogsDir()); err != nil {
+	if err := os.Symlink(external, layout.DebugDir()); err != nil {
 		t.Skipf("directory symlink unavailable: %v", err)
 	}
 	files, err := NewRuntimeLogFiles(t.Context(), layout)
@@ -642,7 +642,7 @@ func newRuntimeLogTestLayout(t *testing.T) *config.Layout {
 
 func assertRuntimeLogAncestorsPinned(t *testing.T, layout *config.Layout) {
 	t.Helper()
-	for _, path := range []string{layout.RuntimeLogDir(), layout.LogsDir(), layout.AppRoot()} {
+	for _, path := range []string{layout.RuntimeLogDir(), layout.DebugDir(), layout.AppRoot()} {
 		renamed := path + "-renamed"
 		if err := os.Rename(path, renamed); err == nil {
 			_ = os.Rename(renamed, path)
@@ -653,7 +653,7 @@ func assertRuntimeLogAncestorsPinned(t *testing.T, layout *config.Layout) {
 
 func assertRuntimeLogAncestorsRenamable(t *testing.T, layout *config.Layout) {
 	t.Helper()
-	for _, path := range []string{layout.RuntimeLogDir(), layout.LogsDir(), layout.AppRoot()} {
+	for _, path := range []string{layout.RuntimeLogDir(), layout.DebugDir(), layout.AppRoot()} {
 		renamed := path + "-renamed"
 		if err := os.Rename(path, renamed); err != nil {
 			t.Fatalf("os.Rename(%q) error = %v", path, err)

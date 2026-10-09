@@ -69,7 +69,7 @@ func newLayoutPaths(root string) layoutPaths {
 		relayStagingDir:      filepath.Join(cacheDir, "downloads", "relay"),
 		buildCacheDir:        filepath.Join(cacheDir, "build"),
 		logsDir:              logsDir,
-		runtimeLogDir:        filepath.Join(logsDir, "runtime"),
+		runtimeLogDir:        filepath.Join(root, "debug", "runtime"),
 		configDir:            filepath.Join(root, "config"),
 		dataDir:              filepath.Join(root, "data"),
 		historyDir:           filepath.Join(root, "history"),

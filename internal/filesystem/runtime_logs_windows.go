@@ -53,7 +53,7 @@ func newRuntimeLogFilesWith(
 	}
 
 	parent := app
-	for _, path := range []string{layout.LogsDir(), layout.RuntimeLogDir()} {
+	for _, path := range []string{layout.DebugDir(), layout.RuntimeLogDir()} {
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}

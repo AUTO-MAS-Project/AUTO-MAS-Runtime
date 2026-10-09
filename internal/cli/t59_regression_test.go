@@ -454,12 +454,22 @@ func t59Layout(t *testing.T, appRoot, installRoot string) *config.Layout {
 
 func t59AssertProtectedPathsAbsent(t *testing.T, layout *config.Layout) {
 	t.Helper()
+	// CLI 会创建 debug/runtime 日志，但不得创建其他诊断或用户数据。
+	entries, err := os.ReadDir(layout.DebugDir())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ReadDir(debug) error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != filepath.Base(layout.RuntimeLogDir()) || !entry.IsDir() {
+			t.Fatalf("debug entry = %q, want only runtime directory", entry.Name())
+		}
+	}
+	t59AssertPathAbsent(t, layout.LogsDir())
 	for _, path := range []string{
 		layout.ConfigDir(),
 		layout.DataDir(),
 		layout.HistoryDir(),
 		layout.ScriptDir(),
-		layout.DebugDir(),
 		layout.PluginsDir(),
 	} {
 		t59AssertPathAbsent(t, path)

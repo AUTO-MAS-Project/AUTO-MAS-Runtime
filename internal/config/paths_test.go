@@ -45,7 +45,7 @@ func TestLayout_FixedPathsMatchSpecification(t *testing.T) {
 		{name: "RelayStagingDir", got: layout.RelayStagingDir(), want: filepath.Join(root, "runtime", "cache", "downloads", "relay")},
 		{name: "BuildCacheDir", got: layout.BuildCacheDir(), want: filepath.Join(root, "runtime", "cache", "build")},
 		{name: "LogsDir", got: layout.LogsDir(), want: filepath.Join(root, "logs")},
-		{name: "RuntimeLogDir", got: layout.RuntimeLogDir(), want: filepath.Join(root, "logs", "runtime")},
+		{name: "RuntimeLogDir", got: layout.RuntimeLogDir(), want: filepath.Join(root, "debug", "runtime")},
 		{name: "ConfigDir", got: layout.ConfigDir(), want: filepath.Join(root, "config")},
 		{name: "DataDir", got: layout.DataDir(), want: filepath.Join(root, "data")},
 		{name: "HistoryDir", got: layout.HistoryDir(), want: filepath.Join(root, "history")},

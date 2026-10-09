@@ -162,9 +162,9 @@ func TestNew_WindowsRejectsJunctionAtEveryLogAncestorAndCurrentLeaf(t *testing.T
 				if err := os.MkdirAll(layout.AppRoot(), 0o755); err != nil {
 					t.Fatalf("MkdirAll(app root) error = %v", err)
 				}
-				junction = layout.LogsDir()
+				junction = layout.DebugDir()
 			case "runtime":
-				if err := os.MkdirAll(layout.LogsDir(), 0o755); err != nil {
+				if err := os.MkdirAll(layout.DebugDir(), 0o755); err != nil {
 					t.Fatalf("MkdirAll(logs) error = %v", err)
 				}
 				junction = layout.RuntimeLogDir()
