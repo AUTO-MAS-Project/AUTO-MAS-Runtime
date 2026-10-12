@@ -444,6 +444,9 @@ func (w *RuntimeLogWriter) Write(p []byte) (int, error) {
 	if identity.attributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 || identity.numberOfLinks != 1 {
 		return 0, &FileError{Operation: "link-count", Path: w.path, Err: ErrUnsafeHardLink}
 	}
+	if identity.size < 0 || int64(len(p)) > MaxRuntimeLogBytes-identity.size {
+		return 0, &FileError{Operation: "capacity", Path: w.path, Err: ErrRuntimeLogCapacity}
+	}
 	n, err := w.api.writeFile(w.file.handle, p)
 	if err != nil {
 		return n, &FileError{Operation: "write", Path: w.path, Err: err}

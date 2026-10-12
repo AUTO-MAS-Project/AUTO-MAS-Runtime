@@ -1,10 +1,17 @@
 package filesystem
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
+
+// MaxRuntimeLogBytes 限制单文件容量；拒绝整条追加，不截断已记录内容。
+const MaxRuntimeLogBytes int64 = 128 << 20
+
+// ErrRuntimeLogCapacity 表示下一次完整追加会超过日志文件容量。
+var ErrRuntimeLogCapacity = errors.New("runtime log file capacity exceeded")
 
 type runtimeLogOwner struct {
 	marker byte

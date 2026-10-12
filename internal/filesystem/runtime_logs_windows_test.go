@@ -1238,3 +1238,28 @@ func containsOpenSpec(values []openSpec, want openSpec) bool {
 	}
 	return false
 }
+func TestRuntimeLogWriter_RejectsCapacityOverflowBeforeWriting(t *testing.T) {
+	files, _ := newRuntimeLogFixture(t)
+	writer, err := files.OpenAppend(t.Context(), "sync", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	const limit = int64(128 << 20)
+	if err := os.Truncate(writer.Path(), limit-4); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := writer.Write([]byte("end\n")); err != nil || n != 4 {
+		t.Fatalf("got %d %v, want complete boundary write", n, err)
+	}
+	if n, err := writer.Write([]byte("overflow\n")); err == nil || n != 0 {
+		t.Fatalf("got %d %v, want rejected whole record", n, err)
+	}
+	info, err := os.Stat(writer.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != limit {
+		t.Fatalf("got size %d, want %d", info.Size(), limit)
+	}
+}
