@@ -328,8 +328,7 @@ func (r *UVRunner) Run(
 			waitErr = errors.Join(waitErr, err)
 		}
 	}
-	stdoutValue := <-stdoutResult
-	stderrValue := <-stderrResult
+	stdoutValue, stderrValue, drainErr := awaitUVStreams(stdout, stderr, stdoutResult, stderrResult, time.Second, cancelCallback)
 	duration := clock().Sub(started)
 	result := UVResult{
 		ExitCode: exitCode(waitErr),
@@ -337,7 +336,7 @@ func (r *UVRunner) Run(
 		Stderr:   stderrValue.output,
 		Duration: duration,
 	}
-	streamErr := errors.Join(stdoutValue.err, stderrValue.err)
+	streamErr := errors.Join(stdoutValue.err, stderrValue.err, drainErr)
 	if err := ctx.Err(); err != nil {
 		return result, runnerCancellationError(options.Stage, runnerDetails(result, resolved), err)
 	}

@@ -292,7 +292,7 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 	}
 	if committedErr := findCommittedOperationError(err); committedErr != nil {
 		code := committedErr.Code()
-		if protocol.IsKnownCode(code) {
+		if definition, ok := protocol.LookupErrorDefinition(code); ok && definition.ExitCode != protocol.ExitCodeSuccess {
 			return code, committedErr.Stage(), committedErr.Message(), committedErr.Details()
 		}
 	}
@@ -322,7 +322,7 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 	var operationErr operationError
 	if errors.As(err, &operationErr) {
 		code := operationErr.Code()
-		if protocol.IsKnownCode(code) {
+		if definition, ok := protocol.LookupErrorDefinition(code); ok && definition.ExitCode != protocol.ExitCodeSuccess {
 			return code, operationErr.Stage(), operationErr.Message(), operationErr.Details()
 		}
 	}

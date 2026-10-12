@@ -534,6 +534,9 @@ func startDetachedGrandchild() string {
 	command := exec.Command(executable, "-test.run=^TestManagedProcessChild$")
 	command.Env = replaceTestEnvironment(os.Environ(), managedChildRoleEnv, managedChildGrandchildRole)
 	command.Env = replaceTestEnvironment(command.Env, managedChildReleaseEnv, os.Getenv(managedGrandchildReleaseEnv))
+	if os.Getenv("AUTO_MAS_TEST_INHERIT_PIPE") == "1" {
+		command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	}
 	if os.Getenv(managedBreakawayGrandchildEnv) == "1" {
 		command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_BREAKAWAY_FROM_JOB}
 	}
@@ -833,5 +836,37 @@ func TestJob_SnapshotSkipsMemberExitingDuringImageQuery(t *testing.T) {
 	}
 	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 		t.Fatalf("上报的错误应保留原因，got %v", err)
+	}
+}
+
+func TestManagedProcess_WaitEmptyClosesInheritedReaders(t *testing.T) {
+	t.Setenv("AUTO_MAS_TEST_INHERIT_PIPE", "1")
+	handle, jobHandle, managed, release := startDetachedGrandchildFixture(t, true)
+	if processInJob(t, handle, jobHandle) {
+		t.Fatal("grandchild did not escape job")
+	}
+	if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	select {
+	case <-managed.Exited():
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// 回收仍在 Job 中的 conhost；显式脱离的孙进程不能被终止。
+	if err := managed.Terminate(98); err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.WaitEmpty(ctx); err != nil {
+		infos, snapErr := managed.Snapshot()
+		t.Fatalf("wait %v, snapshot %#v %v", err, infos, snapErr)
+	}
+	if result, err := managed.Wait(ctx); err != nil || result.ExitCode != 0 {
+		t.Fatalf("got %#v, %v, want success", result, err)
+	}
+	if result, err := windows.WaitForSingleObject(handle, 0); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
+		t.Fatalf("got %v, %v, want surviving breakaway", result, err)
 	}
 }

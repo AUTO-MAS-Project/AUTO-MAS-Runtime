@@ -629,7 +629,7 @@ func TestBackendManaged_ExitedTreeIsTerminatedBeforeWaitingStreams(t *testing.T)
 		t.Fatalf("cleanupProcess() error = %v, want nil", outcome.err)
 	}
 	got := f.proc.orderSnapshot()
-	want := []string{"snapshot", "terminate", "wait", "wait_empty", "close"}
+	want := []string{"snapshot", "terminate", "wait_empty", "wait", "close"}
 	if !equalStrings(got, want) {
 		t.Fatalf("cleanup order = %#v, want %#v", got, want)
 	}
@@ -1630,8 +1630,8 @@ func TestBackend_StreamSinkKeepsDrainingWhenProtocolOutputFails(t *testing.T) {
 	}
 }
 
-// 对照组：文件日志写失败仍然失败关闭（沿用既有语义，本次修订不放宽）。
-func TestBackend_StreamSinkStillFailsClosedWhenRuntimeLogFails(t *testing.T) {
+// 文件日志故障由监督循环观察并优雅关闭，不能触发 process 的整树强杀。
+func TestBackend_StreamSinkKeepsDrainingWhenRuntimeLogFails(t *testing.T) {
 	emitter := &fakeEmitter{}
 	logger := &failingLogger{err: errors.New("disk full")}
 	gate := &streamGate{stage: protocol.StageBackendRun}
@@ -1641,10 +1641,10 @@ func TestBackend_StreamSinkStillFailsClosedWhenRuntimeLogFails(t *testing.T) {
 
 	sink := (&ManagedSupervisor{}).streamSink(Request{Emitter: emitter}, logger, gate)
 	err := sink(context.Background(), process.StreamRecord{Stream: process.StreamStdout, Event: "x", EndOfLine: true})
-	if err == nil {
-		t.Fatal("运行日志写入失败必须返回错误")
+	if err != nil {
+		t.Fatalf("got sink error %v, want nil", err)
 	}
-	assertBackendCode(t, err, protocol.CodeInternalError)
+	assertBackendCode(t, gate.Fault(), protocol.CodeInternalError)
 }
 
 type failingLogger struct {

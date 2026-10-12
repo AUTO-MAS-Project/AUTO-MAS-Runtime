@@ -54,7 +54,10 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 	ticker := newFakeTicker()
 
 	client := &fakeGitClient{
-		list: func(_ context.Context, sourceURL string, gotCA []byte) ([]*plumbing.Reference, error) {
+		list: func(ctx context.Context, sourceURL string, gotCA []byte) ([]*plumbing.Reference, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("list transport has no deadline")
+			}
 			if sourceURL != "https://cnb.cool/AUTO-MAS-Project/AUTO-MAS.git" {
 				t.Fatalf("ListReferences() URL = %q, want cnb source", sourceURL)
 			}
@@ -63,7 +66,10 @@ func TestFetcher_CloneSingleBranchDepthOneWithoutTags(t *testing.T) {
 			}
 			return targetBranchReferences(target), nil
 		},
-		clone: func(_ context.Context, path string, options git.CloneOptions) error {
+		clone: func(ctx context.Context, path string, options git.CloneOptions) error {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("clone transport has no deadline")
+			}
 			wantPath, err := layout.RepoUpdateDir("OPERATION-1")
 			if err != nil {
 				t.Fatalf("RepoUpdateDir() error = %v", err)

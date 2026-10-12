@@ -298,3 +298,11 @@ func (backendCommittedHealthError) Message() string { return "后端健康响应
 func (backendCommittedHealthError) Details() map[string]any { return map[string]any{} }
 
 func (backendCommittedHealthError) Committed() bool { return true }
+
+func TestClassifyFailure_WarningOnlyFailsClosed(t *testing.T) {
+	err := &commandError{code: protocol.CodeBackendForceTerminated, stage: protocol.StageBackendRun, message: "warning used as failure"}
+	code, _, _, _ := classifyFailure(err, protocol.StageBackendRun)
+	if code != protocol.CodeInternalError {
+		t.Fatalf("got %s, want INTERNAL_ERROR", code)
+	}
+}

@@ -345,11 +345,16 @@ func (f *Fetcher) fetchAttempt(
 		)
 	}
 
+	listCtx, cancelList := context.WithTimeout(ctx, 45*time.Second)
 	references, err := f.git.ListReferences(
-		ctx,
+		listCtx,
 		attempt.Source.BaseURL(),
 		append([]byte(nil), f.caBundle...),
 	)
+	if errors.Is(listCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		err = errors.New("git reference transport budget exceeded")
+	}
+	cancelList()
 	if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, err) {
 		return f.finishFailedAttempt(
 			ctx,
@@ -432,7 +437,7 @@ func (f *Fetcher) fetchAttempt(
 
 	// 心跳输出失败时取消派生 context 让传输尽早结束；外层 ctx 不受影响，
 	// 因此后续按外层 ctx 判定取消仍能区分「用户取消」与「输出故障」。
-	cloneCtx, cancelClone := context.WithCancel(ctx)
+	cloneCtx, cancelClone := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancelClone()
 	heartbeat := newCloneHeartbeat(f.emitProgress, f.newTicker, cloneHeartbeatInterval, cancelClone)
 	heartbeat.start()
@@ -449,6 +454,9 @@ func (f *Fetcher) fetchAttempt(
 		InsecureSkipTLS:   false,
 		CABundle:          append([]byte(nil), f.caBundle...),
 	})
+	if errors.Is(cloneCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		cloneErr = errors.New("git clone transport budget exceeded")
+	}
 	// 先停心跳并等待 goroutine 退出，再判定结果与发终态：保证终态之后不会再有迟到的 running。
 	heartbeat.stop()
 	if progressErr := heartbeat.Err(); progressErr != nil {

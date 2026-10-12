@@ -24,6 +24,16 @@ func newIdentityAPI() identityAPI {
 	}
 }
 
+// HandleFileID 读取已固定句柄的卷与文件身份；仅确认 exFAT 时允许旧版身份回退。
+// 调用方必须在使用身份期间继续持有句柄；本函数不会重新按路径打开对象。
+func HandleFileID(handle windows.Handle) (uint64, [16]byte, error) {
+	id, err := identityWindows(handle)
+	if err != nil {
+		return 0, [16]byte{}, err
+	}
+	return id.volumeSerial, id.fileID, nil
+}
+
 func volumeInformationWindows(handle windows.Handle) (string, uint32, error) {
 	var name [windows.MAX_PATH + 1]uint16
 	var flags uint32

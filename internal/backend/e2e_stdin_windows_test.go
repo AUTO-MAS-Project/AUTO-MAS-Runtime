@@ -107,9 +107,8 @@ type backendE2ERuntimeProcess struct {
 	waitErr  chan error
 }
 
-// breakOutputPipe 直接关闭读端的 Windows 句柄，避免 os.File.Close 等待读操作完成。
-// Runner 上的 Go 1.26.7 会让挂起的管道读阻塞 os.File.Close；宿主崩溃测试需要立即让
-// Runtime 看到 ERROR_BROKEN_PIPE，不能依赖正常的 os.File 生命周期收口。
+// breakOutputPipe 取消挂起读取后由 os.File 关闭读端，模拟宿主失联。
+// 不能绕过 os.File 直接 CloseHandle：其清理器会再次关闭被系统复用的句柄。
 func (p *backendE2ERuntimeProcess) breakOutputPipe(t *testing.T, stream **os.File) {
 	t.Helper()
 	file := *stream
@@ -119,11 +118,11 @@ func (p *backendE2ERuntimeProcess) breakOutputPipe(t *testing.T, stream **os.Fil
 	handle := windows.Handle(file.Fd())
 	// 先取消 goroutine 中挂起的同步 ReadFile；仅关闭句柄在 Windows 上可能自身阻塞，
 	// 直到该读操作结束，而子进程仍持有写端时它永远不会结束。
-	if err := windows.CancelIoEx(handle, nil); err != nil && err != windows.ERROR_NOT_FOUND {
+	if err := windows.CancelIoEx(handle, nil); err != nil && !errors.Is(err, windows.ERROR_NOT_FOUND) {
 		t.Fatalf("cancel broken output pipe read: %v", err)
 	}
-	if err := windows.CloseHandle(handle); err != nil {
-		t.Fatalf("close broken output pipe handle: %v", err)
+	if err := file.Close(); err != nil {
+		t.Fatalf("close broken output pipe: %v", err)
 	}
 	*stream = nil
 }
@@ -381,4 +380,20 @@ func TestBackendE2E_HostCrashBrokenStdoutStderrStillClosesGracefully(t *testing.
 	waitE2EPIDExit(t, pythonPID)
 	assertE2EBackendClosedGracefully(t, fixture)
 	fixture.assertResourcesReleased(t)
+}
+func TestBackendE2E_BrokenOutputPipeClosesFileOwner(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = read.Close(); _ = write.Close() })
+	stream := read
+	process := &backendE2ERuntimeProcess{}
+	process.breakOutputPipe(t, &stream)
+	if stream != nil {
+		t.Fatal("got retained broken pipe")
+	}
+	if _, err := read.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("got %v, want os.ErrClosed from file owner", err)
+	}
 }

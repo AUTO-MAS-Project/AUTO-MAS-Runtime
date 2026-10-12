@@ -1,11 +1,15 @@
 package filesystem
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
+
+// ErrStateGuardTimeout 表示状态守卫在独立获取预算内一直被占用。
+var ErrStateGuardTimeout = errors.New("state guard wait budget exceeded")
 
 // MaxStateFileBytes 是受管状态文件默认允许的最大字节数。
 const MaxStateFileBytes int64 = 256 * 1024

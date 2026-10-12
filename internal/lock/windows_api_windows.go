@@ -2,7 +2,13 @@
 
 package lock
 
-import "golang.org/x/sys/windows"
+import (
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
+)
 
 type windowsAPI interface {
 	createFile(
@@ -83,6 +89,14 @@ func (systemWindowsAPI) getFileInformationByHandleEx(
 	information *byte,
 	size uint32,
 ) error {
+	if class == windows.FileIdInfo && size == uint32(unsafe.Sizeof(fileIDInfo{})) {
+		serial, id, err := filesystem.HandleFileID(handle)
+		if err != nil {
+			return err
+		}
+		*(*fileIDInfo)(unsafe.Pointer(information)) = fileIDInfo{VolumeSerialNumber: serial, FileID: id}
+		return nil
+	}
 	return windows.GetFileInformationByHandleEx(
 		handle,
 		class,

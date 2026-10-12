@@ -913,3 +913,25 @@ func TestRunner_LoopbackNeverProxied(t *testing.T) {
 		})
 	}
 }
+
+func TestUVRunner_OutputDrainIsBounded(t *testing.T) {
+	stdout, stdoutWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutWrite.Close()
+	defer stdout.Close()
+	stderr, stderrWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderrWrite.Close()
+	defer stderr.Close()
+	out, errs := make(chan streamResult, 1), make(chan streamResult, 1)
+	go readUVStream("stdout", stdout, nil, nil, out)
+	go readUVStream("stderr", stderr, nil, nil, errs)
+	_, _, err = awaitUVStreams(stdout, stderr, out, errs, time.Millisecond, func() {})
+	if err == nil {
+		t.Fatal("got nil, want output drain failure")
+	}
+}

@@ -898,6 +898,16 @@ func (f *StateFiles) acquireStateGuard(
 	if err := ctx.Err(); err != nil {
 		return pinnedObject{}, err
 	}
+	// 只约束 guard 获取，不把内部预算误分类为调用方取消。
+	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelWait()
+	wait := func() error {
+		err := f.waitGate(waitCtx, stateGateRetryDelay)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return ErrStateGuardTimeout
+		}
+		return err
+	}
 	leaf := stateGuardLeaf(kind)
 	path := filepath.Join(f.pins[1].path.String(), leaf)
 	createSpec, err := stateGuardNTSpec(mode, ntFileCreate)
@@ -912,7 +922,7 @@ func (f *StateFiles) acquireStateGuard(
 	pendingErr := err
 	if !isStateGuardCollision(err) {
 		if errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
-			if err := f.waitGate(ctx, stateGateRetryDelay); err != nil {
+			if err := wait(); err != nil {
 				return pinnedObject{}, stateGuardWaitError(pendingOperation, path, pendingErr, err)
 			}
 		} else {
@@ -928,7 +938,10 @@ func (f *StateFiles) acquireStateGuard(
 		return pinnedObject{}, err
 	}
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := waitCtx.Err(); err != nil {
+			if ctx.Err() == nil {
+				err = ErrStateGuardTimeout
+			}
 			return pinnedObject{}, stateGuardWaitError(pendingOperation, path, pendingErr, err)
 		}
 		handle, err = f.api.ntCreateRelative(f.pins[1].handle, leaf, openSpec)
@@ -944,7 +957,7 @@ func (f *StateFiles) acquireStateGuard(
 		}
 		pendingOperation = "guard-open"
 		pendingErr = err
-		if err := f.waitGate(ctx, stateGateRetryDelay); err != nil {
+		if err := wait(); err != nil {
 			return pinnedObject{}, stateGuardWaitError(pendingOperation, path, pendingErr, err)
 		}
 	}

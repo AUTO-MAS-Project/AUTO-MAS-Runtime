@@ -327,21 +327,45 @@ func ownManagedProcess(
 	sinkContext, cancelSink := context.WithCancel(context.WithoutCancel(ctx))
 	settled := make(chan struct{})
 	var readers sync.WaitGroup
+	readersDone := make(chan struct{})
+	var stopOutput sync.Once
+	managed.stopReaders = func() {
+		stopOutput.Do(func() {
+			timer := time.NewTimer(managedSinkShutdownTimeout)
+			defer timer.Stop()
+			select {
+			case <-readersDone:
+				return
+			case <-timer.C:
+			}
+			// Job 已空时保留短暂排空机会；脱离者持有的写端不能阻止本次监督结束。
+			cancelSink()
+			_ = stdout.Close()
+			_ = stderr.Close()
+		})
+	}
+	recordReadError := func(err error) {
+		if errors.Is(err, os.ErrClosed) && sinkContext.Err() != nil {
+			return
+		}
+		managed.recordSinkError(err)
+	}
 	readers.Add(2)
 	go func() {
 		defer readers.Done()
-		drainStream(sinkContext, StreamStdout, stdout, sink, managed.recordSinkError)
-		if err := stdout.Close(); err != nil {
+		drainStream(sinkContext, StreamStdout, stdout, sink, recordReadError)
+		if err := stdout.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			managed.recordSinkError(fmt.Errorf("close managed process stdout: %w", err))
 		}
 	}()
 	go func() {
 		defer readers.Done()
-		drainStream(sinkContext, StreamStderr, stderr, sink, managed.recordSinkError)
-		if err := stderr.Close(); err != nil {
+		drainStream(sinkContext, StreamStderr, stderr, sink, recordReadError)
+		if err := stderr.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			managed.recordSinkError(fmt.Errorf("close managed process stderr: %w", err))
 		}
 	}()
+	go func() { readers.Wait(); close(readersDone) }()
 	go func() {
 		state, waitErr := processValue.Wait()
 		close(managed.exited)

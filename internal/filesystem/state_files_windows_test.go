@@ -3946,3 +3946,20 @@ func verifyExFATStateLifecycle(t *testing.T, root string, api pathAPI) {
 		}
 	}
 }
+
+func TestStateGuard_WaitBudget(t *testing.T) {
+	files, _ := newStateFilesFixture(t)
+	files.api.ntCreateRelative = func(windows.Handle, string, ntCreateSpec) (windows.Handle, error) {
+		return windows.InvalidHandle, windows.ERROR_SHARING_VIOLATION
+	}
+	files.waitGate = func(ctx context.Context, _ time.Duration) error {
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 31*time.Second {
+			return errors.New("guard wait has no bounded deadline")
+		}
+		return context.DeadlineExceeded
+	}
+	_, err := files.acquireStateGuard(t.Context(), StateBackend, stateGuardShared)
+	if !errors.Is(err, ErrStateGuardTimeout) {
+		t.Fatalf("got %v, want bounded guard wait", err)
+	}
+}

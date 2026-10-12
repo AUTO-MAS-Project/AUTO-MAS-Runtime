@@ -81,6 +81,7 @@ type ManagedProcess struct {
 	sinkStopped bool
 	closeOnce   sync.Once
 	closeError  error
+	stopReaders func()
 }
 
 func (p *ManagedProcess) guardedSink(sink StreamSink) StreamSink {
@@ -170,7 +171,17 @@ func (p *ManagedProcess) WaitEmpty(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("managed process wait-empty context is nil")
 	}
-	return p.job.waitEmpty(ctx)
+	if err := p.job.waitEmpty(ctx); err != nil {
+		return err
+	}
+	select {
+	case <-p.exited:
+		if p.stopReaders != nil {
+			p.stopReaders()
+		}
+	default:
+	}
+	return nil
 }
 
 // Close 幂等关闭 Job handle；调用前应先用 WaitEmpty 证明树为空。

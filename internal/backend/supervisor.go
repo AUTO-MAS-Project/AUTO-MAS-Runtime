@@ -712,7 +712,8 @@ func (s *ManagedSupervisor) streamSink(request Request, logger Logger, gate *str
 			gate.mu.Unlock()
 			fault := newError(protocol.CodeInternalError, stage, "后端运行日志写入失败", map[string]any{"sink": "runtime_log"}, err)
 			gate.setFault(fault)
-			return fault
+			// 诊断文件故障交给监督循环优雅关闭，继续排空管道，避免强杀整树。
+			return nil
 		}
 		// Fragment 仅写入 runtime logger；协议出口只发送最终 Event，或空行。
 		if record.Event == "" && !record.EndOfLine {
@@ -842,6 +843,7 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 	// 的 Snapshot 竞态重新升级为进程清理失败。
 	var processErr error
 	var snapshotErr error
+	var waitEmptyErr error
 	select {
 	case <-proc.Exited():
 		// Exited 只证明根进程已结束；Job 仍可能包含持有 stdout/stderr
@@ -854,6 +856,7 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 			outcome.recordOrphans(members, err, proc.PID())
 			processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
 		}
+		waitEmptyErr = proc.WaitEmpty(cleanupCtx)
 		exitResult, waitErr := proc.Wait(cleanupCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
 			outcome.details["exitCode"] = exitResult.ExitCode
@@ -863,13 +866,13 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 		// 根进程仍存活：这是真正的强制终止，无论树里还有没有别的成员。
 		outcome.rootForced = true
 		processErr = errors.Join(processErr, mapCleanupProcessError("terminate", proc.Terminate(1)))
+		waitEmptyErr = proc.WaitEmpty(cleanupCtx)
 		exitResult, waitErr := proc.Wait(cleanupCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
 			outcome.details["exitCode"] = exitResult.ExitCode
 		}
 		processErr = errors.Join(processErr, mapCleanupProcessError("wait", withoutExpectedCancellation(waitErr, cleanupCtx.Err() != nil)))
 	}
-	waitEmptyErr := proc.WaitEmpty(cleanupCtx)
 	if waitEmptyErr != nil {
 		// 根进程可能已退出但后代仍占用 Job；先强制终止，再次 Wait/WaitEmpty，
 		// 只有第二次确认空树才允许后续成功收口。
@@ -880,11 +883,11 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 			outcome.recordOrphans(members, err, proc.PID())
 		}
 		terminateErr := proc.Terminate(1)
+		forceEmptyErr := proc.WaitEmpty(forceCtx)
 		exitResult, waitErr := proc.Wait(forceCtx)
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
 			outcome.details["exitCode"] = exitResult.ExitCode
 		}
-		forceEmptyErr := proc.WaitEmpty(forceCtx)
 		forceCancel()
 		outcome.forced = forceEmptyErr == nil
 		// 首次收口因上下文预算触发强杀时属于可恢复事实；真实非上下文
