@@ -463,7 +463,8 @@ func newBackendE2EFixture(t *testing.T, configValue backendE2EConfig) *backendE2
 		t.Fatalf("NewProductionManagedSupervisor() error = %v", err)
 	}
 	timerReady := make(chan *backendE2ETimer, 4)
-	// E2E 只缩短注入的健康/重启预算，生产依赖仍使用真实实现。
+	// E2E 只缩短注入的健康/重启预算，生产依赖仍使用真实实现。TotalTimeout 同时缩短首次有效应答
+	// 期限与失联窗口（SilenceTimeout 缺省取它）；后台初始化总预算仍是默认 150 秒。
 	supervisor.deps.Health = health.NewChecker(health.Config{
 		PollInterval:         25 * time.Millisecond,
 		TotalTimeout:         15 * time.Second,
@@ -1169,6 +1170,7 @@ func TestBackendE2E_RuntimeTerminationLeavesNoDescendants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProductionManagedSupervisor(recovery) error = %v", err)
 	}
+	// 与 newBackendE2EFixture 相同：TotalTimeout 缩短首次有效应答期限与失联窗口，后台初始化总预算仍是默认 150 秒。
 	supervisor.deps.Health = health.NewChecker(health.Config{
 		PollInterval:         25 * time.Millisecond,
 		TotalTimeout:         15 * time.Second,

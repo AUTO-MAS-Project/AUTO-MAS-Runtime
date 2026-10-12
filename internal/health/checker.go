@@ -37,6 +37,9 @@ const (
 	// 恰在 Job 快照的两次系统查询之间退出，快照就会带着错误返回。明确的否定结果
 	// （probeUnhealthy）不走这条容忍，仍然立即失败。
 	maxConsecutiveProbeErrors = 3
+	// 拿到过有效应答后的后台初始化总预算（增补 2 C21），从开始检查起算。它必须明显小于
+	// Electron 等待 backend.run running 的 180 秒上限，让 Runtime 总是先给出结构化的超时错误。
+	defaultBackgroundTimeout = 150 * time.Second
 )
 
 // Mode 是健康检查的身份校验模式。
@@ -110,9 +113,16 @@ type Clock interface {
 
 // Config 配置健康检查的传输、时钟和预算。
 type Config struct {
-	Transport            Transport
-	Clock                Clock
-	TotalTimeout         time.Duration
+	Transport Transport
+	Clock     Clock
+	// TotalTimeout 是从开始检查起拿到第一次有效应答的期限（增补 2 C21 第一段），缺省 60 秒。
+	TotalTimeout time.Duration
+	// BackgroundTimeout 是拿到过有效应答后、从开始检查起算的后台初始化总预算（C21），缺省 150 秒。
+	// 解析值小于 TotalTimeout 时按 TotalTimeout 取，有效应答不会让截止时间早于第一段。
+	BackgroundTimeout time.Duration
+	// SilenceTimeout 是拿到过有效应答后距最后一次有效应答的最长间隔（C21 失联兜底）；
+	// 为零时取 TotalTimeout——两者是同一条「60 秒内必须见到有效应答」规则的两个起点。
+	SilenceTimeout       time.Duration
 	PollInterval         time.Duration
 	RequestTimeout       time.Duration
 	ConsecutiveSuccesses int
@@ -123,6 +133,8 @@ type Checker struct {
 	transport            Transport
 	clock                Clock
 	totalTimeout         time.Duration
+	backgroundTimeout    time.Duration
+	silenceTimeout       time.Duration
 	pollInterval         time.Duration
 	requestTimeout       time.Duration
 	consecutiveSuccesses int
@@ -142,6 +154,15 @@ func NewChecker(config Config) *Checker {
 	if totalTimeout <= 0 {
 		totalTimeout = defaultTotalTimeout
 	}
+	backgroundTimeout := config.BackgroundTimeout
+	if backgroundTimeout <= 0 {
+		backgroundTimeout = defaultBackgroundTimeout
+	}
+	backgroundTimeout = max(backgroundTimeout, totalTimeout)
+	silenceTimeout := config.SilenceTimeout
+	if silenceTimeout <= 0 {
+		silenceTimeout = totalTimeout
+	}
 	pollInterval := config.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = defaultPollInterval
@@ -158,6 +179,8 @@ func NewChecker(config Config) *Checker {
 		transport:            transport,
 		clock:                clock,
 		totalTimeout:         totalTimeout,
+		backgroundTimeout:    backgroundTimeout,
+		silenceTimeout:       silenceTimeout,
 		pollInterval:         pollInterval,
 		requestTimeout:       requestTimeout,
 		consecutiveSuccesses: consecutiveSuccesses,
@@ -165,6 +188,8 @@ func NewChecker(config Config) *Checker {
 }
 
 // Check 轮询后端直至连续满足健康条件或返回稳定失败分类。
+// 总截止时间按增补 2 C21 随有效应答移动：从未有效应答时为开始后 TotalTimeout；
+// 有过有效应答后为 min(开始 + BackgroundTimeout, 最后一次有效应答 + SilenceTimeout)。
 func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) error {
 	if ctx == nil {
 		return newError(protocol.CodeBackendHealthInvalid, "健康检查上下文不可用", nil, errors.New("health check context is nil"))
@@ -182,9 +207,12 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	exited := probe.Exited()
 	healthURL := HealthURLForPort(expected.resolvedPort())
 	totalTimer := c.clock.NewTimer(c.totalTimeout)
-	defer totalTimer.Stop()
+	defer func() { totalTimer.Stop() }()
 	total := totalTimer.C()
 	startedAt := c.clock.Now()
+	// deadline 是当前生效的总截止时间，totalTimer 始终对准它；截止时间变化时整体换掉计时器，
+	// 单次请求、轮询等待与进程探针拿到的都是当时的 total，旧计时器不会截断第二段。
+	deadline := startedAt.Add(c.totalTimeout)
 	successes := 0
 	// 连续的探针错误计数；任何一次探针成功都清零。
 	probeErrors := 0
@@ -192,7 +220,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 		if err := cancellationError(ctx); err != nil {
 			return err
 		}
-		if c.clock.Now().Sub(startedAt) >= c.totalTimeout {
+		if !c.clock.Now().Before(deadline) {
 			return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 		}
 		if channelClosed(exited) {
@@ -223,7 +251,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if err := cancellationError(ctx); err != nil {
 				return err
 			}
-			if c.totalExpired(total, startedAt) {
+			if c.totalExpired(total, deadline) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			}
 			if channelClosed(exited) {
@@ -236,8 +264,19 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if err != nil {
 				return err
 			}
-			if c.totalExpired(total, startedAt) {
+			if c.totalExpired(total, deadline) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
+			}
+			// 走到这里即一次有效应答：按 C21 重算截止时间。
+			now := c.clock.Now()
+			if next := c.deadlineAfterValidResponse(startedAt, now); !next.Equal(deadline) {
+				if !now.Before(next) {
+					return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
+				}
+				totalTimer.Stop()
+				deadline = next
+				totalTimer = c.clock.NewTimer(next.Sub(now))
+				total = totalTimer.C()
 			}
 			if observation.continuePolling {
 				successes = 0
@@ -253,7 +292,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if err := cancellationError(ctx); err != nil {
 				return err
 			}
-			if c.totalExpired(total, startedAt) {
+			if c.totalExpired(total, deadline) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			}
 			switch probeResult.kind {
@@ -284,7 +323,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 					if err := cancellationError(ctx); err != nil {
 						return err
 					}
-					if c.totalExpired(total, startedAt) {
+					if c.totalExpired(total, deadline) {
 						return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 					}
 					return nil
@@ -297,8 +336,18 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	}
 }
 
-func (c *Checker) totalExpired(total <-chan time.Time, startedAt time.Time) bool {
-	if c.clock.Now().Sub(startedAt) >= c.totalTimeout {
+// deadlineAfterValidResponse 返回 respondedAt 时刻收到有效应答后的总截止时间（增补 2 C21）：
+// 后台初始化总预算与失联窗口取先到者。
+func (c *Checker) deadlineAfterValidResponse(startedAt, respondedAt time.Time) time.Time {
+	deadline := startedAt.Add(c.backgroundTimeout)
+	if silence := respondedAt.Add(c.silenceTimeout); silence.Before(deadline) {
+		return silence
+	}
+	return deadline
+}
+
+func (c *Checker) totalExpired(total <-chan time.Time, deadline time.Time) bool {
+	if !c.clock.Now().Before(deadline) {
 		return true
 	}
 	select {
