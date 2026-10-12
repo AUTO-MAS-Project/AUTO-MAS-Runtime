@@ -51,6 +51,8 @@ const (
 
 // Expectation 描述本次健康检查的受管身份期望。
 type Expectation struct {
+	// LegacyReady 允许旧后端在原有检查通过后就绪，并记录一次兼容提示；nil 禁止降级。
+	LegacyReady func(context.Context) error
 	// Secret 只用于本次启动的健康证明，不进入诊断。
 	Secret   string
 	Mode     Mode
@@ -188,6 +190,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	total := totalTimer.C()
 	startedAt := c.clock.Now()
 	successes := 0
+	proofRequired := false
 	// 连续的探针错误计数；任何一次探针成功都清零。
 	probeErrors := 0
 	for {
@@ -235,8 +238,17 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if channelClosed(exited) {
 				return preferCancellation(ctx, newError(protocol.CodeBackendExitedBeforeReady, "后端在就绪前退出", nil, nil))
 			}
-			if request.status == http.StatusOK && request.bodyErr == nil && !VerifyHealthProof(expected.Secret, challenge, request.body, request.proof) {
-				return identityError(expected, "supervision", nil)
+			if request.status == http.StatusOK && request.bodyErr == nil {
+				if request.proof == "" {
+					if proofRequired || expected.LegacyReady == nil {
+						return identityError(expected, "supervision", nil)
+					}
+				} else {
+					if !VerifyHealthProof(expected.Secret, challenge, request.body, request.proof) {
+						return identityError(expected, "supervision", nil)
+					}
+					proofRequired = true
+				}
 			}
 			observation, err := inspectResponse(request.status, request.body, request.bodyErr, expected)
 			if cancelErr := cancellationError(ctx); cancelErr != nil {
@@ -295,6 +307,11 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 					}
 					if c.totalExpired(total, startedAt) {
 						return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
+					}
+					if !proofRequired && expected.LegacyReady != nil {
+						if err := expected.LegacyReady(ctx); err != nil {
+							return newError(protocol.CodeInternalError, "旧后端兼容提示写入失败", nil, err)
+						}
 					}
 					return nil
 				}

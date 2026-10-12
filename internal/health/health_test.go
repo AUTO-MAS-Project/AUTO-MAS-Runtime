@@ -805,3 +805,70 @@ func signTestResponse(request *http.Request, response *http.Response) {
 		response.Header.Set(ProofHeader, HealthProof(strings.Repeat("a", 64), request.Header.Get(ChallengeHeader), []byte(response.Header.Get("X-Test-Body"))))
 	}
 }
+
+func TestHealth_LegacyBackendCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		firstSigned bool
+		badProof    bool
+		badIdentity bool
+		badJob      bool
+		noticeErr   bool
+		want        protocol.Code
+	}{
+		{name: "legacy ready"},
+		{name: "signed ready", firstSigned: true},
+		{name: "invalid proof", badProof: true, want: protocol.CodeBackendIdentityMismatch},
+		{name: "wrong identity", badIdentity: true, want: protocol.CodeBackendIdentityMismatch},
+		{name: "wrong job", badJob: true, want: protocol.CodeBackendHealthInvalid},
+		{name: "notice fails", noticeErr: true, want: protocol.CodeInternalError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			version := "v5.4.0"
+			if test.badIdentity {
+				version = "v0.0.0"
+			}
+			responses := []transportResult{{response: jsonResponse(healthBody("ready", "", 1, version, testCommit))}, {response: jsonResponse(healthBody("ready", "", 1, version, testCommit))}}
+			for _, result := range responses {
+				if !test.firstSigned {
+					result.response.Header.Set("X-Test-Unsigned", "1")
+				}
+				if test.badProof {
+					result.response.Header.Set(ProofHeader, "bad-proof")
+				}
+			}
+			calls := 0
+			expected := managedExpectation()
+			expected.LegacyReady = func(context.Context) error {
+				calls++
+				if test.noticeErr {
+					return errors.New("notice failed")
+				}
+				return nil
+			}
+			probe := testProbe()
+			probe.healthy = !test.badJob
+			err := testChecker(&sequenceTransport{responses: responses}).Check(t.Context(), expected, probe)
+			if test.want != "" {
+				assertHealthCode(t, err, test.want)
+			} else if err != nil {
+				t.Fatalf("got %v, want nil", err)
+			}
+			wantCalls := 0
+			if test.name == "legacy ready" || test.noticeErr {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Fatalf("got %d notices, want %d", calls, wantCalls)
+			}
+		})
+	}
+	t.Run("signed then unsigned refuses downgrade", func(t *testing.T) {
+		first := jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))
+		second := jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))
+		second.Header.Set("X-Test-Unsigned", "1")
+		expected := managedExpectation()
+		expected.LegacyReady = func(context.Context) error { t.Fatal("unexpected legacy notice"); return nil }
+		assertHealthCode(t, testChecker(&sequenceTransport{responses: []transportResult{{response: first}, {response: second}}}).Check(t.Context(), expected, testProbe()), protocol.CodeBackendIdentityMismatch)
+	})
+}

@@ -396,12 +396,13 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 
 	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: append([]string(nil), s.deps.PythonPaths...)}
 	if err := s.deps.Health.Check(ctx, health.Expectation{
-		Secret:   secret,
-		Mode:     health.ModeManaged,
-		Protocol: protocol.Version,
-		Version:  revision.Version,
-		Commit:   revision.Commit,
-		Port:     request.Port,
+		Secret:      secret,
+		LegacyReady: s.legacyHealthNotice(request, logger, gate),
+		Mode:        health.ModeManaged,
+		Protocol:    protocol.Version,
+		Version:     revision.Version,
+		Commit:      revision.Commit,
+		Port:        request.Port,
 	}, probe); err != nil {
 		if fault := gate.Fault(); fault != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
@@ -1132,3 +1133,14 @@ func anyExecutable(path string, candidates []string) bool {
 }
 
 var _ health.Probe = processProbe{}
+
+// legacyHealthNotice 在旧后端确认就绪后记录兼容提示，不增加协议 warning。
+func (s *ManagedSupervisor) legacyHealthNotice(request Request, logger Logger, gate *streamGate) func(context.Context) error {
+	return func(ctx context.Context) error {
+		const message = "旧后端未提供健康鉴权证明，已使用兼容模式启动；建议更新后端"
+		if err := logger.Record(ctx, process.StreamRecord{Stream: process.StreamStderr, Fragment: message, Event: message, EndOfLine: true}); err != nil {
+			return err
+		}
+		return gate.Emit(request.Emitter, protocol.LogEvent{Source: "runtime", Stream: "stderr", Message: message})
+	}
+}

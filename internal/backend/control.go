@@ -1402,7 +1402,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		setControlStage(request.Control, protocol.StageBackendHealth)
 		snapshot.set(protocol.StageBackendHealth, protocol.StateStartingBackend, map[string]any{"pid": proc.PID(), "logPath": logger.LogPath()})
 	}
-	healthErr := s.awaitHealth(ctx, request, revision, secret, probe, gate, snapshot, results)
+	healthErr := s.awaitHealth(ctx, request, revision, secret, probe, gate, logger, snapshot, results)
 	if err := healthErr; err != nil {
 		var interrupted *controlInterruptError
 		if errors.As(err, &interrupted) {
@@ -1513,10 +1513,10 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	return attempt, nil
 }
 
-func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, secret string, probe health.Probe, gate *streamGate, snapshot *controlState, results <-chan controlResult) error {
+func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, secret string, probe health.Probe, gate *streamGate, logger Logger, snapshot *controlState, results <-chan controlResult) error {
 	healthCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	expectation := health.Expectation{Secret: secret, Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit, Port: request.Port}
+	expectation := health.Expectation{LegacyReady: s.legacyHealthNotice(request, logger, gate), Secret: secret, Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit, Port: request.Port}
 	if modeForRequest(request) == ModeDevelopment {
 		expectation.Mode = health.ModeDevelopment
 		expectation.Version = ""

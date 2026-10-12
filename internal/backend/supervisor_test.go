@@ -1657,3 +1657,30 @@ type failingLogger struct {
 func (l *failingLogger) Record(context.Context, process.StreamRecord) error { return l.err }
 func (l *failingLogger) LogPath() string                                    { return l.path }
 func (l *failingLogger) Close() error                                       { return nil }
+
+func TestBackend_LegacyHealthNotice(t *testing.T) {
+	f := newBackendFixture(t)
+	request := f.request()
+	gate := &streamGate{stage: protocol.StageBackendHealth}
+	if err := gate.Open(request.Emitter); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.supervisor().legacyHealthNotice(request, f.logger, gate)(t.Context()); err != nil {
+		t.Fatalf("got %v, want nil", err)
+	}
+	if len(f.logger.records) != 1 || f.logger.records[0].Fragment == "" {
+		t.Fatalf("got records %#v, want one persisted notice", f.logger.records)
+	}
+	count := 0
+	for _, event := range f.emitter.eventsSnapshot() {
+		if event == "log:"+f.logger.records[0].Event {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d protocol notices, want 1", count)
+	}
+	if len(f.emitter.warnings) != 0 {
+		t.Fatalf("got warnings %#v, want none", f.emitter.warnings)
+	}
+}
