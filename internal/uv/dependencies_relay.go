@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
@@ -76,6 +78,9 @@ func (s *DependenciesService) syncWithRelay(
 		return DependenciesResult{}, false, nil
 	}
 	plan, planErr := PlanLock(lock, parsePythonVersionLoose(request.PythonVersion))
+	if planErr != nil {
+		relayLogf(request.RelayLog, "warning", "relay lock planning unavailable; uv retains frozen verification", map[string]any{"failureKind": "lock_plan_invalid"})
+	}
 	if planErr == nil && s.intel != nil && plan.Largest.Path != "" {
 		s.intel.SetTarget(mirror.KindPackageIndex, mirror.ProbeTarget{
 			Kind:        mirror.KindPackageIndex,
@@ -99,7 +104,9 @@ func (s *DependenciesService) syncWithRelay(
 		StagingDir: s.layout.RelayStagingDir(),
 		Upstreams:  upstreams,
 		Items:      items,
-	}, relay.Deps{Progress: request.Progress, Logger: request.RelayLog})
+	}, relay.Deps{PinStaging: func(ctx context.Context, dir string) (io.Closer, error) {
+		return filesystem.EnsureManagedDirectory(ctx, s.layout, dir)
+	}, Progress: request.Progress, Logger: request.RelayLog})
 	if err != nil {
 		relayLogf(request.RelayLog, "warning", "relay start failed, falling back to per-source rotation", map[string]any{"error": err.Error()})
 		return DependenciesResult{}, false, nil

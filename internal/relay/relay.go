@@ -6,7 +6,9 @@
 package relay
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 )
@@ -82,6 +84,11 @@ type Upstream struct {
 
 // Config 描述一次中继会话的目录、上游与并发参数；零值字段取包内默认值。
 type Config struct {
+	// MaxUnregisteredBytes 限制缺少锁内身份的制品，零值取 1 GiB。
+	MaxUnregisteredBytes int64
+	// MaxCachedBytes 与 MaxCachedFiles 限制已完成且无读者的缓存。
+	MaxCachedBytes int64
+	MaxCachedFiles int
 	// StagingDir 是 layout.RelayStagingDir()，中继独占，Close 时清空。
 	StagingDir string
 	// Upstreams 按路由给出上游列表；至少要有一条非空路由。
@@ -110,6 +117,8 @@ type Progress struct {
 
 // Deps 是中继的可注入依赖；任一字段为 nil 时取生产默认值（Progress 为不回调）。
 type Deps struct {
+	// PinStaging 由生产调用方固定受管目录及祖先，测试可使用临时目录。
+	PinStaging func(context.Context, string) (io.Closer, error)
 	// Client 是上游客户端，测试注入。
 	Client httpClient
 	Clock  func() time.Time

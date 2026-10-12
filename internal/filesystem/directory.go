@@ -2,10 +2,43 @@ package filesystem
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
+
+// EnsureManagedDirectory 逐层固定已有目录并创建缺失子目录，最终租约覆盖全部祖先。
+// 安装根必须已存在；不沿未知 Reparse 链创建目录。
+func EnsureManagedDirectory(ctx context.Context, layout *config.Layout, path string) (*DirectoryLease, error) {
+	if ctx == nil || layout == nil {
+		return nil, ErrInvalidArgument
+	}
+	relative, err := filepath.Rel(layout.AppRoot(), path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return nil, ErrIdentityChanged
+	}
+	lease, err := OpenManagedDirectory(ctx, layout, path)
+	if err == nil || !errors.Is(err, os.ErrNotExist) || relative == "." {
+		return lease, err
+	}
+	parent, err := EnsureManagedDirectory(ctx, layout, filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	child, createErr := PrepareManagedDirectory(ctx, layout, path)
+	closeErr := parent.Close()
+	if createErr != nil || closeErr != nil {
+		if child != nil {
+			closeErr = errors.Join(closeErr, child.Close())
+		}
+		return nil, errors.Join(createErr, closeErr)
+	}
+	return child, nil
+}
 
 // DirectoryIdentity 是受管目录叶子的不可变 volume/file-ID token。
 //

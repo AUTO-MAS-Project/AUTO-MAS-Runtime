@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
@@ -109,7 +111,9 @@ func (s *ManagedSupervisor) startSupervisedRelay(
 	session, err := s.deps.Relay(ctx, relay.Config{
 		StagingDir: s.layout.RelayStagingDir(),
 		Upstreams:  upstreams,
-	}, relay.Deps{Logger: relayLogger(diagnostics)})
+	}, relay.Deps{PinStaging: func(ctx context.Context, dir string) (io.Closer, error) {
+		return filesystem.EnsureManagedDirectory(ctx, s.layout, dir)
+	}, Logger: relayLogger(diagnostics)})
 	if err != nil {
 		diagnostics.record(ctx, "relay start failed, backend keeps direct mirror lists: "+err.Error())
 		return nil, infrastructure, nil

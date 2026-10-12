@@ -24,6 +24,10 @@ func (e *engine) serveSimple(
 	request *http.Request,
 	name string,
 ) {
+	if err := e.acquireSlot(ctx); err != nil {
+		return
+	}
+	defer e.releaseSlot()
 	headers := map[string]string{}
 	if accept := request.Header.Get("Accept"); accept != "" {
 		headers["Accept"] = accept

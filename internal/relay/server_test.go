@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -247,5 +248,98 @@ func TestServer_SetUpstreamsReplacesOrder(t *testing.T) {
 	}
 	if err := fixture.server.SetUpstreams(RoutePackages, []Upstream{{Key: "x", Base: "http://insecure.example/"}}); err == nil {
 		t.Error("SetUpstreams(http upstream) error = nil, want error")
+	}
+}
+func TestServer_UnexpectedListenerFailureStopsFetch(t *testing.T) {
+	mirror := newFakeMirror(t, true)
+	cfg := loopbackConfig(mirror)
+	cfg.StagingDir = t.TempDir()
+	server, err := Start(t.Context(), cfg, Deps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &testFixture{server: server}
+	if err := fixture.server.listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { fixture.server.background.Wait(); close(done) }()
+	select {
+	case <-fixture.server.fetchCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("listener failure did not cancel fetch")
+	}
+	if err := fixture.server.Close(); err == nil {
+		t.Fatal("got nil Close error, want listener failure")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("background did not exit")
+	}
+}
+func TestServer_UnregisteredStreamLimit(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(strconv.FormatBool(unknown), func(t *testing.T) {
+			mirror := newFakeMirror(t, false)
+			mirror.put("packages/large.whl", bytes.Repeat([]byte("x"), 100))
+			cfg := loopbackConfig(mirror)
+			cfg.MaxUnregisteredBytes = 32
+			deps := Deps{}
+			if unknown {
+				deps.Client = &noLengthClient{client: mirror.server.Client()}
+			}
+			fixture := startFixture(t, fixtureOptions{cfg: cfg, deps: deps}, mirror)
+			response, _ := fixture.get(t, "/packages/large.whl")
+			if response.StatusCode != http.StatusBadGateway {
+				t.Fatalf("got %d, want 502", response.StatusCode)
+			}
+			entries, err := os.ReadDir(fixture.server.cfg.StagingDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("got %d residual files, want 0", len(entries))
+			}
+		})
+	}
+}
+
+type noLengthClient struct{ client *http.Client }
+
+func (c *noLengthClient) Do(request *http.Request) (*http.Response, error) {
+	response, err := c.client.Do(request)
+	if response != nil {
+		response.ContentLength = -1
+	}
+	return response, err
+}
+
+func TestServer_CacheEvictionProtectsReaders(t *testing.T) {
+	mirror := newFakeMirror(t, false)
+	mirror.put("packages/a.whl", []byte("aaaaaaaa"))
+	mirror.put("packages/b.whl", []byte("bbbbbbbb"))
+	cfg := loopbackConfig(mirror)
+	cfg.MaxCachedFiles = 1
+	cfg.MaxCachedBytes = 8
+	fixture := startFixture(t, fixtureOptions{cfg: cfg}, mirror)
+	first, release, err := fixture.server.awaitFile(t.Context(), RoutePackages, "a.whl")
+	if err != nil {
+		t.Fatalf("fetch error=%v logs=%+v requests=%+v", err, fixture.logs.entries, mirror.recorded())
+	}
+	defer release()
+	response, _ := fixture.get(t, "/packages/b.whl")
+	if response.StatusCode != http.StatusOK {
+		t.Fatal(response.StatusCode)
+	}
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("active reader file was removed: %v", err)
+	}
+	if _, err := os.Stat(fixture.server.staging.pathFor(RoutePackages, "b.whl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("idle cache error = %v, want absent", err)
+	}
+	response, _ = fixture.get(t, "/packages/b.whl")
+	if response.StatusCode != http.StatusOK || mirror.count("packages/b.whl") != 4 {
+		t.Fatal("evicted artifact was not fetched again")
 	}
 }

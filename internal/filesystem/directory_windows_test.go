@@ -323,3 +323,30 @@ func directoryTestLayout(t *testing.T, appRoot, base string) *config.Layout {
 	}
 	return layout
 }
+func TestEnsureManagedDirectory_CreatesMissingAncestorsAndPinsTree(t *testing.T) {
+	root := t.TempDir()
+	appRoot := filepath.Join(root, "app")
+	if err := os.Mkdir(appRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout := directoryTestLayout(t, appRoot, root)
+	target := layout.RelayStagingDir()
+	lease, err := EnsureManagedDirectory(t.Context(), layout, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := lease.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := os.Rename(filepath.Dir(target), filepath.Dir(target)+".moved"); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("got %v, want pinned ancestor sharing violation", err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Dir(target), filepath.Dir(target)+".moved"); err != nil {
+		t.Fatal(err)
+	}
+}

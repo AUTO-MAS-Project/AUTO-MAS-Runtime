@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -38,6 +39,9 @@ type internals struct {
 
 // fileEntry 是同一文件的共享取回结果：done 关闭后 path / err 只读。
 type fileEntry struct {
+	refs int
+	used uint64
+	size int64
 	done chan struct{}
 	path string
 	err  error
@@ -58,8 +62,12 @@ type Server struct {
 	fetchCtx    context.Context
 	cancelFetch context.CancelFunc
 
-	mu    sync.Mutex // 保护 files。
-	files map[string]*fileEntry
+	mu       sync.Mutex // 保护 files。
+	files    map[string]*fileEntry
+	clock    uint64
+	serveErr error
+	lease    io.Closer
+	handlers chan struct{}
 
 	inflight   atomic.Int64 // 正在执行的 HTTP handler 数，供 Close 收口断言。
 	stopped    atomic.Bool  // 进度回调失败后置位，后续请求一律 502。
@@ -91,16 +99,31 @@ func start(
 	if private.timers == nil {
 		private.timers = newRuntimeTimer
 	}
+	var lease io.Closer
+	if deps.PinStaging != nil {
+		lease, err = deps.PinStaging(ctx, normalized.StagingDir)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(normalized.StagingDir, 0o700); err != nil {
+		if lease != nil {
+			err = errors.Join(err, lease.Close())
+		}
 		return nil, fmt.Errorf("create relay staging dir: %w", err)
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
+		if lease != nil {
+			err = errors.Join(err, lease.Close())
+		}
 		return nil, fmt.Errorf("listen relay loopback: %w", err)
 	}
 	fetchCtx, cancelFetch := context.WithCancel(ctx)
 	server := &Server{
 		cfg:         normalized,
+		lease:       lease,
+		handlers:    make(chan struct{}, normalized.MaxFiles*2),
 		deps:        deps,
 		baseURL:     "http://" + listener.Addr().String(),
 		listener:    listener,
@@ -128,8 +151,15 @@ func start(
 // serve 在 Close 关闭监听后退出。
 func (s *Server) serve() {
 	defer s.background.Done()
-	// Serve 只在监听被关闭时返回，返回值恒为 ErrServerClosed 或监听错误，无需上报。
-	_ = s.http.Serve(s.listener)
+	if err := s.http.Serve(s.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.mu.Lock()
+		s.serveErr = err
+		s.mu.Unlock()
+		s.stop()
+		if s.deps.Logger != nil {
+			s.deps.Logger("error", "relay listener stopped unexpectedly", nil)
+		}
+	}
 }
 
 // watch 在 ctx 取消时关闭中继；Close 先于 ctx 取消时随 closed 退出。
@@ -200,8 +230,22 @@ func (s *Server) Close() error {
 			shutdownErr = errors.Join(shutdownErr, s.http.Close())
 		}
 		waitErr := waitBounded(&s.background, closeTimeout)
+		if waitErr != nil {
+			// 未证明 I/O 收口前保留目录租约，避免路径替换和正在读取的文件被清理。
+			s.closeErr = errors.Join(shutdownErr, waitErr)
+			return
+		}
 		cleanErr := s.staging.clean()
-		s.closeErr = errors.Join(shutdownErr, waitErr, cleanErr)
+		var leaseErr error
+		if s.lease != nil {
+			leaseErr = s.lease.Close()
+			// 仅尝试删除空目录；未知内容或外部占用时保留，不递归清理。
+			_ = os.Remove(s.cfg.StagingDir)
+		}
+		s.mu.Lock()
+		serveErr := s.serveErr
+		s.mu.Unlock()
+		s.closeErr = errors.Join(shutdownErr, waitErr, cleanErr, leaseErr, serveErr)
 	})
 	return s.closeErr
 }
@@ -224,6 +268,13 @@ func waitBounded(group *sync.WaitGroup, limit time.Duration) error {
 
 // ServeHTTP 只做路由校验与分发；业务错误一律以状态码表达，不写任何标准输出。
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	select {
+	case s.handlers <- struct{}{}:
+		defer func() { <-s.handlers }()
+	default:
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	s.inflight.Add(1)
 	defer s.inflight.Add(-1)
 	resolved := resolveRoute(request)
@@ -248,7 +299,8 @@ func (s *Server) serveFile(
 	route Route,
 	path string,
 ) {
-	staged, err := s.awaitFile(request.Context(), route, path)
+	staged, release, err := s.awaitFile(request.Context(), route, path)
+	defer release()
 	if err != nil {
 		if request.Context().Err() != nil {
 			return
@@ -271,7 +323,7 @@ func (s *Server) serveFile(
 
 // awaitFile 让同一文件的并发请求共享一次取回：第一个到达的请求启动取回，其余等待同一结果。
 // 取回挂在 fetchCtx 下而不是请求 ctx 下，请求方离开不会打断其他等待者。
-func (s *Server) awaitFile(ctx context.Context, route Route, path string) (string, error) {
+func (s *Server) awaitFile(ctx context.Context, route Route, path string) (string, func(), error) {
 	key := route.String() + "/" + path
 	s.mu.Lock()
 	entry, ok := s.files[key]
@@ -281,14 +333,18 @@ func (s *Server) awaitFile(ctx context.Context, route Route, path string) (strin
 		s.background.Add(1)
 		go s.runFetch(key, route, path, entry)
 	}
+	s.clock++
+	entry.used = s.clock
+	entry.refs++
 	s.mu.Unlock()
+	release := func() { s.mu.Lock(); defer s.mu.Unlock(); entry.refs--; s.trimCache() }
 	select {
 	case <-entry.done:
-		return entry.path, entry.err
+		return entry.path, release, entry.err
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return "", release, ctx.Err()
 	case <-s.fetchCtx.Done():
-		return "", s.fetchCtx.Err()
+		return "", release, s.fetchCtx.Err()
 	}
 }
 
@@ -296,12 +352,18 @@ func (s *Server) awaitFile(ctx context.Context, route Route, path string) (strin
 func (s *Server) runFetch(key string, route Route, path string, entry *fileEntry) {
 	defer s.background.Done()
 	entry.path, entry.err = s.fetcher.fetch(s.fetchCtx, route, path)
+	if entry.err == nil {
+		if info, err := os.Stat(entry.path); err == nil {
+			entry.size = info.Size()
+		}
+	}
+	s.mu.Lock()
 	if entry.err != nil {
-		s.mu.Lock()
 		delete(s.files, key)
-		s.mu.Unlock()
 	}
 	close(entry.done)
+	s.trimCache()
+	s.mu.Unlock()
 }
 
 // serveSimple 把请求 ctx 与中继 ctx 合并后交给引擎：请求方离开或 Close 都能打断索引取回。
@@ -422,15 +484,30 @@ func normalizeConfig(cfg Config) (Config, error) {
 		items = append(items, item)
 	}
 	normalized := Config{
-		StagingDir:       filepath.Clean(cfg.StagingDir),
-		Upstreams:        upstreams,
-		Items:            items,
-		ChunkThreshold:   cfg.ChunkThreshold,
-		ChunkSize:        cfg.ChunkSize,
-		MaxFiles:         cfg.MaxFiles,
-		MaxChunksPerFile: cfg.MaxChunksPerFile,
-		StallTimeout:     cfg.StallTimeout,
-		ConnectTimeout:   cfg.ConnectTimeout,
+		StagingDir:           filepath.Clean(cfg.StagingDir),
+		MaxUnregisteredBytes: cfg.MaxUnregisteredBytes,
+		MaxCachedBytes:       cfg.MaxCachedBytes,
+		MaxCachedFiles:       cfg.MaxCachedFiles,
+		Upstreams:            upstreams,
+		Items:                items,
+		ChunkThreshold:       cfg.ChunkThreshold,
+		ChunkSize:            cfg.ChunkSize,
+		MaxFiles:             cfg.MaxFiles,
+		MaxChunksPerFile:     cfg.MaxChunksPerFile,
+		StallTimeout:         cfg.StallTimeout,
+		ConnectTimeout:       cfg.ConnectTimeout,
+	}
+	if normalized.MaxUnregisteredBytes == 0 {
+		normalized.MaxUnregisteredBytes = 1 << 30
+	}
+	if normalized.MaxCachedBytes == 0 {
+		normalized.MaxCachedBytes = 2 << 30
+	}
+	if normalized.MaxCachedFiles == 0 {
+		normalized.MaxCachedFiles = 128
+	}
+	if normalized.MaxUnregisteredBytes < 0 || normalized.MaxCachedBytes < 0 || normalized.MaxCachedFiles < 0 {
+		return Config{}, fmt.Errorf("%w: cache limits must be positive", ErrInvalidConfig)
 	}
 	if normalized.ChunkThreshold == 0 {
 		normalized.ChunkThreshold = DefaultChunkThreshold
@@ -504,4 +581,45 @@ func normalizeDeps(deps Deps) Deps {
 		deps.Clock = time.Now
 	}
 	return deps
+}
+
+// trimCache 在持有 mu 时回收最久未用的已完成文件，读者释放前不移除。
+func (s *Server) trimCache() {
+	for {
+		var total int64
+		var oldest *fileEntry
+		var oldestKey string
+		for key, entry := range s.files {
+			select {
+			case <-entry.done:
+				total += entry.size
+				if entry.refs == 0 && entry.err == nil && (oldest == nil || entry.used < oldest.used) {
+					oldest = entry
+					oldestKey = key
+				}
+			default:
+			}
+		}
+		if total <= s.cfg.MaxCachedBytes && len(s.files) <= s.cfg.MaxCachedFiles {
+			return
+		}
+		if oldest == nil {
+			return
+		}
+		if err := s.staging.remove(oldest.path); err != nil {
+			s.stop()
+			return
+		}
+		delete(s.files, oldestKey)
+	}
+}
+
+func (st *staging) remove(path string) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	delete(st.created, path)
+	return nil
 }

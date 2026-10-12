@@ -119,6 +119,9 @@ func (e *engine) fetch(ctx context.Context, route Route, path string) (string, e
 	if spec.digest == nil {
 		e.probeSize(ctx, &spec)
 	}
+	if spec.digest == nil && spec.size > e.cfg.MaxUnregisteredBytes {
+		return "", errAllSourcesFailed
+	}
 	return e.download(ctx, spec)
 }
 
@@ -314,6 +317,7 @@ func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 	part := target + ".part"
 	e.staging.track(target)
 	e.staging.track(part)
+	defer func() { _ = e.staging.remove(part) }() // part 只属于本次取回，失败也不留存。
 	plan := newChunkPlan(e.clock)
 	if e.tryChunked(ctx, spec, part, plan) {
 		if path, ok := e.publish(spec, part, target, plan.contributions); ok {
@@ -411,7 +415,11 @@ func (e *engine) singleStream(
 		return 0, OutcomeNetwork
 	}
 	hasher := sha256.New()
-	received, outcome := e.readBody(ctx, handle, io.MultiWriter(out, hasher), spec.size, func(count int64) {
+	limit := spec.size
+	if spec.digest == nil && (limit == 0 || limit > e.cfg.MaxUnregisteredBytes) {
+		limit = e.cfg.MaxUnregisteredBytes
+	}
+	received, outcome := e.readBody(ctx, handle, io.MultiWriter(out, hasher), limit, func(count int64) {
 		e.tracker.add(spec.key, spec.name, upstream.Key, count)
 	})
 	if closeErr := out.Close(); closeErr != nil && outcome == "" {
