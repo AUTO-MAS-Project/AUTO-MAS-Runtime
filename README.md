@@ -11,7 +11,7 @@ Runtime 不代理业务 HTTP/WebSocket，不管理 Python 插件依赖，也不�
 后续 Windows Release 由 AUTO-MAS 主仓库构建并提交 SignPath 签名，Runtime 仓库验证
 Authenticode、版本和源 Commit 后发布 `auto-mas-runtime-<tag>.exe` 与覆盖签名后 EXE 的
 `SHA256SUMS.txt`。历史未签名资产不改写。接入状态与配置前提见
-[T7.5 设计](doc/current/M7/设计-T7.5-主仓库构建与签名.md)。
+[T7.5 设计](doc/archive/M7/设计-T7.5-主仓库构建与签名.md)。
 
 免费代码签名由 [SignPath.io](https://signpath.io/) 提供，证书由
 [SignPath Foundation](https://signpath.org/) 提供；提交、审查与签名审批沿用
