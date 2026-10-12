@@ -935,13 +935,3 @@ func TestUVRunner_OutputDrainIsBounded(t *testing.T) {
 		t.Fatal("got nil, want output drain failure")
 	}
 }
-func TestUVEnvironment_SupervisionSecretNeverInherited(t *testing.T) {
-	t.Setenv("AUTO_MAS_SUPERVISION_SECRET", "host-secret")
-	options := RunOptions{Environment: map[string]string{"auto_mas_supervision_secret": "override-secret"}}
-	for _, entry := range buildEnvironment((&UVRunner{}).resolveOptions(options)) {
-		key, _, _ := strings.Cut(entry, "=")
-		if strings.EqualFold(key, "AUTO_MAS_SUPERVISION_SECRET") {
-			t.Fatalf("secret inherited in ordinary uv environment")
-		}
-	}
-}

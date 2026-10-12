@@ -648,7 +648,6 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASMirrorPackageIndex,
 		autoMASMirrorPython,
 		autoMASSupervisedPort,
-		"AUTO_MAS_SUPERVISION_SECRET",
 	} {
 		if strings.EqualFold(key, managed) {
 			return managed, true

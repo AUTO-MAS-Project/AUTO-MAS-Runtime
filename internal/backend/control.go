@@ -293,7 +293,6 @@ func (m *ControlMailbox) SetStage(stage protocol.Stage) {
 var _ ControlReceiver = (*ControlMailbox)(nil)
 
 type controlAttempt struct {
-	secret  string
 	process ManagedProcess
 	tx      TransactionHandle
 	logger  Logger
@@ -1226,10 +1225,6 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
-	secret, err := health.NewSupervisionSecret()
-	if err != nil {
-		return nil, newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "监督密钥创建失败", nil, err)
-	}
 	mode := modeForRequest(request)
 	projectDir := s.layout.RepoDir()
 	projectEnvDir := ""
@@ -1282,7 +1277,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		}
 	}
 	gate := &streamGate{stage: protocol.StageBackendSpawn}
-	attempt := &controlAttempt{secret: secret, tx: tx, logger: logger, gate: gate, stage: protocol.StageBackendSpawn, results: results}
+	attempt := &controlAttempt{tx: tx, logger: logger, gate: gate, stage: protocol.StageBackendSpawn, results: results}
 	if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 		cleanupErr := errors.Join(
 			s.removeBackendTransaction(ctx, tx),
@@ -1314,7 +1309,6 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		return nil, errors.Join(ctxErr, cleanupErr)
 	}
 	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", entryArgument}, uv.ManagedOptions{
-		Secret:         secret,
 		RunOptions:     uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
 		Identity:       identity,
 		Infrastructure: s.infrastructure,
@@ -1402,7 +1396,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		setControlStage(request.Control, protocol.StageBackendHealth)
 		snapshot.set(protocol.StageBackendHealth, protocol.StateStartingBackend, map[string]any{"pid": proc.PID(), "logPath": logger.LogPath()})
 	}
-	healthErr := s.awaitHealth(ctx, request, revision, secret, probe, gate, logger, snapshot, results)
+	healthErr := s.awaitHealth(ctx, request, revision, probe, gate, snapshot, results)
 	if err := healthErr; err != nil {
 		var interrupted *controlInterruptError
 		if errors.As(err, &interrupted) {
@@ -1513,10 +1507,10 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	return attempt, nil
 }
 
-func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, secret string, probe health.Probe, gate *streamGate, logger Logger, snapshot *controlState, results <-chan controlResult) error {
+func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, revision state.Revision, probe health.Probe, gate *streamGate, snapshot *controlState, results <-chan controlResult) error {
 	healthCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	expectation := health.Expectation{LegacyReady: s.legacyHealthNotice(request, logger, gate), Secret: secret, Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit, Port: request.Port}
+	expectation := health.Expectation{Mode: health.ModeManaged, Protocol: protocol.Version, Version: revision.Version, Commit: revision.Commit, Port: request.Port}
 	if modeForRequest(request) == ModeDevelopment {
 		expectation.Mode = health.ModeDevelopment
 		expectation.Version = ""
@@ -1969,7 +1963,7 @@ func (s *ManagedSupervisor) finishControlShutdown(ctx context.Context, request R
 	if !processAlreadyExited(attempt.process) {
 		closer := s.deps.HTTP
 		if closer == nil {
-			closer = newLoopbackHTTPCloser(request.Port, attempt.secret)
+			closer = newLoopbackHTTPCloser(request.Port)
 		}
 		httpErr = closer.Close(closeCtx)
 		graceful = httpErr == nil && waitProcessExit(closeCtx, attempt.process)

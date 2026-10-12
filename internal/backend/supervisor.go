@@ -318,17 +318,12 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		return err
 	}
 
-	secret, err := health.NewSupervisionSecret()
-	if err != nil {
-		return newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "监督密钥创建失败", nil, err)
-	}
 	gate := &streamGate{stage: protocol.StageBackendSpawn}
 	sink := s.streamSink(request, logger, gate)
 	processOwned := false
 	proc, err := s.deps.UV.StartManaged(ctx, []string{
 		"run", "--project", s.layout.RepoDir(), "--no-sync", s.layout.BackendEntryFile(),
 	}, uv.ManagedOptions{
-		Secret: secret,
 		RunOptions: uv.RunOptions{
 			Stage: protocol.StageBackendSpawn,
 			// cwd 是 app-root 而不是 repo：后端相对 cwd 创建的用户数据必须留在
@@ -396,13 +391,11 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 
 	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: append([]string(nil), s.deps.PythonPaths...)}
 	if err := s.deps.Health.Check(ctx, health.Expectation{
-		Secret:      secret,
-		LegacyReady: s.legacyHealthNotice(request, logger, gate),
-		Mode:        health.ModeManaged,
-		Protocol:    protocol.Version,
-		Version:     revision.Version,
-		Commit:      revision.Commit,
-		Port:        request.Port,
+		Mode:     health.ModeManaged,
+		Protocol: protocol.Version,
+		Version:  revision.Version,
+		Commit:   revision.Commit,
+		Port:     request.Port,
 	}, probe); err != nil {
 		if fault := gate.Fault(); fault != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
@@ -1133,14 +1126,3 @@ func anyExecutable(path string, candidates []string) bool {
 }
 
 var _ health.Probe = processProbe{}
-
-// legacyHealthNotice 在旧后端确认就绪后记录兼容提示，不增加协议 warning。
-func (s *ManagedSupervisor) legacyHealthNotice(request Request, logger Logger, gate *streamGate) func(context.Context) error {
-	return func(ctx context.Context) error {
-		const message = "旧后端未提供健康鉴权证明，已使用兼容模式启动；建议更新后端"
-		if err := logger.Record(ctx, process.StreamRecord{Stream: process.StreamStderr, Fragment: message, Event: message, EndOfLine: true}); err != nil {
-			return err
-		}
-		return gate.Emit(request.Emitter, protocol.LogEvent{Source: "runtime", Stream: "stderr", Message: message})
-	}
-}

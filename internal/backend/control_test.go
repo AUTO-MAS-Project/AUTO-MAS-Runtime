@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -1121,9 +1120,6 @@ func TestBackend_FirstUnexpectedExitRestartsOnce(t *testing.T) {
 	waitForStateStatusCount(t, f.emitter, protocol.StateRunning, 2)
 	if f.uv.startCalls != 2 {
 		t.Fatalf("StartManaged calls = %d, want 2", f.uv.startCalls)
-	}
-	if len(f.uv.secrets) != 2 || !health.ValidSupervisionSecret(f.uv.secrets[0]) || !health.ValidSupervisionSecret(f.uv.secrets[1]) || f.uv.secrets[0] == f.uv.secrets[1] {
-		t.Fatal("got invalid or reused restart secret")
 	}
 	if err := mailbox.Submit(context.Background(), protocol.ControlCommand{Command: protocol.ControlCancel, CommandID: "cancel-after-restart"}); err != nil {
 		t.Fatalf("Submit(cancel) error = %v", err)
