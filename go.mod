@@ -6,7 +6,7 @@ toolchain go1.26.9
 
 require (
 	github.com/BurntSushi/toml v1.5.0
-	github.com/getsentry/sentry-go v0.48.0
+	github.com/getsentry/sentry-go v0.50.0
 	github.com/go-git/go-billy/v5 v5.9.0
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/spf13/cobra v1.10.2
