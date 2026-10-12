@@ -317,3 +317,43 @@ func readWorkflowSource(t *testing.T, name string) string {
 	}
 	return strings.ReplaceAll(string(data), "\r\n", "\n")
 }
+func TestWorkflows_ImmutableActionReferences(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("caller unavailable")
+	}
+	root := filepath.Dir(filepath.Dir(filepath.Dir(sourceFile)))
+	paths, err := filepath.Glob(filepath.Join(root, ".github", "workflows", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("got no workflows")
+	}
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "uses:") {
+				continue
+			}
+			ref := strings.Fields(strings.TrimPrefix(trimmed, "uses:"))[0]
+			if strings.HasPrefix(ref, "./") {
+				continue
+			}
+			if strings.HasPrefix(ref, "docker://") {
+				if !strings.Contains(ref, "@sha256:") {
+					t.Errorf("%s: mutable container %s", path, ref)
+				}
+				continue
+			}
+			_, revision, ok := strings.Cut(ref, "@")
+			if !ok || len(revision) != 40 || strings.Trim(revision, "0123456789abcdef") != "" {
+				t.Errorf("%s: mutable action %s", path, ref)
+			}
+		}
+	}
+}
