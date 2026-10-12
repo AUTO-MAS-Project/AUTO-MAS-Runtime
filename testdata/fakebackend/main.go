@@ -4,9 +4,11 @@ package main
 import (
 	"bytes"
 	"context"
+
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"io"
 	"net"
 	"net/http"
@@ -147,16 +149,18 @@ func (b *fakeBackend) handleHealth(writer http.ResponseWriter, request *http.Req
 	}
 	b.mu.Unlock()
 
-	writer.Header().Set("Content-Type", "application/json")
-	status := sequenceValue(b.config.HealthHTTPStatus, requestCount, http.StatusOK)
-	writer.WriteHeader(status)
-	if len(b.config.HealthRaw) > 0 {
-		_, _ = writer.Write([]byte(sequenceValue(b.config.HealthRaw, requestCount, "") + "\n"))
-	} else {
-		if err := json.NewEncoder(writer).Encode(reply); err != nil {
-			return
-		}
+	body, err := json.Marshal(reply)
+	if err != nil {
+		return
 	}
+	body = append(body, '\n')
+	if len(b.config.HealthRaw) > 0 {
+		body = []byte(sequenceValue(b.config.HealthRaw, requestCount, "") + "\n")
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set(health.ProofHeader, health.HealthProof(os.Getenv(health.SecretEnvironment), request.Header.Get(health.ChallengeHeader), body))
+	writer.WriteHeader(sequenceValue(b.config.HealthHTTPStatus, requestCount, http.StatusOK))
+	_, _ = writer.Write(body)
 	if flusher, ok := writer.(http.Flusher); ok {
 		flusher.Flush()
 	}

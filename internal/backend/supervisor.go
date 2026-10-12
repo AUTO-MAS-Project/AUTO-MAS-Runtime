@@ -318,12 +318,17 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		return err
 	}
 
+	secret, err := health.NewSupervisionSecret()
+	if err != nil {
+		return newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "监督密钥创建失败", nil, err)
+	}
 	gate := &streamGate{stage: protocol.StageBackendSpawn}
 	sink := s.streamSink(request, logger, gate)
 	processOwned := false
 	proc, err := s.deps.UV.StartManaged(ctx, []string{
 		"run", "--project", s.layout.RepoDir(), "--no-sync", s.layout.BackendEntryFile(),
 	}, uv.ManagedOptions{
+		Secret: secret,
 		RunOptions: uv.RunOptions{
 			Stage: protocol.StageBackendSpawn,
 			// cwd 是 app-root 而不是 repo：后端相对 cwd 创建的用户数据必须留在
@@ -391,6 +396,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 
 	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: append([]string(nil), s.deps.PythonPaths...)}
 	if err := s.deps.Health.Check(ctx, health.Expectation{
+		Secret:   secret,
 		Mode:     health.ModeManaged,
 		Protocol: protocol.Version,
 		Version:  revision.Version,

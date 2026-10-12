@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -50,22 +52,35 @@ func backendCloseURL(port int) string {
 
 // loopbackHTTPCloser 向派生端口的 /api/core/close 发起关闭请求。
 type loopbackHTTPCloser struct {
-	port int
+	port   int
+	secret string
 }
 
-func newLoopbackHTTPCloser(port int) loopbackHTTPCloser {
-	return loopbackHTTPCloser{port: port}
+func newLoopbackHTTPCloser(port int, secret string) loopbackHTTPCloser {
+	return loopbackHTTPCloser{port: port, secret: secret}
 }
 
 func (c loopbackHTTPCloser) Close(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("backend shutdown context is nil")
 	}
-	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+	if !health.ValidSupervisionSecret(c.secret) {
+		return errors.New("invalid supervision secret")
+	}
+	challenge, err := health.NewChallenge()
+	if err != nil {
+		return err
+	}
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, backendCloseURL(c.port), nil)
 	if err != nil {
 		return err
 	}
+	request.Header.Set(health.ChallengeHeader, challenge)
+	request.Header.Set(health.TimestampHeader, timestamp)
+	request.Header.Set(health.ProofHeader, health.CloseProof(c.secret, challenge, timestamp, c.port))
 	response, err := client.Do(request)
 	if err != nil {
 		return err

@@ -22,7 +22,7 @@ func TestManaged_UsesRunnerEnvironmentAndArguments(t *testing.T) {
 	var recordsMu sync.Mutex
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage: protocol.StageBackendSpawn,
 			Environment: map[string]string{
@@ -85,7 +85,7 @@ func TestManaged_WorkingDirOverridesProjectDir(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-workingdir-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:       protocol.StageBackendSpawn,
 			WorkingDir:  workingDir,
@@ -124,7 +124,7 @@ func TestManaged_WorkingDirDefaultsToProjectDir(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-default-workingdir-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:       protocol.StageBackendSpawn,
 			ProjectDir:  projectDir,
@@ -214,7 +214,7 @@ func TestManagedRunner_ScrubsTelemetryEnvironment(t *testing.T) {
 			if testCase.offline {
 				environment[strings.ToLower(uvOfflineEnv)] = "1"
 			}
-			managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+			managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 				RunOptions: RunOptions{
 					Stage:       protocol.StageBackendSpawn,
 					Environment: environment,
@@ -286,7 +286,7 @@ func TestManaged_CancellationUsesOperationCancelled(t *testing.T) {
 	runner := newTestRunner(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	managed, err := runner.StartManaged(ctx, []string{"run"}, ManagedOptions{
+	managed, err := runner.StartManaged(ctx, []string{"run"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
 	}, nil)
 	if managed != nil {
@@ -312,7 +312,7 @@ func TestManaged_DevelopmentOmitsExpectedIdentity(t *testing.T) {
 	runner := newTestRunner(t)
 	recordPath := filepath.Join(t.TempDir(), "development-record.txt")
 	projectEnvDir := filepath.Join(t.TempDir(), "development-venv")
-	managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+	managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:         protocol.StageBackendSpawn,
 			ProjectEnvDir: projectEnvDir,
@@ -363,7 +363,7 @@ func TestManaged_DevelopmentOmitsExpectedIdentity(t *testing.T) {
 
 func TestManaged_RejectsInvalidManagedIdentityBeforeSpawn(t *testing.T) {
 	runner := newTestRunner(t)
-	managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+	managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
 		Identity:   &SupervisionIdentity{Version: "v6.0.0-test", Commit: "BAD"},
 	}, nil)
@@ -375,7 +375,7 @@ func TestManaged_RejectsInvalidManagedIdentityBeforeSpawn(t *testing.T) {
 func TestManaged_StartFailureIncludesStableDiagnostics(t *testing.T) {
 	runner := newTestRunner(t)
 	runner.Executable = filepath.Join(t.TempDir(), "missing-uv.exe")
-	managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+	managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
 	}, nil)
 	if managed != nil {
@@ -411,7 +411,7 @@ func TestManaged_InjectsInfrastructureAndMirrorSources(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-infrastructure-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:       protocol.StageBackendSpawn,
 			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
@@ -461,7 +461,7 @@ func TestManaged_InjectsEmptyMirrorListsWhenOffline(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-offline-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:       protocol.StageBackendSpawn,
 			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
@@ -497,7 +497,7 @@ func TestManaged_InfrastructureKeysAreControlled(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-controlled-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage: protocol.StageBackendSpawn,
 			Environment: map[string]string{
@@ -546,7 +546,7 @@ func TestManaged_InfrastructureFallsBackToResolvedDirectories(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-fallback-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:            protocol.StageBackendSpawn,
 			CacheDir:         overrideCache,
@@ -596,7 +596,7 @@ func TestManaged_RejectsInvalidInfrastructure(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runner := newTestRunner(t)
-			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 				RunOptions:     RunOptions{Stage: protocol.StageBackendSpawn},
 				Infrastructure: test.infrastructure,
 			}, nil)
@@ -632,7 +632,7 @@ func TestManaged_InjectsSupervisedPort(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-port-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage: protocol.StageBackendSpawn,
 			Environment: map[string]string{
@@ -665,7 +665,7 @@ func TestManaged_OmitsSupervisedPortWhenUnset(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "managed-no-port-record.txt")
 	managed, err := runner.StartManaged(t.Context(), []string{
 		"-test.run=^TestFakeUVProcess$",
-	}, ManagedOptions{
+	}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{
 			Stage:       protocol.StageBackendSpawn,
 			Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
@@ -686,7 +686,7 @@ func TestManaged_RejectsInvalidSupervisedPort(t *testing.T) {
 	for _, port := range []int{1023, 65536, -1} {
 		t.Run(strconv.Itoa(port), func(t *testing.T) {
 			runner := newTestRunner(t)
-			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{
+			managed, err := runner.StartManaged(t.Context(), []string{"run"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 				RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
 				Port:       port,
 			}, nil)
@@ -704,7 +704,7 @@ func TestManaged_RelayIsFirstMirrorEntry(t *testing.T) {
 	packageIndex := []string{"https://mirrors.aliyun.com/pypi/simple/", "https://pypi.org/simple/"}
 	pythonSources := []string{"https://github.com/astral-sh/python-build-standalone/releases/download"}
 	recordPath := filepath.Join(t.TempDir(), "managed-relay-record.txt")
-	managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+	managed, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn, Environment: map[string]string{"FAKE_UV_RECORD": recordPath}},
 		Infrastructure: SupervisionInfrastructure{
 			UVCacheDir:          runner.CacheDir,
@@ -730,7 +730,7 @@ func TestManaged_RelayIsFirstMirrorEntry(t *testing.T) {
 // TestManaged_RejectsNonLoopbackRelay 锁定 RelayBaseURL 只接受回环地址：其它主机会在 spawn 前失败关闭。
 func TestManaged_RejectsNonLoopbackRelay(t *testing.T) {
 	runner := newTestRunner(t)
-	_, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{
+	_, err := runner.StartManaged(t.Context(), []string{"-test.run=^TestFakeUVProcess$"}, ManagedOptions{Secret: strings.Repeat("a", 64),
 		RunOptions: RunOptions{Stage: protocol.StageBackendSpawn},
 		Infrastructure: SupervisionInfrastructure{
 			UVCacheDir:       runner.CacheDir,

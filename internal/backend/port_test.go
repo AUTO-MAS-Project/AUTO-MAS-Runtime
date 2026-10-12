@@ -142,7 +142,7 @@ func TestBackend_CloseRequestTargetsSupervisedPort(t *testing.T) {
 	server.Start()
 	t.Cleanup(server.Close)
 	port := listener.Addr().(*net.TCPAddr).Port
-	closer := newLoopbackHTTPCloser(port)
+	closer := newLoopbackHTTPCloser(port, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err := closer.Close(t.Context()); err != nil {
 		t.Fatalf("Close() error = %v, want nil", err)
 	}

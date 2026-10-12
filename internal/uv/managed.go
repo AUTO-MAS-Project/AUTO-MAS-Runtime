@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/health"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -37,6 +38,8 @@ type SupervisionInfrastructure struct {
 
 // ManagedOptions 把通用 uv 选项与长驻监督身份策略分开，避免调用方直接拼受控环境键。
 type ManagedOptions struct {
+	// Secret 由监督器为每次启动生成，禁止从宿主继承。
+	Secret string
 	RunOptions
 	Identity       *SupervisionIdentity
 	Infrastructure SupervisionInfrastructure
@@ -74,11 +77,15 @@ func (r *UVRunner) StartManaged(
 	if err := ctx.Err(); err != nil {
 		return nil, runnerCancellationError(options.Stage, map[string]any{}, err)
 	}
+	if !health.ValidSupervisionSecret(options.Secret) {
+		return nil, newError(protocol.CodeUVExecFailed, options.Stage, "监督密钥不可用", nil, errors.New("invalid supervision secret"))
+	}
 	resolved := r.resolveOptions(options.RunOptions)
 	supervision := map[string]string{
-		autoMASUVExecutable: r.Executable,
-		autoMASProtocol:     "1",
-		autoMASSupervised:   "1",
+		autoMASUVExecutable:      r.Executable,
+		autoMASProtocol:          "1",
+		autoMASSupervised:        "1",
+		health.SecretEnvironment: options.Secret,
 	}
 	if options.Identity != nil {
 		if err := validateSupervisionIdentity(*options.Identity); err != nil {

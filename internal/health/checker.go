@@ -51,6 +51,8 @@ const (
 
 // Expectation 描述本次健康检查的受管身份期望。
 type Expectation struct {
+	// Secret 只用于本次启动的健康证明，不进入诊断。
+	Secret   string
 	Mode     Mode
 	Protocol int
 	Version  string
@@ -199,7 +201,11 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			return newError(protocol.CodeBackendExitedBeforeReady, "后端在就绪前退出", nil, nil)
 		}
 
-		request := c.request(ctx, healthURL, total, exited)
+		challenge, randomErr := NewChallenge()
+		if randomErr != nil {
+			return newError(protocol.CodeInternalError, "无法创建健康验证挑战", nil, randomErr)
+		}
+		request := c.request(ctx, healthURL, challenge, total, exited)
 		switch request.kind {
 		case requestCancelled:
 			if err := cancellationError(ctx); err != nil {
@@ -228,6 +234,9 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			}
 			if channelClosed(exited) {
 				return preferCancellation(ctx, newError(protocol.CodeBackendExitedBeforeReady, "后端在就绪前退出", nil, nil))
+			}
+			if request.status == http.StatusOK && request.bodyErr == nil && !VerifyHealthProof(expected.Secret, challenge, request.body, request.proof) {
+				return identityError(expected, "supervision", nil)
 			}
 			observation, err := inspectResponse(request.status, request.body, request.bodyErr, expected)
 			if cancelErr := cancellationError(ctx); cancelErr != nil {
@@ -344,6 +353,7 @@ const (
 )
 
 type requestResult struct {
+	proof        string
 	kind         requestKind
 	status       int
 	body         []byte
@@ -351,13 +361,14 @@ type requestResult struct {
 	transportErr error
 }
 
-func (c *Checker) request(ctx context.Context, healthURL string, total <-chan time.Time, exited <-chan struct{}) requestResult {
+func (c *Checker) request(ctx context.Context, healthURL string, challenge string, total <-chan time.Time, exited <-chan struct{}) requestResult {
 	requestContext, cancel := context.WithCancel(ctx)
 	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, healthURL, nil)
 	if err != nil {
 		cancel()
 		return requestResult{kind: requestTransportError, transportErr: err}
 	}
+	request.Header.Set(ChallengeHeader, challenge)
 	done := make(chan requestResult, 1)
 	go func() {
 		response, roundTripErr := c.transport.RoundTrip(request)
@@ -376,7 +387,7 @@ func (c *Checker) request(ctx context.Context, healthURL string, total <-chan ti
 			return
 		}
 		body, bodyErr := readResponseBody(requestContext, response)
-		done <- requestResult{kind: requestResponse, status: response.StatusCode, body: body, bodyErr: bodyErr}
+		done <- requestResult{kind: requestResponse, status: response.StatusCode, body: body, bodyErr: bodyErr, proof: response.Header.Get(ProofHeader)}
 	}()
 	requestTimer := c.clock.NewTimer(c.requestTimeout)
 	defer requestTimer.Stop()
@@ -789,6 +800,9 @@ func validCommit(value string) bool {
 }
 
 func validateExpectation(expected Expectation) error {
+	if !ValidSupervisionSecret(expected.Secret) {
+		return identityError(expected, "supervision", nil)
+	}
 	if expected.Mode != ModeManaged && expected.Mode != ModeDevelopment {
 		return newError(protocol.CodeBackendHealthInvalid, "不支持当前健康检查模式", map[string]any{"mode": expected.Mode}, nil)
 	}

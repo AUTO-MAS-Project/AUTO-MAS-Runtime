@@ -1124,6 +1124,7 @@ type fakeEntry struct{ err error }
 func (e *fakeEntry) Check(context.Context, string) error { return e.err }
 
 type fakeUV struct {
+	secrets         []string
 	proc            ManagedProcess
 	procSequence    []ManagedProcess
 	args            []string
@@ -1152,6 +1153,7 @@ func (u *fakeUV) StartManaged(_ context.Context, args []string, options uv.Manag
 	}
 	u.args = append([]string(nil), args...)
 	u.options = options
+	u.secrets = append(u.secrets, options.Secret)
 	if u.onStart != nil {
 		u.onStart()
 	}
