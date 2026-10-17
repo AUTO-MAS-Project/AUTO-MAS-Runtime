@@ -148,6 +148,36 @@ func TestDarwinDirectory_RejectsRootAliasAndOtherVolume(t *testing.T) {
 	}
 }
 
+func TestDarwinDirectory_RejectsCrossDeviceBeforeCreate(t *testing.T) {
+	layout := darwinTestLayout(t)
+	if err := os.Mkdir(filepath.Join(layout.AppRoot(), "parent"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := openDarwinAbsoluteDirectory(t.Context(), layout.AppRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := directory.file.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	// 注入不匹配的受管卷身份，确认逐层检查发生在创建叶子之前。
+	directory.identity.volumeSerial++
+	created, err := directory.openDirectory(t.Context(), "parent/new", true)
+	if created != nil {
+		if err := created.file.Close(); err != nil {
+			t.Error(err)
+		}
+	}
+	if !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("openDirectory(cross-device) = %v, want ErrIdentityChanged", err)
+	}
+	if _, err := os.Lstat(filepath.Join(layout.AppRoot(), "parent", "new")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Lstat(cross-device leaf) = %v, want absent before any creation", err)
+	}
+}
+
 func TestDarwinDirectory_CancellationAndIdentity(t *testing.T) {
 	layout := darwinTestLayout(t)
 	path := filepath.Join(layout.AppRoot(), "managed")
