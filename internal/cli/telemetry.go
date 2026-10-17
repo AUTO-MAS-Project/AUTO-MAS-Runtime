@@ -36,7 +36,7 @@ func WithTelemetryFactory(factory telemetryFactory) Option {
 }
 
 func newTelemetryRecorder(deps *deps, runtimeVersion string) telemetry.Recorder {
-	if deps == nil {
+	if deps == nil || runtime.GOOS != "windows" {
 		return nil
 	}
 	config := telemetry.LoadConfig()

@@ -19,6 +19,7 @@ func NewProductionManagedSupervisor(
 	io.Writer,
 	func() time.Time,
 	mirror.Policy,
+	...SupervisorOption,
 ) (*ManagedSupervisor, error) {
 	return nil, newError(protocol.CodeUnsupportedMode, protocol.StageBackendSpawn, "受管后端监督不支持当前平台", map[string]any{"reason": "platform_unsupported"}, nil)
 }

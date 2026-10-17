@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -112,6 +113,11 @@ func runOperationSession(
 	if err := ctx.Err(); err != nil {
 		telemetryState.operationErr = err
 		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
+		return exitCode
+	}
+	if failure := platformCommandError(runtime.GOOS, command, stage); failure != nil {
+		telemetryState.operationErr = failure
+		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, failure)
 		return exitCode
 	}
 	operationContext := ctx

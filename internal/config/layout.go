@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -52,13 +53,16 @@ func (l *Layout) AppRoot() string {
 	return l.appRoot
 }
 
-// IdentityKey 返回大小写不敏感的词法身份键。
+// IdentityKey 返回平台对应的词法身份键；物理身份仍须由文件系统能力证明。
 func (l *Layout) IdentityKey() string {
 	return l.identityKey
 }
 
 func identityKey(path string) string {
 	normalized := filepath.Clean(path)
+	if runtime.GOOS != "windows" {
+		return normalized
+	}
 	normalized = strings.ReplaceAll(normalized, "/", `\`)
 	return strings.ToLower(normalized)
 }
@@ -66,7 +70,7 @@ func identityKey(path string) string {
 func isVolumeRoot(path string) bool {
 	volume := filepath.VolumeName(path)
 	if volume == "" {
-		return false
+		return filepath.Clean(path) == string(filepath.Separator)
 	}
 	root := filepath.Clean(volume + string(filepath.Separator))
 	return strings.EqualFold(filepath.Clean(path), root)
