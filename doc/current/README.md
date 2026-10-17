@@ -11,6 +11,9 @@ M7 GitHub CI/CD 发布均已完成；设计和审查记录分别归档到
 
 当前工作：
 
+- [M11 macOS 支持路径](./M11/设计-T11.1-macOS支持路径.md)（T11.1 macOS 子设计草案）：
+  首期 Apple Silicon、最低系统跟随可原生验收的 GitHub Runner，覆盖平台边界、文件系统、
+  launchd 监督、工具部署、Actions 矩阵及发行/宿主接入；Intel 与 Linux 后续；
 - [M12 遥测与错误观测设计](./M12/设计-T12.1-遥测与错误观测.md)：Sentry-only，
   DSN 配置边界、子进程环境隔离、错误白名单和失败静默契约；历史 Umami 迁移已取消；
 - [M12 实施计划](./M12/计划-T12.1-遥测与错误观测.md)：T12.1~T12.6 的 TDD 步骤、
