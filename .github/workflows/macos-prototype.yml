@@ -1,0 +1,134 @@
+name: macOS prototype (not release acceptance)
+
+on:
+  push:
+    branches: [codex/macos-arm64]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-prototype-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-prototype:
+    name: Prototype / macOS ${{ matrix.major }} ARM64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            major: 14
+          - runner: macos-15
+            major: 15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CGO_ENABLED: "1"
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      AUTO_MAS_TELEMETRY: disabled
+      AUTO_MAS_PROBE_CASE_SENSITIVE: "false"
+      EXPECTED_OS_MAJOR: ${{ matrix.major }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.26.9"
+          cache: true
+
+      - name: Record and verify native environment
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $machineArch = & uname -m
+          if ($LASTEXITCODE -ne 0) { throw 'uname failed' }
+          if ($machineArch.Trim() -ne 'arm64') { throw "Expected ARM64, got $machineArch" }
+          $systemVersion = & sw_vers -productVersion
+          if ($LASTEXITCODE -ne 0) { throw 'sw_vers failed' }
+          if (($systemVersion.Trim() -split '\.')[0] -ne $env:EXPECTED_OS_MAJOR) { throw "Unexpected OS $systemVersion" }
+          go env
+          if ($LASTEXITCODE -ne 0) { throw 'go env failed' }
+          @("OS=$systemVersion", "ARCH=$machineArch", "IMAGE=$env:ImageOS $env:ImageVersion", "TARGET=$env:MACOSX_DEPLOYMENT_TARGET") | Tee-Object -FilePath artifacts/environment.txt
+
+      - name: Build complete Runtime and inspect Mach-O
+        run: |
+          go build -buildvcs=false ./...
+          if ($LASTEXITCODE -ne 0) { throw 'complete build failed' }
+          go build -buildvcs=false -o artifacts/auto-mas-runtime-darwin-arm64 ./cmd/auto-mas-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime build failed' }
+          $binaryKind = & file artifacts/auto-mas-runtime-darwin-arm64
+          if ($LASTEXITCODE -ne 0) { throw 'file inspection failed' }
+          if ($binaryKind -notmatch 'Mach-O 64-bit executable arm64') { throw "Unexpected binary $binaryKind" }
+          $loadCommands = & otool -l artifacts/auto-mas-runtime-darwin-arm64
+          if ($LASTEXITCODE -ne 0) { throw 'Mach-O load inspection failed' }
+          $loadCommands | Set-Content artifacts/macho-loads.txt
+          $minimums = [regex]::Matches(($loadCommands -join "`n"), '(?m)^\s*minos\s+(\d+\.\d+(?:\.\d+)?)\s*$')
+          if ($minimums.Count -ne 1) { throw 'Missing or ambiguous Mach-O deployment version' }
+          if ([version]$minimums[0].Groups[1].Value -gt [version]'14.0') { throw 'Binary exceeds the supported deployment target' }
+
+      - name: Run actual Runtime version smoke
+        run: |
+          $transcript = & ./artifacts/auto-mas-runtime-darwin-arm64 --output ndjson --offline version
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime version smoke failed' }
+          $transcript | Set-Content artifacts/version.ndjson
+          $events = @($transcript | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($events[0].type -ne 'hello' -or $events[-1].type -ne 'result' -or -not $events[-1].success) { throw 'Invalid version transcript' }
+
+      - name: Run shared protocol and scoped platform tests
+        run: |
+          go test -race ./internal/protocol/... ./internal/health ./internal/version -count=1
+          if ($LASTEXITCODE -ne 0) { throw 'shared protocol tests failed' }
+          $platformOutput = & go test -v ./internal/cli ./internal/config ./internal/doctor -run '^(TestExecute_PlatformBoundary|TestPlatformCommandError|TestLayout_POSIXIdentity|TestContract_RegisterVersion|TestProbeDiskFree_Production|TestProbeDiskFree_RejectsEmptyPath)$' -count=1 2>&1
+          $platformExit = $LASTEXITCODE
+          $platformOutput | Tee-Object -FilePath artifacts/platform-tests.txt
+          if ($platformExit -ne 0 -or ($platformOutput -match '\[no tests to run\]') -or -not ($platformOutput -match '--- PASS:')) { throw 'scoped platform tests failed' }
+
+      - name: Run launchd and filesystem mechanism probes
+        run: |
+          go test -race -v ./internal/macosprobe -count=1 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/native-probes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'native probes failed' }
+          go test -v ./internal/macosprobe -run '^Test(Launchd_(OwnerDisconnect|GuardKilled)|Root_)' -count=100 -timeout=15m 2>&1 | Tee-Object -FilePath artifacts/repeated-probes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'repeated native probes failed' }
+
+      - name: Repeat directory probes on case-sensitive APFS
+        run: |
+          $imagePath = Join-Path $env:RUNNER_TEMP 'auto-mas-probe.sparseimage'
+          $mountPath = Join-Path $env:RUNNER_TEMP 'auto-mas-apfs-probe'
+          New-Item -ItemType Directory -Path $mountPath | Out-Null
+          hdiutil create -size 256m -fs APFSX -volname AutoMasProbe -type SPARSE -o $imagePath
+          if ($LASTEXITCODE -ne 0) { throw 'APFSX image creation failed' }
+          $mounted = $false
+          try {
+            hdiutil attach -nobrowse -mountpoint $mountPath $imagePath
+            if ($LASTEXITCODE -ne 0) { throw 'APFSX attach failed' }
+            $mounted = $true
+            $env:TMPDIR = "$mountPath/"
+            $env:AUTO_MAS_PROBE_CASE_SENSITIVE = 'true'
+            go test -race -v ./internal/macosprobe -run '^TestRoot_' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive.txt
+            if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS probes failed' }
+          } finally {
+            if ($mounted) {
+              hdiutil detach $mountPath
+              if ($LASTEXITCODE -ne 0) { throw 'APFSX detach failed' }
+            }
+          }
+
+      - name: Save prototype evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: macos-${{ matrix.major }}-arm64-prototype
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
