@@ -239,3 +239,7 @@ func isDarwinStableMissing(err error) bool {
 	cause, cleanup := splitOperationCleanup(err)
 	return cleanup == nil && errors.Is(cause, os.ErrNotExist)
 }
+
+func darwinOutside(operation, path string) error {
+	return &Error{code: protocol.CodePathOutsideManagedRoot, Operation: operation, Path: path, Err: ErrIdentityChanged}
+}

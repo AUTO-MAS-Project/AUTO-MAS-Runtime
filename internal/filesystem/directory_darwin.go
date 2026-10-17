@@ -55,3 +55,23 @@ func InspectManagedDirectory(ctx context.Context, layout *config.Layout, path st
 	}
 	return DirectoryInspection{Exists: true, Identity: identity}, nil
 }
+
+func (o *Operator) openDarwinDirectory(ctx context.Context, path string) (*darwinDirectory, error) {
+	rootPath, relative, err := darwinManagedRelative(ctx, o.layout, path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := openDarwinAbsoluteDirectory(ctx, rootPath.path)
+	if err != nil {
+		return nil, err
+	}
+	directory, openErr := root.openDirectory(ctx, relative, false)
+	closeErr := root.file.Close()
+	if openErr != nil || closeErr != nil {
+		if directory != nil {
+			closeErr = errors.Join(closeErr, directory.file.Close())
+		}
+		return nil, joinOperationCleanup(openErr, closeErr)
+	}
+	return directory, nil
+}

@@ -20,21 +20,6 @@ type pinnedObject struct {
 	identity DirectoryIdentity
 }
 
-// New 不创建未经验证的删除能力。
-func New(context.Context, *config.Layout, Auditor, ...Option) (*Operator, error) {
-	return nil, ErrUnsupported
-}
-
-// RemoveTree 不在身份机制缺失时删除目录。
-func (*Operator) RemoveTree(context.Context, DeleteRequest) (DeleteResult, error) {
-	return DeleteResult{}, ErrUnsupported
-}
-
-// AtomicRename 不在身份机制缺失时移动目录。
-func (*Operator) AtomicRename(context.Context, RenameRequest) (RenameResult, error) {
-	return RenameResult{}, ErrUnsupported
-}
-
 // NewStateFiles 不创建未经验证的事务能力。
 func NewStateFiles(context.Context, *config.Layout) (*StateFiles, error) {
 	return nil, ErrUnsupported
