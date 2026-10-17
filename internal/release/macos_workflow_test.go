@@ -28,4 +28,10 @@ func TestMacOSWorkflow_PrototypeBoundary(t *testing.T) {
 			t.Errorf("unexpected prototype workflow action %q", forbidden)
 		}
 	}
+	directoryStep := strings.Index(source, "name: Run filesystem mechanism probes")
+	sensitiveStep := strings.Index(source, "name: Repeat directory probes on case-sensitive APFS")
+	launchdStep := strings.Index(source, "name: Run launchd mechanism probes")
+	if directoryStep < 0 || sensitiveStep <= directoryStep || launchdStep <= sensitiveStep {
+		t.Fatal("filesystem evidence must run before launchd probes")
+	}
 }

@@ -1,12 +1,10 @@
 package macosprobe
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -46,7 +44,7 @@ type launchdProbe struct {
 	exited     map[int]bool
 }
 
-func startLaunchdProbe(t *testing.T) *launchdProbe {
+func startLaunchdProbe(t *testing.T, domainKind string) *launchdProbe {
 	t.Helper()
 	// Darwin 的 sockaddr_un 有严格长度上限；仅测试使用短临时根，生产 IPC 另行设计。
 	dir, err := os.MkdirTemp("/tmp", "auto-mas-p0-")
@@ -67,10 +65,10 @@ func startLaunchdProbe(t *testing.T) *launchdProbe {
 		})
 	}
 	t.Cleanup(func() { t.Logf("isolated prototype root: %s", dir) })
-	return openLaunchdProbe(t, dir)
+	return openLaunchdProbe(t, dir, domainKind)
 }
 
-func openLaunchdProbe(t *testing.T, dir string) *launchdProbe {
+func openLaunchdProbe(t *testing.T, dir, domainKind string) *launchdProbe {
 	t.Helper()
 	socket := filepath.Join(dir, "owner.sock")
 	if len(socket) >= 104 {
@@ -97,17 +95,32 @@ func openLaunchdProbe(t *testing.T, dir string) *launchdProbe {
 	}
 	token := hex.EncodeToString(nonce[:])
 	label := "org.auto-mas.runtime.probe." + token
-	domain := "user/" + strconv.Itoa(os.Getuid())
+	domain := domainKind + "/" + strconv.Itoa(os.Getuid())
+	session := "Background"
+	if domainKind == "gui" {
+		session = "Aqua"
+	}
+	domainCtx, domainCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer domainCancel()
+	domainErr := exec.CommandContext(domainCtx, "/bin/launchctl", "print", domain).Run()
+	if domainErr != nil {
+		t.Fatalf("required domain %s unavailable: %v", domain, domainErr)
+	}
 	target := domain + "/" + label
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	args := []string{executable, "-test.run=^TestLaunchd_Helper$", "--", "guard", socket, token, strconv.Itoa(os.Getpid())}
-	plist := probePlist(label, args, filepath.Join(dir, "guard.log"))
+	plist := probePlist(label, args, filepath.Join(dir, "guard.log"), session)
 	plistPath := filepath.Join(dir, "probe.plist")
 	if err := os.WriteFile(plistPath, []byte(plist), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	lintCtx, lintCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer lintCancel()
+	if output, err := exec.CommandContext(lintCtx, "/usr/bin/plutil", "-lint", plistPath).CombinedOutput(); err != nil {
+		t.Fatalf("invalid plist: %v: %s", err, output)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), probeBudget)
 	defer cancel()
@@ -128,6 +141,7 @@ func openLaunchdProbe(t *testing.T, dir string) *launchdProbe {
 	})
 	output, err := exec.CommandContext(ctx, "/bin/launchctl", "bootstrap", domain, plistPath).CombinedOutput()
 	if err != nil {
+		logLaunchdFailure(t, label, domain, session, plistPath, plist)
 		t.Fatalf("bootstrap %s: %v: %s", target, err, output)
 	}
 	bootstrapped = true
@@ -268,27 +282,6 @@ func (p *launchdProbe) assertEscapedAlive(t *testing.T) {
 	}
 }
 
-func probePlist(label string, args []string, logPath string) string {
-	var out bytes.Buffer
-	out.WriteString(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>`)
-	// bytes.Buffer 的 Write 不失败；EscapeText 只对这些已验证字符串做 XML 编码。
-	_ = xml.EscapeText(&out, []byte(label))
-	out.WriteString(`</string><key>ProgramArguments</key><array>`)
-	for _, arg := range args {
-		out.WriteString("<string>")
-		_ = xml.EscapeText(&out, []byte(arg))
-		out.WriteString("</string>")
-	}
-	out.WriteString(`</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>AbandonProcessGroup</key><false/><key>ExitTimeOut</key><integer>2</integer>`)
-	for _, key := range []string{"StandardOutPath", "StandardErrorPath"} {
-		out.WriteString("<key>" + key + "</key><string>")
-		_ = xml.EscapeText(&out, []byte(logPath))
-		out.WriteString("</string>")
-	}
-	out.WriteString("</dict></plist>")
-	return out.String()
-}
-
 func verifyPeer(conn *net.UnixConn, expectedPID int) error {
 	raw, err := conn.SyscallConn()
 	if err != nil {
@@ -313,6 +306,35 @@ func verifyPeer(conn *net.UnixConn, expectedPID int) error {
 		return err
 	}
 	return peerErr
+}
+
+func logLaunchdFailure(t *testing.T, label, domain, session, path, source string) {
+	t.Helper()
+	t.Logf("bootstrap diagnostics: domain=%s session=%s uid=%d plist=%s", domain, session, os.Getuid(), source)
+	if info, err := os.Stat(path); err == nil {
+		t.Logf("plist mode=%s size=%d", info.Mode(), info.Size())
+	}
+	for _, args := range [][]string{{"/bin/launchctl", "managername"}, {"/bin/launchctl", "manageruid"}, {"/usr/bin/log", "show", "--last", "2m", "--style", "ndjson", "--predicate", fmt.Sprintf("eventMessage CONTAINS %q", label)}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		command := exec.CommandContext(ctx, args[0], args[1:]...)
+		output := &boundedDiagnostic{limit: 16 * 1024}
+		command.Stdout, command.Stderr = output, output
+		err := command.Run()
+		cancel()
+		t.Logf("diagnostic %s: %v: %s", args[0], err, output.data)
+	}
+}
+
+type boundedDiagnostic struct {
+	limit int
+	data  []byte
+}
+
+// Write 在达到容量后继续消费输出，避免诊断日志本身使子进程阻塞或失败。
+func (w *boundedDiagnostic) Write(p []byte) (int, error) {
+	n := min(len(p), w.limit-len(w.data))
+	w.data = append(w.data, p[:n]...)
+	return len(p), nil
 }
 
 // TestLaunchd_Helper 仅由本测试的 launchd job 或其受控子进程重入。

@@ -94,12 +94,10 @@ jobs:
           $platformOutput | Tee-Object -FilePath artifacts/platform-tests.txt
           if ($platformExit -ne 0 -or ($platformOutput -match '\[no tests to run\]') -or -not ($platformOutput -match '--- PASS:')) { throw 'scoped platform tests failed' }
 
-      - name: Run launchd and filesystem mechanism probes
+      - name: Run filesystem mechanism probes
         run: |
-          go test -race -v ./internal/macosprobe -count=1 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/native-probes.txt
-          if ($LASTEXITCODE -ne 0) { throw 'native probes failed' }
-          go test -v ./internal/macosprobe -run '^Test(Launchd_(OwnerDisconnect|GuardKilled)|Root_)' -count=100 -timeout=15m 2>&1 | Tee-Object -FilePath artifacts/repeated-probes.txt
-          if ($LASTEXITCODE -ne 0) { throw 'repeated native probes failed' }
+          go test -race -v ./internal/macosprobe -run '^Test(Root_|ProbePlist_)' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/filesystem-probes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'filesystem probes failed' }
 
       - name: Repeat directory probes on case-sensitive APFS
         run: |
@@ -123,6 +121,13 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'APFSX detach failed' }
             }
           }
+
+      - name: Run launchd mechanism probes
+        run: |
+          go test -race -v ./internal/macosprobe -run '^TestLaunchd_' -count=1 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/native-probes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'launchd probes failed' }
+          go test -v ./internal/macosprobe -run '^TestLaunchd_(OwnerDisconnect|GuardKilled)$' -count=100 -timeout=15m 2>&1 | Tee-Object -FilePath artifacts/repeated-probes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'repeated launchd probes failed' }
 
       - name: Save prototype evidence
         if: always()
