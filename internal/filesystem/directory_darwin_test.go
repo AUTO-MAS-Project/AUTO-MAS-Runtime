@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
@@ -114,6 +116,35 @@ func TestDarwinFile_RejectsLinksAndSpecialFiles(t *testing.T) {
 	}
 	if _, err := InspectManagedFile(t.Context(), layout, layout.AppRoot()); err == nil {
 		t.Fatal("InspectManagedFile(directory) error = nil, want rejection")
+	}
+	fifo := filepath.Join(layout.AppRoot(), "fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectManagedFile(t.Context(), layout, fifo); err == nil {
+		t.Fatal("InspectManagedFile(fifo) error = nil, want rejection without blocking")
+	}
+}
+
+func TestDarwinDirectory_RejectsRootAliasAndOtherVolume(t *testing.T) {
+	layout := darwinTestLayout(t)
+	link := filepath.Join(t.TempDir(), "app-link")
+	if err := os.Symlink(layout.AppRoot(), link); err != nil {
+		t.Fatal(err)
+	}
+	linkedLayout, err := config.NewLayout(link, filepath.Dir(link))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease, err := OpenManagedDirectory(t.Context(), linkedLayout, link); err == nil || lease != nil {
+		t.Fatalf("OpenManagedDirectory(link root) = %v, %v, want rejection", lease, err)
+	}
+	otherLayout, err := config.NewLayout("/dev", "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease, err := OpenManagedDirectory(t.Context(), otherLayout, "/dev"); err == nil || lease != nil {
+		t.Fatalf("OpenManagedDirectory(devfs) = %v, %v, want rejection", lease, err)
 	}
 }
 

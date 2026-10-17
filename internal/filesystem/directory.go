@@ -60,13 +60,15 @@ func (i *DirectoryIdentity) Equal(other *DirectoryIdentity) bool {
 		i.fileID == other.fileID
 }
 
-// DirectoryLease 固定一个受管目录及其祖先句柄，防止操作期间路径身份被替换。
+// DirectoryLease 持有受管目录的身份能力；Windows 句柄同时阻止路径替换，
+// macOS FD 固定对象身份，位置保证遵循同 UID 信任边界。
 type DirectoryLease struct {
 	mu       sync.Mutex
 	path     string
 	identity *DirectoryIdentity
 	close    func() error
 	closed   bool
+	rootFile *os.File // macOS 的目录 FD，由 close 回调统一释放；Windows 留空。
 }
 
 // PrepareManagedDirectory 在受管根内原子准备一个新的目录租约。
@@ -93,8 +95,7 @@ func OpenManagedDirectory(
 	return pinManagedDirectory(ctx, layout, path)
 }
 
-// PinManagedDirectory 是 OpenManagedDirectory 的语义别名，强调租约在读取期间
-// 固定目录身份并阻止同用户通过重命名替换目录叶子。
+// PinManagedDirectory 是 OpenManagedDirectory 的语义别名，强调读取期间持有目录身份。
 func PinManagedDirectory(
 	ctx context.Context,
 	layout *config.Layout,
