@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -36,6 +38,63 @@ func TestDarwinRuntimeLogs_WriterOutlivesDirectory(t *testing.T) {
 	data, err := os.ReadFile(writer.Path())
 	if err != nil || string(data) != "record\n" {
 		t.Fatalf("log contents = %q, %v, want record", data, err)
+	}
+}
+
+func TestDarwinRuntimeLogs_ConcurrentWritersAndActiveRemoval(t *testing.T) {
+	layout := darwinTestLayout(t)
+	files, err := NewRuntimeLogFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := files.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	date := time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC)
+	var writers [2]*RuntimeLogWriter
+	for index := range writers {
+		writers[index], err = files.OpenAppend(t.Context(), "doctor", date)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := writers[index].Close(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	tokens, err := files.List(t.Context())
+	if err != nil || len(tokens) != 1 {
+		t.Fatalf("List(active) = %v, %v, want one token", tokens, err)
+	}
+	if result, err := files.Remove(t.Context(), tokens[0]); err == nil || result.MutationApplied {
+		t.Fatalf("Remove(active) = %#v, %v, want conflict", result, err)
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for index := range 40 {
+		workers.Go(func() {
+			<-start
+			if n, err := writers[index%2].Write([]byte("record\n")); err != nil || n != 7 {
+				t.Errorf("Write() = %d, %v, want 7, nil", n, err)
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
+	data, err := os.ReadFile(writers[0].Path())
+	if err != nil || string(data) != strings.Repeat("record\n", 40) {
+		t.Fatalf("concurrent log = %q, %v, want 40 whole records", data, err)
+	}
+	for _, writer := range writers {
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if result, err := files.Remove(t.Context(), tokens[0]); err != nil || !result.MutationApplied {
+		t.Fatalf("Remove(after writers close) = %#v, %v, want removed", result, err)
 	}
 }
 

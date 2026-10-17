@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
@@ -58,60 +57,3 @@ func (*StateFiles) RemoveTransactionIfUnchanged(context.Context, StateFileSnapsh
 
 // Close 幂等收口未持有资源的占位能力。
 func (*StateFiles) Close() error { return nil }
-
-// NewDownloadFiles 不创建未经验证的下载发布能力。
-func NewDownloadFiles(*config.Layout) (*DownloadFiles, error) { return nil, ErrUnsupported }
-
-// Begin 不在身份机制缺失时创建下载文件。
-func (*DownloadFiles) Begin(context.Context, string) (*DownloadSession, error) {
-	return nil, ErrUnsupported
-}
-
-// Write 不在身份机制缺失时写下载文件。
-func (*DownloadSession) Write([]byte) (int, error) { return 0, ErrUnsupported }
-
-// Path 返回空值，不能用于后续路径授权。
-func (*DownloadSession) Path() string { return "" }
-
-// PartPath 返回空值，不能用于后续路径授权。
-func (*DownloadSession) PartPath() string { return "" }
-
-// PublishNoReplace 不在身份机制缺失时发布文件。
-func (*DownloadSession) PublishNoReplace(context.Context) (PublishResult, error) {
-	return PublishResult{}, ErrUnsupported
-}
-
-// Abort 不在身份机制缺失时删除文件。
-func (*DownloadSession) Abort(context.Context) (AbortResult, error) {
-	return AbortResult{}, ErrUnsupported
-}
-
-// NewRuntimeLogFiles 不创建未经验证的日志能力。
-func NewRuntimeLogFiles(context.Context, *config.Layout) (*RuntimeLogFiles, error) {
-	return nil, ErrUnsupported
-}
-
-// OpenAppend 不在身份机制缺失时写日志。
-func (*RuntimeLogFiles) OpenAppend(context.Context, string, time.Time) (*RuntimeLogWriter, error) {
-	return nil, ErrUnsupported
-}
-
-// List 不在身份机制缺失时颁发删除令牌。
-func (*RuntimeLogFiles) List(context.Context) ([]RuntimeLogFile, error) { return nil, ErrUnsupported }
-
-// Remove 不在身份机制缺失时删除日志。
-func (*RuntimeLogFiles) Remove(context.Context, RuntimeLogFile) (RemoveResult, error) {
-	return RemoveResult{}, ErrUnsupported
-}
-
-// Close 幂等收口未持有资源的占位能力。
-func (*RuntimeLogFiles) Close() error { return nil }
-
-// Write 不在身份机制缺失时写日志。
-func (*RuntimeLogWriter) Write([]byte) (int, error) { return 0, ErrUnsupported }
-
-// Path 返回空值，不能用于后续路径授权。
-func (*RuntimeLogWriter) Path() string { return "" }
-
-// Close 幂等收口未持有资源的占位能力。
-func (*RuntimeLogWriter) Close() error { return nil }

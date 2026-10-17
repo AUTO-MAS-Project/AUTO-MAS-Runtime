@@ -97,7 +97,7 @@ jobs:
 
       - name: Run Darwin filesystem capability tests
         run: |
-          go test -race -v ./internal/filesystem -run '^TestDarwin' -count=1 2>&1 | Tee-Object -FilePath artifacts/filesystem-capabilities.txt
+          go test -race -v ./internal/filesystem -run '^TestDarwin' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/filesystem-capabilities.txt
           if ($LASTEXITCODE -ne 0) { throw 'filesystem capabilities failed' }
 
       - name: Run filesystem mechanism probes
@@ -121,7 +121,7 @@ jobs:
             $env:AUTO_MAS_PROBE_CASE_SENSITIVE = 'true'
             go test -race -v ./internal/macosprobe -run '^TestRoot_' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive.txt
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS probes failed' }
-            go test -race -v ./internal/filesystem -run '^TestDarwin' -count=1 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-capabilities.txt
+            go test -race -v ./internal/filesystem -run '^TestDarwin' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-capabilities.txt
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS capabilities failed' }
           } finally {
             if ($mounted) {

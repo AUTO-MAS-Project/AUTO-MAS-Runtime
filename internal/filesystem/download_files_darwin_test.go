@@ -129,3 +129,33 @@ func TestDarwinDownload_RejectsUnsafePart(t *testing.T) {
 		t.Fatalf("sentinel = %q, %v, want preserved", data, err)
 	}
 }
+
+func TestDarwinDownload_ActiveSessionIsNotStale(t *testing.T) {
+	layout := darwinTestLayout(t)
+	files, err := NewDownloadFiles(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := files.Begin(t.Context(), "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := active.Abort(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	if second, err := files.Begin(t.Context(), "active"); err == nil || second != nil {
+		t.Fatalf("Begin(active part) = %v, %v, want conflict", second, err)
+	}
+	if _, err := active.Write([]byte("still owned")); err != nil {
+		t.Fatalf("Write after competitor = %v, want original session preserved", err)
+	}
+	other, err := files.Begin(t.Context(), "independent")
+	if err != nil {
+		t.Fatalf("Begin(independent) = %v, want concurrent different name", err)
+	}
+	if _, err := other.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
