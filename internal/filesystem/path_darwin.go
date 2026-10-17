@@ -124,7 +124,7 @@ func openDarwinAbsoluteDirectory(ctx context.Context, path string) (*darwinDirec
 		return nil, err
 	}
 	file := os.NewFile(uintptr(fd), "/")
-	file, err = walkDarwinDirectories(ctx, file, strings.TrimPrefix(canonical.path, "/"), false)
+	file, err = walkDarwinDirectories(ctx, file, strings.TrimPrefix(canonical.path, "/"), false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +132,17 @@ func openDarwinAbsoluteDirectory(ctx context.Context, path string) (*darwinDirec
 }
 
 // walkDarwinDirectories 接管 start 的所有权，每步只接受单个 no-follow 目录组件。
-func walkDarwinDirectories(ctx context.Context, start *os.File, relative string, createLeaf bool) (*os.File, error) {
+func walkDarwinDirectories(ctx context.Context, start *os.File, relative string, createLeaf bool, expectedVolume uint64) (*os.File, error) {
 	current := start
+	if expectedVolume != 0 {
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(current.Fd()), &stat); err != nil {
+			return nil, joinOperationCleanup(err, current.Close())
+		}
+		if uint64(uint32(stat.Dev)) != expectedVolume {
+			return nil, joinOperationCleanup(ErrIdentityChanged, current.Close())
+		}
+	}
 	if relative == "" || relative == "." {
 		if err := ctx.Err(); err != nil {
 			return nil, joinOperationCleanup(err, current.Close())
@@ -160,11 +169,21 @@ func walkDarwinDirectories(ctx context.Context, start *os.File, relative string,
 		if stat.Mode&unix.S_IFMT == unix.S_IFLNK {
 			return nil, joinOperationCleanup(unsafeDarwinLink(component), current.Close())
 		}
+		if expectedVolume != 0 && uint64(uint32(stat.Dev)) != expectedVolume {
+			return nil, joinOperationCleanup(ErrIdentityChanged, current.Close())
+		}
 		fd, err := unix.Openat(int(current.Fd()), component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if err != nil {
 			return nil, joinOperationCleanup(err, current.Close())
 		}
 		next := os.NewFile(uintptr(fd), component)
+		var opened unix.Stat_t
+		if err := unix.Fstat(fd, &opened); err != nil {
+			return nil, joinOperationCleanup(err, errors.Join(next.Close(), current.Close()))
+		}
+		if opened.Dev != stat.Dev || opened.Ino != stat.Ino {
+			return nil, joinOperationCleanup(ErrIdentityChanged, errors.Join(next.Close(), current.Close()))
+		}
 		if err := current.Close(); err != nil {
 			return nil, errors.Join(err, next.Close())
 		}
@@ -197,7 +216,7 @@ func (d *darwinDirectory) openDirectory(ctx context.Context, relative string, cr
 	if err != nil {
 		return nil, err
 	}
-	file, err := walkDarwinDirectories(ctx, os.NewFile(uintptr(fd), d.path), relative, createLeaf)
+	file, err := walkDarwinDirectories(ctx, os.NewFile(uintptr(fd), d.path), relative, createLeaf, d.identity.volumeSerial)
 	if err != nil {
 		return nil, err
 	}
