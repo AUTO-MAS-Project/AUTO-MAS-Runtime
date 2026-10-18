@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -34,7 +35,8 @@ type internals struct {
 	timers  timerFactory
 	fetcher fileFetcher
 	// slotWaiting 非 nil 时，每有一次取回开始等待文件槽位就非阻塞地发一次信号。
-	slotWaiting chan struct{}
+	slotWaiting    chan struct{}
+	handlerWaiting chan struct{}
 }
 
 // fileEntry 是同一文件的共享取回结果：done 关闭后 path / err 只读。
@@ -68,13 +70,16 @@ type Server struct {
 	serveErr error
 	lease    io.Closer
 	handlers chan struct{}
+	// handlerWaiting 仅供同包测试在请求开始排队时建立确定性屏障。
+	handlerWaiting chan struct{}
 
-	inflight   atomic.Int64 // 正在执行的 HTTP handler 数，供 Close 收口断言。
-	stopped    atomic.Bool  // 进度回调失败后置位，后续请求一律 502。
-	background sync.WaitGroup
-	closed     chan struct{}
-	closeOnce  sync.Once
-	closeErr   error
+	inflight        atomic.Int64 // 正在执行的 HTTP handler 数，供 Close 收口断言。
+	waitingHandlers atomic.Int64 // 正在等待 handler 槽位的有效请求数。
+	stopped         atomic.Bool  // 进度回调失败后置位，后续请求一律 502。
+	background      sync.WaitGroup
+	closed          chan struct{}
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // Start 绑定 127.0.0.1:0 并开始服务；ctx 取消即关闭中继。
@@ -121,17 +126,18 @@ func start(
 	}
 	fetchCtx, cancelFetch := context.WithCancel(ctx)
 	server := &Server{
-		cfg:         normalized,
-		lease:       lease,
-		handlers:    make(chan struct{}, normalized.MaxFiles*2),
-		deps:        deps,
-		baseURL:     "http://" + listener.Addr().String(),
-		listener:    listener,
-		staging:     newStaging(normalized.StagingDir),
-		fetchCtx:    fetchCtx,
-		cancelFetch: cancelFetch,
-		files:       make(map[string]*fileEntry),
-		closed:      make(chan struct{}),
+		cfg:            normalized,
+		lease:          lease,
+		handlers:       make(chan struct{}, normalized.MaxFiles*2),
+		handlerWaiting: private.handlerWaiting,
+		deps:           deps,
+		baseURL:        "http://" + listener.Addr().String(),
+		listener:       listener,
+		staging:        newStaging(normalized.StagingDir),
+		fetchCtx:       fetchCtx,
+		cancelFetch:    cancelFetch,
+		files:          make(map[string]*fileEntry),
+		closed:         make(chan struct{}),
 	}
 	server.fetcher = private.fetcher
 	if server.fetcher == nil {
@@ -268,18 +274,20 @@ func waitBounded(group *sync.WaitGroup, limit time.Duration) error {
 
 // ServeHTTP 只做路由校验与分发；业务错误一律以状态码表达，不写任何标准输出。
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	select {
-	case s.handlers <- struct{}{}:
-		defer func() { <-s.handlers }()
-	default:
-		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
-	s.inflight.Add(1)
-	defer s.inflight.Add(-1)
 	resolved := resolveRoute(request)
 	if resolved.status != 0 {
 		writer.WriteHeader(resolved.status)
+		return
+	}
+	if !s.acquireHandler(writer, request, resolved) {
+		return
+	}
+	s.inflight.Add(1)
+	defer func() {
+		s.inflight.Add(-1)
+		<-s.handlers
+	}()
+	if request.Context().Err() != nil {
 		return
 	}
 	if s.stopped.Load() || s.fetchCtx.Err() != nil {
@@ -291,6 +299,44 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	s.serveFile(writer, request, resolved.route, resolved.path)
+}
+
+// acquireHandler 在容量满时等待槽位；请求取消或 Relay 收口会结束等待。
+func (s *Server) acquireHandler(writer http.ResponseWriter, request *http.Request, resolved routeStatus) bool {
+	select {
+	case s.handlers <- struct{}{}:
+		return true
+	default:
+	}
+
+	waiting := s.waitingHandlers.Add(1)
+	fields := map[string]any{
+		"activeHandlers":  len(s.handlers),
+		"waitingHandlers": waiting,
+		"handlerLimit":    cap(s.handlers),
+		"route":           resolved.route.String(),
+		"item":            path.Base(resolved.path),
+	}
+	if s.deps.Logger != nil {
+		s.deps.Logger("warning", "relay handler waiting for capacity", fields)
+	}
+	if s.handlerWaiting != nil {
+		select {
+		case s.handlerWaiting <- struct{}{}:
+		default:
+		}
+	}
+	defer s.waitingHandlers.Add(-1)
+
+	select {
+	case s.handlers <- struct{}{}:
+		return true
+	case <-request.Context().Done():
+		return false
+	case <-s.fetchCtx.Done():
+		writeStatus(writer, http.StatusBadGateway, "relay is stopped")
+		return false
+	}
 }
 
 func (s *Server) serveFile(
