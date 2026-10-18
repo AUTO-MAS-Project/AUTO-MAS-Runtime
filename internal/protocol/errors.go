@@ -48,6 +48,7 @@ const (
 	CodePythonVersionMismatch     Code = "PYTHON_VERSION_MISMATCH"
 	CodeLockfileMissing           Code = "LOCKFILE_MISSING"
 	CodeLockfileOutdated          Code = "LOCKFILE_OUTDATED"
+	CodeWorkspaceRestoreFailed    Code = "WORKSPACE_RESTORE_FAILED"
 	CodeDependencySyncFailed      Code = "DEPENDENCY_SYNC_FAILED"
 	CodeEnvironmentBroken         Code = "ENVIRONMENT_BROKEN"
 	CodeEnvironmentRebuildFailed  Code = "ENVIRONMENT_REBUILD_FAILED"
@@ -147,6 +148,7 @@ var errorDefinitions = []ErrorDefinition{
 	{Code: CodePythonVersionMismatch, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRebuildEnvironment}},
 	{Code: CodeLockfileMissing, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
 	{Code: CodeLockfileOutdated, ExitCode: ExitCodePreconditionFailed, Retryable: false, Remediation: []Remediation{RemediationContactSupport}},
+	{Code: CodeWorkspaceRestoreFailed, ExitCode: ExitCodeGitFailure, Retryable: true, Remediation: []Remediation{RemediationRetrySync, RemediationOpenLog}},
 	{Code: CodeDependencySyncFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRetrySync, RemediationRebuildEnvironment, RemediationOpenLog}},
 	{Code: CodeEnvironmentBroken, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRetrySync, RemediationRebuildEnvironment}},
 	{Code: CodeEnvironmentRebuildFailed, ExitCode: ExitCodeEnvironmentFailure, Retryable: true, Remediation: []Remediation{RemediationRunDoctor, RemediationOpenLog}},

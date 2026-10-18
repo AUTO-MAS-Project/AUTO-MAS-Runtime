@@ -11,6 +11,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 )
 
@@ -186,6 +187,7 @@ func recoverySourceForURL(value string) (mirror.Source, bool) {
 
 type repositoryReader interface {
 	Inspect(ctx context.Context, repositoryPath string) (repositorySnapshot, error)
+	Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error)
 }
 
 type goGitRepositoryReader struct{}

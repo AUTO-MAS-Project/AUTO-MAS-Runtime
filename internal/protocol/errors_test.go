@@ -59,6 +59,7 @@ func TestErrorDefinitionsMatchArchitectureDocument(t *testing.T) {
 		protocol.CodePythonVersionMismatch,
 		protocol.CodeLockfileMissing,
 		protocol.CodeLockfileOutdated,
+		protocol.CodeWorkspaceRestoreFailed,
 		protocol.CodeDependencySyncFailed,
 		protocol.CodeEnvironmentBroken,
 		protocol.CodeEnvironmentRebuildFailed,
