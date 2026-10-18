@@ -24,7 +24,7 @@ func TestDependencies_LockfileContract(t *testing.T) {
 	}{
 		{name: "missing", lockKind: "missing", wantCode: protocol.CodeLockfileMissing},
 		{name: "directory", lockKind: "directory", wantCode: protocol.CodeLockfileMissing},
-		{name: "outdated", lockKind: "outdated", wantCode: protocol.CodeLockfileOutdated},
+		{name: "check_failed", lockKind: "outdated", wantCode: protocol.CodeLockfileCheckFailed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

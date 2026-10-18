@@ -41,6 +41,8 @@ var failureReportability = map[protocol.Code]bool{
 	protocol.CodePythonVersionMismatch:     true,
 	protocol.CodeLockfileMissing:           true,
 	protocol.CodeLockfileOutdated:          true,
+	protocol.CodeLockfileInvalid:           true,
+	protocol.CodeLockfileCheckFailed:       true,
 	protocol.CodeWorkspaceRestoreFailed:    true,
 	protocol.CodeDependencySyncFailed:      true,
 	protocol.CodeEnvironmentBroken:         true,
