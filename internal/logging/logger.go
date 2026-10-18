@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 )
 
 // Logger 将同一 Runtime 操作的诊断与操作记录写入受管本地 sink。
@@ -47,7 +48,7 @@ func New(
 	if err != nil {
 		return nil, err
 	}
-	return newWithDependencies(
+	logger, err := newWithDependencies(
 		ctx,
 		layout,
 		stderr,
@@ -57,6 +58,13 @@ func New(
 		values.clock,
 		values.retention,
 	)
+	if err != nil {
+		return nil, err
+	}
+	if err := logger.recordFileSystem(ctx, filesystem.FileSystemName); err != nil {
+		return nil, errors.Join(fmt.Errorf("record file system diagnostic: %w", err), logger.Close())
+	}
+	return logger, nil
 }
 
 func newWithDependencies(
