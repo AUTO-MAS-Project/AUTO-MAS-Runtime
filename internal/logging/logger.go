@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -77,7 +76,7 @@ func newWithDependencies(
 	clock func() time.Time,
 	retention RetentionPolicy,
 ) (*Logger, error) {
-	now, expectedPath, err := validateNewArguments(
+	now, _, err := validateNewArguments(
 		ctx,
 		layout,
 		stderr,
@@ -116,7 +115,7 @@ func newWithDependencies(
 			closeOwned(writer, files),
 		)
 	}
-	if !filepath.IsAbs(writer.Path()) || !sameRetentionPath(writer.Path(), expectedPath) {
+	if !matchesLogPath(layout, command, now, writer.Path()) {
 		return nil, errors.Join(
 			fmt.Errorf("validate current runtime log path: %w", ErrInvalidArgument),
 			closeOwned(writer, files),
@@ -242,6 +241,19 @@ func retentionContextError(
 }
 
 func (l *Logger) maintainRetentionLocked(ctx context.Context, now time.Time) error {
+	for range 2 {
+		previousPath := l.activePath
+		if err := l.maintainRetentionPassLocked(ctx, now); err != nil {
+			return err
+		}
+		if sameRetentionPath(previousPath, l.activePath) {
+			return nil
+		}
+	}
+	return fmt.Errorf("runtime log retention repeatedly rotated: %w", filesystem.ErrRuntimeLogCapacity)
+}
+
+func (l *Logger) maintainRetentionPassLocked(ctx context.Context, now time.Time) error {
 	listed, listErr := l.files.List(ctx)
 	var listFailure error
 	if listErr != nil {
@@ -309,6 +321,7 @@ func (l *Logger) maintainRetentionLocked(ctx context.Context, now time.Time) err
 			return cancellationErr
 		}
 		return l.writeMaintenanceLocked(
+			ctx,
 			now,
 			LevelInfo,
 			"日志保留清理完成",
@@ -325,6 +338,7 @@ func (l *Logger) maintainRetentionLocked(ctx context.Context, now time.Time) err
 		return errors.Join(errors.Join(failures...), cancellationErr)
 	}
 	warningErr := l.writeMaintenanceLocked(
+		ctx,
 		now,
 		LevelWarn,
 		"日志保留清理存在失败",
@@ -337,6 +351,7 @@ func (l *Logger) maintainRetentionLocked(ctx context.Context, now time.Time) err
 }
 
 func (l *Logger) writeMaintenanceLocked(
+	ctx context.Context,
 	now time.Time,
 	level Level,
 	message string,
@@ -359,7 +374,7 @@ func (l *Logger) writeMaintenanceLocked(
 		return err
 	}
 	if level != LevelWarn {
-		_, err := writeLine(l.writer, encoded.line)
+		_, _, err := l.appendFileLocked(context.WithoutCancel(ctx), now, encoded.line)
 		if err != nil {
 			return fmt.Errorf("write retention record: %w", err)
 		}
@@ -373,6 +388,7 @@ func (l *Logger) writeMaintenanceLocked(
 		message,
 		encoded.detailsJSON,
 	)
-	_, err = writeDiagnosticSinks(l.writer, l.stderr, encoded.line, stderrLine)
-	return err
+	_, _, fileErr := l.appendFileLocked(context.WithoutCancel(ctx), now, encoded.line)
+	_, stderrErr := writeLine(l.stderr, stderrLine)
+	return errors.Join(fileErr, stderrErr)
 }

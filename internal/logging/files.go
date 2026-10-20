@@ -2,8 +2,11 @@ package logging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"strings"
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -28,6 +31,7 @@ type removeResult struct {
 
 type logFiles interface {
 	OpenAppend(ctx context.Context, command string, localDate time.Time) (logWriter, error)
+	OpenNext(ctx context.Context, command string, localDate time.Time) (logWriter, error)
 	List(ctx context.Context) ([]retainedFile, error)
 	Remove(ctx context.Context, file retainedFile) (removeResult, error)
 	Close() error
@@ -46,11 +50,12 @@ func newFilesystemLogFiles(
 	if err != nil {
 		return nil, err
 	}
-	return &filesystemLogFiles{files: files}, nil
+	return &filesystemLogFiles{files: files, layout: layout}, nil
 }
 
 type filesystemLogFiles struct {
-	files *filesystem.RuntimeLogFiles
+	files  *filesystem.RuntimeLogFiles
+	layout *config.Layout
 }
 
 type filesystemLogWriter struct {
@@ -66,11 +71,51 @@ func (f *filesystemLogFiles) OpenAppend(
 	command string,
 	localDate time.Time,
 ) (logWriter, error) {
-	writer, err := f.files.OpenAppend(ctx, command, localDate)
+	sequence, err := f.latestSequence(ctx, command, localDate)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := f.files.OpenAppendSegment(ctx, command, localDate, sequence)
 	if err != nil {
 		return nil, err
 	}
 	return &filesystemLogWriter{writer: writer}, nil
+}
+
+func (f *filesystemLogFiles) OpenNext(ctx context.Context, command string, localDate time.Time) (logWriter, error) {
+	for range 16 {
+		sequence, err := f.latestSequence(ctx, command, localDate)
+		if err != nil {
+			return nil, err
+		}
+		if sequence == ^uint64(0) {
+			return nil, fmt.Errorf("runtime log segment sequence exhausted: %w", filesystem.ErrRuntimeLogCapacity)
+		}
+		writer, err := f.files.CreateSegment(ctx, command, localDate, sequence+1)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &filesystemLogWriter{writer: writer}, nil
+	}
+	return nil, fmt.Errorf("runtime log segment creation contention: %w", fs.ErrExist)
+}
+
+func (f *filesystemLogFiles) latestSequence(ctx context.Context, command string, localDate time.Time) (uint64, error) {
+	files, err := f.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var sequence uint64
+	for _, file := range files {
+		candidate, ok := parseRetainedFile(f.layout, file, localDate.Location())
+		if ok && strings.EqualFold(candidate.command, command) && candidate.localDate.Format("20060102") == localDate.Format("20060102") && candidate.sequence > sequence {
+			sequence = candidate.sequence
+		}
+	}
+	return sequence, nil
 }
 
 func (f *filesystemLogFiles) List(ctx context.Context) ([]retainedFile, error) {
