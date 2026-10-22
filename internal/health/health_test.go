@@ -73,7 +73,7 @@ func TestHealth_RequiresAllNineConditions(t *testing.T) {
 			body := healthBody("ready", "", 1, "v5.4.0", testCommit)
 			body = removeJSONField(body, field)
 			rt := &sequenceTransport{responses: []transportResult{{response: jsonResponse(body)}, {response: jsonResponse(body)}}}
-			err := testChecker(rt).Check(t.Context(), Expectation{Secret: strings.Repeat("a", 64), Mode: ModeManaged, Protocol: 1, Version: "v5.4.0", Commit: testCommit}, testProbe())
+			err := testChecker(rt).Check(t.Context(), Expectation{Mode: ModeManaged, Protocol: 1, Version: "v5.4.0", Commit: testCommit}, testProbe())
 			want := protocol.CodeBackendHealthInvalid
 			if field == "protocol" || field == "version" || field == "commit" {
 				want = protocol.CodeBackendIdentityMismatch
@@ -94,7 +94,7 @@ func TestHealth_RequiresAllNineConditions(t *testing.T) {
 
 	rt := &sequenceTransport{responses: []transportResult{{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))}, {response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))}}}
 	probe := testProbe()
-	if err := testChecker(rt).Check(t.Context(), Expectation{Secret: strings.Repeat("a", 64), Mode: ModeManaged, Protocol: 1, Version: "v5.4.0", Commit: testCommit}, probe); err != nil {
+	if err := testChecker(rt).Check(t.Context(), Expectation{Mode: ModeManaged, Protocol: 1, Version: "v5.4.0", Commit: testCommit}, probe); err != nil {
 		t.Fatalf("Check() error = %v, want nil", err)
 	}
 	if got, want := probe.calls, 2; got != want {
@@ -361,12 +361,12 @@ func TestHealth_TotalTimeoutWinsProbeResult(t *testing.T) {
 func TestHealth_DevelopmentOnlyChecksProtocol(t *testing.T) {
 	body := `{"ready":true,"backgroundStatus":"ready","backgroundError":null,"protocol":1}`
 	rt := &sequenceTransport{responses: []transportResult{{response: jsonResponse(body)}, {response: jsonResponse(body)}}}
-	if err := testChecker(rt).Check(t.Context(), Expectation{Secret: strings.Repeat("a", 64), Mode: ModeDevelopment, Protocol: 1, Version: "ignored", Commit: "ignored"}, testProbe()); err != nil {
+	if err := testChecker(rt).Check(t.Context(), Expectation{Mode: ModeDevelopment, Protocol: 1, Version: "ignored", Commit: "ignored"}, testProbe()); err != nil {
 		t.Fatalf("development Check() error = %v, want nil", err)
 	}
 
 	bad := &sequenceTransport{responses: []transportResult{{response: jsonResponse(`{"ready":true,"backgroundStatus":"ready","backgroundError":null,"protocol":2}`)}}}
-	assertHealthCode(t, testChecker(bad).Check(t.Context(), Expectation{Secret: strings.Repeat("a", 64), Mode: ModeDevelopment, Protocol: 1}, testProbe()), protocol.CodeBackendIdentityMismatch)
+	assertHealthCode(t, testChecker(bad).Check(t.Context(), Expectation{Mode: ModeDevelopment, Protocol: 1}, testProbe()), protocol.CodeBackendIdentityMismatch)
 }
 
 func TestHealth_BoundsAndClosesResponseBody(t *testing.T) {
@@ -434,7 +434,7 @@ func TestHealth_LocalCancelTakesPriorityOverBackendCancelled(t *testing.T) {
 }
 
 func managedExpectation() Expectation {
-	return Expectation{Secret: strings.Repeat("a", 64), Mode: ModeManaged, Protocol: 1, Version: "v5.4.0", Commit: testCommit}
+	return Expectation{Mode: ModeManaged, Protocol: 1, Version: "v5.4.0", Commit: testCommit}
 }
 
 func testChecker(rt http.RoundTripper) *Checker {
@@ -490,7 +490,7 @@ func removeJSONField(body, field string) string {
 }
 
 func jsonResponse(body string) *http.Response {
-	return &http.Response{Header: http.Header{"X-Test-Body": []string{body}}, StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}
 }
 
 func assertHealthCode(t *testing.T, err error, want protocol.Code) {
@@ -526,6 +526,41 @@ type transportResult struct {
 	err      error
 }
 
+func TestHealth_RequestsDoNotUseAuthentication(t *testing.T) {
+	for _, mode := range []Mode{ModeManaged, ModeDevelopment} {
+		for _, proof := range []string{"", "invalid-proof"} {
+			t.Run(string(mode)+"/proof="+proof, func(t *testing.T) {
+				rt := &unauthenticatedTransport{proof: proof}
+				expected := managedExpectation()
+				expected.Mode = mode
+				if err := testChecker(rt).Check(t.Context(), expected, testProbe()); err != nil {
+					t.Fatalf("got %v, want ready without authentication", err)
+				}
+				if len(rt.authenticationHeaders) != 0 {
+					t.Fatalf("got authentication headers %v, want none", rt.authenticationHeaders)
+				}
+			})
+		}
+	}
+}
+
+type unauthenticatedTransport struct {
+	proof                 string
+	authenticationHeaders []string
+}
+
+func (t *unauthenticatedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	for _, header := range []string{"X-Auto-MAS-Challenge", "X-Auto-MAS-Proof", "X-Auto-MAS-Timestamp"} {
+		if request.Header.Get(header) != "" {
+			t.authenticationHeaders = append(t.authenticationHeaders, header)
+		}
+	}
+	response := jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))
+	response.Header = make(http.Header)
+	response.Header.Set("X-Auto-MAS-Proof", t.proof)
+	return response, nil
+}
+
 type sequenceTransport struct {
 	mu        sync.Mutex
 	responses []transportResult
@@ -543,9 +578,6 @@ func (t *sequenceTransport) RoundTrip(request *http.Request) (*http.Response, er
 	}
 	result := t.responses[0]
 	t.responses = t.responses[1:]
-	if result.response != nil && result.response.Header.Get("X-Test-Unsigned") != "1" {
-		signTestResponse(request, result.response)
-	}
 	return result.response, result.err
 }
 
@@ -566,10 +598,9 @@ type barrierTransport struct {
 	response *http.Response
 }
 
-func (t *barrierTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+func (t *barrierTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	close(t.started)
 	<-t.release
-	signTestResponse(request, t.response)
 	return t.response, nil
 }
 
@@ -788,87 +819,4 @@ func TestHealth_RejectsOutOfRangePort(t *testing.T) {
 			}
 		})
 	}
-}
-func TestHealth_RejectsUnsignedPortImpersonator(t *testing.T) {
-	rt := &sequenceTransport{responses: []transportResult{
-		{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))},
-		{response: jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))},
-	}}
-	for _, result := range rt.responses {
-		result.response.Header.Set("X-Test-Unsigned", "1")
-	}
-	assertHealthCode(t, testChecker(rt).Check(t.Context(), managedExpectation(), testProbe()), protocol.CodeBackendIdentityMismatch)
-}
-
-func signTestResponse(request *http.Request, response *http.Response) {
-	if response != nil && response.Header.Get("X-Test-Body") != "" {
-		response.Header.Set(ProofHeader, HealthProof(strings.Repeat("a", 64), request.Header.Get(ChallengeHeader), []byte(response.Header.Get("X-Test-Body"))))
-	}
-}
-
-func TestHealth_LegacyBackendCompatibility(t *testing.T) {
-	for _, test := range []struct {
-		name        string
-		firstSigned bool
-		badProof    bool
-		badIdentity bool
-		badJob      bool
-		noticeErr   bool
-		want        protocol.Code
-	}{
-		{name: "legacy ready"},
-		{name: "signed ready", firstSigned: true},
-		{name: "invalid proof", badProof: true, want: protocol.CodeBackendIdentityMismatch},
-		{name: "wrong identity", badIdentity: true, want: protocol.CodeBackendIdentityMismatch},
-		{name: "wrong job", badJob: true, want: protocol.CodeBackendHealthInvalid},
-		{name: "notice fails", noticeErr: true, want: protocol.CodeInternalError},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			version := "v5.4.0"
-			if test.badIdentity {
-				version = "v0.0.0"
-			}
-			responses := []transportResult{{response: jsonResponse(healthBody("ready", "", 1, version, testCommit))}, {response: jsonResponse(healthBody("ready", "", 1, version, testCommit))}}
-			for _, result := range responses {
-				if !test.firstSigned {
-					result.response.Header.Set("X-Test-Unsigned", "1")
-				}
-				if test.badProof {
-					result.response.Header.Set(ProofHeader, "bad-proof")
-				}
-			}
-			calls := 0
-			expected := managedExpectation()
-			expected.LegacyReady = func(context.Context) error {
-				calls++
-				if test.noticeErr {
-					return errors.New("notice failed")
-				}
-				return nil
-			}
-			probe := testProbe()
-			probe.healthy = !test.badJob
-			err := testChecker(&sequenceTransport{responses: responses}).Check(t.Context(), expected, probe)
-			if test.want != "" {
-				assertHealthCode(t, err, test.want)
-			} else if err != nil {
-				t.Fatalf("got %v, want nil", err)
-			}
-			wantCalls := 0
-			if test.name == "legacy ready" || test.noticeErr {
-				wantCalls = 1
-			}
-			if calls != wantCalls {
-				t.Fatalf("got %d notices, want %d", calls, wantCalls)
-			}
-		})
-	}
-	t.Run("signed then unsigned refuses downgrade", func(t *testing.T) {
-		first := jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))
-		second := jsonResponse(healthBody("ready", "", 1, "v5.4.0", testCommit))
-		second.Header.Set("X-Test-Unsigned", "1")
-		expected := managedExpectation()
-		expected.LegacyReady = func(context.Context) error { t.Fatal("unexpected legacy notice"); return nil }
-		assertHealthCode(t, testChecker(&sequenceTransport{responses: []transportResult{{response: first}, {response: second}}}).Check(t.Context(), expected, testProbe()), protocol.CodeBackendIdentityMismatch)
-	})
 }

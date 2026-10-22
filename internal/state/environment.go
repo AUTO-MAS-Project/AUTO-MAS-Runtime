@@ -194,7 +194,7 @@ func validateBrokenEnvironment(
 
 	switch value.Reason {
 	case ReasonRepositoryChanged:
-		if value.Stage != protocol.StageWorkspaceSwap {
+		if value.Stage != protocol.StageWorkspaceSwap && value.Stage != protocol.StageWorkspaceVerify {
 			return validationError("stage")
 		}
 		if value.ExitCode != 0 {
