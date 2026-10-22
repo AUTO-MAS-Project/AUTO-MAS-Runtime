@@ -104,8 +104,9 @@ func TestDependencies_SyncUsesRelayAndSingleAttempt(t *testing.T) {
 		t.Fatalf("runner calls = %d, want lock check + one relay sync", got)
 	}
 	sync := fixture.runner.calls[1]
-	if !reflect.DeepEqual(sync.args, mirrorSyncArgsFor(staging)) {
-		t.Fatalf("sync args = %#v, want %#v", sync.args, mirrorSyncArgsFor(staging))
+	wantArgs := mirrorSyncArgsFor(staging, "http://127.0.0.1:39170/simple")
+	if !reflect.DeepEqual(sync.args, wantArgs) {
+		t.Fatalf("sync args = %#v, want %#v", sync.args, wantArgs)
 	}
 	if got := sync.options.Environment[uvHTTPTimeoutEnv]; got != relayUVHTTPTimeoutSeconds {
 		t.Fatalf("UV_HTTP_TIMEOUT = %q, want %s", got, relayUVHTTPTimeoutSeconds)

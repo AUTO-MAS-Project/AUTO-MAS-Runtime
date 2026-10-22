@@ -150,10 +150,11 @@ func (silentDeleteAuditor) RecordDeletion(context.Context, filesystem.DeleteAudi
 	return nil
 }
 
-func mirrorSyncArgsFor(projectDir string) []string {
+func mirrorSyncArgsFor(projectDir, defaultIndex string) []string {
 	return []string{
 		"sync", "--project", projectDir, "--python", "3.12.10",
 		"--frozen", "--no-default-groups", "--no-install-workspace",
+		"--default-index", defaultIndex,
 	}
 }
 
@@ -206,9 +207,11 @@ func TestDependencies_SyncRotatesToTheNextMirrorOnFailure(t *testing.T) {
 	if got, want := len(fixture.runner.calls), 3; got != want {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
+	indexes := []string{"https://mirrors.aliyun.com/pypi/simple", "https://pypi.tuna.tsinghua.edu.cn/simple"}
 	for index := 1; index <= 2; index++ {
-		if got := fixture.runner.calls[index].args; !reflect.DeepEqual(got, mirrorSyncArgsFor(staging)) {
-			t.Fatalf("sync args[%d] = %#v, want %#v", index, got, mirrorSyncArgsFor(staging))
+		want := mirrorSyncArgsFor(staging, indexes[index-1])
+		if got := fixture.runner.calls[index].args; !reflect.DeepEqual(got, want) {
+			t.Fatalf("sync args[%d] = %#v, want %#v", index, got, want)
 		}
 	}
 	if len(observedLocks) != 2 {
