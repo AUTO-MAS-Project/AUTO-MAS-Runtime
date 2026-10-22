@@ -127,7 +127,7 @@ doc/                   权威文档
 ### 5.1 工具链
 
 - Windows 10/11 + **PowerShell 7（`pwsh`）**；
-- **Go 1.26**（`go.mod` 声明 `go 1.26.0`；固定工具链 Go 1.26.9）；
+- **Go 1.26**（`go.mod` 声明 `go 1.26.0`；固定工具链 Go 1.26.10）；
 - MSYS2 UCRT64 **GCC/G++ 16.1.0**，`CGO_ENABLED=1`；
 - golangci-lint 2.12.2+（可选，本机当前未安装）。
 
@@ -181,7 +181,7 @@ if ($unformatted) { $unformatted; throw "gofmt found unformatted files" }
 ### 5.4 CI
 
 `.github/workflows/ci.yml`：push / PR 触发，`windows-latest` + `pwsh`，
-步骤 = checkout → setup-go（固定 Go 1.26.9）→ gofmt 检查 → `go vet` → `go build` → `go test` → 固定版本 `govulncheck`。
+步骤 = checkout → setup-go（固定 Go 1.26.10）→ gofmt 检查 → `go vet` → `go build` → `go test` → 固定版本 `govulncheck`。
 本地基础验证门与 CI 保持一致；race detector 是并发相关改动的本地追加门，当前 CI 未覆盖，
 不得把本机 race 结果表述成 CI 证据。
 
