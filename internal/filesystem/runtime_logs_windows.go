@@ -167,6 +167,20 @@ func (f *RuntimeLogFiles) OpenAppend(
 	command string,
 	localDate time.Time,
 ) (*RuntimeLogWriter, error) {
+	return f.OpenAppendSegment(ctx, command, localDate, 0)
+}
+
+// OpenAppendSegment 追加指定日志卷，沿用首卷的祖先固定与叶节点安全检查。
+func (f *RuntimeLogFiles) OpenAppendSegment(ctx context.Context, command string, localDate time.Time, sequence uint64) (*RuntimeLogWriter, error) {
+	return f.openSegment(ctx, command, localDate, sequence, windows.OPEN_ALWAYS)
+}
+
+// CreateSegment 仅创建不存在的日志卷，名称竞争时拒绝覆盖已有对象。
+func (f *RuntimeLogFiles) CreateSegment(ctx context.Context, command string, localDate time.Time, sequence uint64) (*RuntimeLogWriter, error) {
+	return f.openSegment(ctx, command, localDate, sequence, windows.CREATE_NEW)
+}
+
+func (f *RuntimeLogFiles) openSegment(ctx context.Context, command string, localDate time.Time, sequence uint64, creation uint32) (*RuntimeLogWriter, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
 	}
@@ -178,7 +192,7 @@ func (f *RuntimeLogFiles) OpenAppend(
 	if f.closed {
 		return nil, ErrClosed
 	}
-	path, err := f.layout.RuntimeLogFile(command, localDate)
+	path, err := f.layout.RuntimeLogSegmentFile(command, localDate, sequence)
 	if err != nil {
 		return nil, fmt.Errorf("%w: runtime log path: %v", ErrInvalidArgument, err)
 	}
@@ -188,7 +202,7 @@ func (f *RuntimeLogFiles) OpenAppend(
 	spec := openSpec{
 		access:    windows.FILE_APPEND_DATA | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
 		share:     windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
-		creation:  windows.OPEN_ALWAYS,
+		creation:  creation,
 		options:   windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		directory: false,
 	}
@@ -196,6 +210,11 @@ func (f *RuntimeLogFiles) OpenAppend(
 	if err != nil {
 		var fileErr *FileError
 		if !errors.As(err, &fileErr) || fileErr.Operation != "open-relative" {
+			return nil, err
+		}
+		if creation == windows.CREATE_NEW &&
+			(errors.Is(err, windows.ERROR_FILE_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS)) {
+			// create-new 已无副作用地拒绝名称竞争；不再打开已有对象，避免掩盖分类探针故障。
 			return nil, err
 		}
 		return nil, classifyRuntimeLogOpenFailure(

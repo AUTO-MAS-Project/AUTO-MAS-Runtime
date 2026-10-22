@@ -457,7 +457,7 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 			}
 		}
 		if unchanged {
-			return s.finishUnchanged(ctx, request, runtime, machine, check)
+			return s.restoreOrFinishUnchanged(ctx, request, runtime, machine, check, environment, logger.LogPath())
 		}
 	}
 	var update state.TransactionState
@@ -497,7 +497,7 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		if _, err := runtime.Recover(ctx, RecoveryRequest{LogPath: logger.LogPath()}); err != nil {
 			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 		}
-		return s.finishUnchanged(ctx, request, runtime, machine, check)
+		return s.restoreOrFinishUnchanged(ctx, request, runtime, machine, check, environment, logger.LogPath())
 	}
 	setStage(request, protocol.StageWorkspaceSwap)
 	environmentCommitted := false

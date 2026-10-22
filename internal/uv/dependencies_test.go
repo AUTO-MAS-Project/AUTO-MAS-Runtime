@@ -24,7 +24,7 @@ func TestDependencies_LockfileContract(t *testing.T) {
 	}{
 		{name: "missing", lockKind: "missing", wantCode: protocol.CodeLockfileMissing},
 		{name: "directory", lockKind: "directory", wantCode: protocol.CodeLockfileMissing},
-		{name: "outdated", lockKind: "outdated", wantCode: protocol.CodeLockfileOutdated},
+		{name: "check_failed", lockKind: "outdated", wantCode: protocol.CodeLockfileCheckFailed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -197,7 +197,7 @@ func TestDependencies_SyncArguments(t *testing.T) {
 	if got, want := len(fixture.runner.calls), 2; got != want {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
-	want := mirrorSyncArgsFor(fixture.stagingDir(t))
+	want := mirrorSyncArgsFor(fixture.stagingDir(t), "https://mirrors.aliyun.com/pypi/simple")
 	if got := fixture.runner.calls[1].args; !reflect.DeepEqual(got, want) {
 		t.Fatalf("sync args = %#v, want %#v", got, want)
 	}
@@ -255,7 +255,7 @@ func TestDependencies_LockfileCheckPreservesLockSources(t *testing.T) {
 
 			syncCall := runner.calls[1]
 			// 在线时同步跑在改写后的锁副本上，离线完全不改写、沿用原锁。
-			wantSyncArgs := mirrorSyncArgsFor(fixture.stagingDir(t))
+			wantSyncArgs := mirrorSyncArgsFor(fixture.stagingDir(t), "https://mirrors.aliyun.com/pypi/simple")
 			if test.wantOffline {
 				wantSyncArgs = lockedSyncArgsFor(layout.RepoDir())
 			}
@@ -310,7 +310,7 @@ func TestDependencies_SyncPrefersExplicitSource(t *testing.T) {
 			if fixture.attempts[0].Source != test.key {
 				t.Fatalf("first attempt source = %q, want %q", fixture.attempts[0].Source, test.key)
 			}
-			wantArgs := mirrorSyncArgsFor(fixture.stagingDir(t))
+			wantArgs := mirrorSyncArgsFor(fixture.stagingDir(t), "https://pypi.mirrors.ustc.edu.cn/simple")
 			if !test.wantRewritten {
 				wantArgs = lockedSyncArgsFor(fixture.layout.RepoDir())
 			}

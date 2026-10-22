@@ -648,7 +648,6 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASMirrorPackageIndex,
 		autoMASMirrorPython,
 		autoMASSupervisedPort,
-		"AUTO_MAS_SUPERVISION_SECRET",
 	} {
 		if strings.EqualFold(key, managed) {
 			return managed, true
@@ -682,6 +681,8 @@ func canonicalUVOverrideKey(key string) (string, bool) {
 		return uvPythonInstallMirrorEnv, true
 	case strings.EqualFold(key, uvHTTPTimeoutEnv):
 		return uvHTTPTimeoutEnv, true
+	case strings.EqualFold(key, uvConcurrentDownloadsEnv):
+		return uvConcurrentDownloadsEnv, true
 	default:
 		return "", false
 	}

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
@@ -229,6 +231,21 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 	if err := requireRegularLockfile(s.lockfilePath(request.ProjectDir)); err != nil {
 		return err
 	}
+	payload, err := filesystem.ReadManagedFile(ctx, s.layout, s.lockfilePath(request.ProjectDir), maxUVLockFileBytes+1)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return newError(protocol.CodeLockfileCheckFailed, protocol.StageDependenciesCheck,
+			"项目锁文件读取失败，请查看操作日志", map[string]any{"failureKind": "lockfile_read"}, err)
+	}
+	var lock map[string]any
+	if len(payload) > maxUVLockFileBytes {
+		return newError(protocol.CodeLockfileInvalid, protocol.StageDependenciesCheck, "项目锁文件超出支持大小", map[string]any{"failureKind": "lockfile_too_large"}, nil)
+	}
+	if _, err := toml.Decode(string(payload), &lock); err != nil {
+		return newError(protocol.CodeLockfileInvalid, protocol.StageDependenciesCheck, "项目锁文件格式损坏", map[string]any{"failureKind": "lockfile_syntax"}, err)
+	}
 	args := []string{
 		"lock",
 		"--project",
@@ -246,9 +263,9 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 		}
 		if result.ExitCode > 0 {
 			return newError(
-				protocol.CodeLockfileOutdated,
+				protocol.CodeLockfileCheckFailed,
 				protocol.StageDependenciesCheck,
-				"项目锁文件已过期",
+				"项目锁文件检查失败，请查看操作日志",
 				uvFailureDetails(result, "lock_check_nonzero"),
 				err,
 			)
@@ -257,9 +274,9 @@ func (s *DependenciesService) checkLockfile(ctx context.Context, request Depende
 	}
 	if result.ExitCode != 0 {
 		return newError(
-			protocol.CodeLockfileOutdated,
+			protocol.CodeLockfileCheckFailed,
 			protocol.StageDependenciesCheck,
-			"项目锁文件已过期",
+			"项目锁文件检查失败，请查看操作日志",
 			uvFailureDetails(result, "lock_check_nonzero"),
 			nil,
 		)

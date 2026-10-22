@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -37,9 +38,7 @@ func TestEnvironmentEnsure_OfflineCacheMissReturnsNetworkUnavailable(t *testing.
 	if exitCode != protocol.ExitCodeNetworkFailure {
 		t.Fatalf("Execute() exit code = %d, want %d; stderr=%q", exitCode, protocol.ExitCodeNetworkFailure, stderr)
 	}
-	if stderr != "" {
-		t.Fatalf("Execute() stderr = %q, want empty", stderr)
-	}
+	t59AssertFileSystemDiagnostic(t, stderr, root)
 	errorEvent, resultEvent := t59FailureEvents(t, stdout)
 	t59AssertFailureTuple(t, errorEvent, resultEvent, protocol.CodeNetworkUnavailable, protocol.StageUVDownload)
 	if downloader.calls != 0 {
@@ -85,9 +84,10 @@ func TestEnvironmentEnsure_OfflineCacheHitSkipsNetwork(t *testing.T) {
 			return &t59BootstrapEnvironment{bootstrap: bootstrapper}, nil
 		}),
 	)
-	if exitCode != protocol.ExitCodeSuccess || stderr != "" {
+	if exitCode != protocol.ExitCodeSuccess {
 		t.Fatalf("Execute() = %d, stderr=%q, want success", exitCode, stderr)
 	}
+	t59AssertFileSystemDiagnostic(t, stderr, root)
 	events := parseNDJSON(t, stdout)
 	if got := eventString(events[len(events)-1], "code"); got != string(protocol.CodeOK) {
 		t.Fatalf("result code = %q, want OK", got)
@@ -115,15 +115,33 @@ func TestEnvironmentEnsure_OnlineDownloadFailureRemainsUVDownloadFailed(t *testi
 			return &t59BootstrapEnvironment{bootstrap: bootstrapper}, nil
 		}),
 	)
-	if exitCode != protocol.ExitCodeNetworkFailure || stderr != "" {
-		t.Fatalf("Execute() = %d, stderr=%q, want network failure with empty stderr", exitCode, stderr)
+	if exitCode != protocol.ExitCodeNetworkFailure {
+		t.Fatalf("Execute() = %d, stderr=%q, want network failure", exitCode, stderr)
 	}
+	t59AssertFileSystemDiagnostic(t, stderr, root)
 	errorEvent, resultEvent := t59FailureEvents(t, stdout)
 	t59AssertFailureTuple(t, errorEvent, resultEvent, protocol.CodeUVDownloadFailed, protocol.StageUVDownload)
 	if downloader.calls == 0 {
 		t.Fatal("downloader calls = 0, want online source attempts")
 	}
 	t59AssertPathAbsent(t, layout.MutationStateFile())
+}
+
+func t59AssertFileSystemDiagnostic(t *testing.T, stderr string, root string) {
+	t.Helper()
+	prefix, body, found := strings.Cut(stderr, "当前磁盘格式：")
+	format, detailsText, hasDetails := strings.Cut(strings.TrimSuffix(body, "\n"), " ")
+	if !found || !hasDetails || format == "" || strings.Count(stderr, "\n") != 1 ||
+		!strings.Contains(prefix, " INFO [environment ensure] [") {
+		t.Fatalf("stderr = %q, want only one info file system diagnostic", stderr)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(detailsText), &details); err != nil {
+		t.Fatalf("diagnostic details = %q: %v", detailsText, err)
+	}
+	if details["path"] != root || details["fileSystem"] != format {
+		t.Fatalf("diagnostic details = %#v, want path %q and format %q", details, root, format)
+	}
 }
 
 func TestEnvironmentEnsure_TerminalFailureRemovesMutation(t *testing.T) {

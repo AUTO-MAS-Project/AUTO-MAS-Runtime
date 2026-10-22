@@ -142,7 +142,7 @@ func TestBackend_CloseRequestTargetsSupervisedPort(t *testing.T) {
 	server.Start()
 	t.Cleanup(server.Close)
 	port := listener.Addr().(*net.TCPAddr).Port
-	closer := newLoopbackHTTPCloser(port, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	closer := newLoopbackHTTPCloser(port)
 	if err := closer.Close(t.Context()); err != nil {
 		t.Fatalf("Close() error = %v, want nil", err)
 	}
@@ -158,6 +158,24 @@ func TestBackend_CloseRequestTargetsSupervisedPort(t *testing.T) {
 	}
 	if got, want := backendCloseURL(port), health.BaseURL(port)+"/api/core/close"; got != want {
 		t.Fatalf("backendCloseURL(%d) = %q, want %q", port, got, want)
+	}
+}
+
+func TestBackend_CloseRequestWithoutAuthentication(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		for _, header := range []string{"X-Auto-MAS-Challenge", "X-Auto-MAS-Proof", "X-Auto-MAS-Timestamp"} {
+			if request.Header.Get(header) != "" {
+				writer.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	closer := newLoopbackHTTPCloser(port)
+	if err := closer.Close(t.Context()); err != nil {
+		t.Fatalf("got %v, want successful shutdown without authentication", err)
 	}
 }
 
