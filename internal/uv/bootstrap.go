@@ -584,10 +584,12 @@ func (b *Bootstrapper) download(
 	}
 	var downloadedPath string
 	var progressErr error
+	var statuses []int
 	rotationResult, rotationErr := b.rotator.Run(ctx, plan, target, func(
 		attemptContext context.Context,
 		attempt mirror.Attempt,
 	) mirror.AttemptOutcome {
+		statuses = append(statuses, 0)
 		url := strings.TrimRight(attempt.Source.BaseURL(), "/") + "/" + spec.Version + "/" + spec.Name
 		var attemptProgress mirror.ProgressFunc
 		if progress != nil {
@@ -635,12 +637,27 @@ func (b *Bootstrapper) download(
 				Err:         downloadErr,
 			}
 		}
+		kind := mirror.FailureKind("download_failed")
+		var downloadFailure *mirror.DownloadFailure
+		if errors.As(downloadErr, &downloadFailure) {
+			kind = downloadFailure.Kind
+			if kind == mirror.FailureNetwork {
+				kind = mirror.NetworkFailureKind(downloadFailure.Err)
+			}
+			if downloadFailure.StatusCode >= 100 && downloadFailure.StatusCode <= 599 {
+				statuses[len(statuses)-1] = downloadFailure.StatusCode
+			}
+		}
+		if !kind.Valid() {
+			kind = "download_failed"
+		}
 		return mirror.AttemptOutcome{
 			Kind:        mirror.OutcomeSwitchSource,
-			FailureKind: mirror.FailureKind("download_failed"),
+			FailureKind: kind,
 			Err:         downloadErr,
 		}
 	})
+	diagnostics := downloadAttemptDetails(rotationResult.Reports, statuses)
 	if rotationErr != nil {
 		// 原样返回，不经 wrapBootstrapError：错误链要保留 OUTPUT_WRITE_FAILED，
 		// 包一层会把用户可见文案改成「uv 准备失败」。
@@ -648,11 +665,12 @@ func (b *Bootstrapper) download(
 			return mirror.DownloadResult{}, progressErr
 		}
 		if _, ok := rotationErr.(*mirror.IntegrityExhaustedError); ok {
+			diagnostics["expectedSHA256"] = spec.SHA256
 			return mirror.DownloadResult{}, newError(
 				protocol.CodeUVChecksumMismatch,
 				protocol.StageUVVerify,
 				"uv 校验和不匹配",
-				map[string]any{"expectedSHA256": spec.SHA256},
+				diagnostics,
 				rotationErr,
 			)
 		}
@@ -662,7 +680,7 @@ func (b *Bootstrapper) download(
 				protocol.CodeNetworkUnavailable,
 				protocol.StageUVDownload,
 				"离线模式下没有可用的 uv 缓存",
-				map[string]any{},
+				diagnostics,
 				rotationErr,
 			)
 		}
@@ -670,7 +688,7 @@ func (b *Bootstrapper) download(
 			protocol.CodeUVDownloadFailed,
 			protocol.StageUVDownload,
 			"uv 下载失败",
-			map[string]any{},
+			diagnostics,
 			rotationErr,
 		)
 	}
@@ -679,7 +697,7 @@ func (b *Bootstrapper) download(
 			protocol.CodeUVDownloadFailed,
 			protocol.StageUVDownload,
 			"uv 下载失败",
-			map[string]any{},
+			diagnostics,
 			errors.New("uv download returned no attempt report"),
 		)
 	}
@@ -701,6 +719,22 @@ func (b *Bootstrapper) download(
 		return mirror.DownloadResult{}, wrapBootstrapError(protocol.StageUVDownload, err)
 	}
 	return mirror.DownloadResult{Path: path}, nil
+}
+
+func downloadAttemptDetails(reports []mirror.AttemptReport, statuses []int) map[string]any {
+	attempts := make([]map[string]any, 0, len(reports))
+	for i, report := range reports {
+		attempt := map[string]any{
+			"source": report.SourceKey, "sourceTry": report.SourceTry, "globalTry": report.GlobalTry,
+			"outcome": report.Outcome.String(), "failureKind": report.FailureKind.String(),
+			"durationMs": max(int64(0), report.Duration.Milliseconds()),
+		}
+		if i < len(statuses) && statuses[i] != 0 {
+			attempt["httpStatus"] = statuses[i]
+		}
+		attempts = append(attempts, attempt)
+	}
+	return map[string]any{"attempts": attempts}
 }
 
 func (b *Bootstrapper) checkVersion(ctx context.Context, executable string, line LineFunc) error {
