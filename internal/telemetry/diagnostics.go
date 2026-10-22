@@ -35,6 +35,7 @@ const (
 	diagnosticDynamicNumberMap
 	diagnosticProtocolCode
 	diagnosticSHA256
+	diagnosticHTTPStatus
 )
 
 // diagnosticFieldPolicies 是允许离开 Runtime 的结构字段白名单；未知字段默认丢弃。
@@ -49,6 +50,7 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"actualVersion": diagnosticIdentifier, "branch": diagnosticIdentifier, "commit": diagnosticIdentifier,
 	"version": diagnosticIdentifier, "expectedProtocol": diagnosticStableValue, "receivedProtocol": diagnosticStableValue,
 	"expectedSHA256": diagnosticSHA256,
+	"httpStatus":     diagnosticHTTPStatus,
 
 	"path": diagnosticPath, "directory": diagnosticPath, "cwd": diagnosticPath, "log": diagnosticPath,
 	"logPath": diagnosticPath, "previousLogPath": diagnosticPath, "projectDir": diagnosticPath,
@@ -149,6 +151,8 @@ func sanitizeDiagnosticValue(value any, key string, depth int, fields *int) any 
 		return sanitizeDiagnosticPath(typed)
 	case diagnosticNumber:
 		return sanitizeDiagnosticNumber(value)
+	case diagnosticHTTPStatus:
+		return sanitizeDiagnosticHTTPStatus(value)
 	case diagnosticBoolean:
 		typed, ok := diagnosticBool(value)
 		if !ok {
@@ -305,6 +309,36 @@ func sanitizeDynamicNumberMap(value any, depth int, fields *int) map[string]any 
 		result[key] = clean
 	}
 	return result
+}
+
+// sanitizeDiagnosticHTTPStatus 只接受 HTTP 状态范围内的整数，并保留原 JSON 数值类型。
+func sanitizeDiagnosticHTTPStatus(value any) any {
+	clean := sanitizeDiagnosticNumber(value)
+	if clean == nil {
+		return nil
+	}
+	var status float64
+	if number, ok := clean.(json.Number); ok {
+		var err error
+		status, err = number.Float64()
+		if err != nil {
+			return nil
+		}
+	} else {
+		number := reflect.ValueOf(clean)
+		switch number.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			status = float64(number.Int())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			status = float64(number.Uint())
+		case reflect.Float32, reflect.Float64:
+			status = number.Float()
+		}
+	}
+	if status < 100 || status > 599 || math.Trunc(status) != status {
+		return nil
+	}
+	return clean
 }
 
 func sanitizeDiagnosticNumber(value any) any {

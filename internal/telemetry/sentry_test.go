@@ -159,6 +159,38 @@ func TestSentry_CapturesExpectedFailureWithReason(t *testing.T) {
 	}
 }
 
+func TestSentry_RemoteFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Command = "workspace check"
+	observation.Stage = string(protocol.StageWorkspaceCheck)
+	observation.Code = string(protocol.CodeGitRemoteResolveFailed)
+	observation.DiagnosticDetails = map[string]any{"attempts": []map[string]any{{
+		"source": "github", "sourceTry": 1, "globalTry": 2, "outcome": "switch_source",
+		"failureKind": "http_status", "httpStatus": 503, "durationMs": int64(125),
+		"url": "https://user:secret@private.invalid/repo", "error": "private response",
+	}}}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 || events[0].Tags["stage"] != string(protocol.StageWorkspaceCheck) {
+		t.Fatalf("events = %#v, want one workspace.check failure", events)
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"failureKind":"http_status"`, `"httpStatus":503`, `"durationMs":125`} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Errorf("diagnostics = %s, want %s", encoded, required)
+		}
+	}
+	for _, forbidden := range []string{"private", "secret", "https://"} {
+		if bytes.Contains(encoded, []byte(forbidden)) {
+			t.Errorf("diagnostics = %s, want no %q", encoded, forbidden)
+		}
+	}
+}
+
 func TestSentry_BeforeSendRejectsUnreportableFailure(t *testing.T) {
 	provider, transport := newSentryTestProvider(t)
 	observation := validSentryObservation(false)

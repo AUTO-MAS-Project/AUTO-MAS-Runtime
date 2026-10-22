@@ -15,6 +15,32 @@ type unsupportedDiagnostic struct {
 
 type diagnosticMode string
 
+func TestSanitizeDiagnostics_HTTPStatus(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value any
+		keep  bool
+	}{
+		{name: "valid", value: 503, keep: true},
+		{name: "minimum", value: 100, keep: true},
+		{name: "maximum", value: 599, keep: true},
+		{name: "json number", value: json.Number("407"), keep: true},
+		{name: "decoded number", value: float64(404), keep: true},
+		{name: "low", value: 99},
+		{name: "high", value: 600},
+		{name: "fraction", value: 401.5},
+		{name: "text", value: "503 token=secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clean := SanitizeDiagnostics(map[string]any{"httpStatus": test.value})
+			value, present := clean["httpStatus"]
+			if present != test.keep || (test.keep && value != test.value) {
+				t.Fatalf("httpStatus = %#v, present %t, want keep=%t", value, present, test.keep)
+			}
+		})
+	}
+}
+
 type marshaledDiagnostic string
 
 func (m marshaledDiagnostic) MarshalJSON() ([]byte, error) {

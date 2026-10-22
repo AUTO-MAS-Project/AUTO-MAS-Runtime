@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol/contracttest"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 )
 
 type stagingContractService struct {
@@ -54,6 +57,65 @@ func TestWorkspaceStageContract(t *testing.T) {
 
 func TestWorkspaceRemoteContract(t *testing.T) {
 	contracttest.Register(t, "workspace check --remote", stagingContractRunner(true))
+}
+
+func TestWorkspaceRemote_FailureDiagnostics(t *testing.T) {
+	attempts := []map[string]any{
+		{"source": "cnb", "sourceTry": 1, "globalTry": 1, "outcome": "switch_source", "failureKind": "dns_failed", "durationMs": int64(125)},
+		{"source": "github", "sourceTry": 1, "globalTry": 2, "outcome": "switch_source", "failureKind": "http_status", "httpStatus": 503, "durationMs": int64(250)},
+	}
+	service := stagingContractService{err: &commandError{
+		code: protocol.CodeGitRemoteResolveFailed, stage: protocol.StageWorkspaceCheck,
+		message: "无法查询远端分支", details: map[string]any{"attempts": attempts},
+	}}
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	code := executeWithTelemetry(t, []string{"--output", "ndjson", "workspace", "check", "--remote"}, recorder, &stdout,
+		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return service, nil }),
+		WithWorkspaceLoggerFactory(workspaceTestLoggerFactory))
+	definition, _ := protocol.LookupErrorDefinition(protocol.CodeGitRemoteResolveFailed)
+	if code != definition.ExitCode {
+		t.Fatalf("exit = %d, want %d: %s", code, definition.ExitCode, stdout.String())
+	}
+	seen := map[string]int{}
+	var errorDetails map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(stdout.Bytes()), []byte("\n")) {
+		var event struct {
+			Type        string                 `json:"type"`
+			Code        string                 `json:"code"`
+			Stage       protocol.Stage         `json:"stage"`
+			Retryable   bool                   `json:"retryable"`
+			Remediation []protocol.Remediation `json:"remediation"`
+			Details     map[string]any         `json:"details"`
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type != "error" && event.Type != "result" {
+			continue
+		}
+		seen[event.Type]++
+		if event.Code != string(protocol.CodeGitRemoteResolveFailed) || event.Stage != protocol.StageWorkspaceCheck ||
+			event.Retryable != definition.Retryable || !reflect.DeepEqual(event.Remediation, definition.Remediation) {
+			t.Errorf("event = %s, want original error contract at workspace.check", line)
+		}
+		if event.Type == "error" {
+			errorDetails = event.Details
+		}
+		if !reflect.DeepEqual(event.Details, errorDetails) {
+			t.Errorf("details = %#v, want error details %#v", event.Details, errorDetails)
+		}
+	}
+	if seen["error"] != 1 || seen["result"] != 1 {
+		t.Fatalf("terminal events = %#v, want one error and one result", seen)
+	}
+	observations, _, _ := recorder.snapshot()
+	wantDiagnostics := telemetry.SanitizeDiagnostics(map[string]any{"attempts": attempts})
+	if len(observations) != 1 || observations[0].Command != "workspace check" ||
+		observations[0].Stage != string(protocol.StageWorkspaceCheck) ||
+		!reflect.DeepEqual(observations[0].DiagnosticDetails, wantDiagnostics) {
+		t.Fatalf("observations = %#v, want check stage and complete attempt diagnostics", observations)
+	}
 }
 
 func stagingContractRunner(remote bool) contracttest.Runner {

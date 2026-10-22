@@ -938,6 +938,7 @@ func attemptDetails(reports []mirror.AttemptReport) map[string]any {
 			"globalTry":   report.GlobalTry,
 			"outcome":     report.Outcome.String(),
 			"failureKind": report.FailureKind.String(),
+			"durationMs":  max(int64(0), report.Duration.Milliseconds()),
 		})
 	}
 	return map[string]any{"attempts": attempts}
