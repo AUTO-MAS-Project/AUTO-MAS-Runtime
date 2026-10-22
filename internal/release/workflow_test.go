@@ -25,8 +25,6 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "direct executable checksum", snippet: "Get-FileHash -LiteralPath $binary -Algorithm SHA256"},
 		{name: "direct executable upload", snippet: "dist/${{ steps.metadata.outputs.binary_name }}"},
 		{name: "direct executable release", snippet: "release-assets/${{ needs.package.outputs.binary_name }}"},
-		{name: "upload action", snippet: "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"},
-		{name: "download action", snippet: "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"},
 		{name: "release action", snippet: "uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64"},
 		{name: "unmatched asset guard", snippet: "fail_on_unmatched_files: true"},
 		{name: "generated notes", snippet: "generate_release_notes: true"},
@@ -66,6 +64,54 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		if strings.Contains(source, legacy) {
 			t.Errorf("release workflow still uses legacy action %q", legacy)
 		}
+	}
+}
+
+func TestReleaseWorkflow_ArtifactHandoffContract(t *testing.T) {
+	const uploadAction = "uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+	const downloadAction = "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+	source := releaseWorkflowSource(t)
+	for _, test := range []struct {
+		name      string
+		end       string
+		required  []string
+		forbidden []string
+	}{
+		{
+			name: "Upload release assets for publishing", end: "  publish:",
+			required: []string{uploadAction, "name: runtime-release-assets", "path: |\n            dist/${{ steps.metadata.outputs.binary_name }}\n            dist/SHA256SUMS.txt\n          if-no-files-found: error", "retention-days: 7"},
+		},
+		{
+			name: "Download exact signed artifact", end: "      - name: Verify returned signed executable",
+			required:  []string{downloadAction, "github-token: ${{ secrets.AUTO_MAS_SIGNING_TOKEN }}", "repository: AUTO-MAS-Project/AUTO-MAS", "run-id: ${{ steps.signing.outputs.run_id }}", "artifact-ids: ${{ steps.signing.outputs.artifact_id }}", "path: dist", "merge-multiple: true"},
+			forbidden: []string{"\n          name:", "pattern:"},
+		},
+		{
+			name: "Download release assets", end: "      - name: Verify signed release assets before publication",
+			required:  []string{downloadAction, "name: runtime-release-assets", "path: release-assets"},
+			forbidden: []string{"github-token:", "repository:", "run-id:", "artifact-ids:", "pattern:"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, rest, ok := strings.Cut(source, "      - name: "+test.name+"\n")
+			if !ok {
+				t.Fatalf("got no %q step, want artifact handoff", test.name)
+			}
+			step, _, ok := strings.Cut(rest, test.end)
+			if !ok {
+				t.Fatalf("got no boundary %q, want scoped handoff assertion", test.end)
+			}
+			for _, want := range test.required {
+				if !strings.Contains(step, want) {
+					t.Errorf("got step without %q, want artifact contract", want)
+				}
+			}
+			for _, forbidden := range test.forbidden {
+				if strings.Contains(step, forbidden) {
+					t.Errorf("got step with %q, want exact artifact scope", forbidden)
+				}
+			}
+		})
 	}
 }
 
