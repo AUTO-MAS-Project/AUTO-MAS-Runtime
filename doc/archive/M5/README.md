@@ -24,6 +24,8 @@ M5 实现 `internal/uv` 的 uv bootstrap、统一执行器、受管 Python、锁
   真实 uv 与新 EXE 黑盒，修复 check/sync 的锁 sources 覆盖和镜像错误分类。
 - [`设计-T5.12-隔离-Python-支持性检查.md`](./设计-T5.12-隔离-Python-支持性检查.md)：基于
   AUTO-MAS b3 真机失败，隔离 uv 可下载目录查询与宿主 `PATH` 解释器并修正错误分类。
+- [`设计-T5.15-构建依赖镜像索引.md`](./设计-T5.15-构建依赖镜像索引.md)：共用 frozen 同步的
+  默认索引接线、Relay 与逐源回退的真实隔离构建，以及本地与远端验证边界。
 
 ## 本轮冻结决策
 

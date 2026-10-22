@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -132,7 +133,8 @@ func (s *DependenciesService) syncWithRelay(
 	relayRequest := request
 	relayRequest.Line = request.Line
 	uvResult, runErr := s.runStagedSyncWithEnvironment(ctx, relayRequest, rewrite, lock, projectFile, map[string]string{
-		uvHTTPTimeoutEnv: relayUVHTTPTimeoutSeconds,
+		uvHTTPTimeoutEnv:         relayUVHTTPTimeoutSeconds,
+		uvConcurrentDownloadsEnv: strconv.Itoa(relay.DefaultMaxFiles),
 	})
 	summary := session.Summary()
 	if runErr == nil && uvResult.ExitCode == 0 {

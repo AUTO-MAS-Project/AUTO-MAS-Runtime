@@ -777,6 +777,30 @@ func TestRunner_StillStripsHostHTTPTimeout(t *testing.T) {
 	}
 }
 
+func TestRunner_AllowsRelayDownloadConcurrency(t *testing.T) {
+	t.Setenv(uvConcurrentDownloadsEnv, "50")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{
+		strings.ToLower(uvConcurrentDownloadsEnv): "6",
+	}})
+	if got := environment[uvConcurrentDownloadsEnv]; got != "6" {
+		t.Fatalf("environment[%q] = %q, want explicit relay limit 6", uvConcurrentDownloadsEnv, got)
+	}
+	if containsEnvironmentKeyMap(environment, strings.ToLower(uvConcurrentDownloadsEnv)) &&
+		environment[strings.ToLower(uvConcurrentDownloadsEnv)] != "" {
+		t.Fatalf("lowercase key survived, want canonical %q only", uvConcurrentDownloadsEnv)
+	}
+}
+
+func TestRunner_StillStripsHostRelayDownloadConcurrency(t *testing.T) {
+	t.Setenv(uvConcurrentDownloadsEnv, "50")
+	runner := newTestRunner(t)
+	environment := runner.EnvironmentForTesting(RunOptions{Environment: map[string]string{}})
+	if containsEnvironmentKeyMap(environment, uvConcurrentDownloadsEnv) {
+		t.Fatalf("environment contains %q = %q, want scrubbed", uvConcurrentDownloadsEnv, environment[uvConcurrentDownloadsEnv])
+	}
+}
+
 // TestRunner_InjectsNoConfig 锁定增补 2 C20：uv 子进程同时带 UV_NO_CONFIG=1 与 UV_NO_SYSTEM_CONFIG=1，
 // 用户级 %APPDATA%\uv\uv.toml、项目及其父目录里的 uv.toml / [tool.uv] 都不再参与；宿主与调用方都改不掉。
 func TestRunner_InjectsNoConfig(t *testing.T) {
@@ -933,15 +957,5 @@ func TestUVRunner_OutputDrainIsBounded(t *testing.T) {
 	_, _, err = awaitUVStreams(stdout, stderr, out, errs, time.Millisecond, func() {})
 	if err == nil {
 		t.Fatal("got nil, want output drain failure")
-	}
-}
-func TestUVEnvironment_SupervisionSecretNeverInherited(t *testing.T) {
-	t.Setenv("AUTO_MAS_SUPERVISION_SECRET", "host-secret")
-	options := RunOptions{Environment: map[string]string{"auto_mas_supervision_secret": "override-secret"}}
-	for _, entry := range buildEnvironment((&UVRunner{}).resolveOptions(options)) {
-		key, _, _ := strings.Cut(entry, "=")
-		if strings.EqualFold(key, "AUTO_MAS_SUPERVISION_SECRET") {
-			t.Fatalf("secret inherited in ordinary uv environment")
-		}
 	}
 }

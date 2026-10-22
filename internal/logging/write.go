@@ -68,7 +68,12 @@ func (l *Logger) write(
 
 	var fileErr error
 	if fileAvailable {
-		result.FileWritten, fileErr = writeLine(l.writer, encoded.line)
+		var capacityRotated bool
+		result.FileWritten, capacityRotated, fileErr = l.appendFileLocked(committedCtx, now, encoded.line)
+		result.Rotated = result.Rotated || capacityRotated
+		if capacityRotated {
+			fileErr = errors.Join(fileErr, l.maintainRetentionLocked(committedCtx, now))
+		}
 		if fileErr != nil {
 			fileErr = fmt.Errorf("write runtime log file: %w", fileErr)
 		}
@@ -101,10 +106,6 @@ func (l *Logger) rotateLocked(
 		return false, nil
 	}
 
-	expectedPath, err := l.layout.RuntimeLogFile(l.command, now)
-	if err != nil {
-		return false, fmt.Errorf("derive rotated runtime log path: %w", err)
-	}
 	nextWriter, openErr := l.files.OpenAppend(ctx, l.command, now)
 	if openErr != nil {
 		return false, errors.Join(
@@ -115,7 +116,7 @@ func (l *Logger) rotateLocked(
 	if isNilInterface(nextWriter) {
 		return false, fmt.Errorf("open rotated runtime log: %w", ErrInvalidArgument)
 	}
-	if !sameRetentionPath(nextWriter.Path(), expectedPath) {
+	if !matchesLogPath(l.layout, l.command, now, nextWriter.Path()) {
 		return false, errors.Join(
 			fmt.Errorf("validate rotated runtime log path: %w", ErrInvalidArgument),
 			closeWriterIfPresent(nextWriter),
