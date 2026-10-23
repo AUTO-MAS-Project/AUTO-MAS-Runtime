@@ -180,6 +180,21 @@ func TestDependencies_RelayStartFailureFallsBackToMirrors(t *testing.T) {
 
 // TestDependencies_RelayFailuresMapToMirrorExhausted 锁定中继报告了文件失败时 uv 失败映射为 MIRROR_EXHAUSTED，
 // details 带 relay 摘要；没有文件失败的 uv 失败仍按既有依赖同步失败映射。
+func TestDependencies_IndexDiagnosticsPreserveErrorCode(t *testing.T) {
+	session := &fakeRelaySession{baseURL: "http://127.0.0.1:39170", summary: relay.Summary{Failures: []relay.FileFailure{{Item: "six", DiagnosticOnly: true, Attempts: []relay.AttemptOutcome{{Source: "aliyun", Outcome: relay.OutcomeHTTPStatus, FailureKind: "http_status", HTTPStatus: 503}}}}}}
+	fixture := newRelayFixture(t, &fakeRelayFactory{session: session})
+	fixture.runner.responses = []fakeRunnerResponse{{}, {result: UVResult{ExitCode: 2}, err: errors.New("build failed")}}
+	_, err := fixture.service.Sync(t.Context(), fixture.request(t, mirror.PolicySpec{}))
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Code() != protocol.CodeDependencySyncFailed {
+		t.Fatalf("error=%v, want unchanged DEPENDENCY_SYNC_FAILED", err)
+	}
+	if _, ok := failure.Details()["relay"]; !ok {
+		t.Fatalf("details=%#v, want index diagnostics", failure.Details())
+	}
+	fixture.assertNoStagingLeftovers(t)
+}
+
 func TestDependencies_RelayFailuresMapToMirrorExhausted(t *testing.T) {
 	session := &fakeRelaySession{
 		baseURL: "http://127.0.0.1:39170",

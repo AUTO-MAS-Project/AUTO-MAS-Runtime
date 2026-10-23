@@ -94,7 +94,7 @@ func (s *PythonService) installWithRelay(
 	if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 		return result, summary, true, runErr
 	}
-	if len(summary.Failures) > 0 {
+	if hasRelayTransferFailure(summary) {
 		return result, summary, true, newError(
 			protocol.CodeMirrorExhausted,
 			protocol.StagePythonInstall,
@@ -108,13 +108,13 @@ func (s *PythonService) installWithRelay(
 			nonNilRunError(runErr),
 		)
 	}
-	return result, summary, true, pythonError(
+	return result, summary, true, withRelayDiagnostics(pythonError(
 		protocol.CodePythonInstallFailed,
 		protocol.StagePythonInstall,
 		"Python 安装失败",
 		map[string]any{"pythonVersion": spec.Version.String(), "exitCode": result.ExitCode},
 		nonNilRunError(runErr),
-	)
+	), summary)
 }
 
 func (s *PythonService) probeResults(kind mirror.Kind) []mirror.ProbeResult {

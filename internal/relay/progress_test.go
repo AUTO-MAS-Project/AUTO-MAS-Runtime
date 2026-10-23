@@ -163,7 +163,7 @@ func TestSummary_ListsFailuresCapped(t *testing.T) {
 		if failure.Item != fmt.Sprintf("missing-%d.whl", i) {
 			t.Errorf("failure %d item = %q, want the first %d in order", i, failure.Item, maxFailures)
 		}
-		if len(failure.Attempts) != 1 || failure.Attempts[0] != (AttemptOutcome{Source: "a", Outcome: OutcomeHTTPStatus}) {
+		if len(failure.Attempts) != 1 || failure.Attempts[0].Source != "a" || failure.Attempts[0].Outcome != OutcomeHTTPStatus {
 			t.Errorf("failure %d attempts = %v, want [a http_status]", i, failure.Attempts)
 		}
 	}

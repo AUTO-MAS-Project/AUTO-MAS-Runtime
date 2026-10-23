@@ -151,7 +151,7 @@ func (s *DependenciesService) syncWithRelay(
 	if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 		return DependenciesResult{}, true, runErr
 	}
-	if len(summary.Failures) > 0 {
+	if hasRelayTransferFailure(summary) {
 		return DependenciesResult{}, true, newError(
 			protocol.CodeMirrorExhausted,
 			protocol.StageDependenciesSync,
@@ -165,7 +165,30 @@ func (s *DependenciesService) syncWithRelay(
 			nonNilRunError(runErr),
 		)
 	}
-	return DependenciesResult{}, true, dependencySyncError(uvResult, runErr)
+	return DependenciesResult{}, true, withRelayDiagnostics(dependencySyncError(uvResult, runErr), summary)
+}
+
+func hasRelayTransferFailure(summary relay.Summary) bool {
+	for _, failure := range summary.Failures {
+		if !failure.DiagnosticOnly {
+			return true
+		}
+	}
+	return false
+}
+
+func withRelayDiagnostics(err error, summary relay.Summary) error {
+	if len(summary.Failures) == 0 {
+		return err
+	}
+	var failure *Error
+	if !errors.As(err, &failure) {
+		return err
+	}
+	copyOf := *failure
+	copyOf.details = cloneDetails(failure.details)
+	copyOf.details["relay"] = RelaySummaryDetails(summary)
+	return &copyOf
 }
 
 // relayLogf 在有诊断出口时写一条中继诊断；nil 出口静默。
@@ -250,7 +273,23 @@ func RelaySummaryDetails(summary relay.Summary) map[string]any {
 	for _, failure := range summary.Failures {
 		attempts := make([]map[string]any, 0, len(failure.Attempts))
 		for _, attempt := range failure.Attempts {
-			attempts = append(attempts, map[string]any{"source": attempt.Source, "outcome": attempt.Outcome.String()})
+			details := map[string]any{"outcome": attempt.Outcome.String(), "durationMs": max(int64(0), attempt.Duration.Milliseconds())}
+			if attempt.Source != "" {
+				details["source"] = attempt.Source
+			}
+			if attempt.FailureKind != "" {
+				details["failureKind"] = attempt.FailureKind
+			}
+			if attempt.HTTPStatus >= 100 && attempt.HTTPStatus <= 599 {
+				details["httpStatus"] = attempt.HTTPStatus
+			}
+			if attempt.Operation != "" {
+				details["operation"] = attempt.Operation
+			}
+			if attempt.WindowsError != 0 {
+				details["windowsError"] = attempt.WindowsError
+			}
+			attempts = append(attempts, details)
 		}
 		failures = append(failures, map[string]any{"item": filepath.Base(failure.Item), "attempts": attempts})
 	}
