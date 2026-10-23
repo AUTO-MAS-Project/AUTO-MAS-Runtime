@@ -50,8 +50,10 @@ const (
 )
 
 var (
-	ErrInvalidFetcher           = errors.New("git fetcher is invalid")
-	errDirectoryIdentityMissing = errors.New("verified repository directory identity is unavailable")
+	ErrInvalidFetcher             = errors.New("git fetcher is invalid")
+	errDirectoryIdentityMissing   = errors.New("verified repository directory identity is unavailable")
+	errGitReferenceBudgetExceeded = errors.New("git reference transport budget exceeded")
+	errGitCloneBudgetExceeded     = errors.New("git clone transport budget exceeded")
 )
 
 // FetchRequest 固定一次 Git 获取操作的目标、镜像计划和目录所有者。
@@ -281,18 +283,39 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 	}
 
 	var directoryIdentity *filesystem.DirectoryIdentity
+	var diagnostics []map[string]any
 	rotationResult, err := f.rotator.Run(
 		ctx,
 		request.Plan,
 		mirrorTarget,
 		func(attemptCtx context.Context, attempt mirror.Attempt) mirror.AttemptOutcome {
-			return f.fetchAttempt(attemptCtx, request, repositoryPath, attempt, func(identity *filesystem.DirectoryIdentity) {
+			outcome := f.fetchAttempt(attemptCtx, request, repositoryPath, attempt, func(identity *filesystem.DirectoryIdentity) {
 				directoryIdentity = identity
 			})
+			var details map[string]any
+			var failure *Error
+			if errors.As(outcome.Err, &failure) {
+				details = failure.Details()
+			}
+			diagnostics = append(diagnostics, details)
+			return outcome
 		},
 	)
 	if err != nil {
-		return FetchResult{}, mapFetchFailure(ctx, err, rotationResult.Reports)
+		failure := mapFetchFailure(ctx, err, rotationResult.Reports)
+		attempts := failure.details["attempts"].([]map[string]any)
+		for i, details := range diagnostics {
+			if i >= len(attempts) {
+				break
+			}
+			// 仅复制本次最终错误的白名单事实，清理或输出失败覆盖后不再附带网络状态。
+			for _, key := range []string{"operation", "httpStatus"} {
+				if value, present := details[key]; present {
+					attempts[i][key] = value
+				}
+			}
+		}
+		return FetchResult{}, failure
 	}
 	revision, err := newRevision(
 		request.Target,
@@ -352,7 +375,7 @@ func (f *Fetcher) fetchAttempt(
 		append([]byte(nil), f.caBundle...),
 	)
 	if errors.Is(listCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-		err = errors.New("git reference transport budget exceeded")
+		err = errGitReferenceBudgetExceeded
 	}
 	cancelList()
 	if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, err) {
@@ -367,17 +390,18 @@ func (f *Fetcher) fetchAttempt(
 		)
 	}
 	if err != nil {
+		kind, details := fetchNetworkDiagnostics(err, "reference_discovery", failureResolve)
 		return f.finishFailedAttempt(
 			ctx,
 			request,
 			repositoryPath,
 			mirror.OutcomeRetrySameSource,
-			failureResolve,
+			kind,
 			newError(
 				protocol.CodeGitRemoteResolveFailed,
 				protocol.StageWorkspaceClone,
 				messageForCode(protocol.CodeGitRemoteResolveFailed),
-				map[string]any{},
+				details,
 				err,
 			),
 			false,
@@ -455,7 +479,7 @@ func (f *Fetcher) fetchAttempt(
 		CABundle:          append([]byte(nil), f.caBundle...),
 	})
 	if errors.Is(cloneCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-		cloneErr = errors.New("git clone transport budget exceeded")
+		cloneErr = errGitCloneBudgetExceeded
 	}
 	// 先停心跳并等待 goroutine 退出，再判定结果与发终态：保证终态之后不会再有迟到的 running。
 	heartbeat.stop()
@@ -502,17 +526,18 @@ func (f *Fetcher) fetchAttempt(
 		)
 	}
 	if cloneErr != nil {
+		kind, details := fetchNetworkDiagnostics(cloneErr, "clone", failureClone)
 		return f.finishFailedAttempt(
 			ctx,
 			request,
 			repositoryPath,
 			mirror.OutcomeRetrySameSource,
-			failureClone,
+			kind,
 			newError(
 				protocol.CodeGitCloneFailed,
 				protocol.StageWorkspaceClone,
 				messageForCode(protocol.CodeGitCloneFailed),
-				map[string]any{},
+				details,
 				cloneErr,
 			),
 			true,
