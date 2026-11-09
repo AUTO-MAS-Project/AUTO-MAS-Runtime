@@ -1,2 +1,2 @@
-// Package lock 使用 Windows 命名 Mutex 协调同一物理 app root 的 Runtime 操作。
+// Package lock 按物理 app root 协调 Runtime 操作。Windows 使用命名 Mutex，macOS 使用持久 flock 文件。
 package lock
