@@ -46,26 +46,31 @@ func ReadManagedFile(ctx context.Context, layout *config.Layout, path string, li
 		return nil, err
 	}
 	handle := chain.objects[len(chain.objects)-1].handle
+	data, readErr := readManagedSourceHandle(ctx, handle, limit, api)
+	if err := errors.Join(readErr, chain.close()); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func readManagedSourceHandle(ctx context.Context, handle windows.Handle, limit int64, api pathAPI) ([]byte, error) {
 	data := make([]byte, 0, min(limit, 64*1024))
 	buffer := make([]byte, min(limit, 64*1024))
 	for int64(len(data)) < limit {
 		if err := ctx.Err(); err != nil {
-			return nil, errors.Join(err, chain.close())
+			return nil, err
 		}
 		chunk := buffer[:min(int64(len(buffer)), limit-int64(len(data)))]
 		n, readErr := api.readFile(handle, chunk)
 		if readErr != nil {
-			return nil, errors.Join(readErr, chain.close())
+			return nil, readErr
 		}
 		data = append(data, chunk[:n]...)
 		if n == 0 {
 			break
 		}
 	}
-	if err := errors.Join(ctx.Err(), chain.close()); err != nil {
-		return nil, err
-	}
-	return data, nil
+	return data, ctx.Err()
 }
 
 // ReplaceManagedFile 固定父目录并拒绝 Reparse，用同目录临时文件原子替换普通源码文件。
