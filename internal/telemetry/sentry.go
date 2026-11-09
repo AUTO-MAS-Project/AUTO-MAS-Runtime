@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	defaultSentryRelease = "auto-mas-runtime"
-	sentryServerName     = "auto-mas-runtime"
-	maxSentryStackFrames = 64
+	defaultSentryRelease    = "auto-mas-runtime"
+	sentryApplicationModule = "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime"
+	sentryServerName        = "auto-mas-runtime"
+	maxSentryStackFrames    = 64
 
 	sentryObservationTag      = "_auto_mas_observation"
 	sentryObservationInternal = "internal_error"
@@ -270,6 +271,15 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		}},
 	}
 	if kind == sentryObservationFailure {
+		// 仅从净化后的稳定分类派生，不能复制可能携带自由文本的输入 fingerprint。
+		sanitized.Fingerprint = []string{defaultSentryRelease, sentryObservationFailure}
+		for _, key := range []string{"command", "stage", "code"} {
+			value := sanitized.Tags[key]
+			if value == "" {
+				value = "unknown"
+			}
+			sanitized.Fingerprint = append(sanitized.Fingerprint, value)
+		}
 		if diagnostics := sanitizeSentryDiagnostics(event.Contexts); diagnostics != nil {
 			sanitized.Contexts = map[string]sentry.Context{"diagnostics": diagnostics}
 		}
@@ -365,7 +375,8 @@ func sanitizeSentryStacktrace(stacktrace *sentry.Stacktrace) *sentry.Stacktrace 
 		if function == "" && module == "" && line == 0 {
 			continue
 		}
-		frames = append(frames, sentry.Frame{Function: function, Module: module, Lineno: line})
+		inApp := module == "main" || module == sentryApplicationModule || strings.HasPrefix(module, sentryApplicationModule+"/")
+		frames = append(frames, sentry.Frame{Function: function, Module: module, Lineno: line, InApp: inApp})
 	}
 	if len(frames) == 0 {
 		return nil

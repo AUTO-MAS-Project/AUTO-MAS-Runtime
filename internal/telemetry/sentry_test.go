@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -324,6 +325,56 @@ func TestSentry_CapturesUnexpectedPanicWithoutPanicValue(t *testing.T) {
 	}
 	if event.Exception[0].Mechanism.Handled == nil || *event.Exception[0].Mechanism.Handled {
 		t.Fatalf("panic handled flag = %v, want false", event.Exception[0].Mechanism.Handled)
+	}
+}
+
+func TestSentry_GroupsFailuresByValidatedClassification(t *testing.T) {
+	_, transport := newSentryTestProvider(t)
+	options, _, _, _ := transport.snapshot()
+	cases := []struct {
+		name, kind, code, command, stage, version string
+		want                                      []string
+	}{
+		{name: "timeout", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "backend supervise", stage: "backend.health", version: "v0.1.28", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.health", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "another runtime release", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "backend supervise", stage: "backend.health", version: "v0.1.17", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.health", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "another code", kind: sentryObservationFailure, code: "BACKEND_EXITED_BEFORE_READY", command: "backend supervise", stage: "backend.health", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.health", "BACKEND_EXITED_BEFORE_READY"}},
+		{name: "another stage", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "backend supervise", stage: "backend.restart", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.restart", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "invalid dimensions", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "private-command", stage: "private-stage", want: []string{"auto-mas-runtime", "failure", "unknown", "unknown", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "internal keeps stack grouping", kind: sentryObservationInternal, code: "INTERNAL_ERROR"},
+		{name: "panic keeps stack grouping", kind: sentryObservationPanic, code: "INTERNAL_ERROR"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			event := sentry.NewEvent()
+			event.Tags = map[string]string{sentryObservationTag: test.kind, "code": test.code, "command": test.command, "stage": test.stage, "runtime_version": test.version}
+			event.Fingerprint = []string{"secret fingerprint"}
+			clean := options.BeforeSend(event, nil)
+			if clean == nil {
+				t.Fatal("BeforeSend() = nil, want reportable event")
+			}
+			if !slices.Equal(clean.Fingerprint, test.want) {
+				t.Fatalf("fingerprint = %v, want %v", clean.Fingerprint, test.want)
+			}
+		})
+	}
+}
+
+func TestSentry_ClassifiesApplicationFrames(t *testing.T) {
+	for _, test := range []struct {
+		module string
+		want   bool
+	}{
+		{module: "main", want: true},
+		{module: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend", want: true},
+		{module: "github.com/spf13/cobra", want: false},
+		{module: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime-other/internal/backend", want: false},
+	} {
+		t.Run(test.module, func(t *testing.T) {
+			stack := sanitizeSentryStacktrace(&sentry.Stacktrace{Frames: []sentry.Frame{{Module: test.module, Function: "run", Lineno: 1, InApp: !test.want}}})
+			if stack == nil || len(stack.Frames) != 1 || stack.Frames[0].InApp != test.want {
+				t.Fatalf("sanitized stack = %#v, want in_app=%t", stack, test.want)
+			}
+		})
 	}
 }
 
