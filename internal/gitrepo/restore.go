@@ -27,7 +27,7 @@ type sourceRestore struct {
 }
 
 // Restore 以 Commit tree 为准恢复跟踪文件，所有目标 Blob 验证通过后才允许修改。
-func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error) {
+func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (restored int, returnErr error) {
 	if ctx == nil || layout == nil || !validCommit(commit) || beforeWrite == nil {
 		return 0, errInvalidRepositoryRead
 	}
@@ -56,6 +56,11 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 	if err != nil {
 		return 0, err
 	}
+	reader, err := filesystem.NewManagedSourceReader(ctx, layout)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { returnErr = errors.Join(returnErr, reader.Close()) }()
 	pending := make([]sourceRestore, 0)
 	err = tree.Files().ForEach(func(file *object.File) error {
 		if err := ctx.Err(); err != nil {
@@ -72,7 +77,7 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		if err != nil {
 			return err
 		}
-		actual, err := filesystem.ReadManagedFile(ctx, layout, path, file.Size+1)
+		actual, err := reader.Read(ctx, path, file.Size+1)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -93,6 +98,8 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		pending = append(pending, sourceRestore{path: path, payload: payload})
 		return nil
 	})
+	// 修复可能创建缺失目录或替换文件，不能保留扫描中的目录句柄。
+	err = errors.Join(err, reader.Close())
 	if err != nil {
 		return 0, fmt.Errorf("inspect tracked source: %w", err)
 	}

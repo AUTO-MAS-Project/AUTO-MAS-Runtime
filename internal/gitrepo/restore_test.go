@@ -111,6 +111,47 @@ func TestRestoreTrackedFiles_LocalCommit(t *testing.T) {
 	}
 }
 
+func TestRestoreTrackedFiles_ReleasesScanDirectoryBeforeRepair(t *testing.T) {
+	layout, _ := sourceRestoreFixture(t)
+	directory := filepath.Join(layout.RepoDir(), "zzz")
+	path := filepath.Join(directory, "last.py")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := git.PlainOpen(layout.RepoDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repository.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktree.Add("zzz/last.py"); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := worktree.Commit("last directory fixture", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Unix(2, 0)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	count, err := (goGitRepositoryReader{}).Restore(t.Context(), layout, commit.String(), func() error {
+		// 扫描结束的目录必须已释放，恢复时可以重新固定/创建该父目录。
+		return os.Rename(directory, directory+"-retired")
+	})
+	if err != nil || count != 1 {
+		t.Fatalf("repair = %d, %v", count, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("repaired source = %q, %v", data, err)
+	}
+}
+
 func TestRestoreTrackedFiles_BeforeWriteFailure(t *testing.T) {
 	layout, commit := sourceRestoreFixture(t)
 	if err := os.WriteFile(layout.UVLockFile(), []byte("broken"), 0o600); err != nil {
