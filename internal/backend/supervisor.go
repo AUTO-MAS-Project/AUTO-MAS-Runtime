@@ -173,6 +173,10 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if mode != ModeManaged && mode != ModeDevelopment {
 		return newError(protocol.CodeUnsupportedMode, protocol.StageBackendSpawn, "后端运行模式不受支持", map[string]any{"mode": string(mode)}, errors.New("backend mode is unsupported"))
 	}
+	var revision state.Revision
+	defer func() {
+		returnErr = withSupervisionDiagnostics(returnErr, mode, revision)
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -255,7 +259,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if err := validateEnvironmentReady(environment); err != nil {
 		return preferCancellation(ctx, err)
 	}
-	revision, err := s.checkRepository(ctx, environment)
+	revision, err = s.checkRepository(ctx, environment)
 	if err != nil {
 		return preferCancellation(ctx, err)
 	}
@@ -923,6 +927,7 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 			resultErr = errors.Join(resultErr, mapLoggerCleanupError(err))
 		}
 	}
+	outcome.details["terminationRequested"] = outcome.rootForced
 	outcome.err = withFailureDetailsExtra(resultErr, logger, proc, outcome.details)
 	return outcome
 }

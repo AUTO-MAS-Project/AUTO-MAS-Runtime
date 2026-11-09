@@ -616,6 +616,43 @@ func TestBackendManaged_CleanupFailureOverridesHealthFailure(t *testing.T) {
 		backendErr.Details()["exitCode"] != 0 {
 		t.Fatalf("cleanup details = %#v, want operation/logPath/pid/exitCode", backendErr)
 	}
+	if backendErr.Details()["terminationRequested"] != true {
+		t.Fatalf("terminationRequested = %v, want true", backendErr.Details()["terminationRequested"])
+	}
+}
+
+func TestBackendManaged_ReportsFailureIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		controlled, preflight bool
+	}{
+		{name: "health without control"},
+		{name: "health with control", controlled: true},
+		{name: "uv preflight with control", controlled: true, preflight: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newBackendFixture(t)
+			request := f.request()
+			if test.controlled {
+				mailbox := NewControlMailbox(8)
+				defer mailbox.Close()
+				request.Control = mailbox
+			}
+			f.health.err = newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendHealth, "后端健康检查超时", nil, nil)
+			if test.preflight {
+				f.uv.checkErr = errors.New("uv check failed")
+			}
+			err := f.supervisor().Supervise(t.Context(), request)
+			var diagnostic interface{ DiagnosticDetails() map[string]any }
+			if !errors.As(err, &diagnostic) {
+				t.Fatalf("Supervise() error = %v, want structured identity", err)
+			}
+			details := diagnostic.DiagnosticDetails()
+			if details["mode"] != "managed" || details["version"] != f.repository.Version || details["commit"] != f.repository.Commit {
+				t.Fatalf("identity = %#v, want checked managed revision", details)
+			}
+		})
+	}
 }
 
 func TestBackendManaged_ExitedTreeIsTerminatedBeforeWaitingStreams(t *testing.T) {
@@ -627,6 +664,9 @@ func TestBackendManaged_ExitedTreeIsTerminatedBeforeWaitingStreams(t *testing.T)
 	outcome := f.supervisor().cleanupProcess(context.Background(), f.proc, nil, nil)
 	if outcome.err != nil {
 		t.Fatalf("cleanupProcess() error = %v, want nil", outcome.err)
+	}
+	if outcome.details["terminationRequested"] != false {
+		t.Fatalf("terminationRequested = %v, want false for an already exited root", outcome.details["terminationRequested"])
 	}
 	got := f.proc.orderSnapshot()
 	want := []string{"snapshot", "terminate", "wait_empty", "wait", "close"}

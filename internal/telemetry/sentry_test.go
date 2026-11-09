@@ -378,6 +378,33 @@ func TestSentry_ClassifiesApplicationFrames(t *testing.T) {
 	}
 }
 
+func TestSentry_BackendFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = "STATE_WRITE_FAILED"
+	observation.Stage = "backend.cleanup"
+	observation.DiagnosticDetails = map[string]any{
+		"terminationRequested": true,
+		"failures": []map[string]any{
+			{"phase": "primary", "code": "BACKEND_HEALTH_TIMEOUT", "stage": "backend.health"},
+			{"phase": "cleanup", "code": "STATE_WRITE_FAILED", "stage": "private-stage"},
+		},
+	}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	details := events[0].Contexts["diagnostics"]["details"].(map[string]any)
+	failures := details["failures"].([]any)
+	if details["terminationRequested"] != true || failures[0].(map[string]any)["stage"] != "backend.health" {
+		t.Fatalf("diagnostics = %#v, want termination request and primary stage", details)
+	}
+	if _, exists := failures[1].(map[string]any)["stage"]; exists {
+		t.Fatalf("diagnostics = %#v, want unknown stage removed", details)
+	}
+}
+
 func TestSentry_BeforeSendRemovesPIIAndRawText(t *testing.T) {
 	_, transport := newSentryTestProvider(t)
 	options, _, _, _ := transport.snapshot()

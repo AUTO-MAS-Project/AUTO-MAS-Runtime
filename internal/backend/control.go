@@ -615,6 +615,10 @@ func backendErrorHasCode(err error, want protocol.Code) bool {
 
 // superviseControlled 是 T6.4 的长驻控制路径；旧的无 Control 请求继续走 T6.3 路径。
 func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Request) (returnErr error) {
+	var revision state.Revision
+	defer func() {
+		returnErr = withSupervisionDiagnostics(returnErr, modeForRequest(request), revision)
+	}()
 	forwarderCtx, cancelForwarder := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelForwarder()
 	results, readerDone := startControlForwarder(forwarderCtx, request.Control)
@@ -1075,7 +1079,7 @@ func (s *ManagedSupervisor) controlPreflight(ctx context.Context, request Reques
 		ProjectDir:    s.layout.RepoDir(),
 		ProjectEnvDir: s.layout.VenvDir(),
 	}); err != nil {
-		return state.EnvironmentState{}, state.Revision{}, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeEnvironmentBroken, "受管 uv 校验失败", err)
+		return environment, revision, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeEnvironmentBroken, "受管 uv 校验失败", err)
 	}
 	return environment, revision, nil
 }

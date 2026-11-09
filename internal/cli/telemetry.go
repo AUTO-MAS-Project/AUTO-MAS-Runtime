@@ -91,6 +91,9 @@ func recordSessionTelemetry(
 		stage = classifiedStage
 		reason = telemetryReason(details)
 		if telemetry.IsReportableFailure(code) && code != protocol.CodeInternalError {
+			if command == "backend supervise" {
+				details = backendTelemetryDetails(operationErr, details)
+			}
 			diagnosticDetails = telemetry.SanitizeDiagnostics(details)
 		}
 	}
@@ -113,6 +116,51 @@ func recordSessionTelemetry(
 		})
 	}
 	safeTelemetryClose(recorder)
+}
+
+// backendTelemetryDetails 保留身份与被清理错误遮盖的分类，不改变 result 的错误优先级。
+func backendTelemetryDetails(err error, selected map[string]any) map[string]any {
+	details := make(map[string]any, len(selected)+4)
+	for key, value := range selected {
+		details[key] = value
+	}
+	var diagnostic interface{ DiagnosticDetails() map[string]any }
+	if errors.As(err, &diagnostic) {
+		for key, value := range diagnostic.DiagnosticDetails() {
+			details[key] = value
+		}
+	}
+	var primary, cleanup operationError
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		if failure, ok := current.(operationError); ok && telemetry.IsReportableFailure(failure.Code()) {
+			if failure.Stage() == protocol.StageBackendCleanup {
+				if cleanup == nil {
+					cleanup = failure
+				}
+			} else if strings.HasPrefix(string(failure.Stage()), "backend.") {
+				primary = failure
+			}
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+		} else if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			visit(wrapped.Unwrap())
+		}
+	}
+	visit(err)
+	if primary != nil && cleanup != nil {
+		details["failures"] = []map[string]any{
+			{"phase": "primary", "code": string(primary.Code()), "stage": string(primary.Stage())},
+			{"phase": "cleanup", "code": string(cleanup.Code()), "stage": string(cleanup.Stage())},
+		}
+	}
+	return details
 }
 
 func telemetryReason(details map[string]any) string {

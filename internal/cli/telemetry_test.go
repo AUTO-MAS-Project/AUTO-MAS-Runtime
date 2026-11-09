@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -255,6 +256,53 @@ func TestRunOperation_ExpectedFailureReportsSanitizedDiagnostics(t *testing.T) {
 	}
 	if !bytes.Contains(encoded, []byte("repository_invalid")) {
 		t.Fatalf("sanitized observation = %s, want stable failureKind", encoded)
+	}
+}
+
+type telemetryDiagnosticError struct {
+	error
+	details map[string]any
+}
+
+func (e telemetryDiagnosticError) Unwrap() error                     { return e.error }
+func (e telemetryDiagnosticError) DiagnosticDetails() map[string]any { return e.details }
+
+func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
+	primary := &commandError{code: protocol.CodeBackendHealthTimeout, stage: protocol.StageBackendHealth, message: "timeout", committed: true}
+	cleanup := &commandError{code: protocol.CodeStateWriteFailed, stage: protocol.StageBackendCleanup, message: "cleanup", committed: true, details: map[string]any{"exitCode": 1, "terminationRequested": true}}
+	err := telemetryDiagnosticError{error: errors.Join(cleanup, primary), details: map[string]any{"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40), "password": "secret"}}
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	exitCode := executeWithTelemetry(t, []string{"--output", "ndjson", "backend", "supervise", "--mode", "managed"}, recorder, &stdout,
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+			return backendServiceFunc(func(context.Context, backend.Request) error { return err }), nil
+		}),
+	)
+	if exitCode != protocol.ExitCodeOperationConflict {
+		t.Fatalf("exit code = %d, want %d", exitCode, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 || observations[0].Code != string(protocol.CodeStateWriteFailed) {
+		t.Fatalf("observations = %#v, want existing cleanup priority", observations)
+	}
+	want := map[string]any{
+		"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40),
+		"exitCode": 1, "terminationRequested": true,
+		"failures": []any{
+			map[string]any{"phase": "primary", "code": "BACKEND_HEALTH_TIMEOUT", "stage": "backend.health"},
+			map[string]any{"phase": "cleanup", "code": "STATE_WRITE_FAILED", "stage": "backend.cleanup"},
+		},
+	}
+	if !reflect.DeepEqual(observations[0].DiagnosticDetails, want) {
+		t.Fatalf("diagnostics = %#v, want %#v", observations[0].DiagnosticDetails, want)
+	}
+	if !reflect.DeepEqual(cleanup.details, map[string]any{"exitCode": 1, "terminationRequested": true}) {
+		t.Fatalf("original details mutated: %#v", cleanup.details)
+	}
+	events := parseNDJSON(t, stdout.String())
+	result := events[len(events)-1]
+	if details, ok := result.object["details"].(map[string]any); !ok || details["version"] != nil || details["failures"] != nil {
+		t.Fatalf("protocol result gained telemetry-only fields: %#v", result.object["details"])
 	}
 }
 
