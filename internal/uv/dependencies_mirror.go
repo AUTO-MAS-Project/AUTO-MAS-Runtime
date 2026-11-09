@@ -327,7 +327,7 @@ func (s *DependenciesService) runStagedSyncWithEnvironment(
 	}
 	return s.runner.Run(
 		ctx,
-		mirrorSyncArguments(stagingDir, request.PythonVersion),
+		mirrorSyncArguments(stagingDir, request.PythonVersion, rewrite.SimpleBase()),
 		options,
 	)
 }
@@ -418,7 +418,7 @@ func notifyMirrorAttempt(
 	return notify(ctx, attempt)
 }
 
-func mirrorSyncArguments(projectDir, pythonVersion string) []string {
+func mirrorSyncArguments(projectDir, pythonVersion, defaultIndex string) []string {
 	return []string{
 		"sync",
 		"--project",
@@ -428,6 +428,8 @@ func mirrorSyncArguments(projectDir, pythonVersion string) []string {
 		"--frozen",
 		"--no-default-groups",
 		"--no-install-workspace",
+		"--default-index",
+		defaultIndex,
 	}
 }
 

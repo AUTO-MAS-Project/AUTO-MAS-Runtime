@@ -1,6 +1,24 @@
 package config
 
-import "path/filepath"
+import (
+	"errors"
+	"path/filepath"
+	"strings"
+)
+
+// RepositoryFile 返回 Git tree 中普通跟踪文件的受管路径，禁止访问 Git 元数据和根外路径。
+func (l *Layout) RepositoryFile(name string) (string, error) {
+	path := filepath.FromSlash(name)
+	if l == nil || name == "" || !filepath.IsLocal(path) || strings.Contains(name, `\`) {
+		return "", errors.New("repository file path is invalid")
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == "." || part == ".." || strings.EqualFold(part, ".git") {
+			return "", errors.New("repository file component is invalid")
+		}
+	}
+	return filepath.Join(l.RepoDir(), path), nil
+}
 
 type layoutPaths struct {
 	repoDir              string

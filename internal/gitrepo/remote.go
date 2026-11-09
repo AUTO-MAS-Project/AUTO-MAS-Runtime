@@ -40,10 +40,10 @@ func resolveRemoteCommit(ctx context.Context, plan mirror.Plan, target Target) (
 	return resolveRemoteWithClient(ctx, plan, target, goGitClient{})
 }
 
-func resolveRemoteWithClient(ctx context.Context, plan mirror.Plan, target Target, client gitClient) (string, error) {
+func resolveRemoteWithClient(ctx context.Context, plan mirror.Plan, target Target, client gitClient, options ...mirror.RotationOption) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	rotator, err := mirror.NewRotator()
+	rotator, err := mirror.NewRotator(options...)
 	if err != nil {
 		return "", serviceInternalError(protocol.StageWorkspaceCheck, err)
 	}
@@ -51,10 +51,14 @@ func resolveRemoteWithClient(ctx context.Context, plan mirror.Plan, target Targe
 	if err != nil {
 		return "", serviceInternalError(protocol.StageWorkspaceCheck, err)
 	}
+	var httpStatuses []int
 	result, err := rotator.Run(ctx, plan, mt, func(attemptCtx context.Context, attempt mirror.Attempt) mirror.AttemptOutcome {
+		httpStatuses = append(httpStatuses, 0)
 		refs, err := client.ListReferences(attemptCtx, attempt.Source.BaseURL(), nil)
 		if err != nil {
-			return failedOutcome(mirror.OutcomeSwitchSource, failureResolve, newError(protocol.CodeGitRemoteResolveFailed, protocol.StageWorkspaceCheck, messageForCode(protocol.CodeGitRemoteResolveFailed), nil, err))
+			kind, status := classifyRemoteFailure(err)
+			httpStatuses[len(httpStatuses)-1] = status
+			return failedOutcome(mirror.OutcomeSwitchSource, kind, newError(protocol.CodeGitRemoteResolveFailed, protocol.StageWorkspaceCheck, messageForCode(protocol.CodeGitRemoteResolveFailed), nil, err))
 		}
 		for _, ref := range refs {
 			if ref != nil && ref.Name() == plumbing.NewBranchReferenceName(target.Branch()) && validCommit(ref.Hash().String()) {
@@ -64,7 +68,16 @@ func resolveRemoteWithClient(ctx context.Context, plan mirror.Plan, target Targe
 		return failedOutcome(mirror.OutcomeSwitchSource, failureBranchMissing, newError(protocol.CodeGitBranchNotFound, protocol.StageWorkspaceCheck, messageForCode(protocol.CodeGitBranchNotFound), nil, errors.New("release branch is absent")))
 	})
 	if err != nil {
-		return "", mapFetchFailure(ctx, err, result.Reports)
+		failure := mapFetchFailure(ctx, err, result.Reports)
+		// 复用汇总优先级，但只读引用查询没有进入克隆阶段。
+		failure.stage = protocol.StageWorkspaceCheck
+		attempts := failure.details["attempts"].([]map[string]any)
+		for i, status := range httpStatuses {
+			if i < len(attempts) && status != 0 {
+				attempts[i]["httpStatus"] = status
+			}
+		}
+		return "", failure
 	}
 	return result.ActualCommit, nil
 }

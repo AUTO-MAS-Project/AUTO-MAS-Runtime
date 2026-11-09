@@ -151,3 +151,12 @@ func (l *Layout) RuntimeLogFile(command string, localDate time.Time) (string, er
 	name := command + "-" + localDate.Format("20060102") + ".log"
 	return filepath.Join(l.paths.runtimeLogDir, name), nil
 }
+
+// RuntimeLogSegmentFile 返回日志分卷路径；零序号兼容既有首卷文件名。
+func (l *Layout) RuntimeLogSegmentFile(command string, localDate time.Time, sequence uint64) (string, error) {
+	path, err := l.RuntimeLogFile(command, localDate)
+	if err != nil || sequence == 0 {
+		return path, err
+	}
+	return strings.TrimSuffix(path, ".log") + fmt.Sprintf(".%03d.log", sequence), nil
+}

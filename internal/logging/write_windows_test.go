@@ -25,7 +25,7 @@ func TestLoggerWindows_RotatesAndRetainsThroughRuntimeLogFiles(t *testing.T) {
 	location := time.FixedZone("CST", 8*60*60)
 	dayOne := time.Date(2026, 7, 29, 23, 59, 59, 0, location)
 	dayTwo := time.Date(2026, 7, 30, 0, 0, 1, 0, location)
-	clock := &sequenceClock{values: []time.Time{dayOne, dayTwo}}
+	clock := &sequenceClock{values: []time.Time{dayOne, dayOne, dayTwo}}
 	var stderr bytes.Buffer
 	logger, err := New(
 		t.Context(),

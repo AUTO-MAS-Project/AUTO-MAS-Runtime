@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 )
 
 var errAllSourcesFailed = errors.New("relay: all sources failed")
@@ -320,9 +322,11 @@ func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 	defer func() { _ = e.staging.remove(part) }() // part 只属于本次取回，失败也不留存。
 	plan := newChunkPlan(e.clock)
 	if e.tryChunked(ctx, spec, part, plan) {
-		if path, ok := e.publish(spec, part, target, plan.contributions); ok {
+		attempt := AttemptOutcome{}
+		if path, ok := e.publish(spec, part, target, plan.contributions, &attempt); ok {
 			return path, nil
 		}
+		plan.attempts = append(plan.attempts, attempt)
 	}
 	for ctx.Err() == nil {
 		upstream, ok := e.nextUpstream(spec.key.route, plan.failed)
@@ -330,22 +334,22 @@ func (e *engine) download(ctx context.Context, spec fileSpec) (string, error) {
 			break
 		}
 		contributions := map[string]int64{}
-		received, outcome := e.singleStream(ctx, spec, upstream, part, contributions)
+		attempt := AttemptOutcome{Source: upstream.Key}
+		startedAt := e.now()
+		received, outcome := e.singleStream(ctx, spec, upstream, part, contributions, &attempt)
 		if outcome == "" {
 			if spec.size == 0 {
 				spec.size = received
 			}
-			if path, ok := e.publish(spec, part, target, contributions); ok {
+			if path, ok := e.publish(spec, part, target, contributions, &attempt); ok {
 				return path, nil
 			}
 			outcome = OutcomeNetwork
 		}
-		plan.markFailed(upstream.Key, outcome)
+		e.finishAttempt(&attempt, outcome, startedAt)
+		plan.markFailed(upstream.Key, outcome, &attempt)
 		e.tracker.reset(spec.key)
-		e.log("warning", "relay attempt failed", map[string]any{
-			"route": spec.key.route.String(), "item": spec.name,
-			"source": upstream.Key, "outcome": outcome,
-		})
+		e.log("warning", "relay attempt failed", attemptLogFields(attempt, spec.key.route, spec.name))
 		if outcome == OutcomeChecksumMismatch {
 			e.strike(spec.key.route, upstream.Key)
 		}
@@ -364,8 +368,13 @@ func (e *engine) publish(
 	part string,
 	target string,
 	contributions map[string]int64,
+	diagnostics ...*AttemptOutcome,
 ) (string, bool) {
 	if err := os.Rename(part, target); err != nil {
+		diagnoseAttempt(diagnostics, "filesystem_publish", "publish", 0, err)
+		if len(diagnostics) > 0 && diagnostics[0] != nil {
+			diagnostics[0].Outcome = OutcomeNetwork
+		}
 		e.log("warning", "relay staged file publish failed", map[string]any{
 			"item": spec.name, "error": err.Error(),
 		})
@@ -396,21 +405,25 @@ func (e *engine) singleStream(
 	upstream Upstream,
 	part string,
 	contributions map[string]int64,
+	diagnostics ...*AttemptOutcome,
 ) (int64, Outcome) {
-	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+spec.key.path, nil)
+	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+spec.key.path, nil, diagnostics...)
 	if outcome != "" {
 		return 0, outcome
 	}
 	defer handle.close()
 	response := handle.response
 	if response.StatusCode != http.StatusOK {
+		diagnoseAttempt(diagnostics, "http_status", "request", response.StatusCode, nil)
 		return 0, OutcomeHTTPStatus
 	}
 	if spec.size > 0 && response.ContentLength >= 0 && response.ContentLength != spec.size {
+		diagnoseAttempt(diagnostics, "size_mismatch", "response_size", 0, nil)
 		return 0, OutcomeNetwork
 	}
 	out, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
+		diagnoseAttempt(diagnostics, "filesystem_open", "open", 0, err)
 		e.log("warning", "relay staging open failed", map[string]any{"item": spec.name, "error": err.Error()})
 		return 0, OutcomeNetwork
 	}
@@ -421,17 +434,20 @@ func (e *engine) singleStream(
 	}
 	received, outcome := e.readBody(ctx, handle, io.MultiWriter(out, hasher), limit, func(count int64) {
 		e.tracker.add(spec.key, spec.name, upstream.Key, count)
-	})
+	}, diagnostics...)
 	if closeErr := out.Close(); closeErr != nil && outcome == "" {
+		diagnoseAttempt(diagnostics, "filesystem_close", "close", 0, closeErr)
 		outcome = OutcomeNetwork
 	}
 	if outcome != "" {
 		return received, outcome
 	}
 	if spec.size > 0 && received != spec.size {
+		diagnoseAttempt(diagnostics, "size_mismatch", "response_size", 0, nil)
 		return received, OutcomeNetwork
 	}
 	if spec.digest != nil && subtle.ConstantTimeCompare(hasher.Sum(nil), spec.digest) != 1 {
+		diagnoseAttempt(diagnostics, "checksum_mismatch", "verify", 0, nil)
 		return received, OutcomeChecksumMismatch
 	}
 	if spec.size == 0 {
@@ -467,14 +483,17 @@ func (e *engine) open(
 	method string,
 	target string,
 	headers map[string]string,
+	diagnostics ...*AttemptOutcome,
 ) (*upstreamHandle, Outcome) {
 	if _, err := validateHTTPSURL(target); err != nil {
+		diagnoseAttempt(diagnostics, "url_policy", "request", 0, nil)
 		return nil, OutcomeNetwork
 	}
 	requestCtx, cancel := context.WithCancel(ctx)
 	request, err := http.NewRequestWithContext(requestCtx, method, target, nil)
 	if err != nil {
 		cancel()
+		diagnoseAttempt(diagnostics, "request_invalid", "request", 0, nil)
 		return nil, OutcomeNetwork
 	}
 	request.Header.Set("Accept-Encoding", "identity")
@@ -498,8 +517,10 @@ func (e *engine) open(
 		case ctx.Err() != nil:
 			outcome = OutcomeCancelled
 		case result.err != nil:
+			diagnoseNetwork(diagnostics, result.err)
 			outcome = OutcomeNetwork
 		case result.response == nil:
+			diagnoseAttempt(diagnostics, "response_invalid", "request", 0, nil)
 			outcome = OutcomeNetwork
 		}
 	case <-ctx.Done():
@@ -511,6 +532,7 @@ func (e *engine) open(
 		cancel()
 		result = <-results
 		outcome = OutcomeConnectTimeout
+		diagnoseAttempt(diagnostics, "connect_timeout", "request", 0, nil)
 		if ctx.Err() != nil {
 			outcome = OutcomeCancelled
 		}
@@ -523,6 +545,7 @@ func (e *engine) open(
 		return nil, outcome
 	}
 	if err := validateFinalURL(result.response); err != nil {
+		diagnoseAttempt(diagnostics, "url_policy", "request", 0, nil)
 		_ = result.response.Body.Close()
 		cancel()
 		return nil, OutcomeNetwork
@@ -578,6 +601,7 @@ func (e *engine) readBody(
 	writer io.Writer,
 	expected int64,
 	onBytes func(count int64),
+	diagnostics ...*AttemptOutcome,
 ) (int64, Outcome) {
 	requestCtx := handle.response.Request.Context()
 	chunks := make(chan bodyChunk)
@@ -597,10 +621,16 @@ loop:
 			if len(chunk.data) > 0 {
 				count := int64(len(chunk.data))
 				if expected > 0 && received+count > expected {
+					diagnoseAttempt(diagnostics, "size_limit", "read", 0, nil)
 					outcome = OutcomeNetwork
 					break loop
 				}
 				if _, err := writer.Write(chunk.data); err != nil {
+					kind := "filesystem_write"
+					if errors.Is(err, errSimpleBodyTooLarge) {
+						kind = "size_limit"
+					}
+					diagnoseAttempt(diagnostics, kind, "write", 0, err)
 					outcome = OutcomeNetwork
 					break loop
 				}
@@ -609,6 +639,7 @@ loop:
 			}
 			if chunk.err != nil {
 				if !errors.Is(chunk.err, io.EOF) {
+					diagnoseAttempt(diagnostics, mirror.NetworkFailureKind(chunk.err).String(), "read", 0, chunk.err)
 					outcome = OutcomeNetwork
 				}
 				break loop
@@ -619,6 +650,7 @@ loop:
 			}
 			stallTimer.Reset(e.cfg.StallTimeout)
 		case <-stallTimer.C():
+			diagnoseAttempt(diagnostics, "read_timeout", "read", 0, nil)
 			outcome = OutcomeReadTimeout
 			if ctx.Err() != nil {
 				outcome = OutcomeCancelled

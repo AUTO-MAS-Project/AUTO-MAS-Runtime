@@ -246,10 +246,16 @@ func (p *chunkPlan) remaining() int {
 	return len(p.pending)
 }
 
-func (p *chunkPlan) markFailed(key string, outcome Outcome) {
+func (p *chunkPlan) markFailed(key string, outcome Outcome, diagnostics ...*AttemptOutcome) {
+	attempt := AttemptOutcome{Source: key, Outcome: outcome, FailureKind: outcome.String()}
+	if len(diagnostics) > 0 && diagnostics[0] != nil {
+		attempt = *diagnostics[0]
+		attempt.Source = key
+		attempt.Outcome = outcome
+	}
 	p.mu.Lock()
 	p.failed[key] = true
-	p.attempts = append(p.attempts, AttemptOutcome{Source: key, Outcome: outcome})
+	p.attempts = append(p.attempts, attempt)
 	p.mu.Unlock()
 }
 
@@ -291,6 +297,7 @@ func (e *engine) tryChunked(ctx context.Context, spec fileSpec, part string, pla
 	}
 	file, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
 	if err != nil {
+		e.recordLocalFailure(plan, "filesystem_open", "open", err)
 		e.log("warning", "relay staging open failed", map[string]any{"item": spec.name, "error": err.Error()})
 		return false
 	}
@@ -299,6 +306,7 @@ func (e *engine) tryChunked(ctx context.Context, spec fileSpec, part string, pla
 		_ = file.Close()
 	}()
 	if err := file.Truncate(spec.size); err != nil {
+		e.recordLocalFailure(plan, "filesystem_truncate", "truncate", err)
 		e.log("warning", "relay staging truncate failed", map[string]any{"item": spec.name, "error": err.Error()})
 		return false
 	}
@@ -337,15 +345,19 @@ func (e *engine) tryChunked(ctx context.Context, spec fileSpec, part string, pla
 		return false
 	}
 	if err := file.Sync(); err != nil {
+		e.recordLocalFailure(plan, "filesystem_sync", "sync", err)
 		e.log("warning", "relay staging sync failed", map[string]any{"item": spec.name, "error": err.Error()})
 		return false
 	}
-	if !verifyDigest(file, spec.digest) {
+	diagnostic := AttemptOutcome{FailureKind: "checksum_mismatch", Operation: "verify"}
+	if !verifyDigest(file, spec.digest, &diagnostic) {
 		// 分片拼接后无法归因到单个源：所有参与源对本文件失败，但不计入剔除。
 		plan.mu.Lock()
 		for key := range plan.contributions {
 			plan.failed[key] = true
-			plan.attempts = append(plan.attempts, AttemptOutcome{Source: key, Outcome: OutcomeChecksumMismatch})
+			attempt := diagnostic
+			attempt.Source, attempt.Outcome = key, OutcomeChecksumMismatch
+			plan.attempts = append(plan.attempts, attempt)
 			delete(plan.contributions, key)
 		}
 		plan.mu.Unlock()
@@ -393,7 +405,9 @@ func (e *engine) chunkWorker(
 			continue
 		}
 		chunkCtx := plan.begin(ctx, upstream.Key, piece)
-		received, outcome := e.fetchChunk(chunkCtx, spec, upstream, piece, file, plan)
+		attempt := AttemptOutcome{Source: upstream.Key}
+		startedAt := e.now()
+		received, outcome := e.fetchChunk(chunkCtx, spec, upstream, piece, file, plan, &attempt)
 		plan.end(upstream.Key)
 		if outcome == "" {
 			plan.credit(upstream.Key, received)
@@ -418,11 +432,11 @@ func (e *engine) chunkWorker(
 		}
 		plan.push(piece)
 		e.tracker.discard(spec.key, upstream.Key, received)
-		plan.markFailed(upstream.Key, outcome)
-		e.log("warning", "relay chunk failed", map[string]any{
-			"route": spec.key.route.String(), "item": spec.name,
-			"source": upstream.Key, "outcome": outcome, "start": piece.start,
-		})
+		e.finishAttempt(&attempt, outcome, startedAt)
+		plan.markFailed(upstream.Key, outcome, &attempt)
+		fields := attemptLogFields(attempt, spec.key.route, spec.name)
+		fields["start"] = piece.start
+		e.log("warning", "relay chunk failed", fields)
 		return
 	}
 }
@@ -435,44 +449,50 @@ func (e *engine) fetchChunk(
 	piece chunk,
 	file *os.File,
 	plan *chunkPlan,
+	diagnostics ...*AttemptOutcome,
 ) (int64, Outcome) {
 	headers := map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", piece.start, piece.end)}
-	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+spec.key.path, headers)
+	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+spec.key.path, headers, diagnostics...)
 	if outcome != "" {
 		return 0, outcome
 	}
 	defer handle.close()
 	response := handle.response
 	if response.StatusCode != http.StatusPartialContent {
+		diagnoseAttempt(diagnostics, "http_status", "range", response.StatusCode, nil)
 		return 0, OutcomeHTTPStatus
 	}
 	if response.ContentLength >= 0 && response.ContentLength != piece.length() {
+		diagnoseAttempt(diagnostics, "size_mismatch", "response_size", 0, nil)
 		return 0, OutcomeNetwork
 	}
 	writer := io.NewOffsetWriter(file, piece.start)
 	received, outcome := e.readBody(ctx, handle, writer, piece.length(), func(count int64) {
 		e.tracker.add(spec.key, spec.name, upstream.Key, count)
 		plan.progress(upstream.Key, count)
-	})
+	}, diagnostics...)
 	if outcome != "" {
 		return received, outcome
 	}
 	if received != piece.length() {
+		diagnoseAttempt(diagnostics, "size_mismatch", "response_size", 0, nil)
 		return received, OutcomeNetwork
 	}
 	return received, ""
 }
 
 // verifyDigest 从头读一遍拼好的文件计算 sha256；digest 为空时视为通过。
-func verifyDigest(file *os.File, digest []byte) bool {
+func verifyDigest(file *os.File, digest []byte, diagnostics ...*AttemptOutcome) bool {
 	if digest == nil {
 		return true
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		diagnoseAttempt(diagnostics, "filesystem_read", "verify", 0, err)
 		return false
 	}
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
+		diagnoseAttempt(diagnostics, "filesystem_read", "verify", 0, err)
 		return false
 	}
 	return subtle.ConstantTimeCompare(hasher.Sum(nil), digest) == 1

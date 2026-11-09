@@ -207,7 +207,7 @@ func classifyTransportFailure(err error) FailureKind {
 	if errors.As(err, &redirect) {
 		return redirect.kind
 	}
-	return FailureNetwork
+	return NetworkFailureKind(err)
 }
 
 func sanitizeTransportError(err error) error {

@@ -206,7 +206,7 @@ func TestFetch_AllSourcesFailedIs502(t *testing.T) {
 		t.Fatalf("attempts = %v, want %v", failure.Attempts, want)
 	}
 	for i := range want {
-		if failure.Attempts[i] != want[i] {
+		if failure.Attempts[i].Source != want[i].Source || failure.Attempts[i].Outcome != want[i].Outcome {
 			t.Errorf("attempt %d = %v, want %v", i, failure.Attempts[i], want[i])
 		}
 	}

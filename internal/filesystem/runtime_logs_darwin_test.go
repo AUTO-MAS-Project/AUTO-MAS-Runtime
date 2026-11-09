@@ -187,3 +187,84 @@ func TestDarwinRuntimeLogs_ConditionalRemove(t *testing.T) {
 	}
 	t.Fatal("List() omitted replacement ordinary file")
 }
+
+func TestDarwinRuntimeLogs_Segments(t *testing.T) {
+	layout := darwinTestLayout(t)
+	files, err := NewRuntimeLogFiles(t.Context(), layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := files.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	date := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	first, err := files.OpenAppend(t.Context(), "doctor", date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPath, pathErr := layout.RuntimeLogFile("doctor", date)
+	if err := errors.Join(pathErr, first.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if first.Path() != firstPath {
+		t.Fatalf("first segment = %q, want %q", first.Path(), firstPath)
+	}
+
+	writer, err := files.CreateSegment(t.Context(), "doctor", date, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := writer.Write([]byte("before\n"))
+	if err := errors.Join(writeErr, writer.Close()); err != nil {
+		t.Fatal(err)
+	}
+	next, err := files.OpenAppendSegment(t.Context(), "doctor", date, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr = next.Write([]byte("after\n"))
+	if err := errors.Join(writeErr, next.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := files.CreateSegment(t.Context(), "doctor", date, 1); duplicate != nil || !errors.Is(err, os.ErrExist) {
+		t.Fatalf("CreateSegment(existing) = %v, %v, want nil / os.ErrExist", duplicate, err)
+	}
+	for _, tc := range []struct {
+		name     string
+		sequence uint64
+		link     func(string, string) error
+	}{
+		{name: "symbolic", sequence: 2, link: os.Symlink},
+		{name: "hard", sequence: 3, link: os.Link},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sentinel := filepath.Join(t.TempDir(), "sentinel")
+			if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path, err := layout.RuntimeLogSegmentFile("doctor", date, tc.sequence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.link(sentinel, path); err != nil {
+				t.Fatal(err)
+			}
+			if other, err := files.CreateSegment(t.Context(), "doctor", date, tc.sequence); other != nil || !errors.Is(err, os.ErrExist) {
+				t.Fatalf("CreateSegment(link) = %v, %v, want nil / os.ErrExist", other, err)
+			}
+			if other, err := files.OpenAppendSegment(t.Context(), "doctor", date, tc.sequence); other != nil || err == nil {
+				t.Fatalf("OpenAppendSegment(link) = %v, %v, want rejection", other, err)
+			}
+			data, err := os.ReadFile(sentinel)
+			if err != nil || string(data) != "keep" {
+				t.Fatalf("sentinel = %q, %v, want keep", data, err)
+			}
+		})
+	}
+	data, err := os.ReadFile(writer.Path())
+	if err != nil || string(data) != "before\nafter\n" {
+		t.Fatalf("segment content = %q, %v, want both records", data, err)
+	}
+}

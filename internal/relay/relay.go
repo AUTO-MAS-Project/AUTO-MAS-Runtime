@@ -150,14 +150,21 @@ func (o Outcome) String() string { return string(o) }
 
 // AttemptOutcome 记录某个源对某个文件的一次尝试结局。
 type AttemptOutcome struct {
-	Source  string
-	Outcome Outcome
+	Source       string
+	Outcome      Outcome
+	FailureKind  string
+	HTTPStatus   int
+	Duration     time.Duration
+	Operation    string
+	WindowsError uint64
 }
 
 // FileFailure 记录所有源都失败的文件及其逐源结局。
 type FileFailure struct {
 	Item     string
 	Attempts []AttemptOutcome
+	// DiagnosticOnly 表示新增的索引诊断，不参与既有制品耗尽判定。
+	DiagnosticOnly bool
 }
 
 // Summary 是供 result.details.relay 使用的汇总；Failures 上限 32 项。

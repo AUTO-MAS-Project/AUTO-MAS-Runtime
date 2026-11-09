@@ -117,6 +117,16 @@ func NewRuntimeLogFiles(context.Context, *config.Layout) (*RuntimeLogFiles, erro
 }
 
 // OpenAppend 不在身份机制缺失时写日志。
+// OpenAppendSegment 在未支持的平台失败关闭。
+func (*RuntimeLogFiles) OpenAppendSegment(context.Context, string, time.Time, uint64) (*RuntimeLogWriter, error) {
+	return nil, ErrUnsupported
+}
+
+// CreateSegment 在未支持的平台失败关闭。
+func (*RuntimeLogFiles) CreateSegment(context.Context, string, time.Time, uint64) (*RuntimeLogWriter, error) {
+	return nil, ErrUnsupported
+}
+
 func (*RuntimeLogFiles) OpenAppend(context.Context, string, time.Time) (*RuntimeLogWriter, error) {
 	return nil, ErrUnsupported
 }

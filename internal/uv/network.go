@@ -15,6 +15,9 @@ const (
 	// uvHTTPTimeoutEnv 只由中继路径注入（增补 2 C17 第 6 条）：中继整文件就绪后才响应，
 	// uv 默认 30 秒的读超时会把正常的大文件等待判成超时。宿主同名变量仍被剔除。
 	uvHTTPTimeoutEnv = "UV_HTTP_TIMEOUT"
+	// uvConcurrentDownloadsEnv 只由 Relay 依赖同步显式注入；固定 uv 默认允许 50 个并行下载，
+	// 这里将它限制为 Relay 同时取回的文件数，宿主同名变量仍被剔除。
+	uvConcurrentDownloadsEnv = "UV_CONCURRENT_DOWNLOADS"
 	// relayUVHTTPTimeoutSeconds 是中继路径下 uv 的读超时；有界性由中继自己的失速判定保证。
 	relayUVHTTPTimeoutSeconds = "900"
 )

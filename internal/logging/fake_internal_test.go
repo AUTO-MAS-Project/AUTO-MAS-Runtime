@@ -13,9 +13,17 @@ import (
 
 type fakeLogFiles struct {
 	openAppend func(context.Context, string, time.Time) (logWriter, error)
+	openNext   func(context.Context, string, time.Time) (logWriter, error)
 	list       func(context.Context) ([]retainedFile, error)
 	remove     func(context.Context, retainedFile) (removeResult, error)
 	close      func() error
+}
+
+func (f *fakeLogFiles) OpenNext(ctx context.Context, command string, localDate time.Time) (logWriter, error) {
+	if f.openNext == nil {
+		return nil, errors.New("fake open next is not configured")
+	}
+	return f.openNext(ctx, command, localDate)
 }
 
 func (f *fakeLogFiles) OpenAppend(

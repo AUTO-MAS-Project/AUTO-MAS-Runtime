@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -103,8 +104,9 @@ func TestDependencies_SyncUsesRelayAndSingleAttempt(t *testing.T) {
 		t.Fatalf("runner calls = %d, want lock check + one relay sync", got)
 	}
 	sync := fixture.runner.calls[1]
-	if !reflect.DeepEqual(sync.args, mirrorSyncArgsFor(staging)) {
-		t.Fatalf("sync args = %#v, want %#v", sync.args, mirrorSyncArgsFor(staging))
+	wantArgs := mirrorSyncArgsFor(staging, "http://127.0.0.1:39170/simple")
+	if !reflect.DeepEqual(sync.args, wantArgs) {
+		t.Fatalf("sync args = %#v, want %#v", sync.args, wantArgs)
 	}
 	if got := sync.options.Environment[uvHTTPTimeoutEnv]; got != relayUVHTTPTimeoutSeconds {
 		t.Fatalf("UV_HTTP_TIMEOUT = %q, want %s", got, relayUVHTTPTimeoutSeconds)
@@ -141,6 +143,20 @@ func TestDependencies_SyncUsesRelayAndSingleAttempt(t *testing.T) {
 	fixture.assertNoStagingLeftovers(t)
 }
 
+func TestDependencies_RelayLimitsConcurrentDownloads(t *testing.T) {
+	session := &fakeRelaySession{baseURL: "http://127.0.0.1:39172"}
+	fixture := newRelayFixture(t, &fakeRelayFactory{session: session})
+	if _, err := fixture.service.Sync(t.Context(), fixture.request(t, mirror.PolicySpec{})); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if got, want := len(fixture.runner.calls), 2; got != want {
+		t.Fatalf("runner calls = %d, want lock check and relay sync", got)
+	}
+	if got, want := fixture.runner.calls[1].options.Environment[uvConcurrentDownloadsEnv], strconv.Itoa(relay.DefaultMaxFiles); got != want {
+		t.Fatalf("%s = %q, want relay file limit %q", uvConcurrentDownloadsEnv, got, want)
+	}
+}
+
 // TestDependencies_RelayStartFailureFallsBackToMirrors 锁定中继起不来时退回 T13.4 的逐源轮换。
 func TestDependencies_RelayStartFailureFallsBackToMirrors(t *testing.T) {
 	factory := &fakeRelayFactory{err: errors.New("bind: address in use")}
@@ -164,6 +180,21 @@ func TestDependencies_RelayStartFailureFallsBackToMirrors(t *testing.T) {
 
 // TestDependencies_RelayFailuresMapToMirrorExhausted 锁定中继报告了文件失败时 uv 失败映射为 MIRROR_EXHAUSTED，
 // details 带 relay 摘要；没有文件失败的 uv 失败仍按既有依赖同步失败映射。
+func TestDependencies_IndexDiagnosticsPreserveErrorCode(t *testing.T) {
+	session := &fakeRelaySession{baseURL: "http://127.0.0.1:39170", summary: relay.Summary{Failures: []relay.FileFailure{{Item: "six", DiagnosticOnly: true, Attempts: []relay.AttemptOutcome{{Source: "aliyun", Outcome: relay.OutcomeHTTPStatus, FailureKind: "http_status", HTTPStatus: 503}}}}}}
+	fixture := newRelayFixture(t, &fakeRelayFactory{session: session})
+	fixture.runner.responses = []fakeRunnerResponse{{}, {result: UVResult{ExitCode: 2}, err: errors.New("build failed")}}
+	_, err := fixture.service.Sync(t.Context(), fixture.request(t, mirror.PolicySpec{}))
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Code() != protocol.CodeDependencySyncFailed {
+		t.Fatalf("error=%v, want unchanged DEPENDENCY_SYNC_FAILED", err)
+	}
+	if _, ok := failure.Details()["relay"]; !ok {
+		t.Fatalf("details=%#v, want index diagnostics", failure.Details())
+	}
+	fixture.assertNoStagingLeftovers(t)
+}
+
 func TestDependencies_RelayFailuresMapToMirrorExhausted(t *testing.T) {
 	session := &fakeRelaySession{
 		baseURL: "http://127.0.0.1:39170",

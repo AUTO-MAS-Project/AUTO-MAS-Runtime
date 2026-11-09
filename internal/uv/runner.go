@@ -681,6 +681,8 @@ func canonicalUVOverrideKey(key string) (string, bool) {
 		return uvPythonInstallMirrorEnv, true
 	case strings.EqualFold(key, uvHTTPTimeoutEnv):
 		return uvHTTPTimeoutEnv, true
+	case strings.EqualFold(key, uvConcurrentDownloadsEnv):
+		return uvConcurrentDownloadsEnv, true
 	default:
 		return "", false
 	}

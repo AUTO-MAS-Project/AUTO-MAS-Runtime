@@ -29,7 +29,7 @@ func (k TransactionKind) Valid() bool {
 type BrokenReason string
 
 const (
-	// ReasonRepositoryChanged 表示 active repo 已替换但主环境尚未重新证明可用。
+	// ReasonRepositoryChanged 表示 active repo 已替换或受管文件正在恢复，主环境尚未重新证明可用。
 	ReasonRepositoryChanged BrokenReason = "repository_changed"
 	// ReasonOperationFailed 表示改变主环境后的具体叶子操作失败。
 	ReasonOperationFailed BrokenReason = "operation_failed"

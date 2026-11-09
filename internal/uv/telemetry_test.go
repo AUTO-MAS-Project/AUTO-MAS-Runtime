@@ -2,10 +2,23 @@ package uv
 
 import (
 	"testing"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/relay"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 )
+
+func TestRelaySummary_DiagnosticTelemetry(t *testing.T) {
+	details := map[string]any{"relay": RelaySummaryDetails(relay.Summary{Failures: []relay.FileFailure{{Item: "package.whl", Attempts: []relay.AttemptOutcome{{
+		Source: "aliyun", Outcome: relay.OutcomeHTTPStatus, FailureKind: "http_status", HTTPStatus: 503, Duration: 125 * time.Millisecond, Operation: "request",
+	}}}}})}
+	clean := telemetry.SanitizeDiagnostics(details)
+	failures := clean["relay"].(map[string]any)["failures"].([]any)
+	attempt := failures[0].(map[string]any)["attempts"].([]any)[0].(map[string]any)
+	if attempt["failureKind"] != "http_status" || attempt["httpStatus"] != 503 || attempt["durationMs"] != int64(125) || attempt["operation"] != "request" {
+		t.Fatalf("attempt = %#v, want complete safe diagnostics", attempt)
+	}
+}
 
 func TestRelaySummaryDetails_TelemetryPreservesProductionShape(t *testing.T) {
 	details := map[string]any{"relay": RelaySummaryDetails(relay.Summary{

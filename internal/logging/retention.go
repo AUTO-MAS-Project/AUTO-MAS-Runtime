@@ -3,6 +3,7 @@ package logging
 import (
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ type retentionCandidate struct {
 	localDate time.Time
 	pathKey   string
 	active    bool
+	sequence  uint64
 }
 
 func parseRetainedFile(
@@ -25,11 +27,26 @@ func parseRetainedFile(
 	if layout == nil || file == nil || location == nil {
 		return retentionCandidate{}, false
 	}
-	name := file.Name()
+	candidate, ok := parseRetainedPath(layout, file.Name(), file.Path(), location)
+	candidate.file = file
+	return candidate, ok
+}
+
+func parseRetainedPath(layout *config.Layout, name, path string, location *time.Location) (retentionCandidate, bool) {
 	if filepath.Base(name) != name || !strings.HasSuffix(name, ".log") {
 		return retentionCandidate{}, false
 	}
 	stem := strings.TrimSuffix(name, ".log")
+	var sequence uint64
+	if index := strings.LastIndexByte(stem, '.'); index >= 0 {
+		if parsed, err := strconv.ParseUint(stem[index+1:], 10, 64); err == nil {
+			if parsed == 0 {
+				return retentionCandidate{}, false
+			}
+			sequence = parsed
+			stem = stem[:index]
+		}
+	}
 	if len(stem) <= 9 || stem[len(stem)-9] != '-' {
 		return retentionCandidate{}, false
 	}
@@ -39,16 +56,24 @@ func parseRetainedFile(
 	if err != nil {
 		return retentionCandidate{}, false
 	}
-	expected, err := layout.RuntimeLogFile(command, localDate)
-	if err != nil || !sameRetentionPath(expected, file.Path()) {
+	expected, err := layout.RuntimeLogSegmentFile(command, localDate, sequence)
+	if err != nil || !sameRetentionPath(expected, path) {
 		return retentionCandidate{}, false
 	}
 	return retentionCandidate{
-		file:      file,
 		command:   command,
 		localDate: localDate,
-		pathKey:   retentionPathKey(file.Path()),
+		pathKey:   retentionPathKey(path),
+		sequence:  sequence,
 	}, true
+}
+
+func matchesLogPath(layout *config.Layout, command string, now time.Time, path string) bool {
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	candidate, ok := parseRetainedPath(layout, filepath.Base(path), path, now.Location())
+	return ok && strings.EqualFold(candidate.command, command) && candidate.localDate.Format("20060102") == now.Format("20060102")
 }
 
 func selectRetentionRemovals(
@@ -84,6 +109,9 @@ func selectRetentionRemovals(
 			if !a.localDate.Equal(b.localDate) {
 				return a.localDate.After(b.localDate)
 			}
+			if a.sequence != b.sequence {
+				return a.sequence > b.sequence
+			}
 			return a.pathKey < b.pathKey
 		})
 		overflow := len(indexes) - policy.MaxFilesPerCommand
@@ -109,6 +137,9 @@ func selectRetentionRemovals(
 		}
 		if !removals[left].localDate.Equal(removals[right].localDate) {
 			return removals[left].localDate.Before(removals[right].localDate)
+		}
+		if removals[left].sequence != removals[right].sequence {
+			return removals[left].sequence < removals[right].sequence
 		}
 		return removals[left].pathKey < removals[right].pathKey
 	})

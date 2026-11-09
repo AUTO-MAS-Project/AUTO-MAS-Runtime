@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 // maxSimpleBody 限制索引页体积：真实索引页最多几 MB，超出即视为上游异常。
@@ -33,16 +34,18 @@ func (e *engine) serveSimple(
 		headers["Accept"] = accept
 	}
 	relayPrefix := []byte(e.baseURL + "/" + RoutePackages.String() + "/")
+	var attempts []AttemptOutcome
 	for _, upstream := range e.snapshotUpstreams(RouteSimple) {
-		body, contentType, outcome := e.fetchIndex(ctx, upstream, name, headers)
+		attempt := AttemptOutcome{Source: upstream.Key}
+		startedAt := e.now()
+		body, contentType, outcome := e.fetchIndex(ctx, upstream, name, headers, &attempt)
 		if outcome == OutcomeCancelled {
 			return
 		}
 		if outcome != "" {
-			e.log("warning", "relay simple index attempt failed", map[string]any{
-				"route": RouteSimple.String(), "item": name,
-				"source": upstream.Key, "outcome": outcome,
-			})
+			e.finishAttempt(&attempt, outcome, startedAt)
+			attempts = append(attempts, attempt)
+			e.log("warning", "relay simple index attempt failed", attemptLogFields(attempt, RouteSimple, name))
 			continue
 		}
 		if upstream.RewriteFrom != "" {
@@ -60,6 +63,7 @@ func (e *engine) serveSimple(
 	if ctx.Err() != nil {
 		return
 	}
+	e.ledger.failed(displayName(strings.Trim(name, "/")), attempts, true)
 	writeStatus(writer, http.StatusBadGateway, "relay: all index sources failed")
 }
 
@@ -69,21 +73,24 @@ func (e *engine) fetchIndex(
 	upstream Upstream,
 	name string,
 	headers map[string]string,
+	diagnostics ...*AttemptOutcome,
 ) ([]byte, string, Outcome) {
-	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+name, headers)
+	handle, outcome := e.open(ctx, http.MethodGet, upstream.Base+name, headers, diagnostics...)
 	if outcome != "" {
 		return nil, "", outcome
 	}
 	defer handle.close()
 	response := handle.response
 	if response.StatusCode != http.StatusOK {
+		diagnoseAttempt(diagnostics, "http_status", "request", response.StatusCode, nil)
 		return nil, "", OutcomeHTTPStatus
 	}
 	if response.ContentLength > maxSimpleBody {
+		diagnoseAttempt(diagnostics, "size_limit", "response_size", 0, nil)
 		return nil, "", OutcomeNetwork
 	}
 	var buffer bytes.Buffer
-	_, outcome = e.readBody(ctx, handle, &limitedWriter{writer: &buffer, remaining: maxSimpleBody}, 0, func(int64) {})
+	_, outcome = e.readBody(ctx, handle, &limitedWriter{writer: &buffer, remaining: maxSimpleBody}, 0, func(int64) {}, diagnostics...)
 	if outcome != "" {
 		return nil, "", outcome
 	}

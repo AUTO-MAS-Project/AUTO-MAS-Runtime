@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
@@ -28,7 +29,7 @@ func ProductionProbes() Probes {
 	return Probes{
 		UVVersion:  probeUVVersion,
 		DiskFree:   probeDiskFree,
-		FileSystem: probeFileSystem,
+		FileSystem: filesystem.FileSystemName,
 	}
 }
 
@@ -39,7 +40,7 @@ func ProductionProbesForLayout(layout *config.Layout) Probes {
 			return probeUVVersionWithLayout(ctx, layout, exePath, probeUVTimeout)
 		},
 		DiskFree:   probeDiskFree,
-		FileSystem: probeFileSystem,
+		FileSystem: filesystem.FileSystemName,
 	}
 }
 

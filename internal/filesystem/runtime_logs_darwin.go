@@ -28,6 +28,20 @@ func NewRuntimeLogFiles(ctx context.Context, layout *config.Layout) (*RuntimeLog
 
 // OpenAppend 对日志持有共享协作锁，writer 的目录 FD 与父能力独立。
 func (f *RuntimeLogFiles) OpenAppend(ctx context.Context, command string, date time.Time) (*RuntimeLogWriter, error) {
+	return f.OpenAppendSegment(ctx, command, date, 0)
+}
+
+// OpenAppendSegment 追加指定日志卷，复用首卷的对象校验和共享锁。
+func (f *RuntimeLogFiles) OpenAppendSegment(ctx context.Context, command string, date time.Time, sequence uint64) (*RuntimeLogWriter, error) {
+	return f.openSegment(ctx, command, date, sequence, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
+}
+
+// CreateSegment 独占创建日志卷，不探查或覆盖名称已占用的对象。
+func (f *RuntimeLogFiles) CreateSegment(ctx context.Context, command string, date time.Time, sequence uint64) (*RuntimeLogWriter, error) {
+	return f.openSegment(ctx, command, date, sequence, os.O_WRONLY|os.O_CREATE|os.O_APPEND|os.O_EXCL)
+}
+
+func (f *RuntimeLogFiles) openSegment(ctx context.Context, command string, date time.Time, sequence uint64, flags int) (*RuntimeLogWriter, error) {
 	if ctx == nil {
 		return nil, ErrInvalidArgument
 	}
@@ -36,7 +50,7 @@ func (f *RuntimeLogFiles) OpenAppend(ctx context.Context, command string, date t
 	if f.closed {
 		return nil, ErrClosed
 	}
-	path, err := f.layout.RuntimeLogFile(command, date)
+	path, err := f.layout.RuntimeLogSegmentFile(command, date, sequence)
 	if err != nil {
 		return nil, errors.Join(ErrInvalidArgument, err)
 	}
@@ -48,7 +62,7 @@ func (f *RuntimeLogFiles) OpenAppend(ctx context.Context, command string, date t
 	var identity DirectoryIdentity
 	err = withDarwinLock(ctx, directory.file, unix.LOCK_EX, func() error {
 		var openErr error
-		file, identity, openErr = directory.openFile(ctx, filepath.Base(path), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		file, identity, openErr = directory.openFile(ctx, filepath.Base(path), flags, 0o600)
 		if openErr != nil {
 			return openErr
 		}

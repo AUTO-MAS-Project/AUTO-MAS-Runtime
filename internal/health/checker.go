@@ -165,7 +165,7 @@ func NewChecker(config Config) *Checker {
 }
 
 // Check 轮询后端直至连续满足健康条件或返回稳定失败分类。
-func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) error {
+func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) (returnErr error) {
 	if ctx == nil {
 		return newError(protocol.CodeBackendHealthInvalid, "健康检查上下文不可用", nil, errors.New("health check context is nil"))
 	}
@@ -185,6 +185,18 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	defer totalTimer.Stop()
 	total := totalTimer.C()
 	startedAt := c.clock.Now()
+	diagnostics := checkDiagnostics{startedAt: startedAt, port: expected.resolvedPort(), failureKind: "not_observed"}
+	// 只补充已经按原规则判定的 timeout，不改变轮询、取消或退出的优先级。
+	defer func() {
+		var failure *Error
+		if errors.As(returnErr, &failure) && failure.Code() == protocol.CodeBackendHealthTimeout {
+			details := diagnostics.details(c.clock.Now())
+			for key, value := range failure.Details() {
+				details[key] = value
+			}
+			returnErr = newError(failure.Code(), failure.Message(), details, failure.Unwrap())
+		}
+	}()
 	successes := 0
 	// 连续的探针错误计数；任何一次探针成功都清零。
 	probeErrors := 0
@@ -200,6 +212,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 		}
 
 		request := c.request(ctx, healthURL, total, exited)
+		diagnostics.request(request)
 		switch request.kind {
 		case requestCancelled:
 			if err := cancellationError(ctx); err != nil {
@@ -236,6 +249,8 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if err != nil {
 				return err
 			}
+			diagnostics.state = observation.state
+			diagnostics.failureKind = "backend_not_ready"
 			if c.totalExpired(total, startedAt) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			}
@@ -249,6 +264,8 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if channelClosed(exited) {
 				return preferCancellation(ctx, newError(protocol.CodeBackendExitedBeforeReady, "后端在就绪前退出", nil, nil))
 			}
+			diagnostics.failureKind = "job_probe_pending"
+			diagnostics.operation = "job_probe"
 			probeResult := c.probe(ctx, probe, total, exited)
 			if err := cancellationError(ctx); err != nil {
 				return err
@@ -270,6 +287,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 				}
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			case probeError:
+				diagnostics.failureKind = "job_probe_failed"
 				probeErrors++
 				if probeErrors >= maxConsecutiveProbeErrors {
 					return preferCancellation(ctx, newError(protocol.CodeBackendHealthInvalid, "无法验证受管后端进程", map[string]any{"consecutiveErrors": probeErrors}, probeResult.err))
@@ -278,6 +296,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			case probeUnhealthy:
 				return preferCancellation(ctx, newError(protocol.CodeBackendHealthInvalid, "受管后端进程身份无效", map[string]any{"reason": "job_probe_unhealthy"}, nil))
 			case probeHealthy:
+				diagnostics.failureKind = "readiness_pending"
 				probeErrors = 0
 				successes++
 				if successes >= c.consecutiveSuccesses {
@@ -560,6 +579,7 @@ func (c *Checker) probe(ctx context.Context, probe Probe, total <-chan time.Time
 
 type observation struct {
 	continuePolling bool
+	state           string
 }
 
 type healthPayload struct {
@@ -617,12 +637,12 @@ func inspectResponse(httpStatus int, body []byte, bodyErr error, expected Expect
 	}
 	switch status {
 	case "starting", "running":
-		return observation{continuePolling: true}, nil
+		return observation{continuePolling: true, state: status}, nil
 	case "ready":
 		if !ready {
-			return observation{continuePolling: true}, nil
+			return observation{continuePolling: true, state: status}, nil
 		}
-		return observation{}, nil
+		return observation{state: status}, nil
 	}
 	return observation{}, newError(protocol.CodeBackendHealthInvalid, "后端后台状态未知", map[string]any{"field": "backgroundStatus"}, nil)
 }

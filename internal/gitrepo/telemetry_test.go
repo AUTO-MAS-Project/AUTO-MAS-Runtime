@@ -2,6 +2,7 @@ package gitrepo
 
 import (
 	"testing"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
@@ -14,6 +15,7 @@ func TestAttemptDetails_TelemetryPreservesProductionShape(t *testing.T) {
 		GlobalTry:   2,
 		Outcome:     mirror.OutcomeSwitchSource,
 		FailureKind: mirror.FailureKind("network"),
+		Duration:    125 * time.Millisecond,
 	}})
 	clean := telemetry.SanitizeDiagnostics(details)
 	attempts, ok := clean["attempts"].([]any)
@@ -22,7 +24,7 @@ func TestAttemptDetails_TelemetryPreservesProductionShape(t *testing.T) {
 	}
 	attempt, ok := attempts[0].(map[string]any)
 	if !ok || attempt["source"] != "github" || attempt["outcome"] != "switch_source" ||
-		attempt["failureKind"] != "network" || attempt["sourceTry"] != 1 || attempt["globalTry"] != 2 {
+		attempt["failureKind"] != "network" || attempt["sourceTry"] != 1 || attempt["globalTry"] != 2 || attempt["durationMs"] != int64(125) {
 		t.Fatalf("telemetry attempt = %#v, want production fields preserved", attempts[0])
 	}
 }

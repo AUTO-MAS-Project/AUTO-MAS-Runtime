@@ -59,7 +59,11 @@ func (d *darwinDirectory) openFile(ctx context.Context, name string, flags int, 
 		return nil, DirectoryIdentity{}, err
 	}
 	var before unix.Stat_t
-	beforeErr := unix.Fstatat(int(d.file.Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW)
+	var beforeErr error = os.ErrNotExist
+	// 独占创建由内核裁决；先探查已有对象会改变名称竞争的返回语义。
+	if flags&(os.O_CREATE|os.O_EXCL) != os.O_CREATE|os.O_EXCL {
+		beforeErr = unix.Fstatat(int(d.file.Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW)
+	}
 	if beforeErr == nil {
 		if err := validateDarwinOrdinaryFile(before); err != nil {
 			return nil, DirectoryIdentity{}, err
