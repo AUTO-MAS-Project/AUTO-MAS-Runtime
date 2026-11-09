@@ -202,11 +202,11 @@ func (goGitRepositoryReader) Inspect(
 	if err := ctx.Err(); err != nil {
 		return repositorySnapshot{}, err
 	}
-	repository, closeRepository, err := openGitRepository(ctx, access)
+	repository, files, err := openGitRepository(ctx, access)
 	if err != nil {
 		return repositorySnapshot{}, fmt.Errorf("open repository: %w", err)
 	}
-	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
+	defer func() { returnErr = errors.Join(returnErr, files.close()) }()
 	return inspectOpenRepository(ctx, repository)
 }
 

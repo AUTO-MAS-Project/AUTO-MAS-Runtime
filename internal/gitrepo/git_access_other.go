@@ -18,7 +18,7 @@ func openGitFiles(_ context.Context, access repositoryAccess) (gitFiles, error) 
 	return gitFiles{worktree: worktree, metadata: metadata, close: noGitFilesCleanup}, nil
 }
 
-func openGitRepository(_ context.Context, access repositoryAccess) (*git.Repository, func() error, error) {
+func openGitRepository(_ context.Context, access repositoryAccess) (*git.Repository, gitFiles, error) {
 	repo, err := git.PlainOpen(access.path)
-	return repo, noGitFilesCleanup, err
+	return repo, gitFiles{close: noGitFilesCleanup}, err
 }

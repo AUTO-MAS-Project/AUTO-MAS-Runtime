@@ -52,11 +52,11 @@ func bindAlphaRevision(ctx context.Context, access repositoryAccess, revision Re
 	if revision.Branch() != "dev" {
 		return nil
 	}
-	repository, closeRepository, err := openGitRepository(ctx, access)
+	repository, files, err := openGitRepository(ctx, access)
 	if err != nil {
 		return fmt.Errorf("open alpha repository: %w", err)
 	}
-	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
+	defer func() { returnErr = errors.Join(returnErr, files.close()) }()
 	snapshot, err := inspectOpenRepository(ctx, repository)
 	if err != nil {
 		return err

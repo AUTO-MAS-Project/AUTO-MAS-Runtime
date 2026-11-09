@@ -7,13 +7,11 @@ import (
 	"errors"
 	"os"
 
-	git "github.com/go-git/go-git/v5"
-
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 )
 
-func restoreFilesFor(_ *git.Repository, layout *config.Layout) (sourceRestoreFiles, error) {
+func restoreFilesFor(_ gitFiles, layout *config.Layout) (sourceRestoreFiles, error) {
 	return sourceRestoreFiles{
 		read: func(ctx context.Context, path string, limit int64) (sourceFileSnapshot, error) {
 			data, err := filesystem.ReadManagedFile(ctx, layout, path, limit)

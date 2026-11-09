@@ -20,11 +20,11 @@ func TestDarwinGitFS_RejectsEscapeAndLinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
+	defer func() {
 		if err := files.close(); err != nil {
 			t.Error(err)
 		}
-	})
+	}()
 	outside := t.TempDir()
 	sentinel := filepath.Join(outside, "keep")
 	if err := os.WriteFile(sentinel, []byte("original"), 0o600); err != nil {

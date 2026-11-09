@@ -47,12 +47,12 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	repository, closeRepository, err := openGitRepository(ctx, repositoryAccess{path: layout.RepoDir(), lease: lease})
+	repository, files, err := openGitRepository(ctx, repositoryAccess{path: layout.RepoDir(), lease: lease})
 	if err != nil {
 		return 0, err
 	}
-	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
-	sourceFiles, err := restoreFilesFor(repository, layout)
+	defer func() { returnErr = errors.Join(returnErr, files.close()) }()
+	sourceFiles, err := restoreFilesFor(files, layout)
 	if err != nil {
 		return 0, err
 	}

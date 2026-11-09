@@ -40,24 +40,24 @@ func openGitFiles(ctx context.Context, access repositoryAccess) (gitFiles, error
 	}}, nil
 }
 
-func openGitRepository(ctx context.Context, access repositoryAccess) (*git.Repository, func() error, error) {
+func openGitRepository(ctx context.Context, access repositoryAccess) (*git.Repository, gitFiles, error) {
 	files, err := openGitFiles(ctx, access)
 	if err != nil {
-		return nil, nil, err
+		return nil, gitFiles{}, err
 	}
 	metadata, err := files.metadata.Stat(".")
 	if err != nil || !metadata.IsDir() {
-		return nil, nil, errors.Join(git.ErrRepositoryNotExists, err, files.close())
+		return nil, gitFiles{}, errors.Join(git.ErrRepositoryNotExists, err, files.close())
 	}
 	// Runtime 只接受自包含的工作树，避免 Git 使用其他仓库的配置或对象。
 	for _, special := range []string{"commondir", path.Join("objects", "info", "alternates"), path.Join("objects", "info", "http-alternates")} {
 		if _, err := files.metadata.Stat(special); !errors.Is(err, fs.ErrNotExist) {
-			return nil, nil, errors.Join(errInvalidRepositoryID, err, files.close())
+			return nil, gitFiles{}, errors.Join(errInvalidRepositoryID, err, files.close())
 		}
 	}
 	repo, err := git.Open(gitfilesystem.NewStorage(files.metadata, gitcache.NewObjectLRUDefault()), files.worktree)
 	if err != nil {
-		return nil, nil, errors.Join(err, files.close())
+		return nil, gitFiles{}, errors.Join(err, files.close())
 	}
-	return repo, files.close, nil
+	return repo, files, nil
 }

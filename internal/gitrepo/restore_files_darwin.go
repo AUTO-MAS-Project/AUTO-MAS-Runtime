@@ -4,18 +4,13 @@ import (
 	"context"
 	"path/filepath"
 
-	git "github.com/go-git/go-git/v5"
-
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 )
 
-func restoreFilesFor(repo *git.Repository, layout *config.Layout) (sourceRestoreFiles, error) {
-	worktree, err := repo.Worktree()
-	if err != nil {
-		return sourceRestoreFiles{}, err
-	}
-	volume, ok := worktree.Filesystem.(*darwinGitFS)
+func restoreFilesFor(files gitFiles, layout *config.Layout) (sourceRestoreFiles, error) {
+	// go-git 会包装 Worktree().Filesystem；恢复直接复用打开仓库时的原始授权。
+	volume, ok := files.worktree.(*darwinGitFS)
 	if !ok {
 		return sourceRestoreFiles{}, errDirectoryIdentityMissing
 	}
