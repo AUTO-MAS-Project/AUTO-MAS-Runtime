@@ -186,26 +186,31 @@ func recoverySourceForURL(value string) (mirror.Source, bool) {
 }
 
 type repositoryReader interface {
-	Inspect(ctx context.Context, repositoryPath string) (repositorySnapshot, error)
-	Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error)
+	Inspect(ctx context.Context, access repositoryAccess) (repositorySnapshot, error)
+	Restore(ctx context.Context, layout *config.Layout, lease directoryLease, commit string, beforeWrite func() error) (int, error)
 }
 
 type goGitRepositoryReader struct{}
 
 func (goGitRepositoryReader) Inspect(
 	ctx context.Context,
-	repositoryPath string,
-) (repositorySnapshot, error) {
-	if ctx == nil || repositoryPath == "" {
+	access repositoryAccess,
+) (snapshot repositorySnapshot, returnErr error) {
+	if ctx == nil || access.path == "" {
 		return repositorySnapshot{}, errInvalidRepositoryRead
 	}
 	if err := ctx.Err(); err != nil {
 		return repositorySnapshot{}, err
 	}
-	repository, err := git.PlainOpen(repositoryPath)
+	repository, closeRepository, err := openGitRepository(ctx, access)
 	if err != nil {
 		return repositorySnapshot{}, fmt.Errorf("open repository: %w", err)
 	}
+	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
+	return inspectOpenRepository(ctx, repository)
+}
+
+func inspectOpenRepository(ctx context.Context, repository *git.Repository) (repositorySnapshot, error) {
 	snapshot := repositorySnapshot{}
 	if _, err := repository.Worktree(); err != nil {
 		if errors.Is(err, git.ErrIsBareRepository) {

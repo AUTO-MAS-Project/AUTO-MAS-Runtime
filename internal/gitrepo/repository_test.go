@@ -18,7 +18,7 @@ func TestRepositoryReader_InspectsCommittedIdentity(t *testing.T) {
 	sourceURL := "https://example.test/AUTO-MAS.git"
 	repositoryPath, commit := createVerifiedRepository(t, version, sourceURL)
 
-	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), repositoryPath)
+	snapshot, err := inspectTestRepository(t, repositoryPath)
 	if err != nil {
 		t.Fatalf("Inspect() error = %v", err)
 	}

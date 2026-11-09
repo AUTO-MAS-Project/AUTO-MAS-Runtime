@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-git/go-billy/v5/osfs"
 	git "github.com/go-git/go-git/v5"
 	gitcfg "github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -87,7 +86,7 @@ type gitClient interface {
 		sourceURL string,
 		caBundle []byte,
 	) ([]*plumbing.Reference, error)
-	Clone(ctx context.Context, path string, options git.CloneOptions) error
+	Clone(ctx context.Context, access repositoryAccess, options git.CloneOptions) error
 }
 
 type treeRemover interface {
@@ -141,7 +140,7 @@ type fetcherDependencies struct {
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
 	newTicker      tickerFactory
-	bindRevision   func(context.Context, string, Revision) error
+	bindRevision   func(context.Context, repositoryAccess, Revision) error
 }
 
 // Fetcher 获取并验证一个固定目标分支，不负责激活仓库目录。
@@ -156,7 +155,7 @@ type Fetcher struct {
 	caBundle       []byte
 	cleanupContext cleanupContextFactory
 	newTicker      tickerFactory
-	bindRevision   func(context.Context, string, Revision) error
+	bindRevision   func(context.Context, repositoryAccess, Revision) error
 }
 
 // NewFetcher 创建使用 go-git 传输和真实静态校验器的仓库获取器。
@@ -465,7 +464,8 @@ func (f *Fetcher) fetchAttempt(
 	defer cancelClone()
 	heartbeat := newCloneHeartbeat(f.emitProgress, f.newTicker, cloneHeartbeatInterval, cancelClone)
 	heartbeat.start()
-	cloneErr := f.git.Clone(cloneCtx, repositoryPath, git.CloneOptions{
+	access := repositoryAccess{path: repositoryPath, lease: lease}
+	cloneErr := f.git.Clone(cloneCtx, access, git.CloneOptions{
 		URL:               attempt.Source.BaseURL(),
 		RemoteName:        "origin",
 		ReferenceName:     plumbing.NewBranchReferenceName(request.Target.Branch()),
@@ -547,6 +547,7 @@ func (f *Fetcher) fetchAttempt(
 
 	reportFetchStage(request, protocol.StageWorkspaceVerify)
 	verification, verifyErr := f.verifier.Verify(ctx, VerificationRequest{
+		lease:          lease,
 		RepositoryPath: repositoryPath,
 		Target:         request.Target,
 		Source:         attempt.Source,
@@ -610,7 +611,7 @@ func (f *Fetcher) fetchAttempt(
 			lease,
 		)
 	}
-	if err := f.bindRevision(ctx, repositoryPath, verification); err != nil {
+	if err := f.bindRevision(ctx, access, verification); err != nil {
 		return f.finishFailedAttempt(ctx, request, repositoryPath, mirror.OutcomeTargetFailure,
 			failureRepositoryInvalid, invalidRepositoryError("version_mismatch", err), true, lease)
 	}
@@ -1232,23 +1233,23 @@ func (goGitClient) ListReferences(
 
 func (c goGitClient) Clone(
 	ctx context.Context,
-	path string,
+	access repositoryAccess,
 	options git.CloneOptions,
-) error {
+) (returnErr error) {
 	if !c.policy.valid() || !options.NoCheckout {
 		return errInvalidCheckoutPolicy
 	}
-	worktree := osfs.New(path)
-	gitDirectory, err := worktree.Chroot(git.GitDirName)
+	files, err := openGitFiles(ctx, access)
 	if err != nil {
-		return fmt.Errorf("create git directory: %w", err)
+		return fmt.Errorf("open git filesystem: %w", err)
 	}
-	diskStore := gitfilesystem.NewStorage(gitDirectory, gitcache.NewObjectLRUDefault())
+	defer func() { returnErr = errors.Join(returnErr, files.close()) }()
+	diskStore := gitfilesystem.NewStorage(files.metadata, gitcache.NewObjectLRUDefault())
 	store := cloneStorage{
 		Storer: diskStore,
 		init:   diskStore.Init,
 	}
-	repository, err := git.CloneContext(ctx, store, worktree, &options)
+	repository, err := git.CloneContext(ctx, store, files.worktree, &options)
 	if err != nil {
 		return err
 	}

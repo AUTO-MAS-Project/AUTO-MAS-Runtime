@@ -95,7 +95,7 @@ func TestRestoreTrackedFiles_LocalCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforeCalls := 0
-	count, err := (goGitRepositoryReader{}).Restore(t.Context(), layout, commit, func() error { beforeCalls++; return nil })
+	count, err := restoreTestRepository(t.Context(), t, layout, commit, func() error { beforeCalls++; return nil })
 	if err != nil || count != 2 || beforeCalls != 1 {
 		t.Fatalf("Restore() = %d, %v, before=%d, want 2, nil, 1", count, err, beforeCalls)
 	}
@@ -105,7 +105,7 @@ func TestRestoreTrackedFiles_LocalCommit(t *testing.T) {
 			t.Fatalf("file %s = %q, %v, want %q", name, got, err, want)
 		}
 	}
-	count, err = (goGitRepositoryReader{}).Restore(t.Context(), layout, commit, func() error { t.Fatal("clean restore wrote state"); return nil })
+	count, err = restoreTestRepository(t.Context(), t, layout, commit, func() error { t.Fatal("clean restore wrote state"); return nil })
 	if err != nil || count != 0 {
 		t.Fatalf("second restore = %d, %v", count, err)
 	}
@@ -117,7 +117,7 @@ func TestRestoreTrackedFiles_BeforeWriteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	sentinel := errors.New("state write rejected")
-	_, err := (goGitRepositoryReader{}).Restore(t.Context(), layout, commit, func() error { return sentinel })
+	_, err := restoreTestRepository(t.Context(), t, layout, commit, func() error { return sentinel })
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, want state rejection", err)
 	}
@@ -192,7 +192,7 @@ func TestRestoreTrackedFiles_RejectsMissingBlobAndDirectory(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			_, err := (goGitRepositoryReader{}).Restore(t.Context(), layout, commit, func() error { t.Fatal("invalid input began restoration"); return nil })
+			_, err := restoreTestRepository(t.Context(), t, layout, commit, func() error { t.Fatal("invalid input began restoration"); return nil })
 			if err == nil {
 				t.Fatal("Restore accepted invalid input")
 			}
@@ -207,7 +207,7 @@ func TestRestoreTrackedFiles_CancelBeforeReplace(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, err := (goGitRepositoryReader{}).Restore(ctx, layout, commit, func() error { cancel(); return nil })
+	_, err := restoreTestRepository(ctx, t, layout, commit, func() error { cancel(); return nil })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want cancelled", err)
 	}
@@ -215,7 +215,7 @@ func TestRestoreTrackedFiles_CancelBeforeReplace(t *testing.T) {
 	if err != nil || string(got) != "broken" {
 		t.Fatalf("cancelled source = %q, %v", got, err)
 	}
-	count, err := (goGitRepositoryReader{}).Restore(t.Context(), layout, commit, func() error { return nil })
+	count, err := restoreTestRepository(t.Context(), t, layout, commit, func() error { return nil })
 	if err != nil || count != 1 {
 		t.Fatalf("resumed restore = %d, %v", count, err)
 	}

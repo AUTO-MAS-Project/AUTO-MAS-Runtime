@@ -334,7 +334,7 @@ func (r *Recovery) classifyPath(
 		closeErr := lease.Close()
 		return recoveryPath{}, errors.Join(filesystem.ErrIdentityChanged, closeErr)
 	}
-	snapshot, inspectErr := r.reader.Inspect(ctx, path)
+	snapshot, inspectErr := r.reader.Inspect(ctx, repositoryAccess{path: path, lease: lease})
 	closeErr := lease.Close()
 	if closeErr != nil {
 		inspectErr = errors.Join(inspectErr, closeErr)

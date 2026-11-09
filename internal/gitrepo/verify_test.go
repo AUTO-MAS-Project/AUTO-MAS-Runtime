@@ -249,7 +249,7 @@ type fakeRepositoryReader struct {
 	err      error
 }
 
-func (r *fakeRepositoryReader) Inspect(context.Context, string) (repositorySnapshot, error) {
+func (r *fakeRepositoryReader) Inspect(context.Context, repositoryAccess) (repositorySnapshot, error) {
 	return cloneRepositorySnapshot(r.snapshot), r.err
 }
 

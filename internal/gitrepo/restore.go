@@ -27,17 +27,18 @@ type sourceRestore struct {
 }
 
 // Restore 以 Commit tree 为准恢复跟踪文件，所有目标 Blob 验证通过后才允许修改。
-func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error) {
+func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, lease directoryLease, commit string, beforeWrite func() error) (count int, returnErr error) {
 	if ctx == nil || layout == nil || !validCommit(commit) || beforeWrite == nil {
 		return 0, errInvalidRepositoryRead
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	repository, err := git.PlainOpen(layout.RepoDir())
+	repository, closeRepository, err := openGitRepository(ctx, repositoryAccess{path: layout.RepoDir(), lease: lease})
 	if err != nil {
 		return 0, err
 	}
+	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
 	if err := verifySourceObject(ctx, repository, plumbing.CommitObject, plumbing.NewHash(commit)); err != nil {
 		return 0, err
 	}
@@ -189,7 +190,7 @@ func (s *Service) restoreOrFinishUnchanged(ctx context.Context, request SyncRequ
 	if check.directoryIdentity == nil || !check.directoryIdentity.Equal(lease.Identity()) {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, filesystem.ErrIdentityChanged)
 	}
-	count, err := s.reader.Restore(ctx, s.layout, check.Commit, func() error {
+	count, err := s.reader.Restore(ctx, s.layout, lease, check.Commit, func() error {
 		broken, err := runtime.NewBrokenEnvironment(environment.LastSuccessful, state.BrokenEnvironment{TargetVersion: check.Version, Branch: check.Branch, Commit: check.Commit, Reason: state.ReasonRepositoryChanged, Stage: protocol.StageWorkspaceVerify, LogPath: logPath})
 		if err != nil {
 			return serviceStateWriteError(protocol.StageWorkspaceVerify, err)

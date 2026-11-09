@@ -6,12 +6,12 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
-func (*serviceTestReader) Restore(context.Context, *config.Layout, string, func() error) (int, error) {
+func (*serviceTestReader) Restore(context.Context, *config.Layout, directoryLease, string, func() error) (int, error) {
 	return 0, nil
 }
-func (*blockingServiceReader) Restore(context.Context, *config.Layout, string, func() error) (int, error) {
+func (*blockingServiceReader) Restore(context.Context, *config.Layout, directoryLease, string, func() error) (int, error) {
 	return 0, nil
 }
-func (*fakeRepositoryReader) Restore(context.Context, *config.Layout, string, func() error) (int, error) {
+func (*fakeRepositoryReader) Restore(context.Context, *config.Layout, directoryLease, string, func() error) (int, error) {
 	return 0, nil
 }

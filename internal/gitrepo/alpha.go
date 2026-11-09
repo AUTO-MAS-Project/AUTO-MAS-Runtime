@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	git "github.com/go-git/go-git/v5"
 	gitconfig "github.com/go-git/go-git/v5/plumbing/format/config"
 )
 
@@ -49,11 +48,16 @@ func readAlphaBinding(raw *gitconfig.Config) (*alphaBinding, error) {
 
 // bindAlphaRevision 只在完整校验后持目录租约写入身份，不改任何受管源码。
 // 绑定随目录替换，避免崩溃恢复依赖当前远端 dev 或猜测构建版本。
-func bindAlphaRevision(ctx context.Context, path string, revision Revision) error {
+func bindAlphaRevision(ctx context.Context, access repositoryAccess, revision Revision) (returnErr error) {
 	if revision.Branch() != "dev" {
 		return nil
 	}
-	snapshot, err := (goGitRepositoryReader{}).Inspect(ctx, path)
+	repository, closeRepository, err := openGitRepository(ctx, access)
+	if err != nil {
+		return fmt.Errorf("open alpha repository: %w", err)
+	}
+	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
+	snapshot, err := inspectOpenRepository(ctx, repository)
 	if err != nil {
 		return err
 	}
@@ -61,10 +65,7 @@ func bindAlphaRevision(ctx context.Context, path string, revision Revision) erro
 	if err != nil || !validVersion(sourceVersion) || snapshot.commit != revision.Commit() || snapshot.headTarget != "refs/heads/dev" {
 		return errors.Join(errInvalidRepositoryID, err)
 	}
-	repository, err := git.PlainOpen(path)
-	if err != nil {
-		return fmt.Errorf("open alpha repository: %w", err)
-	}
+
 	cfg, err := repository.Config()
 	if err != nil {
 		return fmt.Errorf("read alpha config: %w", err)
@@ -79,7 +80,7 @@ func bindAlphaRevision(ctx context.Context, path string, revision Revision) erro
 	if err := repository.SetConfig(cfg); err != nil {
 		return fmt.Errorf("write alpha identity: %w", err)
 	}
-	snapshot, err = (goGitRepositoryReader{}).Inspect(ctx, path)
+	snapshot, err = inspectOpenRepository(ctx, repository)
 	if err != nil {
 		return err
 	}

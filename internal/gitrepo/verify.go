@@ -26,6 +26,7 @@ type VerificationRequest struct {
 	Target         Target
 	Source         mirror.Source
 	AllowedSources []mirror.Source
+	lease          directoryLease
 }
 
 // Verifier 校验克隆仓库的来源、分支、对象边界和版本文档。
@@ -75,7 +76,7 @@ func (v *Verifier) Verify(
 		return Revision{}, verificationCancelledError(err)
 	}
 
-	snapshot, err := v.reader.Inspect(ctx, request.RepositoryPath)
+	snapshot, err := v.reader.Inspect(ctx, repositoryAccess{path: request.RepositoryPath, lease: request.lease})
 	if ctxErr := ctx.Err(); ctxErr != nil || isCancellation(ctx, err) {
 		return Revision{}, verificationCancelledError(errors.Join(ctxErr, err))
 	}

@@ -1135,8 +1135,8 @@ func (f *fakeGitClient) ListReferences(ctx context.Context, sourceURL string, ca
 	return f.list(ctx, sourceURL, caBundle)
 }
 
-func (f *fakeGitClient) Clone(ctx context.Context, path string, options git.CloneOptions) error {
-	return f.clone(ctx, path, options)
+func (f *fakeGitClient) Clone(ctx context.Context, access repositoryAccess, options git.CloneOptions) error {
+	return f.clone(ctx, access.path, options)
 }
 
 type fakeCloneVerifier struct {
