@@ -307,7 +307,12 @@ func TestSentry_BeforeSendRejectsCancelledAndMismatchedFailureKinds(t *testing.T
 
 func TestSentry_CapturesUnexpectedPanicWithoutPanicValue(t *testing.T) {
 	provider, transport := newSentryTestProvider(t)
-	provider.captureInternal(validSentryObservation(true))
+	observation := validSentryObservation(true)
+	observation.PanicFrames = []StackFrame{
+		{Function: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli.run", Module: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli", Lineno: 42},
+		{Function: "runtime.gopanic", Module: "runtime", Lineno: 99},
+	}
+	provider.captureInternal(observation)
 
 	_, events, _, _ := transport.snapshot()
 	if len(events) != 1 {
@@ -325,6 +330,10 @@ func TestSentry_CapturesUnexpectedPanicWithoutPanicValue(t *testing.T) {
 	}
 	if event.Exception[0].Mechanism.Handled == nil || *event.Exception[0].Mechanism.Handled {
 		t.Fatalf("panic handled flag = %v, want false", event.Exception[0].Mechanism.Handled)
+	}
+	stack := event.Exception[0].Stacktrace
+	if stack == nil || len(stack.Frames) != 2 || !stack.Frames[0].InApp || stack.Frames[1].InApp {
+		t.Fatalf("panic stack = %#v, want application frame followed by system frame", stack)
 	}
 }
 

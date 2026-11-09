@@ -353,8 +353,16 @@ func capturePanicFrames() []telemetry.StackFrame {
 	for {
 		frame, more := frames.Next()
 		if frame.Function != "" {
+			// Go 完整函数名的包分隔点位于最后一个路径分隔符之后。
+			packageNameStart := strings.LastIndex(frame.Function, "/") + 1
+			packageSeparator := strings.Index(frame.Function[packageNameStart:], ".")
+			module := ""
+			if packageSeparator >= 0 {
+				module = frame.Function[:packageNameStart+packageSeparator]
+			}
 			result = append(result, telemetry.StackFrame{
 				Function: frame.Function,
+				Module:   module,
 				Lineno:   frame.Line,
 			})
 		}

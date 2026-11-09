@@ -409,6 +409,7 @@ func TestRunOperation_HelloVersionPanicReportsAfterFinalResult(t *testing.T) {
 	if len(internal) != 1 || !internal[0].Panic || closes != 1 || beforeResult {
 		t.Fatalf("telemetry = internal:%d panic:%v close:%d beforeResult:%v, want 1/true/1/false", len(internal), len(internal) == 1 && internal[0].Panic, closes, beforeResult)
 	}
+	assertPanicFrameModules(t, internal[0].PanicFrames)
 	if strings.Contains(stdout.String(), "secret version panic") {
 		t.Fatal("raw version panic leaked to stdout")
 	}
@@ -563,6 +564,24 @@ func TestRunOperation_PanicReportsSentry(t *testing.T) {
 	if len(internal) != 1 || !internal[0].Panic {
 		t.Fatalf("panic observations = %#v, want one panic", internal)
 	}
+	assertPanicFrameModules(t, internal[0].PanicFrames)
+}
+
+func assertPanicFrameModules(t *testing.T, frames []telemetry.StackFrame) {
+	t.Helper()
+	const applicationPackage = "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli"
+	found := false
+	for _, frame := range frames {
+		if strings.HasPrefix(frame.Function, applicationPackage+".") {
+			found = true
+			if frame.Module != applicationPackage {
+				t.Fatalf("panic frame module = %q, want %q", frame.Module, applicationPackage)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("panic observation has no application frame")
+	}
 }
 
 func TestBackendSupervise_ControlReaderPanicReportsSentry(t *testing.T) {
@@ -586,6 +605,7 @@ func TestBackendSupervise_ControlReaderPanicReportsSentry(t *testing.T) {
 	if len(internal) != 1 || !internal[0].Panic || closes != 1 {
 		t.Fatalf("telemetry = internal:%d panic:%v close:%d, want 1/true/1", len(internal), len(internal) == 1 && internal[0].Panic, closes)
 	}
+	assertPanicFrameModules(t, internal[0].PanicFrames)
 	if strings.Contains(stdout.String(), "secret stdin panic") || strings.Contains(stderr.String(), "secret stdin panic") {
 		t.Fatal("raw control reader panic leaked to process output")
 	}
