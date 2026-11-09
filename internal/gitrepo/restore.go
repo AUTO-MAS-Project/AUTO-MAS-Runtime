@@ -22,8 +22,21 @@ import (
 const maxRestoredSourceBytes int64 = 64 << 20
 
 type sourceRestore struct {
-	path    string
-	payload []byte
+	path     string
+	payload  []byte
+	perm     os.FileMode
+	expected *filesystem.DirectoryIdentity
+}
+
+type sourceFileSnapshot struct {
+	data     []byte
+	identity *filesystem.DirectoryIdentity
+	exists   bool
+}
+
+type sourceRestoreFiles struct {
+	read    func(context.Context, string, int64) (sourceFileSnapshot, error)
+	replace func(context.Context, sourceRestore) (filesystem.PublishResult, error)
 }
 
 // Restore 以 Commit tree 为准恢复跟踪文件，所有目标 Blob 验证通过后才允许修改。
@@ -39,6 +52,10 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		return 0, err
 	}
 	defer func() { returnErr = errors.Join(returnErr, closeRepository()) }()
+	sourceFiles, err := restoreFilesFor(repository, layout)
+	if err != nil {
+		return 0, err
+	}
 	if err := verifySourceObject(ctx, repository, plumbing.CommitObject, plumbing.NewHash(commit)); err != nil {
 		return 0, err
 	}
@@ -73,11 +90,11 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		if err != nil {
 			return err
 		}
-		actual, err := filesystem.ReadManagedFile(ctx, layout, path, file.Size+1)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		actual, err := sourceFiles.read(ctx, path, file.Size+1)
+		if err != nil {
 			return err
 		}
-		if err == nil && int64(len(actual)) == file.Size && plumbing.ComputeHash(plumbing.BlobObject, actual) == file.Hash {
+		if actual.exists && int64(len(actual.data)) == file.Size && plumbing.ComputeHash(plumbing.BlobObject, actual.data) == file.Hash {
 			return nil
 		}
 		reader, err := file.Reader()
@@ -91,7 +108,11 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		if int64(len(payload)) != file.Size || plumbing.ComputeHash(plumbing.BlobObject, payload) != file.Hash {
 			return errors.New("tracked source blob hash does not match commit")
 		}
-		pending = append(pending, sourceRestore{path: path, payload: payload})
+		perm := os.FileMode(0o644)
+		if file.Mode == filemode.Executable {
+			perm = 0o755
+		}
+		pending = append(pending, sourceRestore{path: path, payload: payload, perm: perm, expected: actual.identity})
 		return nil
 	})
 	if err != nil {
@@ -113,19 +134,23 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 	if err := beforeWrite(); err != nil {
 		return 0, err
 	}
-	for index, file := range pending {
-		if err := filesystem.ReplaceManagedFile(ctx, layout, file.path, file.payload); err != nil {
-			return index, err
+	for _, file := range pending {
+		published, err := sourceFiles.replace(ctx, file)
+		if published.Published {
+			count++
 		}
-		actual, err := filesystem.ReadManagedFile(ctx, layout, file.path, int64(len(file.payload))+1)
 		if err != nil {
-			return index + 1, err
+			return count, err
 		}
-		if plumbing.ComputeHash(plumbing.BlobObject, actual) != plumbing.ComputeHash(plumbing.BlobObject, file.payload) {
-			return index + 1, errors.New("restored source verification failed")
+		actual, err := sourceFiles.read(ctx, file.path, int64(len(file.payload))+1)
+		if err != nil {
+			return count, err
+		}
+		if !actual.exists || plumbing.ComputeHash(plumbing.BlobObject, actual.data) != plumbing.ComputeHash(plumbing.BlobObject, file.payload) {
+			return count, errors.New("restored source verification failed")
 		}
 	}
-	return len(pending), nil
+	return count, nil
 }
 
 func verifySourceTrees(ctx context.Context, repository *git.Repository, tree *object.Tree) error {

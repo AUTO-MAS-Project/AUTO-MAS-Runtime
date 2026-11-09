@@ -101,6 +101,20 @@ func (s *DownloadSession) PartPath() string { return s.partPath }
 
 // PublishNoReplace 发布原临时对象，不覆盖竞争目标；发布后错误仍返回 Published=true。
 func (s *DownloadSession) PublishNoReplace(ctx context.Context) (PublishResult, error) {
+	return s.publishDarwin(ctx, darwinPublicationOps{
+		syncPart:      (*os.File).Sync,
+		syncDirectory: (*os.File).Sync,
+		closePins:     closeDarwinPins,
+	})
+}
+
+type darwinPublicationOps struct {
+	syncPart      func(*os.File) error
+	syncDirectory func(*os.File) error
+	closePins     func([]pinnedObject) error
+}
+
+func (s *DownloadSession) publishDarwin(ctx context.Context, ops darwinPublicationOps) (PublishResult, error) {
 	if ctx == nil {
 		return PublishResult{}, ErrInvalidArgument
 	}
@@ -119,7 +133,7 @@ func (s *DownloadSession) PublishNoReplace(ctx context.Context) (PublishResult, 
 	if _, err := directory.verifyFile(filepath.Base(s.partPath), s.part.file, s.part.identity); err != nil {
 		return PublishResult{}, err
 	}
-	if err := s.part.file.Sync(); err != nil {
+	if err := ops.syncPart(s.part.file); err != nil {
 		return PublishResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -135,7 +149,7 @@ func (s *DownloadSession) PublishNoReplace(ctx context.Context) (PublishResult, 
 	s.state = downloadPublished
 	s.published = PublishResult{Published: true}
 	identityErr := directory.verifyName(filepath.Base(s.path), s.part.identity, false)
-	s.closeErr = errors.Join(identityErr, directory.file.Sync(), closeDarwinPins([]pinnedObject{s.part}), closeDarwinPins(s.pins[:]))
+	s.closeErr = errors.Join(identityErr, ops.syncDirectory(directory.file), ops.closePins([]pinnedObject{s.part}), ops.closePins(s.pins[:]))
 	s.part.file = nil
 	return s.published, s.closeErr
 }

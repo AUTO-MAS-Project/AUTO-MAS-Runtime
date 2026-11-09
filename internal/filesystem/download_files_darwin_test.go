@@ -159,3 +159,87 @@ func TestDarwinDownload_ActiveSessionIsNotStale(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDarwinDownload_PublicationFailures(t *testing.T) {
+	fault := errors.New("injected publication fault")
+	for _, stage := range []string{"part sync", "directory sync", "close"} {
+		t.Run(stage, func(t *testing.T) {
+			files, err := NewDownloadFiles(darwinTestLayout(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := files.Begin(t.Context(), "payload.tar.gz")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if _, err := session.Abort(context.Background()); err != nil && !errors.Is(err, fault) {
+					t.Error(err)
+				}
+			})
+			if _, err := session.Write([]byte("payload")); err != nil {
+				t.Fatal(err)
+			}
+
+			var events []string
+			part := session.part.file
+			directory := session.pins[3].file
+			result, err := session.publishDarwin(t.Context(), darwinPublicationOps{
+				syncPart: func(file *os.File) error {
+					events = append(events, "part sync")
+					if stage == "part sync" {
+						return fault
+					}
+					return file.Sync()
+				},
+				syncDirectory: func(file *os.File) error {
+					events = append(events, "directory sync")
+					if stage == "directory sync" {
+						return fault
+					}
+					return file.Sync()
+				},
+				closePins: func(pins []pinnedObject) error {
+					events = append(events, "close")
+					closeErr := closeDarwinPins(pins)
+					if stage == "close" && len(pins) > 1 {
+						return errors.Join(closeErr, fault)
+					}
+					return closeErr
+				},
+			})
+			if !errors.Is(err, fault) || result.Published != (stage != "part sync") {
+				t.Fatalf("Publish(%s) = %#v, %v, want injected fault and correct mutation fact", stage, result, err)
+			}
+			if stage == "part sync" {
+				if len(events) != 1 {
+					t.Fatalf("after failed part sync got %v, want only part sync", events)
+				}
+				if _, err := os.Lstat(session.Path()); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("final path = %v, want absent", err)
+				}
+				if aborted, err := session.Abort(t.Context()); err != nil || !aborted.Removed {
+					t.Fatalf("Abort(unpublished) = %#v, %v, want removed", aborted, err)
+				}
+				return
+			}
+			if len(events) != 4 || events[0] != "part sync" || events[1] != "directory sync" || events[2] != "close" || events[3] != "close" {
+				t.Fatalf("publication order = %v, want sync part, sync directory, close both", events)
+			}
+			for _, file := range []*os.File{part, directory} {
+				if _, err := file.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("published descriptor still open: Stat = %v", err)
+				}
+			}
+			if again, err := session.PublishNoReplace(t.Context()); !again.Published || !errors.Is(err, fault) {
+				t.Fatalf("Publish(repeated) = %#v, %v, want sticky outcome", again, err)
+			}
+			if abort, err := session.Abort(t.Context()); abort.Removed || !errors.Is(err, fault) {
+				t.Fatalf("Abort(published) = %#v, %v, want unchanged and sticky error", abort, err)
+			}
+			if data, err := os.ReadFile(session.Path()); err != nil || string(data) != "payload" {
+				t.Fatalf("published file = %q, %v, want original payload", data, err)
+			}
+		})
+	}
+}
