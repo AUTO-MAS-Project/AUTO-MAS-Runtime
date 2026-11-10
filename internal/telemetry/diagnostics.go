@@ -34,6 +34,7 @@ const (
 	diagnosticContainer
 	diagnosticDynamicNumberMap
 	diagnosticProtocolCode
+	diagnosticProtocolStage
 	diagnosticSHA256
 	diagnosticHTTPStatus
 )
@@ -46,6 +47,7 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"id": diagnosticStableToken, "status": diagnosticStableValue, "brokenStage": diagnosticStableToken,
 	"mode": diagnosticStableToken, "state": diagnosticStableToken, "sink": diagnosticStableToken,
 	"code":          diagnosticProtocolCode,
+	"stage":         diagnosticProtocolStage,
 	"pythonVersion": diagnosticIdentifier, "expectedVersion": diagnosticIdentifier,
 	"actualVersion": diagnosticIdentifier, "branch": diagnosticIdentifier, "commit": diagnosticIdentifier,
 	"version": diagnosticIdentifier, "expectedProtocol": diagnosticStableValue, "receivedProtocol": diagnosticStableValue,
@@ -67,7 +69,8 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"maxBytes": diagnosticNumber, "count": diagnosticNumber, "orphanCount": diagnosticNumber,
 
 	"partial": diagnosticBoolean, "committed": diagnosticBoolean, "removed": diagnosticBoolean,
-	"truncated": diagnosticBoolean, "lockRewritten": diagnosticBoolean, "synchronized": diagnosticBoolean,
+	"terminationRequested": diagnosticBoolean,
+	"truncated":            diagnosticBoolean, "lockRewritten": diagnosticBoolean, "synchronized": diagnosticBoolean,
 	"lockfileChecked": diagnosticBoolean, "orphansTruncated": diagnosticBoolean,
 
 	"attempts": diagnosticContainer, "failures": diagnosticContainer, "items": diagnosticContainer,
@@ -172,6 +175,12 @@ func sanitizeDiagnosticValue(value any, key string, depth int, fields *int) any 
 	case diagnosticProtocolCode:
 		typed, ok := diagnosticString(value)
 		if !ok || !protocol.IsKnownCode(protocol.Code(typed)) {
+			return nil
+		}
+		return typed
+	case diagnosticProtocolStage:
+		typed, ok := diagnosticString(value)
+		if !ok || !protocol.IsKnownStage(protocol.Stage(typed)) {
 			return nil
 		}
 		return typed

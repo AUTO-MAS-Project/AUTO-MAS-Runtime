@@ -396,6 +396,16 @@ func readEnvironmentOrUninitialized(
 		}, nil
 	}
 	if err != nil {
+		var validationErr *state.ValidationError
+		if errors.As(err, &validationErr) && validationErr.Field == "status" {
+			return state.EnvironmentState{}, &commandError{
+				code:    protocol.CodeStateWriteFailed,
+				stage:   protocol.StageBootstrap,
+				message: "环境生命周期状态无效",
+				details: map[string]any{"reason": "invalid_lifecycle_state"},
+				cause:   err,
+			}
+		}
 		return state.EnvironmentState{}, stateStoreError(protocol.StageBootstrap, err)
 	}
 	return value, nil

@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,8 +18,10 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
@@ -258,6 +263,106 @@ func TestRunOperation_ExpectedFailureReportsSanitizedDiagnostics(t *testing.T) {
 	}
 }
 
+func TestBootstrap_InvalidPersistedStatusReportsReason(t *testing.T) {
+	root := t.TempDir()
+	recorder := &telemetryRecorderSpy{}
+	log := &m5TestLog{}
+	payload, err := json.Marshal(state.EnvironmentState{
+		SchemaVersion:  state.SchemaVersion,
+		Status:         protocol.StatePreparingUV,
+		UpdatedAt:      time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC),
+		LastSuccessful: state.Revision{Version: "v5.4.0", Commit: strings.Repeat("a", 40)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = append(payload, '\n')
+	var statePath string
+	preparationStarted := false
+	var stdout bytes.Buffer
+	code := executeWithTelemetry(t, []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0"}, recorder, &stdout,
+		WithCWD(root),
+		WithEnvironmentStateStoreFactory(func(ctx context.Context, layout *config.Layout, clock func() time.Time) (environmentStateStore, error) {
+			statePath = layout.EnvironmentStateFile()
+			if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(statePath, payload, 0o644); err != nil {
+				return nil, err
+			}
+			return state.NewStore(ctx, layout, state.WithClock(clock))
+		}),
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return &m5TestCoordinator{calls: &log.calls}, nil
+		}),
+		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) {
+			preparationStarted = true
+			return &m5TestEnvironment{calls: &log.calls}, nil
+		}),
+	)
+	if code != protocol.ExitCodeOperationConflict || preparationStarted {
+		t.Fatalf("exit/preparation = %d/%t, want %d/false", code, preparationStarted, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 || observations[0].Code != "STATE_WRITE_FAILED" || observations[0].Reason != "invalid_lifecycle_state" {
+		t.Fatalf("observations = %#v, want existing code with invalid lifecycle reason", observations)
+	}
+	remaining, err := os.ReadFile(statePath)
+	if err != nil || !bytes.Equal(remaining, payload) {
+		t.Fatalf("state changed after rejection: payload=%q, error=%v", remaining, err)
+	}
+}
+
+type telemetryDiagnosticError struct {
+	error
+	details map[string]any
+}
+
+func (e telemetryDiagnosticError) Unwrap() error                     { return e.error }
+func (e telemetryDiagnosticError) DiagnosticDetails() map[string]any { return e.details }
+
+func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
+	primary := &commandError{code: protocol.CodeBackendHealthTimeout, stage: protocol.StageBackendHealth, message: "timeout", committed: true}
+	cleanup := &commandError{code: protocol.CodeStateWriteFailed, stage: protocol.StageBackendCleanup, message: "cleanup", committed: true, details: map[string]any{"exitCode": 1}}
+	err := telemetryDiagnosticError{error: errors.Join(cleanup, primary), details: map[string]any{"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40), "terminationRequested": true, "password": "secret"}}
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	exitCode := executeWithTelemetry(t, []string{"--output", "ndjson", "backend", "supervise", "--mode", "managed"}, recorder, &stdout,
+		WithBackendFactory(func(context.Context, *config.Layout, io.Writer, func() time.Time, mirror.Policy) (backendService, error) {
+			return backendServiceFunc(func(context.Context, backend.Request) error { return err }), nil
+		}),
+	)
+	if exitCode != protocol.ExitCodeOperationConflict {
+		t.Fatalf("exit code = %d, want %d", exitCode, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 || observations[0].Code != string(protocol.CodeStateWriteFailed) {
+		t.Fatalf("observations = %#v, want existing cleanup priority", observations)
+	}
+	want := map[string]any{
+		"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40),
+		"exitCode": 1, "terminationRequested": true,
+		"failures": []any{
+			map[string]any{"phase": "primary", "code": "BACKEND_HEALTH_TIMEOUT", "stage": "backend.health"},
+			map[string]any{"phase": "cleanup", "code": "STATE_WRITE_FAILED", "stage": "backend.cleanup"},
+		},
+	}
+	if !reflect.DeepEqual(observations[0].DiagnosticDetails, want) {
+		t.Fatalf("diagnostics = %#v, want %#v", observations[0].DiagnosticDetails, want)
+	}
+	if !reflect.DeepEqual(cleanup.details, map[string]any{"exitCode": 1}) {
+		t.Fatalf("original details mutated: %#v", cleanup.details)
+	}
+	events := parseNDJSON(t, stdout.String())
+	result := events[len(events)-1]
+	if details, ok := result.object["details"].(map[string]any); !ok || details["version"] != nil || details["failures"] != nil || details["terminationRequested"] != nil {
+		t.Fatalf("protocol result gained telemetry-only fields: %#v", result.object["details"])
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("terminationRequested")) {
+		t.Fatalf("NDJSON gained telemetry-only termination fact: %s", stdout.Bytes())
+	}
+}
+
 func TestRunOperation_UnreportableFailureDoesNotReportSentry(t *testing.T) {
 	recorder := &telemetryRecorderSpy{}
 	var stdout bytes.Buffer
@@ -361,6 +466,7 @@ func TestRunOperation_HelloVersionPanicReportsAfterFinalResult(t *testing.T) {
 	if len(internal) != 1 || !internal[0].Panic || closes != 1 || beforeResult {
 		t.Fatalf("telemetry = internal:%d panic:%v close:%d beforeResult:%v, want 1/true/1/false", len(internal), len(internal) == 1 && internal[0].Panic, closes, beforeResult)
 	}
+	assertPanicFrameModules(t, internal[0].PanicFrames)
 	if strings.Contains(stdout.String(), "secret version panic") {
 		t.Fatal("raw version panic leaked to stdout")
 	}
@@ -515,6 +621,24 @@ func TestRunOperation_PanicReportsSentry(t *testing.T) {
 	if len(internal) != 1 || !internal[0].Panic {
 		t.Fatalf("panic observations = %#v, want one panic", internal)
 	}
+	assertPanicFrameModules(t, internal[0].PanicFrames)
+}
+
+func assertPanicFrameModules(t *testing.T, frames []telemetry.StackFrame) {
+	t.Helper()
+	const applicationPackage = "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli"
+	found := false
+	for _, frame := range frames {
+		if strings.HasPrefix(frame.Function, applicationPackage+".") {
+			found = true
+			if frame.Module != applicationPackage {
+				t.Fatalf("panic frame module = %q, want %q", frame.Module, applicationPackage)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("panic observation has no application frame")
+	}
 }
 
 func TestBackendSupervise_ControlReaderPanicReportsSentry(t *testing.T) {
@@ -538,6 +662,7 @@ func TestBackendSupervise_ControlReaderPanicReportsSentry(t *testing.T) {
 	if len(internal) != 1 || !internal[0].Panic || closes != 1 {
 		t.Fatalf("telemetry = internal:%d panic:%v close:%d, want 1/true/1", len(internal), len(internal) == 1 && internal[0].Panic, closes)
 	}
+	assertPanicFrameModules(t, internal[0].PanicFrames)
 	if strings.Contains(stdout.String(), "secret stdin panic") || strings.Contains(stderr.String(), "secret stdin panic") {
 		t.Fatal("raw control reader panic leaked to process output")
 	}
