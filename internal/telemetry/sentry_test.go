@@ -150,6 +150,9 @@ func TestSentry_CapturesExpectedFailureWithReason(t *testing.T) {
 	if len(events) != 1 || events[0].Tags["reason"] != "repository_unknown" {
 		t.Fatalf("events = %#v, want expected failure reason", events)
 	}
+	if events[0].Exception[0].Value != "runtime operation failed: UPDATE_STATE_AMBIGUOUS" || events[0].Message != sentryFailureMessage {
+		t.Fatalf("exception/message = %q/%q, want classified title and fixed message", events[0].Exception[0].Value, events[0].Message)
+	}
 	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)

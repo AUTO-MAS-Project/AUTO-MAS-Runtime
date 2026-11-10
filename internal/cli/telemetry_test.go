@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,8 +18,10 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/version"
 )
@@ -256,6 +260,56 @@ func TestRunOperation_ExpectedFailureReportsSanitizedDiagnostics(t *testing.T) {
 	}
 	if !bytes.Contains(encoded, []byte("repository_invalid")) {
 		t.Fatalf("sanitized observation = %s, want stable failureKind", encoded)
+	}
+}
+
+func TestBootstrap_InvalidPersistedStatusReportsReason(t *testing.T) {
+	root := t.TempDir()
+	recorder := &telemetryRecorderSpy{}
+	log := &m5TestLog{}
+	payload, err := json.Marshal(state.EnvironmentState{
+		SchemaVersion:  state.SchemaVersion,
+		Status:         protocol.StatePreparingUV,
+		UpdatedAt:      time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC),
+		LastSuccessful: state.Revision{Version: "v5.4.0", Commit: strings.Repeat("a", 40)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = append(payload, '\n')
+	var statePath string
+	preparationStarted := false
+	var stdout bytes.Buffer
+	code := executeWithTelemetry(t, []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0"}, recorder, &stdout,
+		WithCWD(root),
+		WithEnvironmentStateStoreFactory(func(ctx context.Context, layout *config.Layout, clock func() time.Time) (environmentStateStore, error) {
+			statePath = layout.EnvironmentStateFile()
+			if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(statePath, payload, 0o644); err != nil {
+				return nil, err
+			}
+			return state.NewStore(ctx, layout, state.WithClock(clock))
+		}),
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return &m5TestCoordinator{calls: &log.calls}, nil
+		}),
+		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) {
+			preparationStarted = true
+			return &m5TestEnvironment{calls: &log.calls}, nil
+		}),
+	)
+	if code != protocol.ExitCodeOperationConflict || preparationStarted {
+		t.Fatalf("exit/preparation = %d/%t, want %d/false", code, preparationStarted, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 || observations[0].Code != "STATE_WRITE_FAILED" || observations[0].Reason != "invalid_lifecycle_state" {
+		t.Fatalf("observations = %#v, want existing code with invalid lifecycle reason", observations)
+	}
+	remaining, err := os.ReadFile(statePath)
+	if err != nil || !bytes.Equal(remaining, payload) {
+		t.Fatalf("state changed after rejection: payload=%q, error=%v", remaining, err)
 	}
 }
 

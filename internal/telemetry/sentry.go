@@ -252,6 +252,10 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		mechanism.SetUnhandled()
 	}
 
+	exceptionValue := message
+	if kind == sentryObservationFailure {
+		exceptionValue += ": " + string(code)
+	}
 	sanitized := &sentry.Event{
 		EventID:     event.EventID,
 		Timestamp:   event.Timestamp,
@@ -264,7 +268,7 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		Tags:        sanitizeSentryTags(event.Tags),
 		Exception: []sentry.Exception{{
 			Type:       sentryExceptionType,
-			Value:      message,
+			Value:      exceptionValue,
 			Module:     "auto-mas-runtime",
 			Stacktrace: sanitizeSentryStacktrace(firstSentryStacktrace(event.Exception)),
 			Mechanism:  mechanism,
