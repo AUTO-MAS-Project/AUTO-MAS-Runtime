@@ -68,12 +68,13 @@ func runVersion(
 	return sessionSuccess{
 		message: "版本信息查询完成",
 		details: map[string]any{
-			"runtimeVersion":  info.Version,
-			"protocolVersion": info.Protocol,
-			"commit":          info.Commit,
-			"buildDate":       info.BuildDate,
-			"goVersion":       info.GoVersion,
-			"alphaBackend":    "dev",
+			"runtimeVersion":            info.Version,
+			"protocolVersion":           info.Protocol,
+			"commit":                    info.Commit,
+			"buildDate":                 info.BuildDate,
+			"goVersion":                 info.GoVersion,
+			"alphaBackend":              "dev",
+			"bootstrapEnvironmentReuse": true,
 		},
 	}, nil
 }

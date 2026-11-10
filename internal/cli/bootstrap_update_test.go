@@ -22,11 +22,9 @@ import (
 )
 
 func TestBootstrap_AlphaStartupAndExplicitUpdate(t *testing.T) {
-	for _, startup := range []bool{true, false} {
-		name := "explicit update"
-		if startup {
-			name = "startup"
-		}
+	for _, option := range []string{"--if-needed", "", "--reuse-ready-environment"} {
+		startup := option == "--if-needed"
+		name := "explicit update" + option
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			log := &m5TestLog{}
@@ -52,8 +50,8 @@ func TestBootstrap_AlphaStartupAndExplicitUpdate(t *testing.T) {
 				return gitrepo.SyncResult{Revision: revision, Status: protocol.StateReadyToStart}, err
 			}}
 			args := []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", version}
-			if startup {
-				args = append(args, "--if-needed")
+			if option != "" {
+				args = append(args, option)
 			}
 			var stdout, stderr bytes.Buffer
 			code := Execute(t.Context(), args, IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(root),
@@ -77,6 +75,13 @@ func TestBootstrap_AlphaStartupAndExplicitUpdate(t *testing.T) {
 }
 
 func TestBootstrap_IfNeededSkipsOnlyUnchangedReadyEnvironment(t *testing.T) {
+	for _, option := range []string{"--if-needed", "--reuse-ready-environment"} {
+		t.Run(option, func(t *testing.T) { testBootstrapUnchangedReadyEnvironment(t, option) })
+	}
+}
+
+func testBootstrapUnchangedReadyEnvironment(t *testing.T, option string) {
+	t.Helper()
 	for _, changed := range []bool{false, true} {
 		name := "unchanged"
 		if changed {
@@ -110,7 +115,7 @@ func TestBootstrap_IfNeededSkipsOnlyUnchangedReadyEnvironment(t *testing.T) {
 				return gitrepo.SyncResult{Revision: revision, Changed: changed, Status: status}, err
 			}}
 			var stdout, stderr bytes.Buffer
-			code := Execute(t.Context(), []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0", "--if-needed"},
+			code := Execute(t.Context(), []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0", option},
 				IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(root),
 				WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
 				WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
@@ -182,6 +187,13 @@ func TestBootstrap_IfNeededRebuildsWhenVenvIsBroken(t *testing.T) {
 }
 
 func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
+	for _, option := range []string{"--if-needed", "--reuse-ready-environment"} {
+		t.Run(option, func(t *testing.T) { testBootstrapDependencyReadiness(t, option) })
+	}
+}
+
+func testBootstrapDependencyReadiness(t *testing.T, option string) {
+	t.Helper()
 	unsynchronized := &commandError{
 		code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesCheck,
 		message: "主项目依赖环境未同步", details: map[string]any{"exitCode": 1},
@@ -192,19 +204,32 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 		cause:   &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StageDependenciesCheck, details: map[string]any{"failureKind": "nonzero_exit"}},
 	}
 	tests := []struct {
-		name     string
-		result   uv.DependenciesResult
-		err      error
-		offline  bool
-		wantSync bool
-		wantCode protocol.Code
+		name            string
+		result          uv.DependenciesResult
+		err             error
+		offline         bool
+		wantSync        bool
+		wantCode        protocol.Code
+		pythonErr       error
+		postErr         error
+		postOutputFault bool
 	}{
 		{name: "healthy", result: uv.DependenciesResult{LockfileChecked: true, Synchronized: true}},
 		{name: "healthy offline", result: uv.DependenciesResult{LockfileChecked: true, Synchronized: true}, offline: true},
 		{name: "base interpreter missing", err: interpreterMissing, wantSync: true},
 		{name: "packages missing", err: unsynchronized, wantSync: true},
 		{name: "packages missing offline", err: unsynchronized, offline: true, wantSync: true},
+		{name: "repair leaves interpreter broken", err: interpreterMissing, postErr: interpreterMissing, wantSync: true, wantCode: protocol.CodeDependencySyncFailed},
+		{name: "post repair output fails", err: unsynchronized, postErr: &commandError{code: protocol.CodeOutputWriteFailed, stage: protocol.StageDependenciesCheck}, wantSync: true, wantCode: protocol.CodeOutputWriteFailed},
+		{name: "post check progress output fails", err: interpreterMissing, postOutputFault: true, wantSync: true, wantCode: protocol.CodeOutputWriteFailed},
 		{name: "unknown check result", wantSync: true},
+		{name: "managed Python missing", pythonErr: &commandError{code: protocol.CodePythonVersionMismatch, stage: protocol.StagePythonCheck, details: map[string]any{"exitCode": 1}}, wantSync: true},
+		{name: "managed Python spawn failure", pythonErr: &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StagePythonCheck}, wantCode: protocol.CodeUVExecFailed},
+		{name: "managed Python cancelled", pythonErr: context.Canceled, wantCode: protocol.CodeOperationCancelled},
+		{name: "managed Python wrapped stream failure", pythonErr: &commandError{
+			code: protocol.CodePythonVersionMismatch, stage: protocol.StagePythonCheck, details: map[string]any{"exitCode": 1},
+			cause: &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StagePythonCheck, details: map[string]any{"failureKind": "output_read_failed"}},
+		}, wantCode: protocol.CodePythonVersionMismatch},
 		{name: "cancelled", err: context.Canceled, wantCode: protocol.CodeOperationCancelled},
 		{name: "uv spawn failed", err: &commandError{code: protocol.CodeUVExecFailed, stage: protocol.StageDependenciesCheck}, wantCode: protocol.CodeUVExecFailed},
 		{name: "output failed", err: &commandError{code: protocol.CodeOutputWriteFailed, stage: protocol.StageDependenciesCheck}, wantCode: protocol.CodeOutputWriteFailed},
@@ -218,6 +243,9 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 		}, wantCode: protocol.CodeDependencySyncFailed},
 	}
 	for _, test := range tests {
+		if (test.pythonErr != nil || test.postErr != nil || test.postOutputFault) && option != "--reuse-ready-environment" {
+			continue
+		}
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			layout, err := config.NewLayout(root, root)
@@ -230,12 +258,23 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 			base := &m5TestEnvironment{calls: &log.calls}
 			environment := &bootstrapReadinessEnvironment{m5TestEnvironment: base}
 			commit := strings.Repeat("a", 40)
+			pythonChecked := false
+			environment.checkPython = func(_ context.Context, request uv.PythonRequest) (uv.PythonCheckResult, error) {
+				pythonChecked = true
+				if !request.MirrorPolicy.Offline() || request.PythonInstallDir != layout.PythonDir() || request.ProjectEnvDir != layout.VenvDir() || request.Commit != commit || request.Line == nil {
+					t.Fatalf("Python check must use offline managed identity: %+v", request)
+				}
+				return uv.PythonCheckResult{Spec: uv.PythonSpec{Version: uv.PythonVersion{Major: 3, Minor: 12, Patch: 10}}}, test.pythonErr
+			}
 			checked := false
 			environment.check = func(_ context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
 				checked = true
 				if !request.MirrorPolicy.Offline() || request.ProjectDir != layout.RepoDir() || request.ProjectEnvDir != layout.VenvDir() ||
 					request.PythonVersion != "3.12.10" || request.Commit != commit || request.Branch != "release/v5.4.0" || request.OperationID == "" || request.Line == nil {
 					t.Fatalf("check request = %+v, want offline managed identity and operation log", request)
+				}
+				if base.syncCalls > 0 {
+					return uv.DependenciesResult{LockfileChecked: true, Synchronized: true}, test.postErr
 				}
 				return test.result, test.err
 			}
@@ -246,13 +285,17 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 				revision, err := gitrepo.NewRevision("v5.4.0", "release/v5.4.0", commit, "github")
 				return gitrepo.SyncResult{Revision: revision, Status: protocol.StateReadyToStart}, err
 			}}
-			args := []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0", "--if-needed"}
+			args := []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0", option}
 			if test.offline {
 				args = append([]string{"--offline"}, args...)
 			} else {
 				args = append([]string{"--mirror", "package-index=aliyun"}, args...)
 			}
-			var stdout, stderr bytes.Buffer
+			var stderr bytes.Buffer
+			stdout := bootstrapPostCheckOutput{
+				shouldFail: func() bool { return test.postOutputFault && base.syncCalls > 0 },
+				fault:      errors.New("injected post-check progress output failure"),
+			}
 			code := Execute(t.Context(), args, IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(root),
 				WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
 				WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
@@ -266,10 +309,14 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 					return log, nil
 				}),
 			)
-			if !checked {
-				t.Fatal("dependency check was not called")
+			if pythonChecked != (option == "--reuse-ready-environment") || checked != (test.pythonErr == nil || (option == "--reuse-ready-environment" && base.syncCalls > 0)) {
+				t.Fatalf("python checked=%t, dependencies checked=%t", pythonChecked, checked)
 			}
-			if test.wantCode != "" {
+			if test.postOutputFault {
+				if code != 20 || !stdout.failed || !strings.Contains(stderr.String(), stdout.fault.Error()) {
+					t.Fatalf("output failure not preserved: exit=%d, injected=%t, stderr=%s", code, stdout.failed, stderr.String())
+				}
+			} else if test.wantCode != "" {
 				events := parseNDJSON(t, stdout.String())
 				last := events[len(events)-1]
 				if code == 0 || last.object["code"] != string(test.wantCode) {
@@ -285,7 +332,11 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 				t.Fatalf("python calls=%d, state writes=%v, want no preparation", base.pythonPrepareCalls, store.writes)
 			}
 			if test.wantSync {
-				if base.pythonPrepareCalls != 1 || len(store.writes) != 1 || store.writes[0].Status != protocol.StateReadyToStart {
+				wantStatus := protocol.StateReadyToStart
+				if test.wantCode != "" {
+					wantStatus = protocol.StateEnvironmentBroken
+				}
+				if base.pythonPrepareCalls != 1 || len(store.writes) != 1 || store.writes[0].Status != wantStatus {
 					t.Fatalf("python calls=%d, writes=%v, want prepared ready environment", base.pythonPrepareCalls, store.writes)
 				}
 				if base.dependencyRequest.MirrorPolicy.Offline() != test.offline {
@@ -303,7 +354,35 @@ func TestBootstrap_IfNeededChecksDependencyReadiness(t *testing.T) {
 
 type bootstrapReadinessEnvironment struct {
 	*m5TestEnvironment
-	check func(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error)
+	check       func(context.Context, uv.DependenciesRequest) (uv.DependenciesResult, error)
+	checkPython func(context.Context, uv.PythonRequest) (uv.PythonCheckResult, error)
+}
+
+// bootstrapPostCheckOutput 在同步后的复验开始事件注入真实输出通道故障。
+type bootstrapPostCheckOutput struct {
+	bytes.Buffer
+	shouldFail func() bool
+	fault      error
+	failed     bool
+}
+
+func (w *bootstrapPostCheckOutput) Write(payload []byte) (int, error) {
+	if w.shouldFail() {
+		var event struct {
+			Type   string                  `json:"type"`
+			Stage  protocol.Stage          `json:"stage"`
+			Status protocol.ProgressStatus `json:"status"`
+		}
+		if json.Unmarshal(payload, &event) == nil && event.Type == "progress" && event.Stage == protocol.StageDependenciesCheck && event.Status == protocol.ProgressRunning {
+			w.failed = true
+			return 0, w.fault
+		}
+	}
+	return w.Buffer.Write(payload)
+}
+
+func (s *bootstrapReadinessEnvironment) CheckPython(ctx context.Context, request uv.PythonRequest) (uv.PythonCheckResult, error) {
+	return s.checkPython(ctx, request)
 }
 
 func (s *bootstrapReadinessEnvironment) CheckDependencies(ctx context.Context, request uv.DependenciesRequest) (uv.DependenciesResult, error) {
