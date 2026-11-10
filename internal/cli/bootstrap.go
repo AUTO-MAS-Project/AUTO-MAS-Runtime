@@ -36,6 +36,7 @@ func bootstrapCommand(deps *deps) *cobra.Command {
 	}
 	command.Flags().String("version", "", "目标版本（例如 v5.4.0-beta.1）")
 	command.Flags().Bool("if-needed", false, "仅在仓库更新或环境未就绪时同步依赖")
+	command.Flags().Bool("reuse-ready-environment", false, "复验并复用健康环境，不改变目标仓库查询")
 	return command
 }
 
@@ -46,6 +47,10 @@ func runBootstrap(
 	emitter *protocol.Emitter,
 ) (success sessionSuccess, returnErr error) {
 	ifNeeded, err := command.Flags().GetBool("if-needed")
+	if err != nil {
+		return sessionSuccess{}, err
+	}
+	reuseReadyEnvironment, err := command.Flags().GetBool("reuse-ready-environment")
 	if err != nil {
 		return sessionSuccess{}, err
 	}
@@ -260,9 +265,9 @@ func runBootstrap(
 	// 结构完整仍可能指向失效的基础 Python，或已被重建成缺包的空环境；
 	// 交给 --no-sync 启动之前必须让 uv 复验实际解释器与锁定依赖。
 	venvIntact := filesystem.InspectVenv(deps.global.layout).Intact
-	if ifNeeded && venvIntact && !workspaceResult.Changed && workspaceResult.Status == protocol.StateReadyToStart &&
+	if (ifNeeded || reuseReadyEnvironment) && venvIntact && !workspaceResult.Changed && workspaceResult.Status == protocol.StateReadyToStart &&
 		initial.Status == protocol.StateReadyToStart && initial.LastSuccessful.Version == revision.Version() && initial.LastSuccessful.Commit == revision.Commit() {
-		ready, err := checkBootstrapReadiness(ctx, deps, service, emitter, revision, operationLogger)
+		ready, err := checkBootstrapReadiness(ctx, deps, service, emitter, revision, operationLogger, reuseReadyEnvironment)
 		if err != nil {
 			return sessionSuccess{}, errors.Join(err, rollbackM5Preparation(emitter, machine, protocol.StageDependenciesCheck, "运行环境检查未完成"))
 		}
@@ -362,6 +367,38 @@ func runBootstrap(
 	if err := emitM5Progress(emitter, protocol.StageDependenciesSync, protocol.ProgressSucceeded, "锁定依赖已同步"); err != nil {
 		return sessionSuccess{}, err
 	}
+	if reuseReadyEnvironment {
+		// uv sync 退出 0 仍可能留下失效的基础解释器；新路径在写入 ready 前严格复验，
+		// 不把复验失败再折回准备，也不自动删除用户环境。
+		if err := emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressRunning, "正在复验准备后的运行环境"); err != nil {
+			return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesCheck, err)
+		}
+		offline, err := mirror.NewPolicy(mirror.PolicySpec{Offline: true})
+		if err != nil {
+			return sessionSuccess{}, err
+		}
+		verified, err := service.CheckDependencies(ctx, uv.DependenciesRequest{
+			ProjectDir: deps.global.layout.RepoDir(), ProjectEnvDir: deps.global.layout.VenvDir(),
+			PythonVersion: pythonResult.Spec.Version.String(), OperationID: emitter.OperationID(),
+			Branch: revision.Branch(), Commit: revision.Commit(), MirrorPolicy: offline, Line: uvLogLine(operationLogger),
+		})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		if err == nil && (!verified.LockfileChecked || !verified.Synchronized) {
+			err = &commandError{
+				code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesCheck,
+				message: "准备后未确认运行环境就绪", details: map[string]any{},
+				cause: errors.New("prepared environment did not pass dependency readiness check"),
+			}
+		}
+		if err != nil {
+			return sessionSuccess{}, persistM5FailureWithLifecycle(ctx, emitter, store, deps.global.layout, initial, revision, uvExecutable, pythonResult.Spec, operationLogger, machine, protocol.StageDependenciesCheck, err)
+		}
+		if err := emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressSucceeded, "准备后的运行环境检查通过"); err != nil {
+			return sessionSuccess{}, err
+		}
+	}
 	ready, err := store.NewReadyEnvironment(revision.Version(), revision.Commit())
 	if err != nil {
 		return sessionSuccess{}, stateStoreError(protocol.StageDependenciesSync, err)
@@ -412,17 +449,37 @@ func checkBootstrapReadiness(
 	emitter *protocol.Emitter,
 	revision gitrepo.Revision,
 	logger workspaceLogger,
+	checkManagedPython bool,
 ) (bool, error) {
 	if err := emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressRunning, "正在检查当前运行环境"); err != nil {
-		return false, err
-	}
-	spec, err := service.ReadPythonSpec(ctx, deps.global.layout.RepoDir())
-	if err != nil {
 		return false, err
 	}
 	policy, err := mirror.NewPolicy(mirror.PolicySpec{Offline: true})
 	if err != nil {
 		return false, err
+	}
+	var spec uv.PythonSpec
+	if checkManagedPython {
+		python, err := service.CheckPython(ctx, uv.PythonRequest{
+			ProjectDir: deps.global.layout.RepoDir(), PythonInstallDir: deps.global.layout.PythonDir(),
+			ProjectEnvDir: deps.global.layout.VenvDir(), CacheDir: deps.global.layout.UVCacheDir(),
+			Branch: revision.Branch(), Commit: revision.Commit(), MirrorPolicy: policy, Line: uvLogLine(logger),
+		})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		if err != nil {
+			if !bootstrapCheckNeedsPreparation(err, protocol.CodePythonVersionMismatch) {
+				return false, err
+			}
+			return false, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressFailed, "受管 Python 未就绪，正在重新准备")
+		}
+		spec = python.Spec
+	} else {
+		spec, err = service.ReadPythonSpec(ctx, deps.global.layout.RepoDir())
+		if err != nil {
+			return false, err
+		}
 	}
 	result, err := service.CheckDependencies(ctx, uv.DependenciesRequest{
 		ProjectDir: deps.global.layout.RepoDir(), ProjectEnvDir: deps.global.layout.VenvDir(),
@@ -434,17 +491,7 @@ func checkBootstrapReadiness(
 		return false, ctxErr
 	}
 	if err != nil {
-		// 只有已完成的 uv 检查报告未同步才进入准备流程；读取管道、
-		// 启动进程或日志出口失败不能被依赖层的外包装掩盖。
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-			findOperationErrorCode(err, protocol.CodeOutputWriteFailed) != nil {
-			return false, err
-		}
-		if executionErr := findOperationErrorCode(err, protocol.CodeUVExecFailed); executionErr != nil && executionErr.Details()["failureKind"] != "nonzero_exit" {
-			return false, err
-		}
-		failure := findOperationErrorCode(err, protocol.CodeDependencySyncFailed)
-		if failure == nil || detailsExitCode(failure.Details()) <= 0 {
+		if !bootstrapCheckNeedsPreparation(err, protocol.CodeDependencySyncFailed) {
 			return false, err
 		}
 		return false, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressFailed, "当前运行环境未同步，正在重新准备")
@@ -453,6 +500,19 @@ func checkBootstrapReadiness(
 		return false, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressFailed, "未确认运行环境就绪，正在重新准备")
 	}
 	return true, emitM5Progress(emitter, protocol.StageDependenciesCheck, protocol.ProgressSucceeded, "当前运行环境检查通过")
+}
+
+// bootstrapCheckNeedsPreparation 只将已完成的 uv 不健康检查归入准备，保留执行与输出故障。
+func bootstrapCheckNeedsPreparation(err error, code protocol.Code) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		findOperationErrorCode(err, protocol.CodeOutputWriteFailed) != nil {
+		return false
+	}
+	if executionErr := findOperationErrorCode(err, protocol.CodeUVExecFailed); executionErr != nil && executionErr.Details()["failureKind"] != "nonzero_exit" {
+		return false
+	}
+	failure := findOperationErrorCode(err, code)
+	return failure != nil && detailsExitCode(failure.Details()) > 0
 }
 
 type directWorkspaceEmitter struct {
