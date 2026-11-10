@@ -1024,11 +1024,16 @@ func wrapBootstrapError(stage protocol.Stage, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
+	var details map[string]any
+	var detailed interface{ Details() map[string]any }
+	if errors.As(err, &detailed) {
+		details = detailed.Details()
+	}
 	return newError(
 		bootstrapErrorCode(err),
 		stage,
 		"uv 准备失败",
-		map[string]any{},
+		details,
 		err,
 	)
 }

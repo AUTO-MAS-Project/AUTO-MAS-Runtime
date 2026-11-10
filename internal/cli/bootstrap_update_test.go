@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
-	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -320,47 +320,63 @@ func writeBootstrapFile(t *testing.T, path string) {
 	}
 }
 
-// TestBootstrap_FailureIsRecordedInOperationLog 钉住「失败必须落盘」：此前 Runtime 的
-// 操作日志只透传 uv 输出与清理统计，失败本身、错误码与 stage 一条都不写——真机上取到
-// 2468 行日志全是 info，零 warn 零 error，用户报上来也无从查起。
+// TestBootstrap_FailureIsRecordedInOperationLog 使用真实日志器验证收尾后失败仍能落盘。
 func TestBootstrap_FailureIsRecordedInOperationLog(t *testing.T) {
 	root := t.TempDir()
-	log := &m5TestLog{}
-	environment := &m5TestEnvironment{calls: &log.calls}
-	store := &m5TestStateStore{calls: &log.calls}
-	workspace := workspaceTestService{sync: func(context.Context, gitrepo.SyncRequest) (gitrepo.SyncResult, error) {
-		return gitrepo.SyncResult{}, errors.New("clone failed")
+	var calls []string
+	environment := &m5TestEnvironment{calls: &calls, uvErr: &commandError{
+		code: protocol.CodeUVExecFailed, stage: protocol.StageUVVerify, message: "uv 准备失败",
+		details: map[string]any{"failureKind": "start_failed", "windowsError": uint64(5)},
 	}}
+	store := &m5TestStateStore{calls: &calls}
 	var stdout, stderr bytes.Buffer
 	code := Execute(t.Context(), []string{"--app-root", root, "--output", "ndjson", "bootstrap", "--version", "v5.4.0"},
 		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr}, WithCWD(root),
 		WithEnvironmentFactory(func(*config.Layout) (environmentService, error) { return environment, nil }),
-		WithWorkspaceFactory(func(*config.Layout) (workspaceService, error) { return workspace, nil }),
 		WithEnvironmentStateStoreFactory(func(context.Context, *config.Layout, func() time.Time) (environmentStateStore, error) {
 			return store, nil
 		}),
 		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
-			return &m5TestCoordinator{calls: &log.calls}, nil
-		}),
-		WithWorkspaceLoggerFactory(func(context.Context, *config.Layout, io.Writer, string, string, func() time.Time) (workspaceLogger, error) {
-			return log, nil
+			return &m5TestCoordinator{calls: &calls}, nil
 		}),
 	)
-	if code == 0 {
-		t.Fatalf("bootstrap exit=0, want failure; output=%s", stdout.String())
+	if code != protocol.ExitCodeEnvironmentFailure {
+		t.Fatalf("bootstrap exit=%d, want UV_EXEC_FAILED exit; output=%s", code, stdout.String())
 	}
-	var failure *m5LogRecord
-	for i := range log.records {
-		if log.records[i].level == logging.LevelError {
-			failure = &log.records[i]
-			break
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(layout.RuntimeLogDir(), "bootstrap-*.log"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("bootstrap log paths = %v, error = %v", paths, err)
+	}
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failures []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte{'\n'}) {
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry["level"] == "error" {
+			failures = append(failures, entry)
 		}
 	}
-	if failure == nil {
-		t.Fatalf("no error-level record; records=%+v", log.records)
+	if len(failures) != 1 {
+		t.Fatalf("error records = %d, want 1; log=%s", len(failures), data)
 	}
-	if failure.details["code"] == nil || failure.details["stage"] == nil {
-		t.Fatalf("failure record details = %+v, want code and stage", failure.details)
+	failure := failures[0]
+	details, ok := failure["details"].(map[string]any)
+	if !ok || details["code"] != "UV_EXEC_FAILED" || details["stage"] != "uv.verify" ||
+		details["failureKind"] != "start_failed" || details["windowsError"] != float64(5) {
+		t.Fatalf("failure details = %#v, want uv execution diagnostics", failure["details"])
+	}
+	events := parseNDJSON(t, stdout.String())
+	if failure["command"] != "bootstrap" || failure["operationId"] != events[0].object["operationId"] {
+		t.Fatalf("failure identity = %#v, want bootstrap and current operationId", failure)
 	}
 }
 
