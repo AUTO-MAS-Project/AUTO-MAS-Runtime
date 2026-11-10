@@ -153,9 +153,8 @@ type deps struct {
 	io      IO
 	options options
 	global  globalOptions
-	// opLog 指向本次会话已打开的操作日志器（可能为 nil）。
-	// 失败落盘要用它：命令失败的唯一出口 emitFailure 在会话层，
-	// 拿不到各命令自己开的 logger，靠这个绑定把两者接起来。
+	// opLog 绑定命令的操作日志器；命令收尾后它可能已关闭。
+	// 会话仅为曾开启操作日志的失败命令创建终态日志器，再通过此绑定记录最终失败。
 	opLog    *workspaceLogBinding
 	exitCode int
 }

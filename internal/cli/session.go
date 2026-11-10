@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -174,6 +175,28 @@ func runOperationSession(
 		telemetryState.operationErr = err
 		if panicked {
 			telemetryState.addPanic(err, panicFrames)
+		}
+		// 命令已关闭自己的日志器；终态使用独立 writer，才能记录包含清理错误的最终失败。
+		// 只为已经开过日志的命令追加，避免早期失败创建原本不存在的受管目录。
+		if deps.opLog.Get() != nil {
+			deps.opLog.Set(nil)
+			logContext, cancelLog := context.WithTimeout(context.WithoutCancel(ctx), m5TransactionCleanupTimeout)
+			defer cancelLog()
+			failureLogger, logErr := deps.options.workspaceLoggerFactory(
+				// 磁盘诊断已经在首次打开时写过 stderr，终态追加不重复播报。
+				logContext, deps.global.layout, io.Discard, command, emitter.OperationID(), deps.options.clock,
+			)
+			if logErr != nil {
+				writeDiagnostic(deps.io, logErr)
+			} else {
+				deps.opLog.Set(failureLogger)
+				defer func() {
+					deps.opLog.Set(nil)
+					if closeErr := failureLogger.Close(); closeErr != nil {
+						writeDiagnostic(deps.io, closeErr)
+					}
+				}()
+			}
 		}
 		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
 		return exitCode
@@ -464,5 +487,7 @@ func recordOperationFailure(
 	// 取消导致的失败同样要落盘，所以剥掉取消信号再写。
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m5TransactionCleanupTimeout)
 	defer cancel()
-	_, _ = logger.Record(ctx, logging.LevelError, message, entry)
+	if _, err := logger.Record(ctx, logging.LevelError, message, entry); err != nil {
+		writeDiagnostic(deps.io, err)
+	}
 }
