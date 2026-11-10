@@ -251,6 +251,13 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		mechanism.SetUnhandled()
 	}
 
+	tags := sanitizeSentryTags(event.Tags)
+	exceptionValue := message
+	if kind == sentryObservationFailure && tags["code"] != "" {
+		// 失败类事件共用同一条遥测内部栈；把冻结错误码放进异常值，使 Sentry 标题可区分失败类别。
+		exceptionValue = message + ": " + tags["code"]
+	}
+
 	sanitized := &sentry.Event{
 		EventID:     event.EventID,
 		Timestamp:   event.Timestamp,
@@ -260,10 +267,11 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		Message:     message,
 		Release:     release,
 		Environment: environment,
-		Tags:        sanitizeSentryTags(event.Tags),
+		Tags:        tags,
+		Fingerprint: sentryFingerprint(kind, tags),
 		Exception: []sentry.Exception{{
 			Type:       sentryExceptionType,
-			Value:      message,
+			Value:      exceptionValue,
 			Module:     "auto-mas-runtime",
 			Stacktrace: sanitizeSentryStacktrace(firstSentryStacktrace(event.Exception)),
 			Mechanism:  mechanism,
@@ -275,6 +283,25 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		}
 	}
 	return sanitized
+}
+
+// sentryFingerprint 按观察类型、错误码与阶段分组。非 panic 事件的栈总是在遥测层
+// 内部生成、彼此相同，若交给 Sentry 默认按栈分组，所有失败类别会被合并成同一个 issue。
+// 只使用已净化的标签值；panic 额外保留默认栈分组以区分不同崩溃位置。
+func sentryFingerprint(kind string, tags map[string]string) []string {
+	code := tags["code"]
+	if code == "" {
+		code = "unknown_code"
+	}
+	stage := tags["stage"]
+	if stage == "" {
+		stage = "unknown_stage"
+	}
+	fingerprint := []string{"auto-mas-runtime", kind, code, stage}
+	if kind == sentryObservationPanic {
+		fingerprint = append(fingerprint, "{{ default }}")
+	}
+	return fingerprint
 }
 
 func sanitizeSentryDiagnostics(contexts map[string]sentry.Context) sentry.Context {

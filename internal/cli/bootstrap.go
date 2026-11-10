@@ -96,7 +96,15 @@ func runBootstrap(
 	}
 	machine, err := protocol.NewLifecycleMachine(initial.Status)
 	if err != nil {
-		return sessionSuccess{}, err
+		// 持久化状态停留在非稳定状态（例如上次准备被中断）时显式分类，
+		// 避免以无 reason 的兜底 INTERNAL_ERROR 上报，丢失可诊断信息。
+		return sessionSuccess{}, &commandError{
+			code:    protocol.CodeInternalError,
+			stage:   protocol.StageBootstrap,
+			message: "环境生命周期状态无效",
+			details: map[string]any{"reason": "invalid_lifecycle_state"},
+			cause:   err,
+		}
 	}
 	service, err := deps.options.environmentFactory(deps.global.layout)
 	if err != nil {

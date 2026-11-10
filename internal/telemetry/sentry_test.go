@@ -589,3 +589,39 @@ func TestSentry_FlushesBeforeClose(t *testing.T) {
 		t.Fatalf("flush/close calls = %d/%d, want 1/1", flushes, closes)
 	}
 }
+
+func TestSentry_FingerprintSeparatesFailureClasses(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	internal := validSentryObservation(false)
+	remote := validSentryObservation(false)
+	remote.Command = "workspace check"
+	remote.Stage = string(protocol.StageWorkspaceCheck)
+	remote.Code = string(protocol.CodeGitRemoteResolveFailed)
+	otherStage := remote
+	otherStage.Stage = string(protocol.StageWorkspaceClone)
+	panicked := validSentryObservation(true)
+	for _, observation := range []InternalObservation{internal, remote, otherStage, panicked} {
+		provider.captureInternal(observation)
+	}
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 4 {
+		t.Fatalf("captured events = %d, want 4", len(events))
+	}
+	want := [][]string{
+		{"auto-mas-runtime", sentryObservationInternal, "INTERNAL_ERROR", "backend.spawn"},
+		{"auto-mas-runtime", sentryObservationFailure, string(protocol.CodeGitRemoteResolveFailed), string(protocol.StageWorkspaceCheck)},
+		{"auto-mas-runtime", sentryObservationFailure, string(protocol.CodeGitRemoteResolveFailed), string(protocol.StageWorkspaceClone)},
+		{"auto-mas-runtime", sentryObservationPanic, "INTERNAL_ERROR", "backend.spawn", "{{ default }}"},
+	}
+	for index, event := range events {
+		if strings.Join(event.Fingerprint, "|") != strings.Join(want[index], "|") {
+			t.Errorf("event %d fingerprint = %#v, want %#v", index, event.Fingerprint, want[index])
+		}
+	}
+	if got := events[1].Exception[0].Value; got != sentryFailureMessage+": "+string(protocol.CodeGitRemoteResolveFailed) {
+		t.Errorf("failure exception value = %q, want code in title", got)
+	}
+	if got := events[0].Exception[0].Value; got != sentryInternalMessage {
+		t.Errorf("internal exception value = %q, want %q", got, sentryInternalMessage)
+	}
+}
