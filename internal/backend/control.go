@@ -730,12 +730,12 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
 			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+			return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 		}
 		if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 			failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr)
-			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+			return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 		}
 		if ctx.Err() != nil {
 			if command, ok := terminalCommand(request.Control); ok {
@@ -753,16 +753,16 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
 			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-			return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+			return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 		case <-ctx.Done():
 			if fault := attempt.gate.Fault(); fault != nil {
 				cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-				return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+				return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 			}
 			if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 				cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 				failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr)
-				return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+				return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 			}
 			if command, ok := terminalCommand(request.Control); ok {
 				if command.Command == protocol.ControlShutdown {
@@ -774,18 +774,18 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 		case <-attempt.process.Exited():
 			if fault := attempt.gate.Fault(); fault != nil {
 				cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-				return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+				return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 			}
 			if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 				cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 				failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr)
-				return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+				return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 			}
 			if _, ok := terminalCommand(request.Control); ok {
 				command, drainErr := s.drainUntilTerminal(ctx, request, stateSnapshot, results)
 				if drainErr != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, drainErr))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(drainErr))
 				}
 				if command.Command == protocol.ControlCancel {
 					return s.finishControlCancel(ctx, request, stateSnapshot, attempt, command.CommandID)
@@ -800,7 +800,8 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 				return s.emitControlFailure(request, stateSnapshot, errors.Join(gateFault, cleanup.err))
 			}
 			if cleanup.err != nil {
-				return s.emitControlFailure(request, stateSnapshot, cleanup.err)
+				primary := newCommittedError(protocol.CodeBackendExitedUnexpectedly, protocol.StageBackendRun, "后端意外退出", nil, nil)
+				return s.emitControlFailure(request, stateSnapshot, cleanup.failure(primary))
 			}
 			if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 				return s.emitControlFailure(request, stateSnapshot, newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr))
@@ -903,12 +904,12 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 			if result.err != nil {
 				if fault := attempt.gate.Fault(); fault != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 				}
 				if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 					failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 				}
 				if handled, terminalErr := s.finishLatchedControl(ctx, request, stateSnapshot, attempt, results); handled {
 					return terminalErr
@@ -918,7 +919,7 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 				}
 				cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 				failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, result.err)
-				return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+				return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 			}
 			switch result.command.Command {
 			case protocol.ControlStatus:
@@ -926,28 +927,28 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 				details = protocol.WithControlCommandID(details, result.command.CommandID)
 				if err := s.emitState(request.Emitter, stage, status, "后端状态快照", details); err != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, err))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(err))
 				}
 			case protocol.ControlCancel:
 				if fault := attempt.gate.Fault(); fault != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 				}
 				if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 					failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 				}
 				return s.finishControlCancel(ctx, request, stateSnapshot, attempt, result.command.CommandID)
 			case protocol.ControlShutdown:
 				if fault := attempt.gate.Fault(); fault != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, fault))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(fault))
 				}
 				if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 					cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
 					failure := newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr)
-					return s.emitControlFailure(request, stateSnapshot, errors.Join(cleanup.err, failure))
+					return s.emitControlFailure(request, stateSnapshot, cleanup.failure(failure))
 				}
 				return s.finishControlShutdown(ctx, request, attempt, stateSnapshot, result.command.CommandID)
 			}
@@ -1327,7 +1328,7 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 				primary = withFailureDetailsExtra(fault, logger, proc, cleanup.details)
 			}
 			failure := withFailureDetailsExtra(primary, logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		cleanupErr := errors.Join(
 			s.removeBackendTransaction(ctx, tx),
@@ -1345,13 +1346,13 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	if fault := gate.Fault(); fault != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		failure := withFailureDetailsExtra(fault, logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	if !restarting {
 		setControlStage(request.Control, protocol.StageBackendSpawn)
 		if err := s.emitState(request.Emitter, protocol.StageBackendSpawn, protocol.StateStartingBackend, "正在启动后端", map[string]any{}); err != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-			return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(err, logger, proc, cleanup.details)))
+			return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(err, logger, proc, cleanup.details)))
 		}
 	} else {
 		setControlStage(request.Control, protocol.StageBackendRestart)
@@ -1360,22 +1361,22 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	}
 	if err := gate.Open(request.Emitter); err != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-		return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(err, logger, proc, cleanup.details)))
+		return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(err, logger, proc, cleanup.details)))
 	}
 	if err := s.deps.State.UpdateBackendTransaction(ctx, tx, protocol.StageBackendHealth); err != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		if fault := gate.Fault(); fault != nil {
 			failure := withFailureDetailsExtra(fault, logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 			failure := withFailureDetailsExtra(newError(protocol.CodeInternalError, protocol.StageBackendHealth, "stdin 控制通道读取失败", nil, infraErr), logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		if _, ok := terminalCommand(request.Control); ok {
 			command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 			if drainErr != nil {
-				return nil, markCommitted(errors.Join(cleanup.err, drainErr))
+				return nil, markCommitted(cleanup.failure(drainErr))
 			}
 			if cleanup.err != nil {
 				return nil, markCommitted(cleanup.err)
@@ -1384,12 +1385,12 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if cleanup.err != nil {
-				return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(ctxErr, logger, proc, cleanup.details)))
+				return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(ctxErr, logger, proc, cleanup.details)))
 			}
 			return nil, ctxErr
 		}
 		failure := withFailureDetailsExtra(newError(protocol.CodeStateWriteFailed, protocol.StageBackendHealth, "后端事务写入失败", nil, err), logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: pythonPaths}
 	if restarting {
@@ -1409,21 +1410,21 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 				return nil, interrupted
 			}
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-			return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(interrupted.cause, logger, proc, cleanup.details)))
+			return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(interrupted.cause, logger, proc, cleanup.details)))
 		}
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		if backendErrorHasCode(err, protocol.CodeOutputWriteFailed) {
 			failure := withFailureDetailsExtra(err, logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		if fault := gate.Fault(); fault != nil {
 			failure := withFailureDetailsExtra(fault, logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		if _, ok := terminalCommand(request.Control); ok {
 			command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 			if drainErr != nil {
-				return nil, markCommitted(errors.Join(cleanup.err, drainErr))
+				return nil, markCommitted(cleanup.failure(drainErr))
 			}
 			if cleanup.err != nil {
 				return nil, markCommitted(cleanup.err)
@@ -1431,21 +1432,21 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 			return nil, &controlInterruptError{command: command}
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(ctxErr, logger, proc, cleanup.details)))
+			return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(ctxErr, logger, proc, cleanup.details)))
 		}
 		failure := withFailureDetailsExtra(mapDependencyError(protocol.StageBackendHealth, protocol.CodeBackendHealthInvalid, "后端健康检查失败", err), logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	if fault := gate.Fault(); fault != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		failure := withFailureDetailsExtra(fault, logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	if _, ok := terminalCommand(request.Control); ok {
 		command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 		if drainErr != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-			return nil, markCommitted(errors.Join(cleanup.err, drainErr))
+			return nil, markCommitted(cleanup.failure(drainErr))
 		}
 		return nil, &controlInterruptError{command: command, attempt: attempt}
 	}
@@ -1453,16 +1454,16 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		if fault := gate.Fault(); fault != nil {
 			failure := withFailureDetailsExtra(fault, logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 			failure := withFailureDetailsExtra(newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr), logger, proc, cleanup.details)
-			return nil, markCommitted(errors.Join(cleanup.err, failure))
+			return nil, markCommitted(cleanup.failure(failure))
 		}
 		if _, ok := terminalCommand(request.Control); ok {
 			command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 			if drainErr != nil {
-				return nil, markCommitted(errors.Join(cleanup.err, drainErr))
+				return nil, markCommitted(cleanup.failure(drainErr))
 			}
 			if cleanup.err != nil {
 				return nil, markCommitted(cleanup.err)
@@ -1471,41 +1472,41 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if cleanup.err != nil {
-				return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(ctxErr, logger, proc, cleanup.details)))
+				return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(ctxErr, logger, proc, cleanup.details)))
 			}
 			return nil, ctxErr
 		}
 		failure := withFailureDetailsExtra(newError(protocol.CodeStateWriteFailed, protocol.StageBackendRun, "后端事务写入失败", nil, err), logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	if fault := gate.Fault(); fault != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		failure := withFailureDetailsExtra(fault, logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		failure := withFailureDetailsExtra(newError(protocol.CodeInternalError, protocol.StageBackendRun, "stdin 控制通道读取失败", nil, infraErr), logger, proc, cleanup.details)
-		return nil, markCommitted(errors.Join(cleanup.err, failure))
+		return nil, markCommitted(cleanup.failure(failure))
 	}
 	if _, ok := terminalCommand(request.Control); ok {
 		command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 		if drainErr != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-			return nil, markCommitted(errors.Join(cleanup.err, drainErr))
+			return nil, markCommitted(cleanup.failure(drainErr))
 		}
 		return nil, &controlInterruptError{command: command, attempt: attempt}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-		return nil, markCommitted(errors.Join(cleanup.err, ctxErr))
+		return nil, markCommitted(cleanup.failure(ctxErr))
 	}
 	gate.SetStage(protocol.StageBackendRun)
 	setControlStage(request.Control, protocol.StageBackendRun)
 	details := map[string]any{"pid": proc.PID(), "baseUrl": health.BaseURL(request.Port), "logPath": logger.LogPath()}
 	if err := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "后端已就绪", details); err != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
-		return nil, markCommitted(errors.Join(cleanup.err, withFailureDetailsExtra(err, logger, proc, cleanup.details)))
+		return nil, markCommitted(cleanup.failure(withFailureDetailsExtra(err, logger, proc, cleanup.details)))
 	}
 	snapshot.set(protocol.StageBackendRun, protocol.StateRunning, details)
 	return attempt, nil
@@ -1841,10 +1842,10 @@ func (s *ManagedSupervisor) finishControlCancel(ctx context.Context, request Req
 	var cleanupResult *processCleanup
 	finalize := func(cleanup processCleanup) error {
 		if controlErr != nil {
-			return errors.Join(stateErr, s.emitControlFailure(request, snapshot, errors.Join(cleanup.err, controlErr, primary)))
+			return errors.Join(stateErr, s.emitControlFailure(request, snapshot, cleanup.failure(controlErr, primary)))
 		}
 		if cleanup.err != nil {
-			return errors.Join(stateErr, s.emitControlFailure(request, snapshot, errors.Join(cleanup.err, primary)))
+			return errors.Join(stateErr, s.emitControlFailure(request, snapshot, cleanup.failure(primary)))
 		}
 		if resourceErr := snapshot.finalizeResources(); resourceErr != nil {
 			return errors.Join(stateErr, s.emitControlFailure(request, snapshot, errors.Join(resourceErr, primary)))

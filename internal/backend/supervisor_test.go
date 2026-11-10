@@ -616,8 +616,17 @@ func TestBackendManaged_CleanupFailureOverridesHealthFailure(t *testing.T) {
 		backendErr.Details()["exitCode"] != 0 {
 		t.Fatalf("cleanup details = %#v, want operation/logPath/pid/exitCode", backendErr)
 	}
-	if backendErr.Details()["terminationRequested"] != true {
-		t.Fatalf("terminationRequested = %v, want true", backendErr.Details()["terminationRequested"])
+	if _, exists := backendErr.Details()["terminationRequested"]; exists {
+		t.Fatalf("protocol details = %#v, want no termination diagnostic", backendErr.Details())
+	}
+	var diagnostic interface{ DiagnosticDetails() map[string]any }
+	if !errors.As(err, &diagnostic) || diagnostic.DiagnosticDetails()["terminationRequested"] != true {
+		t.Fatalf("Supervise() error = %v, want termination request in diagnostics", err)
+	}
+	for _, event := range f.emitter.states() {
+		if _, exists := event.Details["terminationRequested"]; exists {
+			t.Fatalf("state details = %#v, want no termination diagnostic", event.Details)
+		}
 	}
 }
 
@@ -651,6 +660,9 @@ func TestBackendManaged_ReportsFailureIdentity(t *testing.T) {
 			if details["mode"] != "managed" || details["version"] != f.repository.Version || details["commit"] != f.repository.Commit {
 				t.Fatalf("identity = %#v, want checked managed revision", details)
 			}
+			if !test.preflight && details["terminationRequested"] != true {
+				t.Fatalf("diagnostics = %#v, want termination request after successful cleanup", details)
+			}
 		})
 	}
 }
@@ -665,8 +677,8 @@ func TestBackendManaged_ExitedTreeIsTerminatedBeforeWaitingStreams(t *testing.T)
 	if outcome.err != nil {
 		t.Fatalf("cleanupProcess() error = %v, want nil", outcome.err)
 	}
-	if outcome.details["terminationRequested"] != false {
-		t.Fatalf("terminationRequested = %v, want false for an already exited root", outcome.details["terminationRequested"])
+	if outcome.rootForced {
+		t.Fatal("rootForced = true, want false for an already exited root")
 	}
 	got := f.proc.orderSnapshot()
 	want := []string{"snapshot", "terminate", "wait_empty", "wait", "close"}

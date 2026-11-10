@@ -323,8 +323,8 @@ func (e telemetryDiagnosticError) DiagnosticDetails() map[string]any { return e.
 
 func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
 	primary := &commandError{code: protocol.CodeBackendHealthTimeout, stage: protocol.StageBackendHealth, message: "timeout", committed: true}
-	cleanup := &commandError{code: protocol.CodeStateWriteFailed, stage: protocol.StageBackendCleanup, message: "cleanup", committed: true, details: map[string]any{"exitCode": 1, "terminationRequested": true}}
-	err := telemetryDiagnosticError{error: errors.Join(cleanup, primary), details: map[string]any{"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40), "password": "secret"}}
+	cleanup := &commandError{code: protocol.CodeStateWriteFailed, stage: protocol.StageBackendCleanup, message: "cleanup", committed: true, details: map[string]any{"exitCode": 1}}
+	err := telemetryDiagnosticError{error: errors.Join(cleanup, primary), details: map[string]any{"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40), "terminationRequested": true, "password": "secret"}}
 	recorder := &telemetryRecorderSpy{}
 	var stdout bytes.Buffer
 	exitCode := executeWithTelemetry(t, []string{"--output", "ndjson", "backend", "supervise", "--mode", "managed"}, recorder, &stdout,
@@ -350,13 +350,16 @@ func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
 	if !reflect.DeepEqual(observations[0].DiagnosticDetails, want) {
 		t.Fatalf("diagnostics = %#v, want %#v", observations[0].DiagnosticDetails, want)
 	}
-	if !reflect.DeepEqual(cleanup.details, map[string]any{"exitCode": 1, "terminationRequested": true}) {
+	if !reflect.DeepEqual(cleanup.details, map[string]any{"exitCode": 1}) {
 		t.Fatalf("original details mutated: %#v", cleanup.details)
 	}
 	events := parseNDJSON(t, stdout.String())
 	result := events[len(events)-1]
-	if details, ok := result.object["details"].(map[string]any); !ok || details["version"] != nil || details["failures"] != nil {
+	if details, ok := result.object["details"].(map[string]any); !ok || details["version"] != nil || details["failures"] != nil || details["terminationRequested"] != nil {
 		t.Fatalf("protocol result gained telemetry-only fields: %#v", result.object["details"])
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("terminationRequested")) {
+		t.Fatalf("NDJSON gained telemetry-only termination fact: %s", stdout.Bytes())
 	}
 }
 

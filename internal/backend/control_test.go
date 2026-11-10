@@ -1129,6 +1129,34 @@ func TestBackend_FirstUnexpectedExitRestartsOnce(t *testing.T) {
 	}
 }
 
+func TestBackend_UnexpectedExitCleanupPreservesPrimary(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	f.proc.waitEmptyErr = errors.New("job membership cannot be confirmed")
+	mailbox := NewControlMailbox(8)
+	defer mailbox.Close()
+	done := make(chan error, 1)
+	go func() {
+		req := f.request()
+		req.Control = mailbox
+		done <- f.supervisor().Supervise(t.Context(), req)
+	}()
+	waitFor(t, f.emitter.running)
+	f.proc.Exit()
+	err := <-done
+	assertBackendCode(t, err, protocol.CodeBackendShutdownFailed)
+	if !backendErrorHasCode(err, protocol.CodeBackendExitedUnexpectedly) {
+		t.Fatalf("Supervise() error = %v, want original unexpected exit classification", err)
+	}
+	if f.uv.startCalls != 1 {
+		t.Fatalf("StartManaged calls = %d, want no restart after cleanup failure", f.uv.startCalls)
+	}
+	var diagnostic interface{ DiagnosticDetails() map[string]any }
+	if !errors.As(err, &diagnostic) || diagnostic.DiagnosticDetails()["terminationRequested"] != false {
+		t.Fatalf("Supervise() error = %v, want no root termination after natural exit", err)
+	}
+}
+
 func TestBackend_RestartRechecksEnvironment(t *testing.T) {
 	f := newBackendFixture(t)
 	f.proc.keepAlive = true
@@ -1691,6 +1719,11 @@ func TestBackend_ForceTerminatedOnlyWhenRootKilled(t *testing.T) {
 	}
 	if indexOfEvent(events, "warning:"+string(protocol.CodeBackendOrphansReaped)) >= 0 {
 		t.Fatalf("events = %#v, want no orphans warning when the root itself was killed", events)
+	}
+	for _, warning := range f.emitter.warningsSnapshot() {
+		if _, exists := warning.Details["terminationRequested"]; exists {
+			t.Fatalf("warning details = %#v, want unchanged C14 contract", warning.Details)
+		}
 	}
 }
 
