@@ -91,6 +91,7 @@ func recordSessionTelemetry(
 		stage = classifiedStage
 		reason = telemetryReason(details)
 		if telemetry.IsReportableFailure(code) && code != protocol.CodeInternalError {
+			details = failureTelemetryDetails(operationErr, code, stage, details)
 			if command == "backend supervise" {
 				details = backendTelemetryDetails(operationErr, details)
 			}
@@ -118,17 +119,45 @@ func recordSessionTelemetry(
 	safeTelemetryClose(recorder)
 }
 
-// backendTelemetryDetails 保留身份与被清理错误遮盖的分类，不改变 result 的错误优先级。
-func backendTelemetryDetails(err error, selected map[string]any) map[string]any {
+// failureTelemetryDetails 合并专用诊断副本，外层事实优先，协议 details 只作回退。
+func failureTelemetryDetails(err error, code protocol.Code, stage protocol.Stage, selected map[string]any) map[string]any {
 	details := make(map[string]any, len(selected)+4)
-	for key, value := range selected {
-		details[key] = value
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		failure, classified := current.(operationError)
+		if diagnostic, ok := current.(interface{ DiagnosticDetails() map[string]any }); ok &&
+			(!classified || failure.Code() == code && failure.Stage() == stage) {
+			for key, value := range diagnostic.DiagnosticDetails() {
+				if _, exists := details[key]; !exists {
+					details[key] = value
+				}
+			}
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+		} else if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			visit(wrapped.Unwrap())
+		}
 	}
-	var diagnostic interface{ DiagnosticDetails() map[string]any }
-	if errors.As(err, &diagnostic) {
-		for key, value := range diagnostic.DiagnosticDetails() {
+	visit(err)
+	for key, value := range selected {
+		if _, exists := details[key]; !exists {
 			details[key] = value
 		}
+	}
+	return details
+}
+
+// backendTelemetryDetails 保留被清理错误遮盖的分类，不改变 result 的错误优先级。
+func backendTelemetryDetails(err error, selected map[string]any) map[string]any {
+	details := make(map[string]any, len(selected)+1)
+	for key, value := range selected {
+		details[key] = value
 	}
 	var primary, cleanup operationError
 	var visit func(error)

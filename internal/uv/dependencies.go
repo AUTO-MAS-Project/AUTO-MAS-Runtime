@@ -414,26 +414,45 @@ func dependencySyncError(result UVResult, cause error) error {
 	if cause == nil {
 		cause = errors.New("uv sync exited with a non-zero status")
 	}
-	return newError(
+	failure := newError(
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesSync,
 		"Python 依赖同步失败",
 		uvFailureDetails(result, "dependency_sync_nonzero"),
 		cause,
 	)
+	failure.diagnostics = dependencyExecutionDiagnostics(result, cause, "dependency_sync")
+	return failure
 }
 
 func dependencyCheckError(result UVResult, cause error) error {
 	if cause == nil {
 		cause = errors.New("uv sync check exited with a non-zero status")
 	}
-	return newError(
+	failure := newError(
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesCheck,
 		"主项目依赖环境未同步",
 		uvFailureDetails(result, "dependency_check_nonzero"),
 		cause,
 	)
+	failure.diagnostics = dependencyExecutionDiagnostics(result, cause, "dependency_check")
+	return failure
+}
+
+func dependencyExecutionDiagnostics(result UVResult, cause error, phase string) map[string]any {
+	kind := phase + "_failed"
+	if result.ExitCode != 0 {
+		kind = phase + "_nonzero"
+	}
+	details := uvFailureDetails(result, kind)
+	var execution *Error
+	if errors.As(cause, &execution) {
+		for key, value := range execution.Details() {
+			details[key] = value
+		}
+	}
+	return details
 }
 
 func uvFailureDetails(result UVResult, failureKind string) map[string]any {

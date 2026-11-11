@@ -75,6 +75,7 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 
 	"attempts": diagnosticContainer, "failures": diagnosticContainer, "items": diagnosticContainer,
 	"summary": diagnosticContainer, "relay": diagnosticContainer, "details": diagnosticContainer,
+	"mutex": diagnosticContainer, "directories": diagnosticContainer,
 	"checks": diagnosticContainer, "orphans": diagnosticContainer,
 	"bySource": diagnosticDynamicNumberMap,
 }

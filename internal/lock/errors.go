@@ -3,6 +3,7 @@ package lock
 import (
 	"errors"
 	"fmt"
+	"syscall"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
@@ -64,6 +65,19 @@ func (e *OperationError) Unwrap() error {
 // Code 固定返回普通 Mutex 操作故障码。
 func (e *OperationError) Code() protocol.Code {
 	return protocol.CodeMutexOperationFailed
+}
+
+// DiagnosticDetails 返回锁操作的安全事实，不包含命名 Mutex 或根目录身份。
+func (e *OperationError) DiagnosticDetails() map[string]any {
+	operation := map[string]any{"operation": e.Operation}
+	if e.Kind.Valid() {
+		operation["component"] = e.Kind.String()
+	}
+	var errno syscall.Errno
+	if errors.As(e.Cause, &errno) {
+		operation["windowsError"] = uint64(errno)
+	}
+	return map[string]any{"mutex": operation}
 }
 
 // PoisonedError 保留首次使 Set 中毒的 ReleaseMutex 故障。

@@ -195,6 +195,40 @@ func TestSentry_RemoteFailureDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSentry_OperationalFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Command = "bootstrap"
+	observation.Stage = string(protocol.StageBootstrap)
+	observation.Code = string(protocol.CodeMutexOperationFailed)
+	observation.DiagnosticDetails = map[string]any{
+		"mutex": map[string]any{"component": "mutation", "operation": "create-mutex", "windowsError": 5, "name": "private-lock-name", "error": "private cause"},
+		"directories": []map[string]any{
+			{"component": "repo", "state": "valid", "version": "v5.8.0", "commit": strings.Repeat("a", 40), "password": "private-secret"},
+			{"component": "update", "state": "unknown"},
+			{"component": "previous", "state": "not_observed"},
+		},
+		"failureKind": "output_read_failed", "exitCode": 0,
+	}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %#v, want one", events)
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"mutex"`, `"windowsError":5`, `"directories"`, `"component":"previous"`, `"state":"not_observed"`, `"failureKind":"output_read_failed"`, `"exitCode":0`} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Errorf("diagnostics = %s, want %s", encoded, required)
+		}
+	}
+	if bytes.Contains(encoded, []byte("private")) {
+		t.Fatalf("private diagnostics escaped sanitization: %s", encoded)
+	}
+}
+
 func TestSentry_BeforeSendRejectsUnreportableFailure(t *testing.T) {
 	provider, transport := newSentryTestProvider(t)
 	observation := validSentryObservation(false)

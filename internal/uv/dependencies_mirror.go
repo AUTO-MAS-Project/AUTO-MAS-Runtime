@@ -377,23 +377,24 @@ func (s *DependenciesService) mapRotationFailure(
 	}
 	var rotationError *mirror.RotationError
 	if errors.As(rotationErr, &rotationError) && rotationError.Code() == protocol.CodeMirrorExhausted {
+		code := protocol.CodeMirrorExhausted
+		message := "所有镜像源均不可用"
+		cause := rotationErr
 		if planHasOfficialSource(plan) {
 			// 回退那次也失败了，语义与今天的单次 --locked 失败完全一致。
-			return newError(
-				protocol.CodeDependencySyncFailed,
-				protocol.StageDependenciesSync,
-				"Python 依赖同步失败",
-				details,
-				errors.Join(state.lastErr, rotationErr),
-			)
+			code = protocol.CodeDependencySyncFailed
+			message = "Python 依赖同步失败"
+			cause = errors.Join(state.lastErr, rotationErr)
 		}
-		return newError(
-			protocol.CodeMirrorExhausted,
+		failure := newError(
+			code,
 			protocol.StageDependenciesSync,
-			"所有镜像源均不可用",
+			message,
 			details,
-			rotationErr,
+			cause,
 		)
+		failure.diagnostics = dependencyExecutionDiagnostics(state.lastResult, state.lastErr, "dependency_sync")
+		return failure
 	}
 	return rotationErr
 }

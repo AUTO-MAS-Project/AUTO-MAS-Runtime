@@ -142,7 +142,7 @@ func newRecoveryWithDependencies(
 func (r *Recovery) Recover(
 	ctx context.Context,
 	request RecoveryRequest,
-) (RecoveryResult, error) {
+) (result RecoveryResult, returnErr error) {
 	if ctx == nil || r == nil || r.layout == nil ||
 		nilDependency(r.operator) || nilDependency(r.store) || nilDependency(r.reader) {
 		return RecoveryResult{}, recoveryInternalError(errInvalidRecovery)
@@ -182,10 +182,17 @@ func (r *Recovery) Recover(
 	if err != nil {
 		return RecoveryResult{}, recoveryInternalError(err)
 	}
+	diagnostics := recoveryDiagnostics{targetVersion: transaction.state.TargetVersion, targetCommit: transaction.state.TargetCommit}
+	defer func() {
+		if returnErr != nil {
+			returnErr = &recoveryDiagnosticError{cause: returnErr, snapshot: diagnostics}
+		}
+	}()
 	if transaction.state.Command == "workspace stage" && (transaction.state.Stage == protocol.StageWorkspaceClone || transaction.state.Stage == protocol.StageWorkspaceVerify) {
 		update, err := r.classifyPath(ctx, paths.update, recoveryPathPolicy{
 			allowUnreadable: transaction.state.Stage == protocol.StageWorkspaceClone,
 		})
+		diagnostics.update = describeRecoveryDirectory(update, err)
 		if err != nil {
 			return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "staged_update_unknown", err)
 		}
@@ -208,10 +215,12 @@ func (r *Recovery) Recover(
 		allowUnreadable:      allowDamagedRepository,
 		allowInvalidIdentity: transaction.state.Stage == protocol.StageWorkspaceSwap,
 	})
+	diagnostics.repository = describeRecoveryDirectory(repository, err)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "repository_unknown", err)
 	}
 	update, err := r.classifyPath(ctx, paths.update, recoveryPathPolicy{allowUnreadable: allowIncompleteUpdate})
+	diagnostics.update = describeRecoveryDirectory(update, err)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "update_unknown", err)
 	}
@@ -220,6 +229,7 @@ func (r *Recovery) Recover(
 		allowUnreadable:      allowIncompletePrevious,
 		allowInvalidIdentity: allowIncompletePrevious,
 	})
+	diagnostics.previous = describeRecoveryDirectory(previous, err)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "previous_unknown", err)
 	}
