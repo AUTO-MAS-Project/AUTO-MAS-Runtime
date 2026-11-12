@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/doctor"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/gitrepo"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/lock"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/state"
@@ -35,13 +37,14 @@ type telemetryRecorderSpy struct {
 	closeWaits    bool
 }
 
-func (r *telemetryRecorderSpy) CaptureInternal(_ context.Context, observation telemetry.InternalObservation) {
+func (r *telemetryRecorderSpy) CaptureInternal(_ context.Context, observation telemetry.InternalObservation) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.resultWritten != nil && !r.resultWritten.Load() {
 		r.beforeResult = true
 	}
 	r.internal = append(r.internal, observation)
+	return "0123456789abcdef0123456789abcdef"
 }
 
 func (r *telemetryRecorderSpy) Close(ctx context.Context) {
@@ -321,6 +324,104 @@ type telemetryDiagnosticError struct {
 func (e telemetryDiagnosticError) Unwrap() error                     { return e.error }
 func (e telemetryDiagnosticError) DiagnosticDetails() map[string]any { return e.details }
 
+func TestRunOperation_PreservesNestedFailureDiagnostics(t *testing.T) {
+	legacy := map[string]any{"failureKind": "dependency_sync_nonzero", "exitCode": 0}
+	primary := doctor.NewError(protocol.CodeDependencySyncFailed, protocol.StageDependenciesSync, "同步失败", legacy, errors.New("private cause"))
+	inner := telemetryDiagnosticError{error: primary, details: map[string]any{
+		"failureKind": "output_read_failed", "version": "v5.8.0", "password": "private-secret",
+		"mutex":       map[string]any{"operation": "create-mutex", "component": "mutation", "windowsError": 5},
+		"directories": []map[string]any{{"component": "repo", "state": "missing"}},
+	}}
+	failure := telemetryDiagnosticError{error: errors.Join(inner), details: map[string]any{"version": "v5.8.1"}}
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	exitCode := executeWithTelemetry(t, []string{"--output", "ndjson", "doctor"}, recorder, &stdout,
+		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
+			return fakeDoctorService{run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
+				return doctor.Report{}, failure
+			}}, nil
+		}),
+	)
+	if exitCode != protocol.ExitCodeEnvironmentFailure {
+		t.Fatalf("exit code = %d, want %d", exitCode, protocol.ExitCodeEnvironmentFailure)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 {
+		t.Fatalf("observations = %#v, want one", observations)
+	}
+	details := observations[0].DiagnosticDetails
+	if details["failureKind"] != "output_read_failed" || details["version"] != "v5.8.1" || details["exitCode"] != 0 || details["mutex"] == nil || details["directories"] == nil || details["password"] != nil {
+		t.Fatalf("diagnostics = %#v, want nested facts with outer precedence and sanitization", details)
+	}
+	events := parseNDJSON(t, stdout.String())
+	if got := events[len(events)-1].object["details"]; !reflect.DeepEqual(got, map[string]any{"failureKind": "dependency_sync_nonzero", "exitCode": float64(0)}) {
+		t.Fatalf("protocol details = %#v, want original facts", got)
+	}
+	if !reflect.DeepEqual(legacy, map[string]any{"failureKind": "dependency_sync_nonzero", "exitCode": 0}) {
+		t.Fatalf("source details mutated: %#v", legacy)
+	}
+}
+
+func TestBootstrap_MutexFailureReportsDiagnostics(t *testing.T) {
+	failure := &lock.OperationError{Operation: "create-mutex", Kind: lock.KindMutation, Name: "private-mutex-name", Cause: syscall.Errno(5)}
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	exitCode := executeWithTelemetry(t, []string{"--output", "ndjson", "bootstrap", "--version", "v5.8.0"}, recorder, &stdout,
+		WithMutationCoordinatorFactory(func(context.Context, *config.Layout) (gitrepo.MutationCoordinator, error) {
+			return nil, failure
+		}),
+	)
+	if exitCode != protocol.ExitCodeOperationConflict {
+		t.Fatalf("exit code = %d, want %d", exitCode, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 || observations[0].Code != string(protocol.CodeMutexOperationFailed) {
+		t.Fatalf("observations = %#v, want mutex failure", observations)
+	}
+	want := map[string]any{"mutex": map[string]any{"component": "mutation", "operation": "create-mutex", "windowsError": uint64(5)}}
+	want["fileSystem"] = expectedSessionFileSystem(t, observations)
+	if got := observations[0].DiagnosticDetails; !reflect.DeepEqual(got, want) {
+		t.Fatalf("diagnostics = %#v, want %#v", got, want)
+	}
+	if strings.Contains(stdout.String(), `"mutex"`) {
+		t.Fatalf("protocol gained telemetry-only facts: %s", stdout.String())
+	}
+}
+
+type telemetryExecutionError struct {
+	*commandError
+	diagnostics map[string]any
+}
+
+func (e telemetryExecutionError) DiagnosticDetails() map[string]any { return e.diagnostics }
+
+func TestRunOperation_DiagnosticsRespectSelectedFailure(t *testing.T) {
+	cleanup := &commandError{code: protocol.CodeStateWriteFailed, stage: protocol.StageWorkspaceCleanup, message: "清理失败", details: map[string]any{"exitCode": 42}}
+	execution := telemetryExecutionError{
+		commandError: &commandError{code: protocol.CodeDependencySyncFailed, stage: protocol.StageDependenciesSync, message: "执行失败"},
+		diagnostics:  map[string]any{"failureKind": "output_read_failed", "exitCode": 0},
+	}
+	recorder := &telemetryRecorderSpy{}
+	var stdout bytes.Buffer
+	exitCode := executeWithTelemetry(t, []string{"--output", "ndjson", "doctor"}, recorder, &stdout,
+		WithDoctorFactory(func(*config.Layout, doctor.Probes) (doctorService, error) {
+			return fakeDoctorService{run: func(context.Context, *protocol.Emitter) (doctor.Report, error) {
+				return doctor.Report{}, errors.Join(cleanup, execution)
+			}}, nil
+		}),
+	)
+	if exitCode != protocol.ExitCodeOperationConflict {
+		t.Fatalf("exit code = %d, want %d", exitCode, protocol.ExitCodeOperationConflict)
+	}
+	observations, _, _ := recorder.snapshot()
+	if len(observations) != 1 || observations[0].Code != string(protocol.CodeStateWriteFailed) {
+		t.Fatalf("observations = %#v, want selected cleanup failure", observations)
+	}
+	if got := observations[0].DiagnosticDetails; !reflect.DeepEqual(got, map[string]any{"exitCode": 42, "fileSystem": expectedSessionFileSystem(t, observations)}) {
+		t.Fatalf("diagnostics = %#v, want selected failure facts", got)
+	}
+}
+
 func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
 	primary := &commandError{code: protocol.CodeBackendHealthTimeout, stage: protocol.StageBackendHealth, message: "timeout", committed: true}
 	cleanup := &commandError{code: protocol.CodeStateWriteFailed, stage: protocol.StageBackendCleanup, message: "cleanup", committed: true, details: map[string]any{"exitCode": 1}}
@@ -341,7 +442,8 @@ func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
 	}
 	want := map[string]any{
 		"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40),
-		"exitCode": 1, "terminationRequested": true,
+		"fileSystem": expectedSessionFileSystem(t, observations),
+		"exitCode":   1, "terminationRequested": true,
 		"failures": []any{
 			map[string]any{"phase": "primary", "code": "BACKEND_HEALTH_TIMEOUT", "stage": "backend.health"},
 			map[string]any{"phase": "cleanup", "code": "STATE_WRITE_FAILED", "stage": "backend.cleanup"},

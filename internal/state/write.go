@@ -230,8 +230,9 @@ func classifyWriteResult(
 			cause = err
 		}
 		return &WriteError{
-			File:  file,
-			Phase: phase,
+			File:       file,
+			Phase:      phase,
+			UnlinkMode: filesystemWriteErr.UnlinkMode,
 			MutationApplied: result.mutationApplied ||
 				filesystemWriteErr.MutationApplied,
 			RecoveryRequired: result.recoveryRequired ||
@@ -285,12 +286,14 @@ func classifyRemoveResult(
 
 	cause := err
 	var cleanup error
+	unlinkMode := ""
 	var removeErr *filesystem.StateRemoveError
 	if errors.As(err, &removeErr) {
 		if removeErr.Cause != nil {
 			cause = removeErr.Cause
 		}
 		cleanup = removeErr.CleanupError
+		unlinkMode = removeErr.UnlinkMode
 	}
 	if errors.Is(cause, filesystem.ErrIdentityChanged) {
 		cause = &transactionChangedError{cause: cause}
@@ -298,6 +301,7 @@ func classifyRemoveResult(
 	return &WriteError{
 		File:             file,
 		Phase:            WritePhaseRemove,
+		UnlinkMode:       unlinkMode,
 		MutationApplied:  result.mutationApplied,
 		RecoveryRequired: result.recoveryRequired,
 		Cause:            cause,

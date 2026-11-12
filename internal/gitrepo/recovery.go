@@ -142,7 +142,7 @@ func newRecoveryWithDependencies(
 func (r *Recovery) Recover(
 	ctx context.Context,
 	request RecoveryRequest,
-) (RecoveryResult, error) {
+) (result RecoveryResult, returnErr error) {
 	if ctx == nil || r == nil || r.layout == nil ||
 		nilDependency(r.operator) || nilDependency(r.store) || nilDependency(r.reader) {
 		return RecoveryResult{}, recoveryInternalError(errInvalidRecovery)
@@ -182,10 +182,17 @@ func (r *Recovery) Recover(
 	if err != nil {
 		return RecoveryResult{}, recoveryInternalError(err)
 	}
+	diagnostics := recoveryDiagnostics{targetVersion: transaction.state.TargetVersion, targetCommit: transaction.state.TargetCommit}
+	defer func() {
+		if returnErr != nil {
+			returnErr = &recoveryDiagnosticError{cause: returnErr, snapshot: diagnostics}
+		}
+	}()
 	if transaction.state.Command == "workspace stage" && (transaction.state.Stage == protocol.StageWorkspaceClone || transaction.state.Stage == protocol.StageWorkspaceVerify) {
 		update, err := r.classifyPath(ctx, paths.update, recoveryPathPolicy{
 			allowUnreadable: transaction.state.Stage == protocol.StageWorkspaceClone,
 		})
+		diagnostics.update = describeRecoveryDirectory(update, err)
 		if err != nil {
 			return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "staged_update_unknown", err)
 		}
@@ -208,10 +215,12 @@ func (r *Recovery) Recover(
 		allowUnreadable:      allowDamagedRepository,
 		allowInvalidIdentity: transaction.state.Stage == protocol.StageWorkspaceSwap,
 	})
+	diagnostics.repository = describeRecoveryDirectory(repository, err)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "repository_unknown", err)
 	}
 	update, err := r.classifyPath(ctx, paths.update, recoveryPathPolicy{allowUnreadable: allowIncompleteUpdate})
+	diagnostics.update = describeRecoveryDirectory(update, err)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "update_unknown", err)
 	}
@@ -220,6 +229,7 @@ func (r *Recovery) Recover(
 		allowUnreadable:      allowIncompletePrevious,
 		allowInvalidIdentity: allowIncompletePrevious,
 	})
+	diagnostics.previous = describeRecoveryDirectory(previous, err)
 	if err != nil {
 		return RecoveryResult{}, r.classificationError(ctx, transaction.state.Stage, "previous_unknown", err)
 	}
@@ -798,12 +808,12 @@ func (r *Recovery) renameRecoveryRepository(
 		if isAmbiguousFilesystemError(err) && !renameResult.MutationApplied {
 			return recoveryAmbiguousError(protocol.StageWorkspaceSwap, "directory_identity_changed", err)
 		}
-		return mapRenameFailure(
+		return withRepositoryRenameDiagnostics(mapRenameFailure(
 			ctx,
 			err,
 			renameResult.MutationApplied,
 			kind == filesystem.RenameUpdateToRepository && renameResult.MutationApplied,
-		)
+		), kind, renameResult)
 	}
 	if !renameResult.MutationApplied {
 		return swapFailureError(protocol.StageWorkspaceSwap, errSwapNotApplied)
@@ -835,35 +845,35 @@ func (r *Recovery) removeRecoveryTree(
 	if err != nil {
 		if isAmbiguousFilesystemError(err) {
 			if committed {
-				return mapCommittedCleanupFailure(deleteResult, err)
+				return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(deleteResult, err), kind, deleteResult)
 			}
 			return recoveryAmbiguousError(protocol.StageWorkspaceCleanup, "directory_identity_changed", err)
 		}
 		if committed {
-			return mapCommittedCleanupFailure(deleteResult, err)
+			return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(deleteResult, err), kind, deleteResult)
 		}
 		if isCancellation(ctx, err) {
 			return recoveryCancelledError(protocol.StageWorkspaceCleanup, err)
 		}
-		return newError(
+		return withRepositoryCleanupDiagnostics(newError(
 			protocol.CodeGitRepoCleanupFailed,
 			protocol.StageWorkspaceCleanup,
 			messageForCode(protocol.CodeGitRepoCleanupFailed),
 			map[string]any{},
 			err,
-		)
+		), kind, deleteResult)
 	}
 	if deleteResult.Partial || !deleteResult.AuditCompleted {
 		if committed {
-			return mapCommittedCleanupFailure(deleteResult, errRecoveryCleanupIncomplete)
+			return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(deleteResult, errRecoveryCleanupIncomplete), kind, deleteResult)
 		}
-		return newError(
+		return withRepositoryCleanupDiagnostics(newError(
 			protocol.CodeGitRepoCleanupFailed,
 			protocol.StageWorkspaceCleanup,
 			messageForCode(protocol.CodeGitRepoCleanupFailed),
 			map[string]any{},
 			errRecoveryCleanupIncomplete,
-		)
+		), kind, deleteResult)
 	}
 	return nil
 }

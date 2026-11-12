@@ -110,6 +110,13 @@ type UVResult struct {
 	Duration time.Duration
 }
 
+// runnerJob 是一次性 uv 命令消费的最小进程隔离能力。
+type runnerJob interface {
+	Assign(uint32) error
+	Terminate(uint32) error
+	Close() error
+}
+
 // UVRunner 是 Runtime 唯一的 uv 子进程执行入口。
 type UVRunner struct {
 	Executable       string
@@ -118,6 +125,7 @@ type UVRunner struct {
 	ProjectEnvDir    string
 	CacheDir         string
 	Clock            func() time.Time
+	newJob           func() (runnerJob, error)
 }
 
 // NewRunner 创建固定可执行文件的 uv 执行器。
@@ -241,7 +249,11 @@ func (r *UVRunner) Run(
 			closeWriteErr,
 		)
 	}
-	job, jobErr := process.NewJob()
+	newJob := r.newJob
+	if newJob == nil {
+		newJob = func() (runnerJob, error) { return process.NewJob() }
+	}
+	job, jobErr := newJob()
 	if errors.Is(jobErr, process.ErrUnsupported) {
 		_ = command.Process.Kill()
 		_ = command.Wait()
@@ -255,27 +267,31 @@ func (r *UVRunner) Run(
 	}
 	if jobErr != nil {
 		_ = command.Process.Kill()
-		_ = command.Wait()
-		return UVResult{}, newError(
+		waitErr := command.Wait()
+		failure := newError(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 进程隔离失败",
 			map[string]any{"failureKind": "process_isolation_failed"},
 			jobErr,
 		)
+		failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "create_job", jobErr)
+		return UVResult{}, failure
 	}
 	if job != nil {
 		if err := job.Assign(uint32(command.Process.Pid)); err != nil {
 			_ = command.Process.Kill()
-			_ = command.Wait()
+			waitErr := command.Wait()
 			_ = job.Close()
-			return UVResult{}, newError(
+			failure := newError(
 				protocol.CodeUVExecFailed,
 				options.Stage,
 				"uv 进程隔离失败",
 				map[string]any{"failureKind": "process_isolation_failed"},
 				err,
 			)
+			failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "assign_job", err)
+			return UVResult{}, failure
 		}
 	}
 	jobStop := make(chan struct{})

@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -37,15 +39,19 @@ const (
 	diagnosticProtocolStage
 	diagnosticSHA256
 	diagnosticHTTPStatus
+	diagnosticFileSystem
+	diagnosticUnlinkMode
 )
 
 // diagnosticFieldPolicies 是允许离开 Runtime 的结构字段白名单；未知字段默认丢弃。
 var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
+	"fileSystem": diagnosticFileSystem, "unlinkMode": diagnosticUnlinkMode,
 	"operation": diagnosticStableToken, "component": diagnosticStableToken, "phase": diagnosticStableToken,
 	"failureKind": diagnosticStableToken, "outcome": diagnosticStableToken, "field": diagnosticStableToken,
 	"reason": diagnosticStableToken, "sourceKind": diagnosticStableToken, "source": diagnosticSource,
 	"id": diagnosticStableToken, "status": diagnosticStableValue, "brokenStage": diagnosticStableToken,
 	"mode": diagnosticStableToken, "state": diagnosticStableToken, "sink": diagnosticStableToken,
+	"sourceRole": diagnosticStableToken, "destinationRole": diagnosticStableToken,
 	"code":          diagnosticProtocolCode,
 	"stage":         diagnosticProtocolStage,
 	"pythonVersion": diagnosticIdentifier, "expectedVersion": diagnosticIdentifier,
@@ -69,13 +75,20 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"maxBytes": diagnosticNumber, "count": diagnosticNumber, "orphanCount": diagnosticNumber,
 
 	"partial": diagnosticBoolean, "committed": diagnosticBoolean, "removed": diagnosticBoolean,
+	"changed": diagnosticBoolean, "staged": diagnosticBoolean, "updateAvailable": diagnosticBoolean,
 	"terminationRequested": diagnosticBoolean,
+	"mutationApplied":      diagnosticBoolean,
+	"auditCompleted":       diagnosticBoolean,
+	"recoveryRequired":     diagnosticBoolean,
 	"truncated":            diagnosticBoolean, "lockRewritten": diagnosticBoolean, "synchronized": diagnosticBoolean,
 	"lockfileChecked": diagnosticBoolean, "orphansTruncated": diagnosticBoolean,
 
 	"attempts": diagnosticContainer, "failures": diagnosticContainer, "items": diagnosticContainer,
 	"summary": diagnosticContainer, "relay": diagnosticContainer, "details": diagnosticContainer,
-	"checks": diagnosticContainer, "orphans": diagnosticContainer,
+	"mutex": diagnosticContainer, "directories": diagnosticContainer,
+	"persistence": diagnosticContainer, "primary": diagnosticContainer, "cleanup": diagnosticContainer,
+	"repository": diagnosticContainer,
+	"checks":     diagnosticContainer, "orphans": diagnosticContainer,
 	"bySource": diagnosticDynamicNumberMap,
 }
 
@@ -117,6 +130,31 @@ func sanitizeDiagnosticValue(value any, key string, depth int, fields *int) any 
 		return nil
 	}
 	switch policy {
+	case diagnosticFileSystem:
+		typed, ok := diagnosticString(value)
+		if ok {
+			switch strings.ToLower(typed) {
+			case "ntfs":
+				return "NTFS"
+			case "refs":
+				return "ReFS"
+			case "exfat":
+				return "exFAT"
+			case "fat":
+				return "FAT"
+			case "fat32":
+				return "FAT32"
+			case "unknown":
+				return "unknown"
+			}
+		}
+		return nil
+	case diagnosticUnlinkMode:
+		typed, ok := diagnosticString(value)
+		if ok && (typed == "classic" || typed == "posix" || typed == "unknown") {
+			return typed
+		}
+		return nil
 	case diagnosticStableToken:
 		typed, ok := diagnosticString(value)
 		if !ok || !validStableToken(typed, maxDiagnosticStringBytes, true) {
@@ -481,6 +519,9 @@ func validDiagnosticFilename(value string) bool {
 	if value == "" || len(value) > maxDiagnosticStringBytes || strings.TrimSpace(value) != value {
 		return false
 	}
+	if strings.Contains(value, " ") {
+		return validRuntimeLogFilename(value)
+	}
 	for _, character := range value {
 		if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
 			(character >= '0' && character <= '9') || character == '.' || character == '_' ||
@@ -489,6 +530,28 @@ func validDiagnosticFilename(value string) bool {
 		}
 	}
 	return true
+}
+
+func validRuntimeLogFilename(value string) bool {
+	if !strings.HasSuffix(value, ".log") {
+		return false
+	}
+	stem := strings.TrimSuffix(value, ".log")
+	if index := strings.LastIndexByte(stem, '.'); index >= 0 {
+		segment, err := strconv.ParseUint(stem[index+1:], 10, 64)
+		if err != nil || segment == 0 {
+			return false
+		}
+		stem = stem[:index]
+	}
+	if len(stem) <= 9 || stem[len(stem)-9] != '-' {
+		return false
+	}
+	if !validCommand(stem[:len(stem)-9]) {
+		return false
+	}
+	_, err := time.Parse("20060102", stem[len(stem)-8:])
+	return err == nil
 }
 
 func sensitiveDiagnosticKey(key string) bool {

@@ -284,6 +284,7 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 
 	var directoryIdentity *filesystem.DirectoryIdentity
 	var diagnostics []map[string]any
+	var lastFailure *Error
 	rotationResult, err := f.rotator.Run(
 		ctx,
 		request.Plan,
@@ -297,12 +298,16 @@ func (f *Fetcher) Fetch(ctx context.Context, request FetchRequest) (FetchResult,
 			if errors.As(outcome.Err, &failure) {
 				details = failure.Details()
 			}
+			lastFailure = failure
 			diagnostics = append(diagnostics, details)
 			return outcome
 		},
 	)
 	if err != nil {
 		failure := mapFetchFailure(ctx, err, rotationResult.Reports)
+		if lastFailure != nil && failure.Code() == lastFailure.Code() && failure.Stage() == lastFailure.Stage() {
+			failure.diagnostics = lastFailure.diagnostics
+		}
 		attempts := failure.details["attempts"].([]map[string]any)
 		for i, details := range diagnostics {
 			if i >= len(attempts) {
@@ -668,13 +673,13 @@ func (f *Fetcher) fetchAttempt(
 				repositoryPath,
 				mirror.OutcomeTargetFailure,
 				failureCleanup,
-				newError(
+				withRepositoryCloseDiagnostics(newError(
 					protocol.CodeGitRepoCleanupFailed,
 					protocol.StageWorkspaceCleanup,
 					messageForCode(protocol.CodeGitRepoCleanupFailed),
 					map[string]any{},
 					closeErr,
-				),
+				), closeErr),
 				false,
 				directoryIdentity,
 			)
@@ -747,13 +752,13 @@ func (f *Fetcher) finishFailedAttemptWithIdentity(
 	}
 	if lease != nil {
 		if closeErr := closeDirectoryLease(lease); closeErr != nil {
-			operationErr = newError(
+			operationErr = withRepositoryCloseDiagnostics(newError(
 				protocol.CodeGitRepoCleanupFailed,
 				protocol.StageWorkspaceCleanup,
 				messageForCode(protocol.CodeGitRepoCleanupFailed),
 				map[string]any{},
 				errors.Join(operationErr, closeErr),
-			)
+			), closeErr)
 			failureKind = failureCleanup
 			outcomeKind = mirror.OutcomeTargetFailure
 			cleanup = false
@@ -793,6 +798,10 @@ func (f *Fetcher) finishFailedAttemptWithIdentity(
 					errors.Join(operationErr, cleanupErr),
 				)
 				failureKind = failureCleanup
+				var cleanupFailure *Error
+				if errors.As(cleanupErr, &cleanupFailure) {
+					operationErr.diagnostics = cleanupFailure.diagnostics
+				}
 			}
 			outcomeKind = mirror.OutcomeTargetFailure
 		}
@@ -834,10 +843,12 @@ func (f *Fetcher) cleanupTemporary(
 		ExpectedIdentity: expectedIdentity,
 	})
 	if err != nil {
-		return fmt.Errorf("remove repository update: %w", err)
+		return withRepositoryCleanupDiagnostics(newError(protocol.CodeGitRepoCleanupFailed, protocol.StageWorkspaceCleanup,
+			messageForCode(protocol.CodeGitRepoCleanupFailed), map[string]any{}, fmt.Errorf("remove repository update: %w", err)), filesystem.DeleteRepositoryUpdate, result)
 	}
 	if result.Partial || !result.AuditCompleted {
-		return errors.New("repository update cleanup is incomplete")
+		return withRepositoryCleanupDiagnostics(newError(protocol.CodeGitRepoCleanupFailed, protocol.StageWorkspaceCleanup,
+			messageForCode(protocol.CodeGitRepoCleanupFailed), map[string]any{}, errors.New("repository update cleanup is incomplete")), filesystem.DeleteRepositoryUpdate, result)
 	}
 	return nil
 }

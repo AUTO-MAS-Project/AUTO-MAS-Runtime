@@ -519,6 +519,7 @@ func TestRecovery_SwapDamagedRepositoryWithPreviousHasNoSideEffects(t *testing.T
 
 	result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
 	assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+	assertRecoveryDirectoryStates(t, err, map[string]string{"repo": "incomplete", "update": "valid", "previous": "valid"})
 	if result.MutationApplied || result.EnvironmentWritten || result.TransactionRemoved || store.transactionRemoved {
 		t.Fatalf("Recover() result = %#v, want no side effects", result)
 	}
@@ -1323,6 +1324,7 @@ func TestRecovery_NonCloneReaderFailureRemainsAmbiguous(t *testing.T) {
 
 			result, err := recovery.Recover(t.Context(), RecoveryRequest{LogPath: recoveryLogPath(t, layout)})
 			assertGitrepoCode(t, err, protocol.CodeUpdateStateAmbiguous)
+			assertRecoveryDirectoryStates(t, err, map[string]string{"repo": "missing", "update": "unknown", "previous": "not_observed"})
 			var operationErr *Error
 			if !errors.As(err, &operationErr) {
 				t.Fatalf("error = %v, want *Error", err)
@@ -1343,6 +1345,28 @@ func TestRecovery_NonCloneReaderFailureRemainsAmbiguous(t *testing.T) {
 type fakeRecoveryOperator struct {
 	rename func(ctx context.Context, request filesystem.RenameRequest) (filesystem.RenameResult, error)
 	remove func(ctx context.Context, request filesystem.DeleteRequest) (filesystem.DeleteResult, error)
+}
+
+func assertRecoveryDirectoryStates(t *testing.T, err error, want map[string]string) {
+	t.Helper()
+	var diagnostic interface{ DiagnosticDetails() map[string]any }
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("error = %v, want recovery directory diagnostics", err)
+	}
+	details := diagnostic.DiagnosticDetails()
+	directories, ok := details["directories"].([]map[string]any)
+	if !ok || len(directories) != len(want) {
+		t.Fatalf("directories = %#v, want three fixed roles", details["directories"])
+	}
+	for _, directory := range directories {
+		role, _ := directory["component"].(string)
+		if directory["state"] != want[role] {
+			t.Errorf("directory = %#v, want state %q", directory, want[role])
+		}
+		if directory["state"] == "valid" && (directory["version"] == "" || directory["commit"] == "") {
+			t.Errorf("directory = %#v, want verified identity", directory)
+		}
+	}
 }
 
 func (o *fakeRecoveryOperator) AtomicRename(ctx context.Context, request filesystem.RenameRequest) (filesystem.RenameResult, error) {
