@@ -113,9 +113,14 @@ func TestRunner_AssignsBeforeExecuting(t *testing.T) {
 
 type cancelBeforeResumeJob struct {
 	process.Job
-	cancel context.CancelFunc
-	pid    uint32
-	handle windows.Handle
+	cancel     context.CancelFunc
+	pid        uint32
+	handle     windows.Handle
+	closeError error
+}
+
+func (j *cancelBeforeResumeJob) Close() error {
+	return errors.Join(j.Job.Close(), j.closeError)
 }
 
 func (j *cancelBeforeResumeJob) Assign(pid uint32) error {
@@ -159,6 +164,28 @@ func TestRunner_CancelBeforeResumeDoesNotExecute(t *testing.T) {
 	status, waitErr := windows.WaitForSingleObject(job.handle, 0)
 	if waitErr != nil || status != windows.WAIT_OBJECT_0 {
 		t.Fatalf("child %d after Run = wait %d error %v, want confirmed exited", job.pid, status, waitErr)
+	}
+}
+
+func TestRunner_CancelBeforeResumePreservesCleanupError(t *testing.T) {
+	runner := newTestRunner(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cleanupError := errors.New("job close failed")
+	job := &cancelBeforeResumeJob{cancel: cancel, closeError: cleanupError}
+	runner.newJob = func() (runnerJob, error) {
+		var err error
+		job.Job, err = process.NewJob()
+		return job, err
+	}
+	t.Cleanup(func() {
+		if job.handle != 0 {
+			_ = windows.CloseHandle(job.handle)
+		}
+	})
+	_, err := runner.Run(ctx, []string{"-test.run=^TestFakeUVProcess$"}, RunOptions{Stage: protocol.StageUVVerify})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, cleanupError) {
+		t.Fatalf("Run() error = %v, want cancellation and job cleanup error", err)
 	}
 }
 
