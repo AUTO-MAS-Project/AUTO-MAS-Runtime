@@ -70,12 +70,15 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 
 	"partial": diagnosticBoolean, "committed": diagnosticBoolean, "removed": diagnosticBoolean,
 	"terminationRequested": diagnosticBoolean,
+	"mutationApplied":      diagnosticBoolean,
+	"recoveryRequired":     diagnosticBoolean,
 	"truncated":            diagnosticBoolean, "lockRewritten": diagnosticBoolean, "synchronized": diagnosticBoolean,
 	"lockfileChecked": diagnosticBoolean, "orphansTruncated": diagnosticBoolean,
 
 	"attempts": diagnosticContainer, "failures": diagnosticContainer, "items": diagnosticContainer,
 	"summary": diagnosticContainer, "relay": diagnosticContainer, "details": diagnosticContainer,
 	"mutex": diagnosticContainer, "directories": diagnosticContainer,
+	"persistence": diagnosticContainer, "primary": diagnosticContainer, "cleanup": diagnosticContainer,
 	"checks": diagnosticContainer, "orphans": diagnosticContainer,
 	"bySource": diagnosticDynamicNumberMap,
 }

@@ -229,6 +229,35 @@ func TestSentry_OperationalFailureDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSentry_StateFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = string(protocol.CodeStateWriteFailed)
+	observation.DiagnosticDetails = map[string]any{"persistence": map[string]any{
+		"component": "mutation", "phase": "finalize", "mutationApplied": true, "recoveryRequired": true,
+		"primary": map[string]any{"operation": "classic-unlink", "windowsError": uint64(5), "error": "private cause"},
+		"cleanup": map[string]any{"operation": "close", "windowsError": uint64(6), "password": "private password"},
+		"causes":  []string{"private local cause"},
+	}}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"persistence"`, `"component":"mutation"`, `"mutationApplied":true`, `"recoveryRequired":true`, `"primary"`, `"cleanup"`, `"windowsError":5`, `"windowsError":6`} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Fatalf("diagnostics = %s, want %s", encoded, required)
+		}
+	}
+	if bytes.Contains(encoded, []byte("private")) || bytes.Contains(encoded, []byte("causes")) {
+		t.Fatalf("private data escaped: %s", encoded)
+	}
+}
+
 func TestSentry_BeforeSendRejectsUnreportableFailure(t *testing.T) {
 	provider, transport := newSentryTestProvider(t)
 	observation := validSentryObservation(false)

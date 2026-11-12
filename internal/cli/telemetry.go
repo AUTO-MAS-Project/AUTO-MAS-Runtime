@@ -127,9 +127,14 @@ func failureTelemetryDetails(err error, code protocol.Code, stage protocol.Stage
 		if current == nil {
 			return
 		}
-		failure, classified := current.(operationError)
-		if diagnostic, ok := current.(interface{ DiagnosticDetails() map[string]any }); ok &&
-			(!classified || failure.Code() == code && failure.Stage() == stage) {
+		// 不匹配的分类分支连同其底层诊断一起跳过，避免次要错误污染终态事实。
+		if failure, ok := current.(operationError); ok && (failure.Code() != code || failure.Stage() != stage) {
+			return
+		}
+		if failure, ok := current.(interface{ Code() protocol.Code }); ok && failure.Code() != code {
+			return
+		}
+		if diagnostic, ok := current.(interface{ DiagnosticDetails() map[string]any }); ok {
 			for key, value := range diagnostic.DiagnosticDetails() {
 				if _, exists := details[key]; !exists {
 					details[key] = value
