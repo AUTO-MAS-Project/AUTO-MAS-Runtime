@@ -297,21 +297,23 @@ func (r *UVRunner) Run(
 	// 挂起创建阻止短命探针先于 Assign 退出，也阻止未纳管的后代逃出 Job。
 	// 取消先于恢复检查，避免退出期间再开始 uv 的业务工作。
 	if err := ctx.Err(); err != nil {
-		_ = command.Process.Kill()
-		_ = command.Wait()
+		killErr := command.Process.Kill()
+		waitErr := command.Wait()
+		var closeErr error
 		if job != nil {
-			_ = job.Close()
+			closeErr = job.Close()
 		}
-		return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, err)
+		return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(err, killErr, waitErr, closeErr))
 	}
 	if err := process.ResumeSuspended(command.Process); err != nil {
-		_ = command.Process.Kill()
+		killErr := command.Process.Kill()
 		waitErr := command.Wait()
+		var closeErr error
 		if job != nil {
-			_ = job.Close()
+			closeErr = job.Close()
 		}
 		failure := newError(protocol.CodeUVExecFailed, options.Stage, "uv 进程隔离失败",
-			map[string]any{"failureKind": "process_isolation_failed"}, err)
+			map[string]any{"failureKind": "process_isolation_failed"}, errors.Join(err, killErr, waitErr, closeErr))
 		failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "resume_process", err)
 		return UVResult{}, failure
 	}
