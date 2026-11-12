@@ -126,6 +126,7 @@ type UVRunner struct {
 	CacheDir         string
 	Clock            func() time.Time
 	newJob           func() (runnerJob, error)
+	resumeProcess    func(*os.Process) error
 }
 
 // NewRunner 创建固定可执行文件的 uv 执行器。
@@ -293,6 +294,37 @@ func (r *UVRunner) Run(
 			failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "assign_job", err)
 			return UVResult{}, failure
 		}
+	}
+	// 挂起创建阻止短命探针先于 Assign 退出，也阻止未纳管的后代逃出 Job。
+	// 取消先于恢复检查，避免退出期间再开始 uv 的业务工作。
+	if err := ctx.Err(); err != nil {
+		killErr := command.Process.Kill()
+		waitErr := command.Wait()
+		var closeErr error
+		if job != nil {
+			closeErr = job.Close()
+		}
+		return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(err, killErr, waitErr, closeErr))
+	}
+	resumeProcess := r.resumeProcess
+	if resumeProcess == nil {
+		resumeProcess = process.ResumeSuspended
+	}
+	if err := resumeProcess(command.Process); err != nil {
+		killErr := command.Process.Kill()
+		waitErr := command.Wait()
+		var closeErr error
+		if job != nil {
+			closeErr = job.Close()
+		}
+		// CommandContext 可能在上次检查后结束挂起进程，线程恢复失败仍应保留取消语义。
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(cancelErr, err, killErr, waitErr, closeErr))
+		}
+		failure := newError(protocol.CodeUVExecFailed, options.Stage, "uv 进程隔离失败",
+			map[string]any{"failureKind": "process_isolation_failed"}, errors.Join(err, killErr, waitErr, closeErr))
+		failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "resume_process", err)
+		return UVResult{}, failure
 	}
 	jobStop := make(chan struct{})
 	jobDone := make(chan struct{})

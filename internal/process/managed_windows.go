@@ -170,13 +170,25 @@ func startManagedWindows(
 	if err := ctx.Err(); err != nil {
 		return cleanupStarted(err)
 	}
-	thread, err := operations.initialThread(uint32(processValue.Pid))
+	if err := resumeInitialThread(uint32(processValue.Pid), operations); err != nil {
+		return cleanupStarted(err)
+	}
+	return ownManagedProcess(ctx, spec.Sink, processValue, job, stdoutRead, stderrRead), nil
+}
+
+// ResumeSuspended 恢复已纳入 Job 的挂起进程；失败时由进程 owner 负责终止并等待。
+func ResumeSuspended(processValue *os.Process) error {
+	return resumeInitialThread(uint32(processValue.Pid), defaultWindowsStartOperations())
+}
+
+func resumeInitialThread(pid uint32, operations windowsStartOperations) error {
+	thread, err := operations.initialThread(pid)
 	if err != nil {
 		var threadCloseErr error
 		if thread != 0 {
 			threadCloseErr = operations.closeHandle(thread)
 		}
-		return cleanupStarted(errors.Join(fmt.Errorf("find managed process initial thread: %w", err), threadCloseErr))
+		return errors.Join(fmt.Errorf("find managed process initial thread: %w", err), threadCloseErr)
 	}
 	previous, resumeErr := operations.resumeThread(thread)
 	threadCloseErr := operations.closeHandle(thread)
@@ -187,9 +199,9 @@ func startManagedWindows(
 		if resumeErr != nil {
 			resumeErr = fmt.Errorf("resume managed process initial thread: %w", resumeErr)
 		}
-		return cleanupStarted(errors.Join(resumeErr, threadCloseErr))
+		return errors.Join(resumeErr, threadCloseErr)
 	}
-	return ownManagedProcess(ctx, spec.Sink, processValue, job, stdoutRead, stderrRead), nil
+	return nil
 }
 
 func validateStartSpec(ctx context.Context, spec StartSpec) error {
