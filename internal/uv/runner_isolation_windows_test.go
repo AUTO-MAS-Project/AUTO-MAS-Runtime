@@ -189,6 +189,89 @@ func TestRunner_CancelBeforeResumePreservesCleanupError(t *testing.T) {
 	}
 }
 
+func TestRunner_ResumeFailurePreservesCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		wantContext  error
+		wantCode     protocol.Code
+		wantExitCode protocol.ExitCode
+	}{
+		{name: "cancel", wantContext: context.Canceled, wantCode: protocol.CodeOperationCancelled, wantExitCode: protocol.ExitCodeOperationCancelled},
+		{name: "deadline", wantContext: context.DeadlineExceeded, wantCode: protocol.CodeOperationCancelled, wantExitCode: protocol.ExitCodeOperationCancelled},
+		{name: "uncancelled", wantCode: protocol.CodeUVExecFailed, wantExitCode: protocol.ExitCodeEnvironmentFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newTestRunner(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			if test.name == "deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), 5*time.Second)
+			}
+			defer cancel()
+			cleanupError := errors.New("job close failed after actual close")
+			job := &cancelBeforeResumeJob{cancel: func() {}, closeError: cleanupError}
+			runner.newJob = func() (runnerJob, error) {
+				var err error
+				job.Job, err = process.NewJob()
+				return job, err
+			}
+			t.Cleanup(func() {
+				if job.handle != 0 {
+					_ = windows.CloseHandle(job.handle)
+				}
+			})
+			var resumeError error
+			var waitStatus uint32
+			var waitError error
+			runner.resumeProcess = func(child *os.Process) error {
+				// 调用点已越过 Run 的取消检查，只控制外部进程恢复前的时序。
+				switch test.name {
+				case "cancel":
+					cancel()
+				case "deadline":
+					<-ctx.Done()
+				case "uncancelled":
+					if err := child.Kill(); err != nil {
+						return err
+					}
+				}
+				waitStatus, waitError = windows.WaitForSingleObject(job.handle, 5000)
+				resumeError = process.ResumeSuspended(child)
+				return resumeError
+			}
+			recordPath := filepath.Join(t.TempDir(), "must-not-exist.txt")
+			_, err := runner.Run(ctx, []string{"-test.run=^TestFakeUVProcess$"}, RunOptions{
+				Stage: protocol.StageUVVerify, Environment: map[string]string{"FAKE_UV_RECORD": recordPath},
+			})
+			var failure *Error
+			if !errors.As(err, &failure) {
+				t.Fatalf("Run() error = %v, want structured uv error", err)
+			}
+			definition, ok := protocol.LookupErrorDefinition(failure.Code())
+			t.Logf("Run code=%s exitCode=%d ctx=%v resume=%v wait=%d", failure.Code(), definition.ExitCode, ctx.Err(), resumeError, waitStatus)
+			if failure.Code() != test.wantCode || !ok || definition.ExitCode != test.wantExitCode {
+				t.Errorf("Run() code=%s exitCode=%d, want %s / %d", failure.Code(), definition.ExitCode, test.wantCode, test.wantExitCode)
+			}
+			if !errors.Is(ctx.Err(), test.wantContext) || test.wantContext != nil && !errors.Is(err, test.wantContext) {
+				t.Errorf("Run() error = %v ctx=%v, want context %v in chain", err, ctx.Err(), test.wantContext)
+			}
+			if waitError != nil || waitStatus != windows.WAIT_OBJECT_0 || resumeError == nil {
+				t.Fatalf("resume boundary = wait %d error %v resume %v, want exited child and real resume failure", waitStatus, waitError, resumeError)
+			}
+			var exitError *exec.ExitError
+			if !errors.Is(err, resumeError) || !errors.Is(err, cleanupError) || !errors.As(err, &exitError) {
+				t.Errorf("Run() error = %v, want original resume, job cleanup and Wait errors", err)
+			}
+			if _, statErr := os.Stat(recordPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("suspended child executed: marker error = %v", statErr)
+			}
+			if test.wantContext == nil && (failure.Details()["failureKind"] != "process_isolation_failed" || failure.DiagnosticDetails()["operation"] != "resume_process") {
+				t.Errorf("uncancelled failure details = %v / %v, want isolation failure", failure.Details(), failure.DiagnosticDetails())
+			}
+		})
+	}
+}
+
 func TestRunner_CancelReapsDescendants(t *testing.T) {
 	runner := newTestRunner(t)
 	ctx, cancel := context.WithCancel(t.Context())

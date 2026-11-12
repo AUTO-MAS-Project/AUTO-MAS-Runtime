@@ -126,6 +126,7 @@ type UVRunner struct {
 	CacheDir         string
 	Clock            func() time.Time
 	newJob           func() (runnerJob, error)
+	resumeProcess    func(*os.Process) error
 }
 
 // NewRunner 创建固定可执行文件的 uv 执行器。
@@ -305,12 +306,20 @@ func (r *UVRunner) Run(
 		}
 		return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(err, killErr, waitErr, closeErr))
 	}
-	if err := process.ResumeSuspended(command.Process); err != nil {
+	resumeProcess := r.resumeProcess
+	if resumeProcess == nil {
+		resumeProcess = process.ResumeSuspended
+	}
+	if err := resumeProcess(command.Process); err != nil {
 		killErr := command.Process.Kill()
 		waitErr := command.Wait()
 		var closeErr error
 		if job != nil {
 			closeErr = job.Close()
+		}
+		// CommandContext 可能在上次检查后结束挂起进程，线程恢复失败仍应保留取消语义。
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(cancelErr, err, killErr, waitErr, closeErr))
 		}
 		failure := newError(protocol.CodeUVExecFailed, options.Stage, "uv 进程隔离失败",
 			map[string]any{"failureKind": "process_isolation_failed"}, errors.Join(err, killErr, waitErr, closeErr))
