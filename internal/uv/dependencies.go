@@ -421,7 +421,7 @@ func dependencySyncError(result UVResult, cause error) error {
 		uvFailureDetails(result, "dependency_sync_nonzero"),
 		cause,
 	)
-	failure.diagnostics = dependencyExecutionDiagnostics(result, cause, "dependency_sync")
+	failure.diagnostics = executionDiagnostics(result, cause, "dependency_sync")
 	return failure
 }
 
@@ -436,33 +436,8 @@ func dependencyCheckError(result UVResult, cause error) error {
 		uvFailureDetails(result, "dependency_check_nonzero"),
 		cause,
 	)
-	failure.diagnostics = dependencyExecutionDiagnostics(result, cause, "dependency_check")
+	failure.diagnostics = executionDiagnostics(result, cause, "dependency_check")
 	return failure
-}
-
-func dependencyExecutionDiagnostics(result UVResult, cause error, phase string) map[string]any {
-	kind := phase + "_failed"
-	if result.ExitCode != 0 {
-		kind = phase + "_nonzero"
-	}
-	details := uvFailureDetails(result, kind)
-	var execution *Error
-	if errors.As(cause, &execution) {
-		for key, value := range execution.Details() {
-			details[key] = value
-		}
-	}
-	return details
-}
-
-func uvFailureDetails(result UVResult, failureKind string) map[string]any {
-	return map[string]any{
-		"failureKind":         failureKind,
-		"exitCode":            result.ExitCode,
-		"durationMs":          result.Duration.Milliseconds(),
-		"capturedStdoutBytes": len(result.Stdout),
-		"capturedStderrBytes": len(result.Stderr),
-	}
 }
 
 func containsNUL(value string) bool {

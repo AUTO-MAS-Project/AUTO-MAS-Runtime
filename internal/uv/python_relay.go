@@ -95,7 +95,7 @@ func (s *PythonService) installWithRelay(
 		return result, summary, true, runErr
 	}
 	if hasRelayTransferFailure(summary) {
-		return result, summary, true, newError(
+		failure := newError(
 			protocol.CodeMirrorExhausted,
 			protocol.StagePythonInstall,
 			"所有镜像源均不可用",
@@ -107,14 +107,10 @@ func (s *PythonService) installWithRelay(
 			},
 			nonNilRunError(runErr),
 		)
+		failure.diagnostics = executionDiagnostics(result, runErr, "python_install")
+		return result, summary, true, failure
 	}
-	return result, summary, true, withRelayDiagnostics(pythonError(
-		protocol.CodePythonInstallFailed,
-		protocol.StagePythonInstall,
-		"Python 安装失败",
-		map[string]any{"pythonVersion": spec.Version.String(), "exitCode": result.ExitCode},
-		nonNilRunError(runErr),
-	), summary)
+	return result, summary, true, withRelayDiagnostics(pythonInstallFailure(spec, result, nonNilRunError(runErr)), summary)
 }
 
 func (s *PythonService) probeResults(kind mirror.Kind) []mirror.ProbeResult {

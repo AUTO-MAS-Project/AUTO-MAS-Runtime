@@ -393,7 +393,7 @@ func (s *DependenciesService) mapRotationFailure(
 			details,
 			cause,
 		)
-		failure.diagnostics = dependencyExecutionDiagnostics(state.lastResult, state.lastErr, "dependency_sync")
+		failure.diagnostics = executionDiagnostics(state.lastResult, state.lastErr, "dependency_sync")
 		return failure
 	}
 	return rotationErr

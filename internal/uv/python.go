@@ -270,13 +270,7 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 			if isNetworkPolicyError(err) {
 				return PythonResult{}, err
 			}
-			return PythonResult{}, pythonError(
-				protocol.CodePythonInstallFailed,
-				protocol.StagePythonInstall,
-				"Python 安装失败",
-				map[string]any{"pythonVersion": spec.Version.String(), "exitCode": installResult.ExitCode},
-				err,
-			)
+			return PythonResult{}, pythonInstallFailure(spec, installResult, err)
 		}
 	}
 	findResult, err := s.runner.Run(ctx, []string{

@@ -8,12 +8,13 @@ import (
 
 // Error 描述工作区 Git 服务失败，供 CLI 映射协议四元组。
 type Error struct {
-	code      protocol.Code
-	stage     protocol.Stage
-	message   string
-	details   map[string]any
-	cause     error
-	committed bool
+	code        protocol.Code
+	stage       protocol.Stage
+	message     string
+	details     map[string]any
+	diagnostics map[string]any
+	cause       error
+	committed   bool
 }
 
 func newError(

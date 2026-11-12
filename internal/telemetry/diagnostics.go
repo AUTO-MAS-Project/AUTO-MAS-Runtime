@@ -46,6 +46,7 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"reason": diagnosticStableToken, "sourceKind": diagnosticStableToken, "source": diagnosticSource,
 	"id": diagnosticStableToken, "status": diagnosticStableValue, "brokenStage": diagnosticStableToken,
 	"mode": diagnosticStableToken, "state": diagnosticStableToken, "sink": diagnosticStableToken,
+	"sourceRole": diagnosticStableToken, "destinationRole": diagnosticStableToken,
 	"code":          diagnosticProtocolCode,
 	"stage":         diagnosticProtocolStage,
 	"pythonVersion": diagnosticIdentifier, "expectedVersion": diagnosticIdentifier,
@@ -71,6 +72,7 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"partial": diagnosticBoolean, "committed": diagnosticBoolean, "removed": diagnosticBoolean,
 	"terminationRequested": diagnosticBoolean,
 	"mutationApplied":      diagnosticBoolean,
+	"auditCompleted":       diagnosticBoolean,
 	"recoveryRequired":     diagnosticBoolean,
 	"truncated":            diagnosticBoolean, "lockRewritten": diagnosticBoolean, "synchronized": diagnosticBoolean,
 	"lockfileChecked": diagnosticBoolean, "orphansTruncated": diagnosticBoolean,
@@ -79,7 +81,8 @@ var diagnosticFieldPolicies = map[string]diagnosticFieldKind{
 	"summary": diagnosticContainer, "relay": diagnosticContainer, "details": diagnosticContainer,
 	"mutex": diagnosticContainer, "directories": diagnosticContainer,
 	"persistence": diagnosticContainer, "primary": diagnosticContainer, "cleanup": diagnosticContainer,
-	"checks": diagnosticContainer, "orphans": diagnosticContainer,
+	"repository": diagnosticContainer,
+	"checks":     diagnosticContainer, "orphans": diagnosticContainer,
 	"bySource": diagnosticDynamicNumberMap,
 }
 

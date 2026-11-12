@@ -474,10 +474,10 @@ func recordOperationFailure(
 	}
 	entry["code"] = string(code)
 	entry["stage"] = string(stage)
+	for key, value := range failureTelemetryDetails(cause, code, stage, nil) {
+		entry[key] = value
+	}
 	if code == protocol.CodeStateWriteFailed {
-		for key, value := range failureTelemetryDetails(cause, code, stage, nil) {
-			entry[key] = value
-		}
 		var commandErr *commandError
 		if errors.As(cause, &commandErr) && commandErr.cause != nil {
 			entry["cause"] = commandErr.cause.Error()

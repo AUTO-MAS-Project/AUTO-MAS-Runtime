@@ -808,12 +808,12 @@ func (r *Recovery) renameRecoveryRepository(
 		if isAmbiguousFilesystemError(err) && !renameResult.MutationApplied {
 			return recoveryAmbiguousError(protocol.StageWorkspaceSwap, "directory_identity_changed", err)
 		}
-		return mapRenameFailure(
+		return withRepositoryRenameDiagnostics(mapRenameFailure(
 			ctx,
 			err,
 			renameResult.MutationApplied,
 			kind == filesystem.RenameUpdateToRepository && renameResult.MutationApplied,
-		)
+		), kind, renameResult)
 	}
 	if !renameResult.MutationApplied {
 		return swapFailureError(protocol.StageWorkspaceSwap, errSwapNotApplied)
@@ -845,35 +845,35 @@ func (r *Recovery) removeRecoveryTree(
 	if err != nil {
 		if isAmbiguousFilesystemError(err) {
 			if committed {
-				return mapCommittedCleanupFailure(deleteResult, err)
+				return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(deleteResult, err), kind, deleteResult)
 			}
 			return recoveryAmbiguousError(protocol.StageWorkspaceCleanup, "directory_identity_changed", err)
 		}
 		if committed {
-			return mapCommittedCleanupFailure(deleteResult, err)
+			return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(deleteResult, err), kind, deleteResult)
 		}
 		if isCancellation(ctx, err) {
 			return recoveryCancelledError(protocol.StageWorkspaceCleanup, err)
 		}
-		return newError(
+		return withRepositoryCleanupDiagnostics(newError(
 			protocol.CodeGitRepoCleanupFailed,
 			protocol.StageWorkspaceCleanup,
 			messageForCode(protocol.CodeGitRepoCleanupFailed),
 			map[string]any{},
 			err,
-		)
+		), kind, deleteResult)
 	}
 	if deleteResult.Partial || !deleteResult.AuditCompleted {
 		if committed {
-			return mapCommittedCleanupFailure(deleteResult, errRecoveryCleanupIncomplete)
+			return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(deleteResult, errRecoveryCleanupIncomplete), kind, deleteResult)
 		}
-		return newError(
+		return withRepositoryCleanupDiagnostics(newError(
 			protocol.CodeGitRepoCleanupFailed,
 			protocol.StageWorkspaceCleanup,
 			messageForCode(protocol.CodeGitRepoCleanupFailed),
 			map[string]any{},
 			errRecoveryCleanupIncomplete,
-		)
+		), kind, deleteResult)
 	}
 	return nil
 }
