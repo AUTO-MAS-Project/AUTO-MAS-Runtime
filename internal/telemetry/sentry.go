@@ -115,9 +115,9 @@ func newSentryProviderWithTransport(config Config, transport sentry.Transport) (
 	}, nil
 }
 
-func (p *sentryProvider) captureInternal(observation InternalObservation) {
+func (p *sentryProvider) captureInternal(observation InternalObservation) string {
 	if p == nil || !validInternalObservation(observation) {
-		return
+		return ""
 	}
 
 	kind := sentryObservationInternal
@@ -146,6 +146,9 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 	}
 	if observation.Reason != "" {
 		event.Tags["reason"] = observation.Reason
+	}
+	if observation.OperationID != "" {
+		event.Tags["operation_id"] = observation.OperationID
 	}
 	if kind == sentryObservationFailure && len(observation.DiagnosticDetails) > 0 {
 		event.Contexts = map[string]sentry.Context{"diagnostics": {
@@ -178,9 +181,12 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed || p.hub == nil {
-		return
+		return ""
 	}
-	p.hub.CaptureEvent(event)
+	if id := p.hub.CaptureEvent(event); id != nil {
+		return string(*id)
+	}
+	return ""
 }
 
 func (p *sentryProvider) close(ctx context.Context) {
@@ -305,7 +311,7 @@ func sanitizeSentryDiagnostics(contexts map[string]sentry.Context) sentry.Contex
 }
 
 func sanitizeSentryTags(tags map[string]string) map[string]string {
-	allowed := [...]string{"command", "stage", "code", "reason", "runtime_version", "protocol_version", "platform"}
+	allowed := [...]string{"command", "stage", "code", "reason", "runtime_version", "protocol_version", "platform", "operation_id"}
 	clean := make(map[string]string, len(allowed))
 	for _, key := range allowed {
 		value := strings.TrimSpace(tags[key])
@@ -321,6 +327,8 @@ func validSentryTag(key, value string) bool {
 		return false
 	}
 	switch key {
+	case "operation_id":
+		return validOperationID(value)
 	case "command":
 		return validCommand(value)
 	case "stage":

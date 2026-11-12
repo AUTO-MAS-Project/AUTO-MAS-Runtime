@@ -242,7 +242,9 @@ func runBackendSuperviseSession(
 				exitCode, telemetryState.terminalWritten = safeEmitPanicFailure(deps, emitter, stage, failure)
 			}
 		}
+		deps.sessionLog.finish(exitCode)
 		telemetryState.finish()
+		deps.sessionLog.close()
 	}()
 
 	output, err := newProcessOutput(deps)

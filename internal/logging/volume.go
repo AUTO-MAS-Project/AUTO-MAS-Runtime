@@ -9,6 +9,9 @@ func (l *Logger) recordFileSystem(ctx context.Context, probe func(context.Contex
 		// 格式只用于排障，探测不可用不能成为安装或启动的新前置条件。
 		format = "unknown"
 	}
+	l.mu.Lock()
+	l.fileSystem = format
+	l.mu.Unlock()
 	_, err = l.Diagnostic(ctx, LevelInfo, "当前磁盘格式："+format, map[string]any{
 		"path":       path,
 		"fileSystem": format,

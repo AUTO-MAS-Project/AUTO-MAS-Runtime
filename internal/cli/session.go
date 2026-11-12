@@ -89,7 +89,9 @@ func runOperationSession(
 				exitCode, telemetryState.terminalWritten = safeEmitPanicFailure(deps, emitter, stage, failure)
 			}
 		}
+		deps.sessionLog.finish(exitCode)
 		telemetryState.finish()
+		deps.sessionLog.close()
 	}()
 
 	output, err := newProcessOutput(deps)
@@ -176,9 +178,9 @@ func runOperationSession(
 		if panicked {
 			telemetryState.addPanic(err, panicFrames)
 		}
-		// 独立终态 writer 记录命令收尾后的错误；早期状态故障也须保留可导出的恢复线索。
+		// 独立终态 writer 记录命令收尾和业务日志建立前的错误。
 		failureCode, _, _, _ := classifyFailure(err, stage)
-		if deps.opLog.Get() != nil || failureCode == protocol.CodeStateWriteFailed {
+		if sessionRecordsFailure(failureCode) && (deps.opLog.Get() != nil || deps.sessionLog != nil) {
 			deps.opLog.Set(nil)
 			logContext, cancelLog := context.WithTimeout(context.WithoutCancel(ctx), m5TransactionCleanupTimeout)
 			defer cancelLog()
@@ -228,18 +230,21 @@ func helloRuntimeVersion(ctx context.Context, source versionSourceFunc) string {
 }
 
 func newProcessOutput(deps *deps) (*protocol.ProcessOutput, error) {
+	var renderer protocol.EventRenderer
+	var err error
 	switch deps.global.output {
 	case outputNDJSON:
-		return protocol.NewProcessOutput(deps.io.Out)
+		renderer, err = protocol.NewNDJSONRenderer(deps.io.Out)
 	case outputHuman:
-		renderer, err := protocol.NewHumanRenderer(deps.io.Out, deps.io.Err)
-		if err != nil {
-			return nil, err
-		}
-		return protocol.NewProcessOutputWithRenderer(renderer)
+		renderer, err = protocol.NewHumanRenderer(deps.io.Out, deps.io.Err)
 	default:
 		return nil, fmt.Errorf("unsupported output mode %q", deps.global.output)
 	}
+	if err != nil {
+		return nil, err
+	}
+	deps.sessionLog = &sessionDiagnostics{EventRenderer: renderer, deps: deps}
+	return protocol.NewProcessOutputWithRenderer(deps.sessionLog)
 }
 
 // sessionSetupFailure 发生在协议会话建立阶段，此时只能写 stderr 诊断。
@@ -263,6 +268,9 @@ func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, su
 
 func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) (int, bool) {
 	code, stage, message, details := classifyFailure(err, fallbackStage)
+	if deps.sessionLog != nil && sessionRecordsFailure(code) {
+		deps.sessionLog.observe(func() { deps.sessionLog.open() })
+	}
 	recordOperationFailure(deps, code, stage, message, details, err)
 	errorEvent, eventErr := protocol.NewErrorEvent(code, stage, message, details)
 	if eventErr != nil {
@@ -446,7 +454,7 @@ func exitCodeFor(code protocol.Code) int {
 // 操作日志此前只有 uv 输出透传与清理审计，全是 info：真机上取到 2468 行日志零 warn
 // 零 error，失败本身、错误码与 stage 一条都不落盘，用户报上来无从查起。这里在失败的
 // 唯一出口补一条 error 记录。状态写入失败另在本地日志保留底层 cause，
-// 以便区分文件系统能力、占用与权限；协议事件仍只含稳定字段。
+// 以便区分文件系统能力、占用与权限；其他失败也保留有界错误链，协议仍只含稳定字段。
 //
 // 日志器不可用时，状态写入失败把有界错误链写到 stderr，其余失败静默跳过；
 // 写日志失败不改变命令结局。
@@ -462,10 +470,17 @@ func recordOperationFailure(
 		return
 	}
 	logger := deps.opLog.Get()
+	if logger == nil && code == protocol.CodeStateWriteFailed && cause != nil {
+		writeStateFailureDiagnostic(deps.io, cause)
+	}
+	if logger == nil && deps.sessionLog != nil {
+		deps.sessionLog.observe(func() {
+			if deps.sessionLog.logger != nil {
+				logger = deps.sessionLog.logger
+			}
+		})
+	}
 	if logger == nil {
-		if code == protocol.CodeStateWriteFailed && cause != nil {
-			writeStateFailureDiagnostic(deps.io, cause)
-		}
 		return
 	}
 	entry := make(map[string]any, len(details)+2)
@@ -482,8 +497,8 @@ func recordOperationFailure(
 		if errors.As(cause, &commandErr) && commandErr.cause != nil {
 			entry["cause"] = commandErr.cause.Error()
 		}
-		entry["causes"], entry["causesTruncated"] = localStateErrorChain(cause)
 	}
+	entry["causes"], entry["causesTruncated"] = localStateErrorChain(cause)
 	ctx := deps.ctx
 	if ctx == nil {
 		ctx = context.Background()

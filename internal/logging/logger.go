@@ -32,6 +32,14 @@ type Logger struct {
 	activePath  string
 	closed      bool
 	closeErr    error
+	fileSystem  string
+}
+
+// FileSystem 返回构造时已有的磁盘格式诊断，不再访问文件系统。
+func (l *Logger) FileSystem() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fileSystem
 }
 
 // New 创建并立即打开当前本地日期的 Runtime 日志文件。

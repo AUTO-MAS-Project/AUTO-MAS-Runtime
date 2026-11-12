@@ -71,7 +71,7 @@ type stateFileOwner struct {
 
 // StateFiles 表示受管状态目录能力。
 type StateFiles struct {
-	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed、classicUnlink 与操作/关闭的句柄生命周期。
+	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed、classicUnlink、unlinkMode 与操作/关闭的句柄生命周期。
 
 	layout              *config.Layout
 	api                 pathAPI
@@ -82,6 +82,7 @@ type StateFiles struct {
 	pins                [2]pinnedObject
 	probePassed         map[StateFileKind]bool
 	classicUnlink       bool
+	unlinkMode          string
 	closed              bool
 	closeErr            error
 }
@@ -121,6 +122,7 @@ type StateRemoveResult struct {
 
 // StateWriteError 保存写入阶段、主因和独立清理错误。
 type StateWriteError struct {
+	UnlinkMode       string
 	Phase            StateWritePhase
 	MutationApplied  bool
 	RecoveryRequired bool
@@ -154,6 +156,7 @@ func (e *StateWriteError) Unwrap() []error {
 
 // StateRemoveError 分离条件删除的主因和独立清理错误。
 type StateRemoveError struct {
+	UnlinkMode   string
 	Cause        error
 	CleanupError error
 }

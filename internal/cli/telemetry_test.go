@@ -37,13 +37,14 @@ type telemetryRecorderSpy struct {
 	closeWaits    bool
 }
 
-func (r *telemetryRecorderSpy) CaptureInternal(_ context.Context, observation telemetry.InternalObservation) {
+func (r *telemetryRecorderSpy) CaptureInternal(_ context.Context, observation telemetry.InternalObservation) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.resultWritten != nil && !r.resultWritten.Load() {
 		r.beforeResult = true
 	}
 	r.internal = append(r.internal, observation)
+	return "0123456789abcdef0123456789abcdef"
 }
 
 func (r *telemetryRecorderSpy) Close(ctx context.Context) {
@@ -378,6 +379,7 @@ func TestBootstrap_MutexFailureReportsDiagnostics(t *testing.T) {
 		t.Fatalf("observations = %#v, want mutex failure", observations)
 	}
 	want := map[string]any{"mutex": map[string]any{"component": "mutation", "operation": "create-mutex", "windowsError": uint64(5)}}
+	want["fileSystem"] = expectedSessionFileSystem(t, observations)
 	if got := observations[0].DiagnosticDetails; !reflect.DeepEqual(got, want) {
 		t.Fatalf("diagnostics = %#v, want %#v", got, want)
 	}
@@ -415,7 +417,7 @@ func TestRunOperation_DiagnosticsRespectSelectedFailure(t *testing.T) {
 	if len(observations) != 1 || observations[0].Code != string(protocol.CodeStateWriteFailed) {
 		t.Fatalf("observations = %#v, want selected cleanup failure", observations)
 	}
-	if got := observations[0].DiagnosticDetails; !reflect.DeepEqual(got, map[string]any{"exitCode": 42}) {
+	if got := observations[0].DiagnosticDetails; !reflect.DeepEqual(got, map[string]any{"exitCode": 42, "fileSystem": expectedSessionFileSystem(t, observations)}) {
 		t.Fatalf("diagnostics = %#v, want selected failure facts", got)
 	}
 }
@@ -440,7 +442,8 @@ func TestBackendTelemetry_PreservesPrimaryAndCleanupFacts(t *testing.T) {
 	}
 	want := map[string]any{
 		"mode": "managed", "version": "v1.2.3", "commit": strings.Repeat("a", 40),
-		"exitCode": 1, "terminationRequested": true,
+		"fileSystem": expectedSessionFileSystem(t, observations),
+		"exitCode":   1, "terminationRequested": true,
 		"failures": []any{
 			map[string]any{"phase": "primary", "code": "BACKEND_HEALTH_TIMEOUT", "stage": "backend.health"},
 			map[string]any{"phase": "cleanup", "code": "STATE_WRITE_FAILED", "stage": "backend.cleanup"},

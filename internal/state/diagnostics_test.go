@@ -9,6 +9,30 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 )
 
+func TestStateErrors_DiagnosticDetails(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		kind string
+	}{
+		{name: "corrupt", err: &CorruptError{File: "mutation", Cause: errInvalidJSON}, kind: "corrupt"},
+		{name: "schema", err: &UnsupportedSchemaError{File: "environment", Got: 9}, kind: "unsupported_schema"},
+		{name: "validation", err: &ValidationError{Field: "pid", Cause: errInvalidValue}, kind: "validation"},
+		{name: "pid", err: &PIDProbeError{Operation: "open-process", PID: 123, Cause: syscall.Errno(5)}, kind: "pid_probe"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			diagnostic, ok := test.err.(interface{ DiagnosticDetails() map[string]any })
+			if !ok {
+				t.Fatal("missing State diagnostic details")
+			}
+			details, _ := diagnostic.DiagnosticDetails()["persistence"].(map[string]any)
+			if details["failureKind"] != test.kind {
+				t.Fatalf("got %#v, want %s", details, test.kind)
+			}
+		})
+	}
+}
+
 func TestWriteError_DiagnosticDetails(t *testing.T) {
 	for _, test := range []struct {
 		name string

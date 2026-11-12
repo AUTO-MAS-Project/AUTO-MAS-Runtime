@@ -13,6 +13,7 @@ import (
 type telemetryFactory func(telemetry.Config) telemetry.Recorder
 
 type sessionTelemetryState struct {
+	deps            *deps
 	recorder        telemetry.Recorder
 	command         string
 	stage           protocol.Stage
@@ -71,9 +72,11 @@ func recordSessionTelemetry(
 	operationErr error,
 	panicked bool,
 	panicFrames []telemetry.StackFrame,
-) {
+	operationID string,
+	fileSystem string,
+) string {
 	if recorder == nil {
-		return
+		return ""
 	}
 	if recoveredFrames, recovered := recoveredControlReaderPanic(operationErr); recovered {
 		panicked = true
@@ -103,7 +106,12 @@ func recordSessionTelemetry(
 		diagnosticDetails = map[string]any{}
 	}
 	if telemetry.IsReportableFailure(code) {
-		safeTelemetryCaptureInternal(recorder, telemetry.InternalObservation{
+		if code != protocol.CodeInternalError {
+			diagnosticDetails["fileSystem"] = fileSystem
+			diagnosticDetails = telemetry.SanitizeDiagnostics(diagnosticDetails)
+		}
+		receipt := safeTelemetryCaptureInternal(recorder, telemetry.InternalObservation{
+			OperationID:       operationID,
 			Command:           command,
 			Stage:             string(stage),
 			Code:              string(code),
@@ -115,8 +123,11 @@ func recordSessionTelemetry(
 			Panic:             panicked,
 			PanicFrames:       append([]telemetry.StackFrame(nil), panicFrames...),
 		})
+		safeTelemetryClose(recorder)
+		return receipt
 	}
 	safeTelemetryClose(recorder)
+	return ""
 }
 
 // failureTelemetryDetails 合并专用诊断副本，外层事实优先，协议 details 只作回退。
@@ -220,6 +231,7 @@ func newSessionTelemetryState(
 	panicFrames []telemetry.StackFrame,
 ) *sessionTelemetryState {
 	return &sessionTelemetryState{
+		deps:           deps,
 		recorder:       newTelemetryRecorder(deps, runtimeVersion),
 		command:        command,
 		stage:          stage,
@@ -234,7 +246,17 @@ func (s *sessionTelemetryState) finish() {
 		return
 	}
 	if s.terminalWritten || (!s.sessionStarted && s.panicked) {
-		recordSessionTelemetry(
+		operationID, fileSystem := "", "unknown"
+		if s.deps != nil && s.deps.sessionLog != nil {
+			log := s.deps.sessionLog
+			log.observe(func() {
+				operationID = log.operationID
+				if log.logger != nil {
+					fileSystem = log.logger.FileSystem()
+				}
+			})
+		}
+		receipt := recordSessionTelemetry(
 			s.recorder,
 			s.command,
 			s.stage,
@@ -242,7 +264,13 @@ func (s *sessionTelemetryState) finish() {
 			s.operationErr,
 			s.panicked,
 			s.panicFrames,
+			operationID,
+			fileSystem,
 		)
+		if receipt != "" && s.deps != nil && s.deps.sessionLog != nil {
+			log := s.deps.sessionLog
+			log.observe(func() { log.record("telemetry.accepted", map[string]any{"sentryEventId": receipt, "accepted": true}) })
+		}
 		return
 	}
 	safeTelemetryClose(s.recorder)
@@ -301,11 +329,12 @@ func telemetryOutputFailure(stage protocol.Stage) error {
 	}
 }
 
-func safeTelemetryCaptureInternal(recorder telemetry.Recorder, observation telemetry.InternalObservation) {
+func safeTelemetryCaptureInternal(recorder telemetry.Recorder, observation telemetry.InternalObservation) (receipt string) {
 	defer func() { _ = recover() }()
 	if recorder != nil {
-		recorder.CaptureInternal(context.Background(), observation)
+		return recorder.CaptureInternal(context.Background(), observation)
 	}
+	return ""
 }
 
 func safeTelemetryClose(recorder telemetry.Recorder) {

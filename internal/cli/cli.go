@@ -154,9 +154,10 @@ type deps struct {
 	options options
 	global  globalOptions
 	// opLog 绑定命令的操作日志器；命令收尾后它可能已关闭。
-	// 会话为曾开日志或发生状态故障的命令创建终态日志器，再通过此绑定记录最终失败。
-	opLog    *workspaceLogBinding
-	exitCode int
+	// 会话为有效失败创建终态日志器，再通过此绑定记录最终失败。
+	opLog      *workspaceLogBinding
+	sessionLog *sessionDiagnostics
+	exitCode   int
 }
 
 // Execute 执行一次 Runtime 顶层命令并返回进程退出码。
