@@ -205,6 +205,9 @@ func resumeInitialThread(pid uint32, operations windowsStartOperations) error {
 }
 
 func validateStartSpec(ctx context.Context, spec StartSpec) error {
+	if spec.ReadStream != nil {
+		return ErrUnsupported
+	}
 	if ctx == nil {
 		return errors.New("managed process context is nil")
 	}

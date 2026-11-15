@@ -1,2 +1,2 @@
-// Package lock 使用 Windows 命名 Mutex 协调同一物理 app root 的 Runtime 操作。
+// Package lock 以平台原生协调机制串行化同一物理 app root 的 Runtime 租约。
 package lock
