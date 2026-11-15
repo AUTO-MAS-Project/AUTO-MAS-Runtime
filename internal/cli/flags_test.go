@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,13 @@ func TestParseGlobalOptions_AppRootRelativeResolvesUnderCWD(t *testing.T) {
 }
 
 func TestParseGlobalOptions_AppRootVolumeRootRejected(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		_, err := parseTestOptions(t, t.TempDir(), "--app-root", "/", "doctor")
+		if !errors.Is(err, config.ErrAppRootIsRoot) {
+			t.Fatal(err)
+		}
+		return
+	}
 	t.Parallel()
 	_, err := parseTestOptions(t, t.TempDir(), "--app-root", `C:\`, "doctor")
 	if err == nil || !errors.Is(err, config.ErrAppRootIsRoot) {

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1124,6 +1126,14 @@ func descendantOf(pid, root uint32, snapshot []process.Info) bool {
 }
 
 func sameExecutable(left, right string) bool {
+	if runtime.GOOS != "windows" {
+		if filepath.Clean(left) == filepath.Clean(right) {
+			return true
+		}
+		a, e := os.Stat(left)
+		b, f := os.Stat(right)
+		return e == nil && f == nil && os.SameFile(a, b)
+	}
 	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }
 

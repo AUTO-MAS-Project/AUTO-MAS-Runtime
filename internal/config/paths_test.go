@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -35,9 +36,9 @@ func TestLayout_FixedPathsMatchSpecification(t *testing.T) {
 		{name: "RuntimeDir", got: layout.RuntimeDir(), want: filepath.Join(root, "runtime")},
 		{name: "UVToolsDir", got: layout.UVToolsDir(), want: filepath.Join(root, "runtime", "tools", "uv")},
 		{name: "PythonDir", got: layout.PythonDir(), want: filepath.Join(root, "runtime", "environment", "python")},
-		{name: "PythonExecutable", got: layout.PythonExecutable(), want: filepath.Join(root, "runtime", "environment", "python", "python.exe")},
+		{name: "PythonExecutable", got: layout.PythonExecutable(), want: expectedPythonPath(root)},
 		{name: "VenvDir", got: layout.VenvDir(), want: filepath.Join(root, "runtime", "environment", "venv")},
-		{name: "VenvPythonExecutable", got: layout.VenvPythonExecutable(), want: filepath.Join(root, "runtime", "environment", "venv", "Scripts", "python.exe")},
+		{name: "VenvPythonExecutable", got: layout.VenvPythonExecutable(), want: config.PythonExecutableInVenv(filepath.Join(root, "runtime", "environment", "venv"))},
 		{name: "VenvConfigFile", got: layout.VenvConfigFile(), want: filepath.Join(root, "runtime", "environment", "venv", "pyvenv.cfg")},
 		{name: "RuntimeCacheDir", got: layout.RuntimeCacheDir(), want: filepath.Join(root, "runtime", "cache")},
 		{name: "UVCacheDir", got: layout.UVCacheDir(), want: filepath.Join(root, "runtime", "cache", "uv")},
@@ -215,13 +216,20 @@ func newFixedPathsLayout(t *testing.T) *config.Layout {
 func TestLayout_PythonExecutable(t *testing.T) {
 	layout := newFixedPathsLayout(t)
 	got := layout.PythonExecutable()
-	if want := filepath.Join(layout.PythonDir(), "python.exe"); got != want {
+	if want := expectedPythonPath(layout.AppRoot()); got != want {
 		t.Fatalf("PythonExecutable() = %q, want %q", got, want)
 	}
-	if filepath.Base(got) != "python.exe" {
+	if filepath.Base(got) != filepath.Base(expectedPythonPath(layout.AppRoot())) {
 		t.Errorf("PythonExecutable() base = %q, want python.exe", filepath.Base(got))
 	}
 	if !filepath.IsAbs(got) {
 		t.Errorf("PythonExecutable() = %q, want absolute path", got)
 	}
+}
+
+func expectedPythonPath(root string) string {
+	if runtime.GOOS != "windows" {
+		return filepath.Join(root, "runtime", "environment", "python", "bin", "python3")
+	}
+	return filepath.Join(root, "runtime", "environment", "python", "python.exe")
 }

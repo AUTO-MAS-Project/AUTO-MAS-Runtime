@@ -44,7 +44,7 @@ func expectedSessionFileSystem(t *testing.T, observations []telemetry.InternalOb
 	}
 	format := observations[0].DiagnosticDetails["fileSystem"]
 	switch format {
-	case "NTFS", "ReFS", "exFAT", "FAT", "FAT32", "unknown":
+	case "NTFS", "ReFS", "exFAT", "FAT", "FAT32", "unknown", "ext4", "btrfs", "xfs", "tmpfs", "overlayfs", "apfs", "hfs":
 		return format
 	}
 	t.Fatalf("got filesystem %v, want known diagnostic format", format)

@@ -45,7 +45,7 @@ func TestLayout_DynamicPathsPreserveSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(versionDir, "uv.exe"); executable != want {
+	if want := filepath.Join(versionDir, config.UVExecutableName()); executable != want {
 		t.Fatalf("UVExecutable() = %q, want %q", executable, want)
 	}
 

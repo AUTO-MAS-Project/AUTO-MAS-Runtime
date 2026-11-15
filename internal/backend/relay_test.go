@@ -97,7 +97,7 @@ func TestBackendSupervise_InjectsRelayAsFirstMirror(t *testing.T) {
 	if simple := session.config.Upstreams[relay.RouteSimple]; simple[0].RewriteFrom != "https://mirrors.aliyun.com/pypi/packages/" {
 		t.Errorf("simple upstream rewrite = %+v", simple[0])
 	}
-	if !strings.HasSuffix(session.config.StagingDir, `\downloads\relay`) {
+	if !strings.HasSuffix(session.config.StagingDir, filepath.Join("downloads", "relay")) {
 		t.Errorf("relay staging dir = %q", session.config.StagingDir)
 	}
 }

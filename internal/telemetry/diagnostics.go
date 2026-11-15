@@ -144,6 +144,8 @@ func sanitizeDiagnosticValue(value any, key string, depth int, fields *int) any 
 				return "FAT"
 			case "fat32":
 				return "FAT32"
+			case "ext4", "btrfs", "xfs", "tmpfs", "overlayfs", "apfs", "hfs":
+				return strings.ToLower(typed)
 			case "unknown":
 				return "unknown"
 			}

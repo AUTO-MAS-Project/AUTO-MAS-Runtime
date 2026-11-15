@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 )
 
@@ -29,6 +30,10 @@ type pythonDownloadEntry struct {
 // 这是增补 2 C16 的 python 探针目标来源：uv 的 JSON 是机器输出而非自然语言，
 // 且只在 uv 已就绪后调用；任何失败都只让 python Kind 退回目录顺序。
 func pythonDownloadPath(ctx context.Context, runner Runner, options RunOptions, version PythonVersion) (string, error) {
+	return pythonDownloadPathFor(ctx, runner, options, version, runtime.GOOS, runtime.GOARCH)
+}
+
+func pythonDownloadPathFor(ctx context.Context, runner Runner, options RunOptions, version PythonVersion, goos, goarch string) (string, error) {
 	if runner == nil {
 		return "", fmt.Errorf("%w: runner is nil", errPythonDownloadPath)
 	}
@@ -53,8 +58,16 @@ func pythonDownloadPath(ctx context.Context, runner Runner, options RunOptions, 
 		return "", fmt.Errorf("%w: %w", errPythonDownloadPath, err)
 	}
 	expected := version.String()
+	targetOS := goos
+	if targetOS == "darwin" {
+		targetOS = "macos"
+	}
+	targetArch := "x86_64"
+	if goarch == "arm64" {
+		targetArch = "aarch64"
+	}
 	for _, entry := range entries {
-		if entry.Version != expected || entry.OS != "windows" || !isX8664Arch(entry.Arch) {
+		if entry.Version != expected || entry.OS != targetOS || !matchesPythonArch(entry.Arch, targetArch) {
 			continue
 		}
 		for _, base := range pythonDownloadBases {
@@ -64,20 +77,22 @@ func pythonDownloadPath(ctx context.Context, runner Runner, options RunOptions, 
 		}
 		return "", fmt.Errorf("%w: url %q is not under an official base", errPythonDownloadPath, entry.URL)
 	}
-	return "", fmt.Errorf("%w: no windows x86_64 download for %s", errPythonDownloadPath, expected)
+	return "", fmt.Errorf("%w: no native python download for %s", errPythonDownloadPath, expected)
 }
 
 // isX8664Arch 兼容 uv 清单里 arch 的两种形态：字符串 "x86_64" 或带 family 字段的对象。
-func isX8664Arch(raw json.RawMessage) bool {
+func isX8664Arch(raw json.RawMessage) bool { return matchesPythonArch(raw, "x86_64") }
+
+func matchesPythonArch(raw json.RawMessage, expected string) bool {
 	var plain string
 	if json.Unmarshal(raw, &plain) == nil {
-		return plain == "x86_64"
+		return plain == expected
 	}
 	var object struct {
 		Family string `json:"family"`
 	}
 	if json.Unmarshal(raw, &object) == nil {
-		return object.Family == "x86_64"
+		return object.Family == expected
 	}
 	return false
 }

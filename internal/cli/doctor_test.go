@@ -46,7 +46,7 @@ func healthyDoctorFixture(t *testing.T) string {
 		t.Fatalf("Marshal() error = %v", err)
 	}
 	writeDoctorFixtureFile(t, layout.RepoVersionFile(), versionData)
-	writeDoctorFixtureFile(t, filepath.Join(layout.PythonDir(), "python.exe"), nil)
+	writeDoctorFixtureFile(t, layout.PythonExecutable(), nil)
 	// 健康夹具的 venv 必须结构完整：只有目录时 CPython 一启动就以
 	// `No pyvenv.cfg file` 退出，doctor 现在把这种 venv 判为 error。
 	writeDoctorFixtureFile(t, layout.VenvPythonExecutable(), nil)
@@ -55,7 +55,7 @@ func healthyDoctorFixture(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("UVVersionDir() error = %v", err)
 	}
-	writeDoctorFixtureFile(t, filepath.Join(uvDir, "uv.exe"), nil)
+	writeDoctorFixtureFile(t, filepath.Join(uvDir, config.UVExecutableName()), nil)
 	if err := os.MkdirAll(layout.LogsDir(), 0o755); err != nil {
 		t.Fatalf("MkdirAll(logs) error = %v", err)
 	}

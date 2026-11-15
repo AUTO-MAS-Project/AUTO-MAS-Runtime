@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -565,7 +566,7 @@ func TestUVRunner_StartFailureIncludesStableDiagnostics(t *testing.T) {
 		details["projectEnvDir"] != filepath.Join(missing, ".venv") {
 		t.Fatalf("Run() details = %#v, want stable start diagnostics", details)
 	}
-	if _, ok := details["windowsError"]; !ok {
+	if _, ok := details["windowsError"]; runtime.GOOS == "windows" && !ok {
 		t.Fatalf("Run() details = %#v, want windowsError", details)
 	}
 }

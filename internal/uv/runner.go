@@ -186,6 +186,9 @@ func (r *UVRunner) Run(
 			err,
 		)
 	}
+	if native, ok := r.runNative(ctx, args, options, resolved); ok {
+		return native.result, native.err
+	}
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	command := exec.CommandContext(runContext, r.Executable, args...)

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -218,15 +219,23 @@ func NewBootstrapper(
 	if err != nil {
 		return nil, fmt.Errorf("create uv rotator: %w", err)
 	}
+	artifact, err := ArtifactFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return nil, err
+	}
+	var extractor ArchiveExtractor = zipExtractor{}
+	if runtime.GOOS != "windows" {
+		extractor = tarExtractor{}
+	}
 	values := bootstrapOptions{
 		downloader: downloader,
-		extractor:  zipExtractor{},
+		extractor:  extractor,
 		publisher:  filesystemPublisher{layout: layout},
 		remover:    filesystemVersionRemover{layout: layout},
 		checker:    runnerVersionChecker{layout: layout},
 		catalog:    catalog,
 		rotator:    rotator,
-		artifact:   WindowsX64ArtifactSpec(),
+		artifact:   artifact,
 	}
 	for _, option := range optionValues {
 		if option == nil {

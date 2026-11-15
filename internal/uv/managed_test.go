@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -390,7 +391,7 @@ func TestManaged_StartFailureIncludesStableDiagnostics(t *testing.T) {
 		details["projectEnvDir"] != runner.ProjectEnvDir {
 		t.Fatalf("StartManaged() details = %#v, want stable start diagnostics", details)
 	}
-	if _, ok := details["windowsError"]; !ok {
+	if _, ok := details["windowsError"]; runtime.GOOS == "windows" && !ok {
 		t.Fatalf("StartManaged() details = %#v, want windowsError", details)
 	}
 }

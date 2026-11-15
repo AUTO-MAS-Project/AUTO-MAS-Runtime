@@ -34,6 +34,31 @@ func windowsMarkerEnvironment(version PythonVersion) markerEnvironment {
 	}}
 }
 
+// nativeMarkerEnvironment 使用当前原生平台规划受管 CPython 制品。
+func targetMarkerEnvironment(version PythonVersion, goos, goarch string) markerEnvironment {
+	e := windowsMarkerEnvironment(version)
+	if goos == "windows" {
+		return e
+	}
+	e.values["os_name"] = "posix"
+	e.values["sys_platform"] = goos
+	e.values["platform_system"] = "Linux"
+	if goos == "darwin" {
+		e.values["platform_system"] = "Darwin"
+	}
+	e.values["platform_machine"] = "x86_64"
+	if goarch == "arm64" {
+		e.values["platform_machine"] = "aarch64"
+		if goos == "darwin" {
+			e.values["platform_machine"] = "arm64"
+		}
+	}
+	// 版本条件无法静态证明时由现有 marker 失败处理保守纳入，不伪造 Windows 版本。
+	delete(e.values, "platform_release")
+	delete(e.values, "platform_version")
+	return e
+}
+
 // withExtra 返回带指定 extra 的副本；空串表示无 extra。
 func (e markerEnvironment) withExtra(extra string) markerEnvironment {
 	values := make(map[string]string, len(e.values))

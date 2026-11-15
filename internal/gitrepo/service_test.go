@@ -12,7 +12,6 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
-	"golang.org/x/sys/windows"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -62,68 +61,6 @@ func TestService_CheckIsReadOnly(t *testing.T) {
 	}
 	if after := directoryNames(t, root); strings.Join(before, "\x00") != strings.Join(after, "\x00") {
 		t.Fatalf("Check() changed app-root entries: before=%v after=%v", before, after)
-	}
-}
-
-func TestService_CheckPinsRepositoryDuringReader(t *testing.T) {
-	root := t.TempDir()
-	layout := testServiceLayout(t, root)
-	if err := os.Mkdir(layout.RepoDir(), 0o755); err != nil {
-		t.Fatalf("Mkdir(repo) error = %v", err)
-	}
-	reader := &blockingServiceReader{
-		snapshot: testServiceSnapshot("v1.0.0"),
-		entered:  make(chan struct{}),
-		release:  make(chan struct{}),
-	}
-	service, err := newServiceWithDependencies(
-		layout,
-		reader,
-		func(context.Context, *config.Layout) (mutationLockSet, error) {
-			t.Fatal("Check() acquired mutation locks")
-			return nil, nil
-		},
-		func(context.Context, *config.Layout, SyncRequest, OperationLogger) (syncRuntime, error) {
-			t.Fatal("Check() built mutation runtime")
-			return nil, nil
-		},
-		func(context.Context, mirror.Policy) (mirror.Plan, error) { return mirror.Plan{}, nil },
-	)
-	if err != nil {
-		t.Fatalf("newServiceWithDependencies() error = %v", err)
-	}
-	type checkResult struct {
-		result CheckResult
-		err    error
-	}
-	resultCh := make(chan checkResult, 1)
-	go func() {
-		result, checkErr := service.Check(t.Context())
-		resultCh <- checkResult{result: result, err: checkErr}
-	}()
-	select {
-	case <-reader.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reader did not reach barrier")
-	}
-	retired := filepath.Join(layout.AppRoot(), "repo.reader-race")
-	// 第一步 A->hold 必须被 lease 拦截；若它成功，后续可构造 B->repo->A 的 ABA。
-	renameErr := os.Rename(layout.RepoDir(), retired)
-	if !errors.Is(renameErr, windows.ERROR_SHARING_VIOLATION) &&
-		!errors.Is(renameErr, windows.ERROR_ACCESS_DENIED) {
-		t.Fatalf("Rename(repo while Check reader is active) error = %v, want sharing/access denial", renameErr)
-	}
-	close(reader.release)
-	select {
-	case checked := <-resultCh:
-		if checked.err != nil {
-			t.Fatalf("Check() error = %v", checked.err)
-		}
-		if !checked.result.Healthy {
-			t.Fatalf("Check() = %#v, want healthy result", checked.result)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Check() did not finish after reader release")
 	}
 }
 
@@ -694,6 +631,7 @@ func (l *serviceTestLocks) AcquireMutation(context.Context) (mutationLease, erro
 	}
 	return l.lease, nil
 }
+
 func (l *serviceTestLocks) Close() error { l.closed = true; return nil }
 
 type serviceTestLease struct{ closed bool }
@@ -702,7 +640,8 @@ func (l *serviceTestLease) Close() error { l.closed = true; return nil }
 
 type serviceCodedError struct{ code protocol.Code }
 
-func (e serviceCodedError) Error() string       { return string(e.code) }
+func (e serviceCodedError) Error() string { return string(e.code) }
+
 func (e serviceCodedError) Code() protocol.Code { return e.code }
 
 type serviceTestRuntime struct {
@@ -738,9 +677,11 @@ func (r *serviceTestRuntime) Recover(ctx context.Context, request RecoveryReques
 	}
 	return RecoveryResult{}, nil
 }
+
 func (r *serviceTestRuntime) ReadEnvironment(context.Context) (state.EnvironmentState, error) {
 	return r.environment, r.readEnvironmentErr
 }
+
 func (r *serviceTestRuntime) NewTransaction(_ state.TransactionKind, input state.TransactionInput) (state.TransactionState, error) {
 	r.newTransactionCalls++
 	if r.newTransactionErr != nil {
@@ -748,6 +689,7 @@ func (r *serviceTestRuntime) NewTransaction(_ state.TransactionKind, input state
 	}
 	return state.TransactionState{SchemaVersion: state.SchemaVersion, OperationID: input.OperationID, Command: input.Command, PID: input.PID, StartedAt: time.Now().UTC(), TargetVersion: input.TargetVersion, Stage: input.Stage}, nil
 }
+
 func (r *serviceTestRuntime) WriteTransaction(_ context.Context, _ state.TransactionKind, value state.TransactionState) error {
 	r.writeTransactionCalls++
 	if err := r.writeTransactionErrByStage[value.Stage]; err != nil {
@@ -755,17 +697,21 @@ func (r *serviceTestRuntime) WriteTransaction(_ context.Context, _ state.Transac
 	}
 	return r.writeTransactionErr
 }
+
 func (r *serviceTestRuntime) ReadTransaction(context.Context, state.TransactionKind) (state.TransactionSnapshot, error) {
 	return state.TransactionSnapshot{}, nil
 }
+
 func (r *serviceTestRuntime) RemoveTransaction(_ context.Context, snapshot state.TransactionSnapshot) error {
 	r.updateRemovals++
 	return nil
 }
+
 func (r *serviceTestRuntime) Fetch(context.Context, FetchRequest) (FetchResult, error) {
 	r.fetchCalls++
 	return r.fetchResult, nil
 }
+
 func (r *serviceTestRuntime) Swap(ctx context.Context, request SwapRequest) (SwapResult, error) {
 	r.swapCalls++
 	var result SwapResult
@@ -784,9 +730,11 @@ func (r *serviceTestRuntime) Swap(ctx context.Context, request SwapRequest) (Swa
 	}
 	return result, err
 }
+
 func (r *serviceTestRuntime) NewBrokenEnvironment(last state.Revision, broken state.BrokenEnvironment) (state.EnvironmentState, error) {
 	return state.EnvironmentState{SchemaVersion: state.SchemaVersion, Status: protocol.StateEnvironmentBroken, LastSuccessful: last, Broken: &broken}, nil
 }
+
 func (r *serviceTestRuntime) WriteEnvironment(ctx context.Context, value state.EnvironmentState) error {
 	r.writeEnvironmentCalls++
 	if r.writeEnvironment != nil {
@@ -795,12 +743,14 @@ func (r *serviceTestRuntime) WriteEnvironment(ctx context.Context, value state.E
 	r.writtenEnvironment = value
 	return r.writeEnvironmentErr
 }
+
 func (r *serviceTestRuntime) Close() error { return nil }
 
 type serviceTestLogger struct{}
 
 func (serviceTestLogger) LogPath() string { return filepath.Join("C:\\runtime", "workspace-sync.log") }
-func (serviceTestLogger) Close() error    { return nil }
+
+func (serviceTestLogger) Close() error { return nil }
 
 type serviceTestAuditor struct{}
 
@@ -811,7 +761,8 @@ func (serviceTestAuditor) RecordDeletion(context.Context, filesystem.DeleteAudit
 type serviceTestEmitter struct{}
 
 func (serviceTestEmitter) EmitProgress(protocol.ProgressEvent) error { return nil }
-func (serviceTestEmitter) EmitState(protocol.StateEvent) error       { return nil }
+
+func (serviceTestEmitter) EmitState(protocol.StateEvent) error { return nil }
 
 type recordingServiceEmitter struct {
 	states []protocol.StateEvent

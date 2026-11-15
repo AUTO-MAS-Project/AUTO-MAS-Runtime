@@ -1,5 +1,7 @@
 package uv
 
+import "fmt"
+
 import "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 
 const (
@@ -27,4 +29,23 @@ func WindowsX64ArtifactSpec() Artifact {
 		Name:    WindowsX64Artifact,
 		SHA256:  WindowsX64SHA256,
 	}
+}
+
+// ArtifactFor 返回冻结的 OS/架构官方资产；摘要来自 uv 0.12.3 的 sha256.sum。
+func ArtifactFor(goos, goarch string) (Artifact, error) {
+	if goos == "windows" && goarch == "amd64" {
+		return WindowsX64ArtifactSpec(), nil
+	}
+	type asset struct{ name, hash string }
+	assets := map[string]asset{
+		"linux/amd64":  {"uv-x86_64-unknown-linux-gnu.tar.gz", "600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"},
+		"linux/arm64":  {"uv-aarch64-unknown-linux-gnu.tar.gz", "bb66cb52e7b1823aed1183630d8d8e5c958840d584a4c55ec10a4cfc168dcca2"},
+		"darwin/amd64": {"uv-x86_64-apple-darwin.tar.gz", "4c9f52262a14da336e4a42ed24992d12d0c956acde87619e4611d321dffa602b"},
+		"darwin/arm64": {"uv-aarch64-apple-darwin.tar.gz", "546f7f8a6c70ff13a3a9d2bc958db3427298cebf3e0cb756f9177133b7068843"},
+	}
+	value, ok := assets[goos+"/"+goarch]
+	if !ok {
+		return Artifact{}, fmt.Errorf("unsupported uv target %s/%s", goos, goarch)
+	}
+	return Artifact{Version: FixedVersion, Kind: mirror.KindUV, Name: value.name, SHA256: value.hash}, nil
 }

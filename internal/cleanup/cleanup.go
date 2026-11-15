@@ -396,7 +396,7 @@ func isLinkDirEntry(entry fs.DirEntry) bool {
 	if mode&os.ModeIrregular != 0 {
 		return true
 	}
-	return mode&os.ModeSymlink != 0 && entry.IsDir()
+	return mode&os.ModeSymlink != 0
 }
 
 // invalidLinkItem 构造「链接目录不跟随、不删除」的失败关闭条目。

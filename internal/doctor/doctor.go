@@ -90,6 +90,7 @@ type Report struct {
 
 // Probes 是 doctor 需要注入替身的只读探测点。
 type Probes struct {
+	PythonExecutable    func(context.Context, *config.Layout) (string, error)
 	UVVersion           func(ctx context.Context, exePath string) (string, error)
 	UVVersionWithLayout func(ctx context.Context, layout *config.Layout, exePath string) (string, error)
 	DiskFree            func(ctx context.Context, path string) (uint64, error)
@@ -395,7 +396,7 @@ func (s *Service) uvExecutables(entries []os.DirEntry) []string {
 	return executables
 }
 
-func (s *Service) checkPython(context.Context) Check {
+func (s *Service) checkPython(ctx context.Context) Check {
 	info, err := os.Stat(s.layout.PythonDir())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -406,7 +407,19 @@ func (s *Service) checkPython(context.Context) Check {
 	if !info.IsDir() {
 		return specPython.failed("Python 路径不是目录")
 	}
-	if fileInfo, err := os.Stat(s.layout.PythonExecutable()); err != nil || fileInfo.IsDir() {
+	path := s.layout.PythonExecutable()
+	if s.probes.PythonExecutable != nil {
+		var err error
+		path, err = s.probes.PythonExecutable(ctx, s.layout)
+		if err != nil {
+			return specPython.missing("未找到受管 Python")
+		}
+		inside, err := filesystem.PathContains(ctx, s.layout.PythonDir(), path)
+		if err != nil || !inside {
+			return specPython.failed("受管 Python 路径身份不安全")
+		}
+	}
+	if fileInfo, err := os.Stat(path); err != nil || !fileInfo.Mode().IsRegular() {
 		return specPython.missing("未找到受管 python.exe")
 	}
 	return specPython.ok("Python 目录存在", nil)
