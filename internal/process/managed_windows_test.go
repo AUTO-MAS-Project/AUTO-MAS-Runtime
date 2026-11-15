@@ -375,9 +375,7 @@ func TestJob_BreakawayGrandchildSurvivesJobClose(t *testing.T) {
 	if processInJob(t, handle, jobHandle) {
 		t.Fatal("breakaway grandchild is still inside the runtime job")
 	}
-	if !processInJob(t, handle, 0) {
-		t.Fatal("breakaway grandchild belongs to no job at all, want its own or none of ours")
-	}
+	// 外层宿主可以不使用 Job；以不属于当前 Runtime Job 且关闭后存活为准。
 	closeManagedAfterRelease(t, managed, release)
 	if result, err := windows.WaitForSingleObject(handle, 500); err != nil || result != uint32(windows.WAIT_TIMEOUT) {
 		t.Fatalf("breakaway grandchild after job close = result %d, err %v, want WAIT_TIMEOUT", result, err)
