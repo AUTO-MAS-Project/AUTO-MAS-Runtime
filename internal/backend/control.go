@@ -666,15 +666,32 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 	}()
 
 	stateSnapshot.closeResources = closeResources
+	if request.DeferBusinessStart {
+		repo := s.layout.RepoDir()
+		if modeForRequest(request) == ModeDevelopment {
+			repo = request.DevelopmentRepo
+		}
+		if err := checkDeferredStartupCapability(ctx, repo); err != nil {
+			if !request.AllowLegacyBusinessStart {
+				return errors.Join(s.closeControlBeforeFailure(request, stateSnapshot, false), err)
+			}
+			request.DeferBusinessStart = false
+		}
+	}
+	if request.DeferBusinessStart {
+		defer func() {
+			returnErr = withFailureDetailsExtra(returnErr, nil, nil, map[string]any{"businessDeferred": true})
+		}()
+	}
 	environment, revision, err := s.awaitStartupPreflight(ctx, request, stateSnapshot, results)
 	if err != nil {
 		var interrupted *controlInterruptError
 		if errors.As(err, &interrupted) {
 			if interrupted.command.Command == protocol.ControlCancel {
 				cancelled := newControlCancelled(interrupted.command.CommandID)
-				return errors.Join(s.closeControlBeforeCancel(request, stateSnapshot), cancelled)
+				return errors.Join(interrupted.cause, s.closeControlBeforeCancel(request, stateSnapshot), cancelled)
 			}
-			return s.finishControlShutdownInterrupt(ctx, request, stateSnapshot, interrupted.command.CommandID)
+			return errors.Join(interrupted.cause, s.finishControlShutdownInterrupt(ctx, request, stateSnapshot, interrupted.command.CommandID))
 		}
 		if backendErrorHasCode(err, protocol.CodeOutputWriteFailed) {
 			_, status, _ := stateSnapshot.snapshot()
@@ -690,7 +707,7 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 			return errors.Join(closeErr, failure, err)
 		}
 		if handled, terminalErr := s.finishLatchedControl(ctx, request, stateSnapshot, nil, results); handled {
-			return terminalErr
+			return errors.Join(err, terminalErr)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			closeErr := s.closeControlBeforeFailure(request, stateSnapshot, backendErrorHasCode(err, protocol.CodeOutputWriteFailed))
@@ -861,9 +878,9 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 					if interrupted.attempt == nil {
 						if interrupted.command.Command == protocol.ControlCancel {
 							cancelled := newControlCancelled(interrupted.command.CommandID)
-							return errors.Join(s.closeControlBeforeCancel(request, stateSnapshot), cancelled)
+							return errors.Join(interrupted.cause, s.closeControlBeforeCancel(request, stateSnapshot), cancelled)
 						}
-						return s.finishControlShutdownInterrupt(ctx, request, stateSnapshot, interrupted.command.CommandID)
+						return errors.Join(interrupted.cause, s.finishControlShutdownInterrupt(ctx, request, stateSnapshot, interrupted.command.CommandID))
 					}
 					if interrupted.command.Command == protocol.ControlCancel {
 						return s.finishControlCancel(ctx, request, stateSnapshot, nil, interrupted.command.CommandID)
@@ -877,7 +894,7 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 					return s.emitControlFailure(request, stateSnapshot, err)
 				}
 				if handled, terminalErr := s.finishLatchedControl(ctx, request, stateSnapshot, nil, results); handled {
-					return terminalErr
+					return errors.Join(err, terminalErr)
 				}
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return s.finishControlCancel(ctx, request, stateSnapshot, nil, "")
@@ -935,11 +952,18 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 			switch result.command.Command {
 			case protocol.ControlActivate:
 				if err := s.activateAutomaticWork(ctx, request, stateSnapshot, result.command.CommandID); err != nil {
-					_, _, details := stateSnapshot.snapshot()
-					details["startupActivation"] = "unknown"
-					stateSnapshot.set(protocol.StageBackendRun, protocol.StateRunning, details)
-					if emitErr := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "无法确认自动业务是否已放行", protocol.WithControlCommandID(details, result.command.CommandID)); emitErr != nil {
-						return emitErr
+					if !backendErrorHasCode(err, protocol.CodeOutputWriteFailed) {
+						_, _, details := stateSnapshot.snapshot()
+						details["startupActivation"] = "unknown"
+						stateSnapshot.set(protocol.StageBackendRun, protocol.StateRunning, details)
+						err = s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "无法确认自动业务是否已放行", protocol.WithControlCommandID(details, result.command.CommandID))
+					}
+					if err != nil {
+						if commandID, ok := shutdownLatchedBehindOutputFault(request.Control, err); ok {
+							return errors.Join(err, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
+						}
+						cleanup := s.cleanupProcess(context.WithoutCancel(ctx), attempt.process, attempt.tx, attempt.logger)
+						return s.emitControlFailure(request, stateSnapshot, cleanup.failure(err))
 					}
 				}
 			case protocol.ControlStatus:
@@ -1002,28 +1026,30 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 				return state.EnvironmentState{}, state.Revision{}, newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "stdin 控制通道读取失败", nil, infraErr)
 			}
 			if _, ok := terminalCommand(request.Control); ok {
+				interruptCause := ctx.Err()
 				command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 				if drainErr != nil {
 					return state.EnvironmentState{}, state.Revision{}, drainErr
 				}
-				return state.EnvironmentState{}, state.Revision{}, &controlInterruptError{command: command}
+				return state.EnvironmentState{}, state.Revision{}, &controlInterruptError{command: command, cause: interruptCause}
 			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return state.EnvironmentState{}, state.Revision{}, ctxErr
 			}
 			return result.environment, result.revision, result.err
 		case <-ctx.Done():
+			interruptCause := ctx.Err()
 			cancel()
 			<-done
 			if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
-				return state.EnvironmentState{}, state.Revision{}, newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "stdin 控制通道读取失败", nil, infraErr)
+				return state.EnvironmentState{}, state.Revision{}, errors.Join(interruptCause, newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "stdin 控制通道读取失败", nil, infraErr))
 			}
 			if _, ok := terminalCommand(request.Control); ok {
 				command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 				if drainErr != nil {
-					return state.EnvironmentState{}, state.Revision{}, drainErr
+					return state.EnvironmentState{}, state.Revision{}, errors.Join(interruptCause, drainErr)
 				}
-				return state.EnvironmentState{}, state.Revision{}, &controlInterruptError{command: command}
+				return state.EnvironmentState{}, state.Revision{}, &controlInterruptError{command: command, cause: interruptCause}
 			}
 			return state.EnvironmentState{}, state.Revision{}, ctx.Err()
 		case result := <-results:
@@ -1052,12 +1078,13 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 					return state.EnvironmentState{}, state.Revision{}, err
 				}
 			case protocol.ControlCancel, protocol.ControlShutdown:
+				interruptCause := ctx.Err()
 				cancel()
 				<-done
 				if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 					return state.EnvironmentState{}, state.Revision{}, newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "stdin 控制通道读取失败", nil, infraErr)
 				}
-				return state.EnvironmentState{}, state.Revision{}, &controlInterruptError{command: result.command}
+				return state.EnvironmentState{}, state.Revision{}, &controlInterruptError{command: result.command, cause: interruptCause}
 			}
 		}
 	}

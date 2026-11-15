@@ -34,8 +34,13 @@ func (s *ManagedSupervisor) awaitStartupPreflight(ctx context.Context, request R
 	workCtx, cancel := context.WithTimeout(ctx, max(0, request.startupDeadline.Sub(s.deps.Clock())))
 	defer cancel()
 	environment, revision, err := s.awaitControlPreflight(workCtx, request, snapshot, results)
-	if workCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		err = newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendSpawn, "后端启动工作预算耗尽", nil, err)
+	if workCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil && (err == nil || errors.Is(err, context.DeadlineExceeded)) {
+		var interrupted *controlInterruptError
+		if errors.As(err, &interrupted) {
+			interrupted.cause = newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendSpawn, "后端启动工作预算耗尽", nil, interrupted.cause)
+		} else {
+			err = newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendSpawn, "后端启动工作预算耗尽", nil, err)
+		}
 	}
 	return environment, revision, err
 }

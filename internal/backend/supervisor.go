@@ -176,9 +176,6 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	var revision state.Revision
 	defer func() {
 		returnErr = withSupervisionDiagnostics(returnErr, mode, revision)
-		if request.DeferBusinessStart {
-			returnErr = withFailureDetailsExtra(returnErr, nil, nil, map[string]any{"businessDeferred": true})
-		}
 	}()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -215,18 +212,6 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		}
 	}
 	if request.Control != nil {
-		if request.DeferBusinessStart {
-			repo := s.layout.RepoDir()
-			if mode == ModeDevelopment {
-				repo = request.DevelopmentRepo
-			}
-			if err := checkDeferredStartupCapability(ctx, repo); err != nil {
-				if !request.AllowLegacyBusinessStart {
-					return err
-				}
-				request.DeferBusinessStart = false
-			}
-		}
 		return s.superviseControlled(ctx, request)
 	}
 	if request.DeferBusinessStart {
