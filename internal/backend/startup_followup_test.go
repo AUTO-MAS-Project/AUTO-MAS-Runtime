@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,19 +107,90 @@ func TestBackend_HealthDeadlineUsesTerminalAcceptanceOrder(t *testing.T) {
 }
 
 func TestBackend_WorkDeadlinePreservesHealthDiagnostics(t *testing.T) {
-	f := newBackendFixture(t)
-	supervisor := f.supervisor()
-	supervisor.deps.Clock = time.Now
-	supervisor.deps.Health = deadlineDiagnosticHealth{}
-	request := f.request()
-	request.startupDeadline = time.Now().Add(time.Millisecond)
-	err := supervisor.checkStartupHealth(t.Context(), request, health.Expectation{}, nil)
-	assertBackendCode(t, err, protocol.CodeBackendHealthTimeout)
-	failure := err.(interface{ Details() map[string]any })
-	details := failure.Details()
-	if details["attemptCount"] != 3 || details["durationMs"] != 23.5 || details["failureKind"] != "request_timeout" || details["state"] != "running" {
-		t.Fatalf("health diagnostics lost: %#v", details)
+	for _, phase := range []string{"poll wait", "request"} {
+		t.Run(phase, func(t *testing.T) {
+			f := newBackendFixture(t)
+			f.proc.keepAlive = true
+			clock := &pausedHealthClock{startupBudgetClock: &startupBudgetClock{now: time.Unix(0, 0)}, polled: make(chan struct{}, 1)}
+			transport := &runningUntilCancelledTransport{entered: make(chan struct{})}
+			supervisor := f.supervisor()
+			supervisor.deps.Clock = clock.Now
+			supervisor.deps.Health = health.NewChecker(health.Config{Clock: clock, Transport: transport})
+			expire := make(chan func(), 1)
+			var scopes int
+			supervisor.deps.WithStartupTimeout = func(parent context.Context, remaining time.Duration, cause error) (context.Context, context.CancelFunc) {
+				scopes++
+				if scopes == 1 {
+					return context.WithTimeoutCause(parent, remaining, cause)
+				}
+				work, cancel := context.WithCancelCause(parent)
+				expire <- func() { cancel(cause) }
+				return work, func() { cancel(context.Canceled) }
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			finished := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				defer close(finished)
+				request := f.request()
+				request.Control = NewControlMailbox(8)
+				done <- supervisor.Supervise(ctx, request)
+			}()
+			t.Cleanup(func() { cancel(); <-finished })
+			// 创建轮询计时器证明第一份合法 running 响应已被 Checker 消费。
+			waitFor(t, clock.polled)
+			wantAttempts, wantKind := 1, "backend_not_ready"
+			if phase == "request" {
+				clock.advance(200 * time.Millisecond)
+				waitFor(t, transport.entered)
+				wantAttempts, wantKind = 2, "request_incomplete"
+			} else {
+				clock.advance(25 * time.Millisecond)
+			}
+			(<-expire)()
+			err := <-done
+			assertBackendCode(t, err, protocol.CodeBackendHealthTimeout)
+			var failure interface{ Details() map[string]any }
+			if !errors.As(err, &failure) {
+				t.Fatalf("missing health diagnostics: %v", err)
+			}
+			details := failure.Details()
+			duration, ok := details["durationMs"].(int64)
+			if details["attemptCount"] != wantAttempts || details["failureKind"] != wantKind || details["state"] != "running" || !ok || duration <= 0 || duration >= 1000 {
+				t.Fatalf("health diagnostics lost: %#v", details)
+			}
+		})
 	}
+}
+
+type pausedHealthClock struct {
+	*startupBudgetClock
+	polled chan struct{}
+}
+
+func (c *pausedHealthClock) NewTimer(duration time.Duration) health.Timer {
+	c.mu.Lock()
+	timer := &startupBudgetTimer{clock: c.startupBudgetClock, deadline: c.now.Add(duration), channel: make(chan time.Time, 1)}
+	c.timers = append(c.timers, timer)
+	c.mu.Unlock()
+	if duration == 200*time.Millisecond {
+		c.polled <- struct{}{}
+	}
+	return timer
+}
+
+type runningUntilCancelledTransport struct {
+	requests atomic.Int32
+	entered  chan struct{}
+}
+
+func (r *runningUntilCancelledTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if r.requests.Add(1) == 1 {
+		return (runningHealthTransport{}).RoundTrip(request)
+	}
+	close(r.entered)
+	<-request.Context().Done()
+	return nil, request.Context().Err()
 }
 
 func TestBackend_ShutdownDuringHealthDoesNotRetainInducedCancellation(t *testing.T) {

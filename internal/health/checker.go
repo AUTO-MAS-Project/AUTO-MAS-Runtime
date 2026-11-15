@@ -211,10 +211,10 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	total := totalTimer.C()
 	startedAt := c.clock.Now()
 	diagnostics := checkDiagnostics{startedAt: startedAt, port: expected.resolvedPort(), failureKind: "not_observed"}
-	// 只补充已经按原规则判定的 timeout，不改变轮询、取消或退出的优先级。
+	// 超时与取消都保留已经采集的诊断；取消来源由调用方判定，不改变原有优先级。
 	defer func() {
 		var failure *Error
-		if errors.As(returnErr, &failure) && failure.Code() == protocol.CodeBackendHealthTimeout {
+		if errors.As(returnErr, &failure) && (failure.Code() == protocol.CodeBackendHealthTimeout || failure.Code() == protocol.CodeOperationCancelled) {
 			details := diagnostics.details(c.clock.Now())
 			for key, value := range failure.Details() {
 				details[key] = value
