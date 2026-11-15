@@ -19,6 +19,7 @@ const (
 	ControlCancel   ControlKind = "cancel"
 	ControlShutdown ControlKind = "shutdown"
 	ControlStatus   ControlKind = "status"
+	ControlActivate ControlKind = "activate"
 
 	maxControlPayloadBytes  = 4096
 	controlReaderBufferSize = maxControlPayloadBytes + 2
@@ -554,7 +555,7 @@ func isControlField(field string) bool {
 
 func isKnownControlKind(command ControlKind) bool {
 	switch command {
-	case ControlCancel, ControlShutdown, ControlStatus:
+	case ControlCancel, ControlShutdown, ControlStatus, ControlActivate:
 		return true
 	default:
 		return false

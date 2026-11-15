@@ -336,6 +336,16 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 			return cleanupErr.Code(), cleanupErr.Stage(), cleanupErr.Message(), cleanupErr.Details()
 		}
 	}
+	var internalDeadline interface {
+		operationError
+		InternalDeadline() bool
+	}
+	if errors.As(err, &internalDeadline) && internalDeadline.InternalDeadline() {
+		// 外层错误带有进程/清理诊断；内部预算标记只负责与调用方取消区分。
+		var primary operationError
+		errors.As(err, &primary)
+		return primary.Code(), primary.Stage(), primary.Message(), primary.Details()
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		stage := fallbackStage
 		details := map[string]any{}

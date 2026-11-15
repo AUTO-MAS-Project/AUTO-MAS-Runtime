@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -97,12 +98,26 @@ func TestFetch_ChunkFailureRequeues(t *testing.T) {
 	flaky.behave(bigWheel, mirrorBehavior{failRangesFrom: 64 << 10})
 	steady := newFakeMirror(t, true)
 	steady.put(bigWheel, content)
-	fixture := startFixture(t, fixtureOptions{cfg: chunkedConfig([]Item{item}, flaky, steady)}, flaky, steady)
+	failed := make(chan struct{})
+	steady.behave(bigWheel, mirrorBehavior{gate: failed})
+	logs := &logRecorder{}
+	var release sync.Once
+	fixture := startFixture(t, fixtureOptions{
+		cfg: chunkedConfig([]Item{item}, flaky, steady),
+		deps: Deps{Logger: func(level, message string, fields map[string]any) {
+			logs.record(level, message, fields)
+			// 先确认故障源确实失败，快源才继续，避免它提前拿完余下分片。
+			if fields["source"] == "a" && fields["outcome"] == OutcomeHTTPStatus {
+				release.Do(func() { close(failed) })
+			}
+		}},
+	}, flaky, steady)
 
-	response, body := fixture.get(t, relayPath(bigWheel))
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", response.StatusCode)
+	result := awaitResult(t, fixture.getAsync(relayPath(bigWheel)), "response after requeued chunk")
+	if result.err != nil || result.status != http.StatusOK {
+		t.Fatalf("result = %+v, want 200", result)
 	}
+	body := result.body
 	if !bytes.Equal(body, content) {
 		t.Fatalf("assembled body mismatch (%d bytes, want %d)", len(body), len(content))
 	}
@@ -115,7 +130,7 @@ func TestFetch_ChunkFailureRequeues(t *testing.T) {
 	if failedRanges != 1 {
 		t.Errorf("flaky mirror failing-range requests = %d, want exactly 1 (worker exits after first failure)", failedRanges)
 	}
-	if got := fixture.logs.outcomes("a"); len(got) != 1 || got[0] != OutcomeHTTPStatus {
+	if got := logs.outcomes("a"); len(got) != 1 || got[0] != OutcomeHTTPStatus {
 		t.Errorf("outcomes for a = %v, want [http_status]", got)
 	}
 	summary := fixture.server.Summary()

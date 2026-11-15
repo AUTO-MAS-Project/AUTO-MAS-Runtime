@@ -161,6 +161,7 @@ const (
 	// 永远不发 shutdown，优雅关闭退化成 Job 强杀。
 	CapabilityStdinShutdown Capability = "stdin.shutdown"
 	CapabilityStdinStatus   Capability = "stdin.status"
+	CapabilityStdinActivate Capability = "stdin.activate"
 )
 
 var knownCapabilities = []Capability{
@@ -169,6 +170,7 @@ var knownCapabilities = []Capability{
 	CapabilityLogStream,
 	CapabilityStdinShutdown,
 	CapabilityStdinStatus,
+	CapabilityStdinActivate,
 }
 
 // AllCapabilities 按文档顺序返回全部稳定能力标识的防御性副本。

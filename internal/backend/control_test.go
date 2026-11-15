@@ -1443,6 +1443,11 @@ type failingControlReceiver struct {
 	release <-chan struct{}
 }
 
+func (*failingControlReceiver) WithTerminalCancellation(ctx context.Context) (context.Context, context.CancelFunc) {
+	// 该接收器只报告读取故障，不接受终止命令。
+	return context.WithCancel(ctx)
+}
+
 func (r *failingControlReceiver) Receive(ctx context.Context) (protocol.ControlCommand, error) {
 	if r.ready != nil {
 		select {
@@ -1466,6 +1471,10 @@ type delayedControlReceiver struct {
 	release  <-chan struct{}
 }
 
+func (r *delayedControlReceiver) WithTerminalCancellation(ctx context.Context) (context.Context, context.CancelFunc) {
+	return r.receiver.WithTerminalCancellation(ctx)
+}
+
 func (r *delayedControlReceiver) Receive(ctx context.Context) (protocol.ControlCommand, error) {
 	select {
 	case <-r.release:
@@ -1475,13 +1484,13 @@ func (r *delayedControlReceiver) Receive(ctx context.Context) (protocol.ControlC
 	}
 }
 
-func (r *delayedControlReceiver) TerminalCommand() (protocol.ControlCommand, bool) {
+func (r *delayedControlReceiver) TerminalCommand() (AcceptedControlCommand, bool) {
 	if source, ok := r.receiver.(interface {
-		TerminalCommand() (protocol.ControlCommand, bool)
+		TerminalCommand() (AcceptedControlCommand, bool)
 	}); ok {
 		return source.TerminalCommand()
 	}
-	return protocol.ControlCommand{}, false
+	return AcceptedControlCommand{}, false
 }
 
 func (r *delayedControlReceiver) InfrastructureError() error {

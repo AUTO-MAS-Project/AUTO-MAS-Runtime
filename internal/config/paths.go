@@ -6,6 +6,11 @@ import (
 	"strings"
 )
 
+// BackendCapabilitiesFile 返回所选源码仓库的 Runtime 能力清单路径。
+func BackendCapabilitiesFile(repoDir string) string {
+	return filepath.Join(repoDir, "res", "runtime-capabilities.json")
+}
+
 // RepositoryFile 返回 Git tree 中普通跟踪文件的受管路径，禁止访问 Git 元数据和根外路径。
 func (l *Layout) RepositoryFile(name string) (string, error) {
 	path := filepath.FromSlash(name)

@@ -37,6 +37,9 @@ const (
 	// 恰在 Job 快照的两次系统查询之间退出，快照就会带着错误返回。明确的否定结果
 	// （probeUnhealthy）不走这条容忍，仍然立即失败。
 	maxConsecutiveProbeErrors = 3
+	// 拿到过有效应答后的后台初始化总预算（增补 2 C22），从开始检查起算。它必须明显小于
+	// Electron 等待 backend.run running 的 180 秒上限，让 Runtime 总是先给出结构化的超时错误。
+	defaultBackgroundTimeout = 150 * time.Second
 )
 
 // Mode 是健康检查的身份校验模式。
@@ -51,10 +54,12 @@ const (
 
 // Expectation 描述本次健康检查的受管身份期望。
 type Expectation struct {
-	Mode     Mode
-	Protocol int
-	Version  string
-	Commit   string
+	DeferBusinessStart bool
+	StartupDeadline    time.Time
+	Mode               Mode
+	Protocol           int
+	Version            string
+	Commit             string
 	// Port 是受监督后端的监听端口（增补 1 C12）；健康端点地址由它派生，
 	// 零值回退 DefaultPort，非零但越界失败关闭。
 	Port int
@@ -110,9 +115,16 @@ type Clock interface {
 
 // Config 配置健康检查的传输、时钟和预算。
 type Config struct {
-	Transport            Transport
-	Clock                Clock
-	TotalTimeout         time.Duration
+	Transport Transport
+	Clock     Clock
+	// TotalTimeout 是从开始检查起拿到第一次有效应答的期限（增补 2 C22 第一段），缺省 60 秒。
+	TotalTimeout time.Duration
+	// BackgroundTimeout 是拿到过有效应答后、从开始检查起算的后台初始化总预算（C22），缺省 150 秒。
+	// 解析值小于 TotalTimeout 时按 TotalTimeout 取，有效应答不会让截止时间早于第一段。
+	BackgroundTimeout time.Duration
+	// SilenceTimeout 是拿到过有效应答后距最后一次有效应答的最长间隔（C22 失联兜底）；
+	// 为零时取 TotalTimeout——两者是同一条「60 秒内必须见到有效应答」规则的两个起点。
+	SilenceTimeout       time.Duration
 	PollInterval         time.Duration
 	RequestTimeout       time.Duration
 	ConsecutiveSuccesses int
@@ -123,6 +135,8 @@ type Checker struct {
 	transport            Transport
 	clock                Clock
 	totalTimeout         time.Duration
+	backgroundTimeout    time.Duration
+	silenceTimeout       time.Duration
 	pollInterval         time.Duration
 	requestTimeout       time.Duration
 	consecutiveSuccesses int
@@ -142,6 +156,15 @@ func NewChecker(config Config) *Checker {
 	if totalTimeout <= 0 {
 		totalTimeout = defaultTotalTimeout
 	}
+	backgroundTimeout := config.BackgroundTimeout
+	if backgroundTimeout <= 0 {
+		backgroundTimeout = defaultBackgroundTimeout
+	}
+	backgroundTimeout = max(backgroundTimeout, totalTimeout)
+	silenceTimeout := config.SilenceTimeout
+	if silenceTimeout <= 0 {
+		silenceTimeout = totalTimeout
+	}
 	pollInterval := config.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = defaultPollInterval
@@ -158,6 +181,8 @@ func NewChecker(config Config) *Checker {
 		transport:            transport,
 		clock:                clock,
 		totalTimeout:         totalTimeout,
+		backgroundTimeout:    backgroundTimeout,
+		silenceTimeout:       silenceTimeout,
 		pollInterval:         pollInterval,
 		requestTimeout:       requestTimeout,
 		consecutiveSuccesses: consecutiveSuccesses,
@@ -182,14 +207,14 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	exited := probe.Exited()
 	healthURL := HealthURLForPort(expected.resolvedPort())
 	totalTimer := c.clock.NewTimer(c.totalTimeout)
-	defer totalTimer.Stop()
+	defer func() { totalTimer.Stop() }()
 	total := totalTimer.C()
 	startedAt := c.clock.Now()
 	diagnostics := checkDiagnostics{startedAt: startedAt, port: expected.resolvedPort(), failureKind: "not_observed"}
-	// 只补充已经按原规则判定的 timeout，不改变轮询、取消或退出的优先级。
+	// 超时与取消都保留已经采集的诊断；取消来源由调用方判定，不改变原有优先级。
 	defer func() {
 		var failure *Error
-		if errors.As(returnErr, &failure) && failure.Code() == protocol.CodeBackendHealthTimeout {
+		if errors.As(returnErr, &failure) && (failure.Code() == protocol.CodeBackendHealthTimeout || failure.Code() == protocol.CodeOperationCancelled) {
 			details := diagnostics.details(c.clock.Now())
 			for key, value := range failure.Details() {
 				details[key] = value
@@ -197,6 +222,15 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			returnErr = newError(failure.Code(), failure.Message(), details, failure.Unwrap())
 		}
 	}()
+	// deadline 是当前生效的总截止时间，totalTimer 始终对准它；截止时间变化时整体换掉计时器，
+	// 单次请求、轮询等待与进程探针拿到的都是当时的 total，旧计时器不会截断第二段。
+	deadline := startedAt.Add(c.totalTimeout)
+	if !expected.StartupDeadline.IsZero() && expected.StartupDeadline.Before(deadline) {
+		deadline = expected.StartupDeadline
+		totalTimer.Stop()
+		totalTimer = c.clock.NewTimer(max(0, deadline.Sub(c.clock.Now())))
+		total = totalTimer.C()
+	}
 	successes := 0
 	// 连续的探针错误计数；任何一次探针成功都清零。
 	probeErrors := 0
@@ -204,7 +238,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 		if err := cancellationError(ctx); err != nil {
 			return err
 		}
-		if c.clock.Now().Sub(startedAt) >= c.totalTimeout {
+		if !c.clock.Now().Before(deadline) {
 			return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 		}
 		if channelClosed(exited) {
@@ -236,7 +270,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if err := cancellationError(ctx); err != nil {
 				return err
 			}
-			if c.totalExpired(total, startedAt) {
+			if c.totalExpired(total, deadline) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			}
 			if channelClosed(exited) {
@@ -251,8 +285,23 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			}
 			diagnostics.state = observation.state
 			diagnostics.failureKind = "backend_not_ready"
-			if c.totalExpired(total, startedAt) {
+			if c.totalExpired(total, deadline) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
+			}
+			// 走到这里即一次有效应答：按 C22 重算截止时间。
+			now := c.clock.Now()
+			next := c.deadlineAfterValidResponse(startedAt, now)
+			if !expected.StartupDeadline.IsZero() && expected.StartupDeadline.Before(next) {
+				next = expected.StartupDeadline
+			}
+			if !next.Equal(deadline) {
+				if !now.Before(next) {
+					return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
+				}
+				totalTimer.Stop()
+				deadline = next
+				totalTimer = c.clock.NewTimer(next.Sub(now))
+				total = totalTimer.C()
 			}
 			if observation.continuePolling {
 				successes = 0
@@ -270,7 +319,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 			if err := cancellationError(ctx); err != nil {
 				return err
 			}
-			if c.totalExpired(total, startedAt) {
+			if c.totalExpired(total, deadline) {
 				return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 			}
 			switch probeResult.kind {
@@ -303,7 +352,7 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 					if err := cancellationError(ctx); err != nil {
 						return err
 					}
-					if c.totalExpired(total, startedAt) {
+					if c.totalExpired(total, deadline) {
 						return newError(protocol.CodeBackendHealthTimeout, "后端健康检查超时", nil, nil)
 					}
 					return nil
@@ -316,8 +365,18 @@ func (c *Checker) Check(ctx context.Context, expected Expectation, probe Probe) 
 	}
 }
 
-func (c *Checker) totalExpired(total <-chan time.Time, startedAt time.Time) bool {
-	if c.clock.Now().Sub(startedAt) >= c.totalTimeout {
+// deadlineAfterValidResponse 返回 respondedAt 时刻收到有效应答后的总截止时间（增补 2 C22）：
+// 后台初始化总预算与失联窗口取先到者。
+func (c *Checker) deadlineAfterValidResponse(startedAt, respondedAt time.Time) time.Time {
+	deadline := startedAt.Add(c.backgroundTimeout)
+	if silence := respondedAt.Add(c.silenceTimeout); silence.Before(deadline) {
+		return silence
+	}
+	return deadline
+}
+
+func (c *Checker) totalExpired(total <-chan time.Time, deadline time.Time) bool {
+	if !c.clock.Now().Before(deadline) {
 		return true
 	}
 	select {
@@ -583,12 +642,13 @@ type observation struct {
 }
 
 type healthPayload struct {
-	Ready            json.RawMessage `json:"ready"`
-	BackgroundStatus json.RawMessage `json:"backgroundStatus"`
-	BackgroundError  json.RawMessage `json:"backgroundError"`
-	Protocol         json.RawMessage `json:"protocol"`
-	Version          json.RawMessage `json:"version"`
-	Commit           json.RawMessage `json:"commit"`
+	StartupActivation json.RawMessage `json:"startupActivation"`
+	Ready             json.RawMessage `json:"ready"`
+	BackgroundStatus  json.RawMessage `json:"backgroundStatus"`
+	BackgroundError   json.RawMessage `json:"backgroundError"`
+	Protocol          json.RawMessage `json:"protocol"`
+	Version           json.RawMessage `json:"version"`
+	Commit            json.RawMessage `json:"commit"`
 }
 
 func inspectResponse(httpStatus int, body []byte, bodyErr error, expected Expectation) (observation, error) {
@@ -639,6 +699,12 @@ func inspectResponse(httpStatus int, body []byte, bodyErr error, expected Expect
 	case "starting", "running":
 		return observation{continuePolling: true, state: status}, nil
 	case "ready":
+		if expected.DeferBusinessStart {
+			var activation string
+			if err := json.Unmarshal(payload.StartupActivation, &activation); err != nil || activation != "pending" {
+				return observation{}, newError(protocol.CodeBackendHealthInvalid, "后端未确认暂缓自动业务", map[string]any{"field": "startupActivation"}, err)
+			}
+		}
 		if !ready {
 			return observation{continuePolling: true, state: status}, nil
 		}
@@ -723,12 +789,13 @@ func decodePayload(body []byte) (healthPayload, error) {
 		return healthPayload{}, err
 	}
 	return healthPayload{
-		Ready:            fields["ready"],
-		BackgroundStatus: fields["backgroundStatus"],
-		BackgroundError:  fields["backgroundError"],
-		Protocol:         fields["protocol"],
-		Version:          fields["version"],
-		Commit:           fields["commit"],
+		StartupActivation: fields["startupActivation"],
+		Ready:             fields["ready"],
+		BackgroundStatus:  fields["backgroundStatus"],
+		BackgroundError:   fields["backgroundError"],
+		Protocol:          fields["protocol"],
+		Version:           fields["version"],
+		Commit:            fields["commit"],
 	}, nil
 }
 

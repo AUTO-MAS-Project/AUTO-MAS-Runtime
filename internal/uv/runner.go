@@ -35,12 +35,13 @@ const (
 	// noProxyEnv 是 Runtime 唯一会改写的宿主代理变量：uv（reqwest）会把发往 127.0.0.1 回环中继的
 	// 请求也送进 HTTP(S)_PROXY / ALL_PROXY，而 NO_PROXY=localhost 并不豁免 127.0.0.1（uv 0.12.3 实测），
 	// 所以宿主值原样保留、缺的回环项补齐后以规范大写键下发。
-	noProxyEnv          = "NO_PROXY"
-	autoMASUVExecutable = "AUTO_MAS_UV_EXE"
-	autoMASProtocol     = "AUTO_MAS_RUNTIME_PROTOCOL"
-	autoMASVersion      = "AUTO_MAS_EXPECTED_VERSION"
-	autoMASCommit       = "AUTO_MAS_EXPECTED_COMMIT"
-	autoMASSupervised   = "AUTO_MAS_SUPERVISED"
+	noProxyEnv                = "NO_PROXY"
+	autoMASUVExecutable       = "AUTO_MAS_UV_EXE"
+	autoMASProtocol           = "AUTO_MAS_RUNTIME_PROTOCOL"
+	autoMASVersion            = "AUTO_MAS_EXPECTED_VERSION"
+	autoMASCommit             = "AUTO_MAS_EXPECTED_COMMIT"
+	autoMASSupervised         = "AUTO_MAS_SUPERVISED"
+	autoMASDeferBusinessStart = "AUTO_MAS_DEFER_BUSINESS_START"
 	// 以下四个键按增补 1 C11 下发受管基础设施与有序镜像源，与上面五个身份键
 	// 同属受监督进程的环境契约：宿主同名变量被清除，调用方也不能经
 	// RunOptions.Environment 覆盖。
@@ -691,6 +692,7 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASVersion,
 		autoMASCommit,
 		autoMASSupervised,
+		autoMASDeferBusinessStart,
 		autoMASUVCacheDir,
 		autoMASUVPythonInstallDir,
 		autoMASMirrorPackageIndex,
@@ -712,6 +714,7 @@ func isSupervisionEnvironmentKey(key string) bool {
 // isRuntimeOnlyEnvironmentKey 阻止仅供 Runtime 配置的观测键跨越 uv/Python 进程边界。
 func isRuntimeOnlyEnvironmentKey(key string) bool {
 	return strings.EqualFold(key, autoMASTelemetry) ||
+		strings.EqualFold(key, "AUTO_MAS_RUNTIME_DEFER_BUSINESS_START") ||
 		strings.EqualFold(key, autoMASSentryDSN) ||
 		strings.EqualFold(key, autoMASSentryEnv) ||
 		strings.EqualFold(key, autoMASSentryRelease)
