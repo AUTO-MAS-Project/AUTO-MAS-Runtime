@@ -45,6 +45,9 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	if deps.Clock == nil {
 		deps.Clock = time.Now
 	}
+	if deps.WithStartupTimeout == nil {
+		deps.WithStartupTimeout = context.WithTimeoutCause
+	}
 	if deps.ShutdownTimeout <= 0 {
 		deps.ShutdownTimeout = defaultShutdownTimeout
 	}

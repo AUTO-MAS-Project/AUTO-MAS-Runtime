@@ -24,6 +24,46 @@ func declareDeferredStartup(t *testing.T, repo string) {
 	}
 }
 
+func TestDeferredStartup_StopCancelsUncommittedActivation(t *testing.T) {
+	f := newBackendFixture(t)
+	f.proc.keepAlive = true
+	f.depsHTTP = &orderedHTTPCloser{process: f.proc, record: func(string) {}}
+	declareDeferredStartup(t, f.layout.RepoDir())
+	activation := &cancellableActivation{entered: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+	supervisor := f.supervisor()
+	supervisor.deps.Activation = activation
+	mailbox := NewControlMailbox(8)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		request := f.request()
+		request.Control, request.DeferBusinessStart = mailbox, true
+		done <- supervisor.Supervise(ctx, request)
+	}()
+	waitFor(t, f.emitter.running)
+	if err := mailbox.Submit(ctx, protocol.ControlCommand{Command: protocol.ControlActivate, CommandID: "activate-before-stop"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, activation.entered)
+	if err := mailbox.Submit(ctx, protocol.ControlCommand{Command: protocol.ControlShutdown, CommandID: "stop-before-commit"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-activation.cancelled:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("accepted stop did not cancel in-flight activation")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	if activation.committed.Load() {
+		t.Fatal("activation committed after the accepted stop")
+	}
+}
+
 type lostActivationAck struct {
 	calls   atomic.Int32
 	queries atomic.Int32

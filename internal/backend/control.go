@@ -35,6 +35,8 @@ type AcceptedControlCommand struct {
 	AcceptedAt time.Time
 }
 
+type controlOperation struct{ cancel context.CancelFunc }
+
 // ControlMailbox 是 ControlReader 与 Supervisor loop 之间的有界 FIFO。
 // Submit 不执行进程或网络副作用；终止命令在入队时记录 first-wins latch。
 type ControlMailbox struct {
@@ -51,6 +53,7 @@ type ControlMailbox struct {
 	readerReported bool
 	terminal       AcceptedControlCommand
 	hasTerm        bool
+	operation      *controlOperation
 	beforeShutdown func(string)
 	setStage       func(protocol.Stage)
 }
@@ -96,8 +99,7 @@ func (m *ControlMailbox) Submit(ctx context.Context, command protocol.ControlCom
 			firstTerminal := false
 			if command.Command == protocol.ControlCancel || command.Command == protocol.ControlShutdown {
 				if !m.hasTerm {
-					m.terminal = AcceptedControlCommand{ControlCommand: command, AcceptedAt: time.Now()}
-					m.hasTerm = true
+					m.acceptTerminalLocked(command)
 					firstTerminal = true
 				}
 			}
@@ -142,8 +144,7 @@ func (m *ControlMailbox) Receive(ctx context.Context) (protocol.ControlCommand, 
 			m.queue = m.queue[1:]
 			if command.Command == protocol.ControlCancel || command.Command == protocol.ControlShutdown {
 				if !m.hasTerm {
-					m.terminal = AcceptedControlCommand{ControlCommand: command, AcceptedAt: time.Now()}
-					m.hasTerm = true
+					m.acceptTerminalLocked(command)
 				}
 			}
 			m.signalLocked()
@@ -174,6 +175,35 @@ func (m *ControlMailbox) Receive(ctx context.Context) (protocol.ControlCommand, 
 		case <-closeCh:
 			continue
 		}
+	}
+}
+
+func (m *ControlMailbox) acceptTerminalLocked(command protocol.ControlCommand) {
+	m.terminal = AcceptedControlCommand{ControlCommand: command, AcceptedAt: time.Now()}
+	m.hasTerm = true
+	if m.operation != nil {
+		m.operation.cancel()
+	}
+}
+
+// WithTerminalCancellation 绑定监督循环当前的外部调用；终止接受与取消在同一锁内完成。
+func (m *ControlMailbox) WithTerminalCancellation(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	operation := &controlOperation{cancel: cancel}
+	m.mu.Lock()
+	if m.hasTerm || m.closed {
+		cancel()
+	} else {
+		m.operation = operation
+	}
+	m.mu.Unlock()
+	return ctx, func() {
+		m.mu.Lock()
+		if m.operation == operation {
+			m.operation = nil
+		}
+		m.mu.Unlock()
+		cancel()
 	}
 }
 
@@ -223,6 +253,9 @@ func (m *ControlMailbox) Close() {
 	m.mu.Lock()
 	if !m.closed {
 		m.closed = true
+		if m.operation != nil {
+			m.operation.cancel()
+		}
 		m.stopped = true
 		close(m.closeCh)
 		select {
@@ -1600,7 +1633,7 @@ func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, re
 				if drainErr != nil {
 					return drainErr
 				}
-				return &controlInterruptError{command: command}
+				return &controlInterruptError{command: command, cause: healthControlFailure(err, request.Control)}
 			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -1670,7 +1703,7 @@ func (s *ManagedSupervisor) awaitHealth(ctx context.Context, request Request, re
 				if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
 					return &controlInterruptError{cause: newError(protocol.CodeInternalError, protocol.StageBackendHealth, "stdin 控制通道读取失败", nil, infraErr)}
 				}
-				return &controlInterruptError{command: result.command, cause: err}
+				return &controlInterruptError{command: result.command, cause: healthControlFailure(err, request.Control)}
 			}
 		}
 	}

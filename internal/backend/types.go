@@ -55,28 +55,31 @@ const (
 // ControlReceiver 为监督循环提供已由 ControlReader 校验并按 FIFO 排队的命令。
 type ControlReceiver interface {
 	Receive(context.Context) (protocol.ControlCommand, error)
+	WithTerminalCancellation(context.Context) (context.Context, context.CancelFunc)
 }
 
 // Dependencies 是 ManagedSupervisor 的消费侧依赖集合。
 type Dependencies struct {
-	Activation      HTTPActivator
-	Lock            LockSet
-	State           StateStore
-	Repository      RepositoryChecker
-	Entry           EntryChecker
-	UV              UVRunner
-	Health          HealthChecker
-	Logger          LoggerFactory
-	Clock           func() time.Time
-	UVPath          string
-	PythonPath      string
-	PythonPaths     []string
-	PID             PIDProbe
-	HTTP            HTTPCloser
-	ShutdownTimeout time.Duration
-	RestartDelay    time.Duration
-	Timer           func(time.Duration) <-chan time.Time
-	NewTimer        func(time.Duration) Timer
+	Activation HTTPActivator
+	Lock       LockSet
+	State      StateStore
+	Repository RepositoryChecker
+	Entry      EntryChecker
+	UV         UVRunner
+	Health     HealthChecker
+	Logger     LoggerFactory
+	Clock      func() time.Time
+	// WithStartupTimeout 创建启动工作预算作用域，默认使用 context.WithTimeoutCause。
+	WithStartupTimeout func(context.Context, time.Duration, error) (context.Context, context.CancelFunc)
+	UVPath             string
+	PythonPath         string
+	PythonPaths        []string
+	PID                PIDProbe
+	HTTP               HTTPCloser
+	ShutdownTimeout    time.Duration
+	RestartDelay       time.Duration
+	Timer              func(time.Duration) <-chan time.Time
+	NewTimer           func(time.Duration) Timer
 	// MirrorPolicy 是已解析的全局镜像策略，用于按增补 1 C11 生成下发给后端的
 	// 有序源列表。零值表示调用方未配置，按目录默认顺序处理。
 	MirrorPolicy mirror.Policy

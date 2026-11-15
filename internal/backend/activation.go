@@ -18,31 +18,71 @@ import (
 
 const startupWorkBudget = 175 * time.Second
 
+var errStartupWorkDeadline = errors.New("backend startup work deadline exceeded")
+
+// 别名让嵌入字段与 Error() 方法不同名，保留 backend.Error 的完整契约。
+type startupFailure = Error
+
+// startupDeadlineError 标记内部计时预算，原始诊断和错误链仍保留。
+type startupDeadlineError struct {
+	*startupFailure
+	deadline time.Time
+}
+
+// InternalDeadline 区分服务内部预算与调用方取消。
+func (*startupDeadlineError) InternalDeadline() bool { return true }
+
+func newStartupDeadlineError(stage protocol.Stage, cause error, work context.Context) error {
+	var diagnostic interface{ Details() map[string]any }
+	details := map[string]any{}
+	if errors.As(cause, &diagnostic) {
+		details = diagnostic.Details()
+	}
+	deadline, _ := work.Deadline()
+	return &startupDeadlineError{startupFailure: &Error{code: protocol.CodeBackendHealthTimeout, stage: stage,
+		message: "后端启动工作预算耗尽", details: cloneDetails(details), cause: cause}, deadline: deadline}
+}
+
 func (s *ManagedSupervisor) checkStartupHealth(ctx context.Context, request Request, expected health.Expectation, probe health.Probe) error {
-	workCtx, cancel := context.WithTimeout(ctx, max(0, request.startupDeadline.Sub(s.deps.Clock())))
+	workCtx, cancel := s.deps.WithStartupTimeout(ctx, max(0, request.startupDeadline.Sub(s.deps.Clock())), errStartupWorkDeadline)
 	defer cancel()
 	expected.StartupDeadline = request.startupDeadline
 	expected.DeferBusinessStart = request.DeferBusinessStart
 	err := s.deps.Health.Check(workCtx, expected, probe)
-	if workCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		return newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendHealth, "后端启动工作预算耗尽", nil, err)
+	if errors.Is(context.Cause(workCtx), errStartupWorkDeadline) {
+		return newStartupDeadlineError(protocol.StageBackendHealth, err, workCtx)
 	}
 	return err
 }
 
 func (s *ManagedSupervisor) awaitStartupPreflight(ctx context.Context, request Request, snapshot *controlState, results <-chan controlResult) (state.EnvironmentState, state.Revision, error) {
-	workCtx, cancel := context.WithTimeout(ctx, max(0, request.startupDeadline.Sub(s.deps.Clock())))
+	workCtx, cancel := s.deps.WithStartupTimeout(ctx, max(0, request.startupDeadline.Sub(s.deps.Clock())), errStartupWorkDeadline)
 	defer cancel()
 	environment, revision, err := s.awaitControlPreflight(workCtx, request, snapshot, results)
-	if workCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil && (err == nil || errors.Is(err, context.DeadlineExceeded)) {
+	if errors.Is(context.Cause(workCtx), errStartupWorkDeadline) && (err == nil || errors.Is(err, context.DeadlineExceeded)) {
 		var interrupted *controlInterruptError
 		if errors.As(err, &interrupted) {
-			interrupted.cause = newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendSpawn, "后端启动工作预算耗尽", nil, interrupted.cause)
+			interrupted.cause = newStartupDeadlineError(protocol.StageBackendSpawn, interrupted.cause, workCtx)
 		} else {
-			err = newError(protocol.CodeBackendHealthTimeout, protocol.StageBackendSpawn, "后端启动工作预算耗尽", nil, err)
+			err = newStartupDeadlineError(protocol.StageBackendSpawn, err, workCtx)
 		}
 	}
 	return environment, revision, err
+}
+
+func healthControlFailure(err error, receiver ControlReceiver) error {
+	var budget *startupDeadlineError
+	if errors.As(err, &budget) {
+		command, accepted := acceptedTerminalCommand(receiver)
+		if accepted && !command.AcceptedAt.After(budget.deadline) {
+			return nil
+		}
+		return err
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func checkDeferredStartupCapability(ctx context.Context, repo string) error {
@@ -125,7 +165,9 @@ func (s *ManagedSupervisor) refreshActivationStatus(ctx context.Context, request
 	if !ok {
 		return
 	}
-	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	operationCtx, finish := request.Control.WithTerminalCancellation(ctx)
+	defer finish()
+	queryCtx, cancel := context.WithTimeout(operationCtx, 2*time.Second)
 	defer cancel()
 	status, err := query.Status(queryCtx, request.Port)
 	if err == nil && (status == "active" || status == "pending") {
@@ -147,14 +189,22 @@ func (s *ManagedSupervisor) activateAutomaticWork(ctx context.Context, request R
 		if activator == nil {
 			activator = loopbackHTTPActivator{}
 		}
-		activationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		operationCtx, finish := request.Control.WithTerminalCancellation(ctx)
+		defer finish()
+		activationCtx, cancel := context.WithTimeout(operationCtx, 5*time.Second)
 		err := activator.Activate(activationCtx, request.Port)
 		cancel()
 		if err != nil {
+			if _, terminal := terminalCommand(request.Control); terminal {
+				return nil
+			}
 			return err
 		}
 		details["startupActivation"] = "active"
 		snapshot.set(protocol.StageBackendRun, protocol.StateRunning, details)
+	}
+	if _, terminal := terminalCommand(request.Control); terminal {
+		return nil
 	}
 	return s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "自动业务已放行", protocol.WithControlCommandID(details, commandID))
 }

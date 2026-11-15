@@ -88,6 +88,12 @@ func TestBackend_EarlyShutdownDoesNotBecomeTimeoutDuringPreflightCleanup(t *test
 	slow := &delayedPreflightUV{fakeUV: f.uv, started: make(chan struct{}), expired: make(chan struct{}), release: make(chan struct{})}
 	supervisor := f.supervisor()
 	supervisor.deps.UV = slow
+	workScope := make(chan context.Context, 1)
+	supervisor.deps.WithStartupTimeout = func(parent context.Context, remaining time.Duration, cause error) (context.Context, context.CancelFunc) {
+		work, cancel := context.WithTimeoutCause(parent, remaining, cause)
+		workScope <- work
+		return work, cancel
+	}
 	var calls atomic.Int32
 	origin := time.Unix(0, 0)
 	supervisor.deps.Clock = func() time.Time {
@@ -107,7 +113,7 @@ func TestBackend_EarlyShutdownDoesNotBecomeTimeoutDuringPreflightCleanup(t *test
 		t.Fatal(err)
 	}
 	waitFor(t, slow.expired)
-	time.Sleep(1100 * time.Millisecond)
+	<-((<-workScope).Done())
 	close(slow.release)
 	if err := <-done; err != nil {
 		t.Fatalf("early shutdown changed into a timeout: %v", err)
@@ -148,19 +154,6 @@ func TestBackend_PreflightTimeoutSurvivesLateShutdown(t *testing.T) {
 	}
 }
 
-type pausedControlMailbox struct {
-	*ControlMailbox
-	forward chan struct{}
-}
-
-func (m *pausedControlMailbox) Receive(ctx context.Context) (protocol.ControlCommand, error) {
-	select {
-	case <-m.forward:
-		return m.ControlMailbox.Receive(ctx)
-	case <-ctx.Done():
-		return protocol.ControlCommand{}, ctx.Err()
-	}
-}
 func TestBackend_EarlyAcceptedShutdownSurvivesDelayedForwarding(t *testing.T) {
 	f := newBackendFixture(t)
 	slow := &delayedPreflightUV{fakeUV: f.uv, started: make(chan struct{}), expired: make(chan struct{}), release: make(chan struct{})}
