@@ -17,7 +17,7 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
 
-// NewProductionManagedSupervisor 创建延迟打开受管依赖的 Windows supervisor。
+// NewProductionManagedSupervisor 创建延迟打开受管依赖的本机 supervisor。
 func NewProductionManagedSupervisor(
 	ctx context.Context,
 	layout *config.Layout,

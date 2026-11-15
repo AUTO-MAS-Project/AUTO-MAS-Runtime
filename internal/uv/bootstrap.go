@@ -32,7 +32,7 @@ type DownloadClient interface {
 	Download(ctx context.Context, request mirror.DownloadRequest) (mirror.DownloadResult, error)
 }
 
-// ArchiveExtractor 把已校验的 uv zip 解压到指定暂存目录。
+// ArchiveExtractor 把已校验的 uv 归档解压到指定暂存目录。
 type ArchiveExtractor interface {
 	Extract(ctx context.Context, archivePath, stagingDir string) error
 }
@@ -97,7 +97,7 @@ func WithDownloader(downloader DownloadClient) BootstrapOption {
 	}
 }
 
-// WithArchiveExtractor 注入 zip 解压器。
+// WithArchiveExtractor 注入归档解压器。
 func WithArchiveExtractor(extractor ArchiveExtractor) BootstrapOption {
 	return func(options *bootstrapOptions) error {
 		if extractor == nil {

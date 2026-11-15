@@ -155,7 +155,7 @@ func (l *Layout) VenvDir() string { return l.paths.venvDir }
 // VenvPythonExecutable 返回受管项目虚拟环境的 Python 解释器路径。
 func (l *Layout) VenvPythonExecutable() string { return l.paths.venvPythonExecutable }
 
-// PythonExecutableInVenv 返回指定 Windows 虚拟环境的解释器路径。
+// PythonExecutableInVenv 返回指定虚拟环境的本机解释器路径。
 func PythonExecutableInVenv(venvDir string) string {
 	if runtime.GOOS != "windows" {
 		return filepath.Join(venvDir, "bin", "python")

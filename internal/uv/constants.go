@@ -1,8 +1,10 @@
 package uv
 
-import "fmt"
+import (
+	"fmt"
 
-import "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
+)
 
 const (
 	// FixedVersion 是 Runtime 首版固定使用的 uv 版本。

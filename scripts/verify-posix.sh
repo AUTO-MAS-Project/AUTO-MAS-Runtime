@@ -17,5 +17,5 @@ if [[ -n "${AUTO_MAS_UV_INTEGRATION_ARCHIVE:-}" ]]; then
   go test -tags=integration ./internal/uv -run '^TestIntegration_OfficialUVArtifact$' -v -count=1
 fi
 go test -race ./... -count=1
-go test ./internal/protocol ./internal/lock ./internal/process -count=100
+go test ./internal/protocol ./internal/lock ./internal/state ./internal/process -count=100
 git diff --check
