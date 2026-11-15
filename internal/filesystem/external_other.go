@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
 func pathContains(ctx context.Context, parent, child string) (bool, error) {
@@ -17,6 +19,8 @@ func pathContains(ctx context.Context, parent, child string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	parent = config.SystemPath(parent)
+	child = config.SystemPath(child)
 	parentInfo, err := inspectExternalPath(ctx, parent, true)
 	if err != nil {
 		return false, err
@@ -52,7 +56,7 @@ func inspectExternalPath(ctx context.Context, path string, wantDirectory bool) (
 	if err := ctx.Err(); err != nil {
 		return ExternalPathInspection{}, err
 	}
-	path, err := filepath.Abs(filepath.Clean(path))
+	path, err := filepath.Abs(config.SystemPath(filepath.Clean(path)))
 	if err != nil {
 		return ExternalPathInspection{}, err
 	}

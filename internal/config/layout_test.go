@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -38,6 +39,9 @@ func TestNewLayout_ResolvesExplicitBase(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if runtime.GOOS != "windows" && (test.name == "mixed separators with parent and trailing separator" || test.name == "volume relative app root" || test.name == "unc share root") {
+				t.Skip("Windows 路径语法")
+			}
 			layout, err := config.NewLayout(test.appRoot, base)
 			if err != nil {
 				t.Fatalf("NewLayout(%q, %q) error = %v", test.appRoot, base, err)
@@ -70,6 +74,9 @@ func TestNewLayout_RejectsInvalidInputs(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if runtime.GOOS != "windows" && (test.name == "mixed separators with parent and trailing separator" || test.name == "volume relative app root" || test.name == "unc share root") {
+				t.Skip("Windows 路径语法")
+			}
 			_, err := config.NewLayout(test.appRoot, test.base)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("NewLayout(%q, %q) error = %v, want errors.Is(_, %v)", test.appRoot, test.base, err, test.want)
@@ -91,6 +98,9 @@ func TestNewLayout_DoesNotExpandShellSyntax(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if runtime.GOOS != "windows" && (test.name == "mixed separators with parent and trailing separator" || test.name == "volume relative app root" || test.name == "unc share root") {
+				t.Skip("Windows 路径语法")
+			}
 			layout, err := config.NewLayout(test.appRoot, base)
 			if err != nil {
 				t.Fatalf("NewLayout(%q, %q) error = %v", test.appRoot, base, err)
@@ -144,6 +154,9 @@ func TestNewLayout_DoesNotReadCurrentDirectory(t *testing.T) {
 }
 
 func TestLayout_IdentityKeyIsCaseInsensitive(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows 身份键大小写规则")
+	}
 	base := t.TempDir()
 	upper, err := config.NewLayout("AUTO-MAS", base)
 	if err != nil {

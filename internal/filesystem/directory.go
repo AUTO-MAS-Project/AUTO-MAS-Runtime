@@ -60,7 +60,8 @@ func (i *DirectoryIdentity) Equal(other *DirectoryIdentity) bool {
 		i.fileID == other.fileID
 }
 
-// DirectoryLease 固定一个受管目录及其祖先句柄，防止操作期间路径身份被替换。
+// DirectoryLease 保存受管目录及祖先的句柄与身份，供平台能力复核。
+// Windows 句柄阻止重命名；POSIX 按每步身份复验，不能阻止外部 rename。
 type DirectoryLease struct {
 	mu       sync.Mutex
 	path     string
@@ -94,7 +95,7 @@ func OpenManagedDirectory(
 }
 
 // PinManagedDirectory 是 OpenManagedDirectory 的语义别名，强调租约在读取期间
-// 固定目录身份并阻止同用户通过重命名替换目录叶子。
+// 保存目录身份；是否阻止重命名取决于平台能力。
 func PinManagedDirectory(
 	ctx context.Context,
 	layout *config.Layout,
