@@ -6,6 +6,22 @@ AUTO-MAS Runtime 是 AUTO-MAS 的 Windows 本机运行时管理程序。它负�
 Runtime 不代理业务 HTTP/WebSocket，不管理 Python 插件依赖，也不负责自身更新。
 正式发布首版只支持 Windows；实现进度以 [任务拆分](doc/任务拆分.md) 为准。
 
+
+## Linux / macOS 适配
+
+M11 已加入 Ubuntu 24.04 LTS 与 macOS 15+ 的 amd64/arm64 实现和原生 CI 矩阵；
+原生平台、发行与真实 AUTO-MAS 联调的验收状态见 [M11 验证记录](doc/current/M11/验收记录.md)。
+Windows 文件名和 Authenticode 签名链保持原样。POSIX 文件名为
+`auto-mas-runtime_<tag>_<linux|darwin>_<amd64|arm64>`，与 Windows 一起列入 `SHA256SUMS.txt`。
+
+下载后先核对 SHA-256，再执行 `chmod +x <文件名>`。macOS 首批二进制未签名、未公证；
+确认来源及哈希后，可在「系统设置 → 隐私与安全」允许首次运行。
+源码验证使用 Go 1.26.11，执行 `bash scripts/verify-posix.sh`。
+
+普通 worker/Agent 随后端回收；游戏、模拟器必须显式建立新 session 才可脱离。
+仅改变进程组仍在回收范围内。真实 AUTO-MAS 的脱离启动接线另行联调。
+POSIX 租约协调要求本机文件系统支持目录 `flock` 与扩展属性；不支持时失败关闭。
+
 ## Code signing policy
 
 后续 Windows Release 由 AUTO-MAS 主仓库构建并提交 SignPath 签名，Runtime 仓库验证

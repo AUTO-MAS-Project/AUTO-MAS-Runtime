@@ -13,8 +13,8 @@ import (
 // TestWorkflowAndScripts_PowerShellAST 用 pwsh 的语言解析器校验全部工作流 run block
 // 与 scripts/*.ps1 的 PowerShell 语法，恢复 T7.2 时代的手工 AST 门禁并以代码固化。
 func TestWorkflowAndScripts_PowerShellAST(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("PowerShell AST gate requires pwsh, which this gate only provisions on Windows runners")
+	if _, err := exec.LookPath("pwsh"); err != nil {
+		t.Skip("PowerShell AST gate requires pwsh")
 	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
@@ -40,7 +40,7 @@ func TestWorkflowAndScripts_PowerShellAST(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadFile(%q) error = %v", workflow, err)
 		}
-		for i, block := range extractRunBlocks(string(data)) {
+		for i, block := range extractPowerShellRunBlocks(string(data)) {
 			name := filepath.Base(workflow) + "#run[" + itoa(i) + "]"
 			chunks[name] = block
 		}
@@ -157,4 +157,26 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return digits
+}
+
+// extractPowerShellRunBlocks 仅把 Windows/pwsh job 的脚本送给 PowerShell 解析器。
+func extractPowerShellRunBlocks(source string) []string {
+	_, jobs, ok := strings.Cut(source, "\njobs:\n")
+	if !ok {
+		return nil
+	}
+	boundary := regexp.MustCompile(`(?m)^  [A-Za-z0-9_-]+:\s*$`)
+	starts := boundary.FindAllStringIndex(jobs, -1)
+	var result []string
+	for i, start := range starts {
+		end := len(jobs)
+		if i+1 < len(starts) {
+			end = starts[i+1][0]
+		}
+		job := jobs[start[0]:end]
+		if strings.Contains(job, "shell: pwsh") || strings.Contains(job, "runs-on: windows-latest") {
+			result = append(result, extractRunBlocks(job)...)
+		}
+	}
+	return result
 }

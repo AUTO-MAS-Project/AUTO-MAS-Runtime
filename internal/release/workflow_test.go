@@ -24,7 +24,7 @@ func TestReleaseWorkflow_PackageAndPublishContract(t *testing.T) {
 		{name: "versioned executable name", snippet: "$binaryName = \"auto-mas-runtime-$($env:RELEASE_TAG).exe\""},
 		{name: "direct executable checksum", snippet: "Get-FileHash -LiteralPath $binary -Algorithm SHA256"},
 		{name: "direct executable upload", snippet: "dist/${{ steps.metadata.outputs.binary_name }}"},
-		{name: "direct executable release", snippet: "release-assets/${{ needs.package.outputs.binary_name }}"},
+		{name: "direct executable release", snippet: "release-assets/auto-mas-runtime*"},
 		{name: "release action", snippet: "uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64"},
 		{name: "unmatched asset guard", snippet: "fail_on_unmatched_files: true"},
 		{name: "generated notes", snippet: "generate_release_notes: true"},
@@ -88,8 +88,8 @@ func TestReleaseWorkflow_ArtifactHandoffContract(t *testing.T) {
 		},
 		{
 			name: "Download release assets", end: "      - name: Verify signed release assets before publication",
-			required:  []string{downloadAction, "name: runtime-release-assets", "path: release-assets"},
-			forbidden: []string{"github-token:", "repository:", "run-id:", "artifact-ids:", "pattern:"},
+			required:  []string{downloadAction, "pattern: runtime-release-assets*", "merge-multiple: true", "path: release-assets", "scripts/assemble-runtime-release.ps1"},
+			forbidden: []string{"github-token:", "repository:", "run-id:", "artifact-ids:"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -192,7 +192,7 @@ func TestReleaseWorkflow_VersionedExecutableName(t *testing.T) {
 	}{
 		{name: "versioned executable name", snippet: "$binaryName = \"auto-mas-runtime-$($env:RELEASE_TAG).exe\""},
 		{name: "dynamic executable upload", snippet: "dist/${{ steps.metadata.outputs.binary_name }}"},
-		{name: "dynamic executable release", snippet: "release-assets/${{ needs.package.outputs.binary_name }}"},
+		{name: "dynamic executable release", snippet: "release-assets/auto-mas-runtime*"},
 		{name: "checksum dynamic executable", snippet: "$hash  $($env:BINARY_NAME)"},
 		{name: "smoke exact executable", snippet: "--pattern $env:BINARY_NAME"},
 	}
