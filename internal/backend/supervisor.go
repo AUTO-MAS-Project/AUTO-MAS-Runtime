@@ -176,6 +176,9 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	var revision state.Revision
 	defer func() {
 		returnErr = withSupervisionDiagnostics(returnErr, mode, revision)
+		if request.DeferBusinessStart {
+			returnErr = withFailureDetailsExtra(returnErr, nil, nil, map[string]any{"businessDeferred": true})
+		}
 	}()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -185,6 +188,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		return err
 	}
 	request.Port = port
+	request.startupDeadline = s.deps.Clock().Add(startupWorkBudget)
 	// 回环中继与实测顺序在任何 spawn 之前就位，并随本次监督整体存活（增补 2 C17 第 8 条）。
 	// 后端 Logger 此时还没建立，中继诊断先进缓冲，Logger 建立后 attach 冲刷。
 	s.relayDiagnostics = &relayDiagnostics{}
@@ -211,7 +215,22 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		}
 	}
 	if request.Control != nil {
+		if request.DeferBusinessStart {
+			repo := s.layout.RepoDir()
+			if mode == ModeDevelopment {
+				repo = request.DevelopmentRepo
+			}
+			if err := checkDeferredStartupCapability(ctx, repo); err != nil {
+				if !request.AllowLegacyBusinessStart {
+					return err
+				}
+				request.DeferBusinessStart = false
+			}
+		}
 		return s.superviseControlled(ctx, request)
+	}
+	if request.DeferBusinessStart {
+		return newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "暂缓自动业务需要 stdin 控制通道", nil, nil)
 	}
 
 	locks, err := s.deps.Lock.Acquire(ctx)
@@ -394,7 +413,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	}
 
 	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: append([]string(nil), s.deps.PythonPaths...)}
-	if err := s.deps.Health.Check(ctx, health.Expectation{
+	if err := s.checkStartupHealth(ctx, request, health.Expectation{
 		Mode:     health.ModeManaged,
 		Protocol: protocol.Version,
 		Version:  revision.Version,

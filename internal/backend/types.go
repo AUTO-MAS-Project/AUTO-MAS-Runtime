@@ -21,10 +21,13 @@ type EventEmitter interface {
 
 // Request 描述一次受管后端监督请求。
 type Request struct {
-	OperationID     string
-	RuntimePID      uint32
-	Mode            Mode
-	DevelopmentRepo string
+	DeferBusinessStart       bool
+	AllowLegacyBusinessStart bool
+	startupDeadline          time.Time
+	OperationID              string
+	RuntimePID               uint32
+	Mode                     Mode
+	DevelopmentRepo          string
 	// ShutdownTimeout 是从发出 POST /api/core/close 到进程退出的等待上限，
 	// 超时才收 Job（增补 1 C9）。CLI 由 --shutdown-timeout 提供，取值 1~120 秒；
 	// 为零或负数时回退 Dependencies.ShutdownTimeout。
@@ -56,6 +59,7 @@ type ControlReceiver interface {
 
 // Dependencies 是 ManagedSupervisor 的消费侧依赖集合。
 type Dependencies struct {
+	Activation      HTTPActivator
 	Lock            LockSet
 	State           StateStore
 	Repository      RepositoryChecker
