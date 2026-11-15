@@ -29,6 +29,12 @@ var (
 	ErrControlMailboxClosed = errors.New("backend control mailbox is closed")
 )
 
+// AcceptedControlCommand 记录控制命令的实际入队时刻，仅用于本机先后判断。
+type AcceptedControlCommand struct {
+	protocol.ControlCommand
+	AcceptedAt time.Time
+}
+
 // ControlMailbox 是 ControlReader 与 Supervisor loop 之间的有界 FIFO。
 // Submit 不执行进程或网络副作用；终止命令在入队时记录 first-wins latch。
 type ControlMailbox struct {
@@ -43,7 +49,7 @@ type ControlMailbox struct {
 	closeCh        chan struct{}
 	readerErr      error
 	readerReported bool
-	terminal       protocol.ControlCommand
+	terminal       AcceptedControlCommand
 	hasTerm        bool
 	beforeShutdown func(string)
 	setStage       func(protocol.Stage)
@@ -90,7 +96,7 @@ func (m *ControlMailbox) Submit(ctx context.Context, command protocol.ControlCom
 			firstTerminal := false
 			if command.Command == protocol.ControlCancel || command.Command == protocol.ControlShutdown {
 				if !m.hasTerm {
-					m.terminal = command
+					m.terminal = AcceptedControlCommand{ControlCommand: command, AcceptedAt: time.Now()}
 					m.hasTerm = true
 					firstTerminal = true
 				}
@@ -136,7 +142,7 @@ func (m *ControlMailbox) Receive(ctx context.Context) (protocol.ControlCommand, 
 			m.queue = m.queue[1:]
 			if command.Command == protocol.ControlCancel || command.Command == protocol.ControlShutdown {
 				if !m.hasTerm {
-					m.terminal = command
+					m.terminal = AcceptedControlCommand{ControlCommand: command, AcceptedAt: time.Now()}
 					m.hasTerm = true
 				}
 			}
@@ -235,9 +241,9 @@ func (m *ControlMailbox) signalLocked() {
 }
 
 // TerminalCommand 返回入队时记录的 first-wins 终止命令。
-func (m *ControlMailbox) TerminalCommand() (protocol.ControlCommand, bool) {
+func (m *ControlMailbox) TerminalCommand() (AcceptedControlCommand, bool) {
 	if m == nil {
-		return protocol.ControlCommand{}, false
+		return AcceptedControlCommand{}, false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1026,7 +1032,7 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 				return state.EnvironmentState{}, state.Revision{}, newError(protocol.CodeInternalError, protocol.StageBackendSpawn, "stdin 控制通道读取失败", nil, infraErr)
 			}
 			if _, ok := terminalCommand(request.Control); ok {
-				interruptCause := ctx.Err()
+				interruptCause := preflightInterruptCause(ctx, request.Control)
 				command, drainErr := s.drainUntilTerminal(ctx, request, snapshot, results)
 				if drainErr != nil {
 					return state.EnvironmentState{}, state.Revision{}, drainErr
@@ -1038,7 +1044,7 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 			}
 			return result.environment, result.revision, result.err
 		case <-ctx.Done():
-			interruptCause := ctx.Err()
+			interruptCause := preflightInterruptCause(ctx, request.Control)
 			cancel()
 			<-done
 			if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
@@ -1078,7 +1084,7 @@ func (s *ManagedSupervisor) awaitControlPreflight(ctx context.Context, request R
 					return state.EnvironmentState{}, state.Revision{}, err
 				}
 			case protocol.ControlCancel, protocol.ControlShutdown:
-				interruptCause := ctx.Err()
+				interruptCause := preflightInterruptCause(ctx, request.Control)
 				cancel()
 				<-done
 				if infraErr := controlInfrastructureError(request.Control); infraErr != nil {
@@ -1703,15 +1709,35 @@ func startControlForwarder(ctx context.Context, receiver ControlReceiver) (<-cha
 }
 
 func terminalCommand(receiver ControlReceiver) (protocol.ControlCommand, bool) {
+	accepted, ok := acceptedTerminalCommand(receiver)
+	return accepted.ControlCommand, ok
+}
+
+func acceptedTerminalCommand(receiver ControlReceiver) (AcceptedControlCommand, bool) {
 	if receiver == nil {
-		return protocol.ControlCommand{}, false
+		return AcceptedControlCommand{}, false
 	}
 	if source, ok := receiver.(interface {
-		TerminalCommand() (protocol.ControlCommand, bool)
+		TerminalCommand() (AcceptedControlCommand, bool)
 	}); ok {
 		return source.TerminalCommand()
 	}
-	return protocol.ControlCommand{}, false
+	return AcceptedControlCommand{}, false
+}
+
+func preflightInterruptCause(ctx context.Context, receiver ControlReceiver) error {
+	cause := ctx.Err()
+	command, accepted := acceptedTerminalCommand(receiver)
+	if cause == context.Canceled && accepted {
+		return nil
+	}
+	if cause == context.DeadlineExceeded {
+		deadline, bounded := ctx.Deadline()
+		if accepted && bounded && !command.AcceptedAt.After(deadline) {
+			return nil
+		}
+	}
+	return cause
 }
 
 func setControlStage(receiver ControlReceiver, stage protocol.Stage) {

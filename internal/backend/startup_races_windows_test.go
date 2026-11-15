@@ -147,3 +147,59 @@ func TestBackend_PreflightTimeoutSurvivesLateShutdown(t *testing.T) {
 		t.Fatal("supervision did not settle")
 	}
 }
+
+type pausedControlMailbox struct {
+	*ControlMailbox
+	forward chan struct{}
+}
+
+func (m *pausedControlMailbox) Receive(ctx context.Context) (protocol.ControlCommand, error) {
+	select {
+	case <-m.forward:
+		return m.ControlMailbox.Receive(ctx)
+	case <-ctx.Done():
+		return protocol.ControlCommand{}, ctx.Err()
+	}
+}
+func TestBackend_EarlyAcceptedShutdownSurvivesDelayedForwarding(t *testing.T) {
+	f := newBackendFixture(t)
+	slow := &delayedPreflightUV{fakeUV: f.uv, started: make(chan struct{}), expired: make(chan struct{}), release: make(chan struct{})}
+	control := &pausedControlMailbox{ControlMailbox: NewControlMailbox(8), forward: make(chan struct{})}
+	supervisor := f.supervisor()
+	supervisor.deps.UV = slow
+	var clockCalls atomic.Int32
+	origin := time.Unix(0, 0)
+	supervisor.deps.Clock = func() time.Time {
+		if clockCalls.Add(1) == 1 {
+			return origin
+		}
+		return origin.Add(startupWorkBudget - 200*time.Millisecond)
+	}
+	done := make(chan error, 1)
+	go func() {
+		request := f.request()
+		request.Control = control
+		done <- supervisor.Supervise(t.Context(), request)
+	}()
+	waitFor(t, slow.started)
+	select {
+	case <-slow.expired:
+		t.Fatal("deadline expired before early command could be accepted")
+	default:
+	}
+	if err := control.Submit(t.Context(), protocol.ControlCommand{Command: protocol.ControlShutdown, CommandID: "early-accepted-shutdown"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, slow.expired)
+	close(slow.release)
+	close(control.forward)
+	select {
+	case err := <-done:
+		t.Logf("accepted shutdown before deadline, delivered after deadline, result=%v", err)
+		if err != nil {
+			t.Fatalf("accepted shutdown was replaced by timeout: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not settle")
+	}
+}

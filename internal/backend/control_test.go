@@ -1475,13 +1475,13 @@ func (r *delayedControlReceiver) Receive(ctx context.Context) (protocol.ControlC
 	}
 }
 
-func (r *delayedControlReceiver) TerminalCommand() (protocol.ControlCommand, bool) {
+func (r *delayedControlReceiver) TerminalCommand() (AcceptedControlCommand, bool) {
 	if source, ok := r.receiver.(interface {
-		TerminalCommand() (protocol.ControlCommand, bool)
+		TerminalCommand() (AcceptedControlCommand, bool)
 	}); ok {
 		return source.TerminalCommand()
 	}
-	return protocol.ControlCommand{}, false
+	return AcceptedControlCommand{}, false
 }
 
 func (r *delayedControlReceiver) InfrastructureError() error {
