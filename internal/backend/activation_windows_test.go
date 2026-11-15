@@ -24,6 +24,28 @@ func declareDeferredStartup(t *testing.T, repo string) {
 	}
 }
 
+func TestDeferredStartup_PreflightDeadlineKeepsRetrySafety(t *testing.T) {
+	f := newBackendFixture(t)
+	declareDeferredStartup(t, f.layout.RepoDir())
+	supervisor := f.supervisor()
+	supervisor.deps.WithStartupTimeout = func(parent context.Context, _ time.Duration, cause error) (context.Context, context.CancelFunc) {
+		return context.WithTimeoutCause(parent, 0, cause)
+	}
+	mailbox := NewControlMailbox(8)
+	defer mailbox.Close()
+	request := f.request()
+	request.Control, request.DeferBusinessStart = mailbox, true
+	err := supervisor.Supervise(t.Context(), request)
+	assertBackendCode(t, err, protocol.CodeBackendHealthTimeout)
+	var failure interface{ Details() map[string]any }
+	if !errors.As(err, &failure) || failure.Details()["businessDeferred"] != true {
+		t.Fatalf("deferred preflight failure lost safe-retry fact: %v", err)
+	}
+	if f.uv.startCalls != 0 {
+		t.Fatalf("spawned %d backends before the preflight deadline", f.uv.startCalls)
+	}
+}
+
 func TestDeferredStartup_StopCancelsUncommittedActivation(t *testing.T) {
 	f := newBackendFixture(t)
 	f.proc.keepAlive = true

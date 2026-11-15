@@ -32,6 +32,9 @@ type startupDeadlineError struct {
 // InternalDeadline 区分服务内部预算与调用方取消。
 func (*startupDeadlineError) InternalDeadline() bool { return true }
 
+// Unwrap 保留可被既有诊断包装识别的 backend.Error，再由它展开原始根因。
+func (e *startupDeadlineError) Unwrap() error { return e.startupFailure }
+
 func newStartupDeadlineError(stage protocol.Stage, cause error, work context.Context) error {
 	var diagnostic interface{ Details() map[string]any }
 	details := map[string]any{}
