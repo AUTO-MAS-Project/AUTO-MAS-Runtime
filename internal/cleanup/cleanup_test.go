@@ -178,7 +178,11 @@ New-Item -ItemType Junction -Path $path -Target $target -ErrorAction Stop |
 func deadPID(t *testing.T) uint32 {
 	t.Helper()
 	if runtime.GOOS != "windows" {
-		cmd := exec.CommandContext(t.Context(), "/bin/true")
+		trueExecutable, err := exec.LookPath("true")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), trueExecutable)
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
