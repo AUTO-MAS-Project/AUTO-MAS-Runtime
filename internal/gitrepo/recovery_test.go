@@ -564,7 +564,7 @@ func TestRecovery_ExistingRepositoryChangedIsNotRewritten(t *testing.T) {
 	previous := mustRepoPreviousDir(t, layout, tx.state.OperationID)
 	writeRecoveryRepository(t, layout.RepoDir(), "v5.4.0", recoverySourceURL(t), "target")
 	writeRecoveryRepository(t, previous, "v5.3.0", recoverySourceURL(t), "old")
-	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), layout.RepoDir())
+	snapshot, err := inspectTestRepository(t, layout.RepoDir())
 	if err != nil {
 		t.Fatalf("Inspect(active repo) error = %v", err)
 	}
@@ -826,7 +826,7 @@ func TestRecovery_ReparseAncestorHasNoSideEffects(t *testing.T) {
 		t.Fatalf("MkdirAll(external) error = %v", err)
 	}
 	alias := filepath.Join(container, "alias")
-	mustCreateGitRepoJunction(t, alias, external)
+	mustCreateGitRepoDirectoryLink(t, alias, external)
 	layout, err := config.NewLayout(filepath.Join(alias, "app"), container)
 	if err != nil {
 		t.Fatalf("config.NewLayout() error = %v", err)
@@ -880,11 +880,11 @@ func TestRecovery_PreSwapSameTargetCommitFromDifferentSourcesIsEquivalent(t *tes
 	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
 	writeRecoveryRepository(t, layout.RepoDir(), "v5.4.0", recoverySourceURLForKey(t, "cnb"), "active")
 	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURLForKey(t, "github"), "candidate")
-	activeSnapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), layout.RepoDir())
+	activeSnapshot, err := inspectTestRepository(t, layout.RepoDir())
 	if err != nil {
 		t.Fatalf("Inspect(active) error = %v", err)
 	}
-	updateSnapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), update)
+	updateSnapshot, err := inspectTestRepository(t, update)
 	if err != nil {
 		t.Fatalf("Inspect(update) error = %v", err)
 	}
@@ -913,11 +913,11 @@ func TestRecovery_SwapSameTargetCommitFromDifferentSourcesIsNotMultipleRevision(
 	update := mustRepoUpdateDir(t, layout, tx.state.OperationID)
 	writeRecoveryRepository(t, layout.RepoDir(), "v5.4.0", recoverySourceURLForKey(t, "cnb"), "active")
 	writeRecoveryRepository(t, update, "v5.4.0", recoverySourceURLForKey(t, "github"), "candidate")
-	activeSnapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), layout.RepoDir())
+	activeSnapshot, err := inspectTestRepository(t, layout.RepoDir())
 	if err != nil {
 		t.Fatalf("Inspect(active) error = %v", err)
 	}
-	updateSnapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), update)
+	updateSnapshot, err := inspectTestRepository(t, update)
 	if err != nil {
 		t.Fatalf("Inspect(update) error = %v", err)
 	}
@@ -1496,7 +1496,7 @@ func setupIncompletePreviousRecovery(
 	previous := mustRepoPreviousDir(t, layout, tx.state.OperationID)
 	writeRecoveryRepository(t, layout.RepoDir(), tx.state.TargetVersion, recoverySourceURL(t), "target")
 	writeRecoveryRepository(t, previous, "v5.4.0", recoverySourceURL(t), "previous")
-	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), layout.RepoDir())
+	snapshot, err := inspectTestRepository(t, layout.RepoDir())
 	if err != nil {
 		t.Fatalf("Inspect(active repo) error = %v", err)
 	}

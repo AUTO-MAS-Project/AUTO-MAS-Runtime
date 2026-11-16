@@ -111,7 +111,6 @@ func probeUVVersionWithLayout(
 	}
 	return version, nil
 }
-
 func probeManagedPythonExecutable(ctx context.Context, layout *config.Layout) (string, error) {
 	executable, err := layout.UVExecutable(uv.FixedVersion)
 	if err != nil {

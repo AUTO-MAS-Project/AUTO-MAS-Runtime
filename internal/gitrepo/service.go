@@ -262,7 +262,7 @@ func (s *Service) Check(ctx context.Context) (CheckResult, error) {
 		}
 		return CheckResult{Reason: "invalid"}, nil
 	}
-	snapshot, inspectErr := s.reader.Inspect(ctx, s.layout.RepoDir())
+	snapshot, inspectErr := s.reader.Inspect(ctx, repositoryAccess{path: s.layout.RepoDir(), lease: lease})
 	closeErr := lease.Close()
 	if closeErr != nil {
 		inspectErr = errors.Join(inspectErr, closeErr)

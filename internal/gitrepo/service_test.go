@@ -76,7 +76,7 @@ func TestService_CheckRejectsReparseAncestor(t *testing.T) {
 		t.Fatalf("MkdirAll(external app) error = %v", err)
 	}
 	alias := filepath.Join(container, "alias")
-	mustCreateGitRepoJunction(t, alias, external)
+	mustCreateGitRepoDirectoryLink(t, alias, external)
 	layout, err := config.NewLayout(filepath.Join(alias, "app"), container)
 	if err != nil {
 		t.Fatalf("config.NewLayout() error = %v", err)
@@ -599,7 +599,7 @@ type blockingServiceReader struct {
 	release  chan struct{}
 }
 
-func (r *blockingServiceReader) Inspect(ctx context.Context, _ string) (repositorySnapshot, error) {
+func (r *blockingServiceReader) Inspect(ctx context.Context, _ repositoryAccess) (repositorySnapshot, error) {
 	close(r.entered)
 	select {
 	case <-r.release:
@@ -609,7 +609,7 @@ func (r *blockingServiceReader) Inspect(ctx context.Context, _ string) (reposito
 	}
 }
 
-func (r *serviceTestReader) Inspect(context.Context, string) (repositorySnapshot, error) {
+func (r *serviceTestReader) Inspect(context.Context, repositoryAccess) (repositorySnapshot, error) {
 	if r.err != nil {
 		return repositorySnapshot{}, r.err
 	}

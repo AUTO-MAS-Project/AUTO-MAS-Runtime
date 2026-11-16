@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// mustCreateGitRepoJunction 创建测试用目录 Junction，并只在清理时移除链接本身。
-func mustCreateGitRepoJunction(t *testing.T, link, target string) {
+// mustCreateGitRepoDirectoryLink 创建测试用目录 Junction，并只在清理时移除链接本身。
+func mustCreateGitRepoDirectoryLink(t *testing.T, link, target string) {
 	t.Helper()
 	script := `$ErrorActionPreference = 'Stop'
 $target = $env:AUTO_MAS_GITREPO_JUNCTION_TARGET

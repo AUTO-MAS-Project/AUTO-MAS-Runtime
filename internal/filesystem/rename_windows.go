@@ -3,13 +3,10 @@ package filesystem
 import (
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/windows"
-
-	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 type renameAttempt struct {
@@ -115,31 +112,6 @@ func (o *Operator) AtomicRename(
 			return RenameResult{}, err
 		}
 	}
-}
-
-func validateRenameRequestValues(
-	ctx context.Context,
-	request RenameRequest,
-) error {
-	if ctx == nil {
-		return fmt.Errorf("%w: context is nil", ErrInvalidArgument)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !request.Kind.Valid() || request.Source == "" || request.Destination == "" ||
-		validateAuditValue(request.OperationID) != nil ||
-		validateAuditValue(request.Reason) != nil {
-		return ErrInvalidArgument
-	}
-	if request.Kind == RenameUVStagingToVersion {
-		if request.Version == "" {
-			return ErrInvalidArgument
-		}
-	} else if request.Version != "" {
-		return ErrInvalidArgument
-	}
-	return nil
 }
 
 func (o *Operator) pinRenameAttempt(
@@ -250,31 +222,6 @@ func (o *Operator) pinRenameAttempt(
 	}, nil
 }
 
-func (o *Operator) expectedRenamePaths(
-	request RenameRequest,
-) (string, string, error) {
-	switch request.Kind {
-	case RenameRepositoryToRetired:
-		destination, err := o.layout.RepoPreviousDir(request.OperationID)
-		return o.layout.RepoDir(), destination, wrapLayoutArgument(err)
-	case RenameUpdateToRepository:
-		source, err := o.layout.RepoUpdateDir(request.OperationID)
-		return source, o.layout.RepoDir(), wrapLayoutArgument(err)
-	case RenameRepositoryRollback:
-		source, err := o.layout.RepoPreviousDir(request.OperationID)
-		return source, o.layout.RepoDir(), wrapLayoutArgument(err)
-	case RenameUVStagingToVersion:
-		source, sourceErr := o.layout.UVStagingDir(request.Version, request.OperationID)
-		destination, destinationErr := o.layout.UVVersionDir(request.Version)
-		return source, destination, errors.Join(
-			wrapLayoutArgument(sourceErr),
-			wrapLayoutArgument(destinationErr),
-		)
-	default:
-		return "", "", ErrInvalidArgument
-	}
-}
-
 func renameSourceSpec() openSpec {
 	return openSpec{
 		access:    windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE,
@@ -337,13 +284,4 @@ func sameRenamePath(left, right string) bool {
 	left = filepath.Clean(strings.ReplaceAll(left, "/", `\`))
 	right = filepath.Clean(strings.ReplaceAll(right, "/", `\`))
 	return strings.EqualFold(left, right)
-}
-
-func occupiedRenameError(path string, cause error) error {
-	return &Error{
-		code:      protocol.CodeDirectoryOccupied,
-		Operation: "rename",
-		Path:      path,
-		Err:       cause,
-	}
 }

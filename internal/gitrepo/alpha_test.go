@@ -38,7 +38,7 @@ func TestComponent_AlphaDevIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch(alpha) = %v, want dev clone", err)
 	}
-	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), first.RepositoryPath)
+	snapshot, err := inspectTestRepository(t, first.RepositoryPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestComponent_AlphaDevIdentity(t *testing.T) {
 	if err != nil || second.Revision.Commit() == first.Revision.Commit() {
 		t.Fatalf("Fetch(moved dev) = %+v, %v, want new commit", second, err)
 	}
-	snapshot, err = (goGitRepositoryReader{}).Inspect(t.Context(), second.RepositoryPath)
+	snapshot, err = inspectTestRepository(t, second.RepositoryPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestComponent_AlphaDevIdentity(t *testing.T) {
 	if err := cloned.SetConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err = (goGitRepositoryReader{}).Inspect(t.Context(), second.RepositoryPath)
+	snapshot, err = inspectTestRepository(t, second.RepositoryPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestComponent_AlphaDevIdentity(t *testing.T) {
 		t.Fatal("identity accepted mismatched binding commit")
 	}
 	bindingAttempted := false
-	fetcher.bindRevision = func(context.Context, string, Revision) error {
+	fetcher.bindRevision = func(context.Context, repositoryAccess, Revision) error {
 		bindingAttempted = true
 		return errors.New("injected alpha binding write failure")
 	}
@@ -126,7 +126,7 @@ func bindAlphaFixture(t *testing.T, path, version string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bindAlphaRevision(t.Context(), path, revision); err != nil {
+	if err := bindAlphaRevision(t.Context(), testRepositoryAccess(t, path), revision); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -224,7 +224,7 @@ func TestService_LegacyAlphaReleaseCheck(t *testing.T) {
 	if err != nil || !current.Healthy || current.Version != version || current.Branch != "release/"+version {
 		t.Fatalf("legacy alpha Check = %+v, %v", current, err)
 	}
-	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), layout.RepoDir())
+	snapshot, err := inspectTestRepository(t, layout.RepoDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestService_LegacyAlphaStagedMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeRecoveryRepositoryWithExtraCommit(t, update, req.Target.Version(), recoverySourceURL(t), "new")
-	snapshot, err := (goGitRepositoryReader{}).Inspect(t.Context(), update)
+	snapshot, err := inspectTestRepository(t, update)
 	if err != nil {
 		t.Fatal(err)
 	}

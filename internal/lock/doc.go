@@ -1,2 +1,3 @@
-// Package lock 以平台原生协调机制串行化同一物理 app root 的 Runtime 租约。
+// Package lock 按物理 app root 协调 Runtime 操作。
+// Windows 使用命名 Mutex；POSIX 使用持久文件锁并复核锁文件身份。
 package lock

@@ -2,23 +2,19 @@ package filesystem
 
 import (
 	"context"
-	"strings"
+	"fmt"
 
 	"golang.org/x/sys/unix"
 )
 
-// FileSystemName 返回内核报告的实际挂载格式。
+// FileSystemName 只读查询路径所在卷的文件系统格式。
 func FileSystemName(ctx context.Context, path string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	var info unix.Statfs_t
-	if err := unix.Statfs(path, &info); err != nil {
-		return "", err
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return "", fmt.Errorf("query file system: %w", err)
 	}
-	name := strings.TrimRight(string(info.Fstypename[:]), "\x00")
-	if name != "apfs" && name != "hfs" {
-		name = "unknown"
-	}
-	return name, nil
+	return unix.ByteSliceToString(stat.Fstypename[:]), nil
 }

@@ -61,13 +61,15 @@ func (i *DirectoryIdentity) Equal(other *DirectoryIdentity) bool {
 }
 
 // DirectoryLease 保存受管目录及祖先的句柄与身份，供平台能力复核。
-// Windows 句柄阻止重命名；POSIX 按每步身份复验，不能阻止外部 rename。
+// Windows 句柄阻止重命名；POSIX 按每步身份复验。macOS FD 固定对象身份，
+// 位置保证遵循同 UID 信任边界；Linux 不能阻止外部 rename。
 type DirectoryLease struct {
 	mu       sync.Mutex
 	path     string
 	identity *DirectoryIdentity
 	close    func() error
 	closed   bool
+	rootFile *os.File // macOS 的目录 FD，由 close 回调统一释放；Windows 留空。
 }
 
 // PrepareManagedDirectory 在受管根内原子准备一个新的目录租约。

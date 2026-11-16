@@ -1,12 +1,13 @@
-//go:build linux || darwin
-
 package filesystem
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
 
 func validateAuditValue(value string) error {
@@ -60,6 +61,31 @@ func wrapLayoutArgument(err error) error {
 	return fmt.Errorf("%w: layout getter: %w", ErrInvalidArgument, err)
 }
 
+func validateRenameRequestValues(
+	ctx context.Context,
+	request RenameRequest,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: context is nil", ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !request.Kind.Valid() || request.Source == "" || request.Destination == "" ||
+		validateAuditValue(request.OperationID) != nil ||
+		validateAuditValue(request.Reason) != nil {
+		return ErrInvalidArgument
+	}
+	if request.Kind == RenameUVStagingToVersion {
+		if request.Version == "" {
+			return ErrInvalidArgument
+		}
+	} else if request.Version != "" {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
 func (o *Operator) expectedRenamePaths(
 	request RenameRequest,
 ) (string, string, error) {
@@ -82,5 +108,14 @@ func (o *Operator) expectedRenamePaths(
 		)
 	default:
 		return "", "", ErrInvalidArgument
+	}
+}
+
+func occupiedRenameError(path string, cause error) error {
+	return &Error{
+		code:      protocol.CodeDirectoryOccupied,
+		Operation: "rename",
+		Path:      path,
+		Err:       cause,
 	}
 }

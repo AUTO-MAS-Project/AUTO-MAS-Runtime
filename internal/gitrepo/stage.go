@@ -154,7 +154,7 @@ func (s *Service) readPreparedFetch(ctx context.Context, transaction state.Trans
 		return FetchResult{}, serviceAmbiguousError(protocol.StageWorkspaceVerify, "prepared_update_missing", err)
 	}
 	identityToken := lease.Identity()
-	snapshot, inspectErr := s.reader.Inspect(ctx, path)
+	snapshot, inspectErr := s.reader.Inspect(ctx, repositoryAccess{path: path, lease: lease})
 	closeErr := lease.Close()
 	if inspectErr != nil || closeErr != nil {
 		return FetchResult{}, serviceAmbiguousError(protocol.StageWorkspaceVerify, "prepared_update_unreadable", errors.Join(inspectErr, closeErr))
