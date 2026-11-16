@@ -52,9 +52,23 @@ func TestPOSIXProcess_StartAndTerminate(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("backend readiness timed out")
 	}
-	infos, err := proc.Snapshot()
-	if err != nil || len(infos) == 0 {
-		t.Fatalf("got %+v %v, want managed members", infos, err)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	readyDeadline := time.NewTimer(5 * time.Second)
+	defer readyDeadline.Stop()
+	for {
+		infos, snapshotErr := proc.Snapshot()
+		if snapshotErr != nil {
+			t.Fatal(snapshotErr)
+		}
+		if len(infos) >= 2 {
+			break
+		}
+		select {
+		case <-readyDeadline.C:
+			t.Fatalf("got %+v, want managed root and descendant", infos)
+		case <-ticker.C:
+		}
 	}
 	if err = proc.Terminate(1); err != nil {
 		t.Fatal(err)

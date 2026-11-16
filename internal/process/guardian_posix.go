@@ -156,29 +156,42 @@ func (j *posixManagedJob) snapshot() ([]Info, error) {
 	return sessionMembers(j.session)
 }
 func (j *posixManagedJob) Terminate(uint32) error {
-	members, err := j.snapshot()
-	if err != nil {
-		return err
-	}
 	var result error
-	for _, member := range members {
-		sid, e := unix.Getsid(int(member.PID))
-		if errors.Is(e, unix.ESRCH) {
-			continue
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		members, err := j.snapshot()
+		if err != nil {
+			return errors.Join(result, err)
 		}
-		if e != nil {
-			result = errors.Join(result, e)
-			continue
+		if len(members) == 0 {
+			return result
 		}
-		if sid != j.session {
-			continue
+		for _, member := range members {
+			sid, e := unix.Getsid(int(member.PID))
+			if errors.Is(e, unix.ESRCH) {
+				continue
+			}
+			if e != nil {
+				result = errors.Join(result, e)
+				continue
+			}
+			if sid != j.session {
+				continue
+			}
+			e = unix.Kill(int(member.PID), unix.SIGKILL)
+			if !errors.Is(e, unix.ESRCH) {
+				result = errors.Join(result, e)
+			}
 		}
-		e = unix.Kill(int(member.PID), unix.SIGKILL)
-		if !errors.Is(e, unix.ESRCH) {
-			result = errors.Join(result, e)
+		select {
+		case <-deadline.C:
+			return errors.Join(result, errors.New("managed process session did not empty"))
+		case <-ticker.C:
 		}
 	}
-	return result
 }
 func (j *posixManagedJob) waitEmpty(ctx context.Context) error {
 	timer := time.NewTicker(10 * time.Millisecond)
