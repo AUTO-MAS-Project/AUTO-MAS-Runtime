@@ -150,11 +150,11 @@ func (p *chunkPlan) demoteLaggards(self string) []string {
 
 // demoteTailLaggard 由队列已空、准备退出的 worker 调用：若还有别的 worker 在取片、本 worker 至少完成过一片、
 // 且对方进度未过半，则判对方为慢源并取消其片，让本 worker 接手剩余范围。
-// 返回 (是否降级了谁, 再等多久)：候选存在但片龄还不够时返回距离最小在飞时长的剩余时间，调用方等够再来；
+// 返回 (被降级源, 再等多久)：候选存在但片龄还不够时返回距离最小在飞时长的剩余时间，调用方等够再来；
 // 没有候选（对方进度已过半或已判慢）时两者都为零值。
-func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) (bool, time.Duration) {
+func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) (string, time.Duration) {
 	if !selfCompleted {
-		return false, 0
+		return "", 0
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -175,9 +175,9 @@ func (p *chunkPlan) demoteTailLaggard(self string, selfCompleted bool) (bool, ti
 		}
 		p.slow[key] = true
 		entry.cancel()
-		return true, 0
+		return key, 0
 	}
-	return false, retryAfter
+	return "", retryAfter
 }
 
 // awaitChange 等待 pending / inflight 发生变化，或 ctx 结束；用于降级后等待慢源把剩余范围回队。
@@ -190,6 +190,24 @@ func (p *chunkPlan) awaitChange(ctx context.Context) bool {
 		return true
 	case <-ctx.Done():
 		return false
+	}
+}
+
+// awaitEnd 等待指定源完成当前片并把它已有的剩余范围重新入队。
+func (p *chunkPlan) awaitEnd(ctx context.Context, key string) bool {
+	for {
+		p.mu.Lock()
+		_, inflight := p.inflight[key]
+		changed := p.changed
+		p.mu.Unlock()
+		if !inflight {
+			return true
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
@@ -388,10 +406,10 @@ func (e *engine) chunkWorker(
 				return
 			}
 			demoted, retryAfter := plan.demoteTailLaggard(upstream.Key, selfCompleted)
-			if !demoted && retryAfter <= 0 {
+			if demoted == "" && retryAfter <= 0 {
 				return
 			}
-			if !demoted {
+			if demoted == "" {
 				// 落后者还太年轻：等到它够龄（或它先有变化）再判一次，而不是退出后干等它慢慢取完。
 				if !plan.awaitChangeOrTimeout(ctx, e.timers(retryAfter)) {
 					return
@@ -399,7 +417,7 @@ func (e *engine) chunkWorker(
 				continue
 			}
 			// 被降级的 worker 会把剩余范围回队；等它回队（或退出）后再取。
-			if !plan.awaitChange(ctx) {
+			if !plan.awaitEnd(ctx, demoted) {
 				return
 			}
 			continue
@@ -408,12 +426,15 @@ func (e *engine) chunkWorker(
 		attempt := AttemptOutcome{Source: upstream.Key}
 		startedAt := e.now()
 		received, outcome := e.fetchChunk(chunkCtx, spec, upstream, piece, file, plan, &attempt)
-		plan.end(upstream.Key)
 		if outcome == "" {
+			plan.end(upstream.Key)
 			plan.credit(upstream.Key, received)
 			plan.complete()
 			selfCompleted = true
 			for _, demoted := range plan.demoteLaggards(upstream.Key) {
+				if !plan.awaitEnd(ctx, demoted) {
+					return
+				}
 				e.demoteUpstream(spec.key.route, demoted)
 				e.log("info", "relay slow source demoted", map[string]any{
 					"route": spec.key.route.String(), "item": spec.name, "source": demoted, "by": upstream.Key,
@@ -427,9 +448,11 @@ func (e *engine) chunkWorker(
 			if received < piece.length() {
 				plan.push(chunk{start: piece.start + received, end: piece.end})
 			}
+			plan.end(upstream.Key)
 			e.demoteUpstream(spec.key.route, upstream.Key)
 			return
 		}
+		plan.end(upstream.Key)
 		plan.push(piece)
 		e.tracker.discard(spec.key, upstream.Key, received)
 		e.finishAttempt(&attempt, outcome, startedAt)
