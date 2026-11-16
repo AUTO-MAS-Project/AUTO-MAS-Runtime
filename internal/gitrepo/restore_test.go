@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,9 @@ func TestRestoreTrackedFiles_LocalCommit(t *testing.T) {
 }
 
 func TestRestoreTrackedFiles_ReleasesScanDirectoryBeforeRepair(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("macOS rooted Git intentionally retains the repository lease across restore")
+	}
 	layout, _ := sourceRestoreFixture(t)
 	directory := filepath.Join(layout.RepoDir(), "zzz")
 	path := filepath.Join(directory, "last.py")

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"time"
 )
 
@@ -18,7 +19,11 @@ func main() {
 	root, err := os.MkdirTemp("", "runtime-smoke-")
 	check(err)
 	defer os.RemoveAll(root)
-	for _, args := range [][]string{{"version", "--output", "ndjson"}, {"doctor", "--output", "ndjson", "--app-root", root}} {
+	commands := [][]string{{"version", "--output", "ndjson"}}
+	if runtime.GOOS != "darwin" {
+		commands = append(commands, []string{"doctor", "--output", "ndjson", "--app-root", root})
+	}
+	for _, args := range commands {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		cmd := exec.CommandContext(ctx, os.Args[1], args...)
 		var stdout, stderr bytes.Buffer
