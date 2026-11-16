@@ -33,13 +33,13 @@ jobs:
 
       - name: Check formatting
         run: |
-          $goFiles = Get-ChildItem -LiteralPath . -Recurse -Filter "*.go" -File
-          $formatDiff = gofmt -d $goFiles.FullName
+          $goFiles = @(git ls-files '*.go')
+          if ($LASTEXITCODE -ne 0) { throw "git ls-files failed" }
+          if ($goFiles.Count -eq 0) { throw "no Go files found" }
+          & gofmt -w $goFiles
           if ($LASTEXITCODE -ne 0) { throw "gofmt failed" }
-          if ($formatDiff) {
-            $formatDiff
-            throw "Go files are not formatted"
-          }
+          & git diff --exit-code -- '*.go'
+          if ($LASTEXITCODE -ne 0) { throw "Go files are not formatted" }
 
       - name: Vet
         run: |

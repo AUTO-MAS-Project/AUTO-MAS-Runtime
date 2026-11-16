@@ -3,8 +3,16 @@ set -euo pipefail
 export GOTOOLCHAIN=go1.26.11
 export GOCACHE="${TMPDIR:-/tmp}/auto-mas-runtime-verify"
 export AUTO_MAS_TELEMETRY=disabled
-gofmt_command="$(go env GOROOT)/bin/gofmt"
-[[ -z "$("$gofmt_command" -l .)" ]]
+go_files=()
+while IFS= read -r -d '' go_file; do
+  go_files+=("$go_file")
+done < <(git ls-files -z -- '*.go')
+if ((${#go_files[@]} == 0)); then
+  echo "no Go files found" >&2
+  exit 1
+fi
+gofmt -w "${go_files[@]}"
+git diff --exit-code -- '*.go'
 go version
 go vet ./...
 go build -buildvcs=false ./...
