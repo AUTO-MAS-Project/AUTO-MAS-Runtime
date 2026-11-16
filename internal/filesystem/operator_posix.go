@@ -75,13 +75,24 @@ func (o *Operator) RemoveTree(ctx context.Context, r DeleteRequest) (DeleteResul
 	if r.ExpectedIdentity != nil && !r.ExpectedIdentity.Equal(&id) {
 		return DeleteResult{}, errors.Join(ErrIdentityChanged, c.close())
 	}
+	if id.attributes&unix.S_IFMT != unix.S_IFDIR {
+		return DeleteResult{}, errors.Join(ErrIdentityChanged, c.close())
+	}
 	record := DeleteAuditRecord{Phase: DeleteAuditStarted, Kind: r.Kind, Target: r.Target, OperationID: r.OperationID, Reason: r.Reason}
 	if err = o.auditor.RecordDeletion(ctx, record); err != nil {
 		return DeleteResult{}, errors.Join(&AuditError{Phase: DeleteAuditStarted, Cause: err}, c.close())
 	}
 	err = c.verify(ctx)
 	if err == nil {
-		err = removePOSIXTree(ctx, c.leaf(), filepath.Base(r.Target), id, c.ids[len(c.ids)-1].volumeSerial, func() error { return c.verify(ctx) })
+		err = removePOSIXTree(
+			ctx,
+			c.leaf(),
+			filepath.Base(r.Target),
+			id,
+			c.ids[len(c.ids)-1].volumeSerial,
+			r.Kind == DeleteUVCache,
+			func() error { return c.verify(ctx) },
+		)
 	}
 	result := DeleteResult{Removed: err == nil, Partial: err != nil}
 	record.Phase = DeleteAuditFinished
@@ -107,7 +118,15 @@ func posixEntryIdentity(parent *os.File, name string) (DirectoryIdentity, bool, 
 	}
 	return posixIdentityFromStat(&st).directory, true, nil
 }
-func removePOSIXTree(ctx context.Context, parent *os.File, name string, expected DirectoryIdentity, device uint64, verify func() error) error {
+func removePOSIXTree(
+	ctx context.Context,
+	parent *os.File,
+	name string,
+	expected DirectoryIdentity,
+	device uint64,
+	removeLeafLinks bool,
+	verify func() error,
+) error {
 	if err := verify(); err != nil {
 		return err
 	}
@@ -126,6 +145,10 @@ func removePOSIXTree(ctx context.Context, parent *os.File, name string, expected
 		if id.numberOfLinks != 1 {
 			return ErrUnsafeHardLink
 		}
+		return unix.Unlinkat(int(parent.Fd()), name, 0)
+	}
+	if mode == unix.S_IFLNK && removeLeafLinks {
+		// uv 缓存用链接引用 archive；只删除已核验链接本身，目标永不进入遍历。
 		return unix.Unlinkat(int(parent.Fd()), name, 0)
 	}
 	if mode != unix.S_IFDIR {
@@ -151,7 +174,7 @@ func removePOSIXTree(ctx context.Context, parent *os.File, name string, expected
 		id, _, e := posixEntryIdentity(dir, child)
 		err = e
 		if err == nil {
-			err = removePOSIXTree(ctx, dir, child, id, device, func() error {
+			err = removePOSIXTree(ctx, dir, child, id, device, removeLeafLinks, func() error {
 				if err := verify(); err != nil {
 					return err
 				}
