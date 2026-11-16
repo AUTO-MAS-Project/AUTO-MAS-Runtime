@@ -18,7 +18,7 @@ type fakeProvider struct {
 	deadline    chan time.Time
 }
 
-func (p *fakeProvider) captureInternal(InternalObservation) {}
+func (p *fakeProvider) captureInternal(InternalObservation) string { return "" }
 
 func (p *fakeProvider) close(ctx context.Context) {
 	p.mu.Lock()
@@ -213,13 +213,13 @@ func TestConfig_InvalidSentryAddressSkipsFactory(t *testing.T) {
 
 type recordingProvider struct{ internalCalls int }
 
-func (p *recordingProvider) captureInternal(InternalObservation) { p.internalCalls++ }
-func (p *recordingProvider) close(context.Context)               {}
+func (p *recordingProvider) captureInternal(InternalObservation) string { p.internalCalls++; return "" }
+func (p *recordingProvider) close(context.Context)                      {}
 
 type panickingProvider struct{}
 
-func (panickingProvider) captureInternal(InternalObservation) { panic("capture") }
-func (panickingProvider) close(context.Context)               { panic("close") }
+func (panickingProvider) captureInternal(InternalObservation) string { panic("capture") }
+func (panickingProvider) close(context.Context)                      { panic("close") }
 
 type blockingProvider struct {
 	captureStarted chan struct{}
@@ -227,9 +227,10 @@ type blockingProvider struct {
 	closeStarted   chan struct{}
 }
 
-func (p *blockingProvider) captureInternal(InternalObservation) {
+func (p *blockingProvider) captureInternal(InternalObservation) string {
 	close(p.captureStarted)
 	<-p.releaseCapture
+	return ""
 }
 
 func (p *blockingProvider) close(context.Context) { close(p.closeStarted) }

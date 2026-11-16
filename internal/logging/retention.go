@@ -2,6 +2,7 @@ package logging
 
 import (
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -154,9 +155,15 @@ func sameRetentionPath(left, right string) bool {
 	if left == "" || right == "" {
 		return false
 	}
+	if runtime.GOOS != "windows" {
+		return filepath.Clean(left) == filepath.Clean(right)
+	}
 	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }
 
 func retentionPathKey(path string) string {
+	if runtime.GOOS != "windows" {
+		return filepath.Clean(path)
+	}
 	return strings.ToLower(strings.ReplaceAll(filepath.Clean(path), "/", `\`))
 }

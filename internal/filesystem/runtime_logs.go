@@ -47,11 +47,14 @@ type RuntimeLogWriter struct {
 
 // RuntimeLogFile 表示只能由所属目录能力消费的日志文件令牌。
 type RuntimeLogFile struct {
-	owner        *runtimeLogOwner
-	path         string
-	name         string
-	volumeSerial uint64
-	fileID       [16]byte
+	owner                 *runtimeLogOwner
+	path                  string
+	name                  string
+	volumeSerial          uint64
+	fileID                [16]byte
+	changeTimeSeconds     int64
+	changeTimeNanoseconds int32
+	generation            uint32
 }
 
 // RemoveResult 报告日志删除副作用是否已经发生。

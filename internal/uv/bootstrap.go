@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
@@ -31,7 +32,7 @@ type DownloadClient interface {
 	Download(ctx context.Context, request mirror.DownloadRequest) (mirror.DownloadResult, error)
 }
 
-// ArchiveExtractor 把已校验的 uv zip 解压到指定暂存目录。
+// ArchiveExtractor 把已校验的 uv 归档解压到指定暂存目录。
 type ArchiveExtractor interface {
 	Extract(ctx context.Context, archivePath, stagingDir string) error
 }
@@ -96,7 +97,7 @@ func WithDownloader(downloader DownloadClient) BootstrapOption {
 	}
 }
 
-// WithArchiveExtractor 注入 zip 解压器。
+// WithArchiveExtractor 注入归档解压器。
 func WithArchiveExtractor(extractor ArchiveExtractor) BootstrapOption {
 	return func(options *bootstrapOptions) error {
 		if extractor == nil {
@@ -218,15 +219,23 @@ func NewBootstrapper(
 	if err != nil {
 		return nil, fmt.Errorf("create uv rotator: %w", err)
 	}
+	artifact, err := ArtifactFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return nil, err
+	}
+	var extractor ArchiveExtractor = zipExtractor{}
+	if runtime.GOOS != "windows" {
+		extractor = tarExtractor{}
+	}
 	values := bootstrapOptions{
 		downloader: downloader,
-		extractor:  zipExtractor{},
+		extractor:  extractor,
 		publisher:  filesystemPublisher{layout: layout},
 		remover:    filesystemVersionRemover{layout: layout},
 		checker:    runnerVersionChecker{layout: layout},
 		catalog:    catalog,
 		rotator:    rotator,
-		artifact:   WindowsX64ArtifactSpec(),
+		artifact:   artifact,
 	}
 	for _, option := range optionValues {
 		if option == nil {
@@ -1024,11 +1033,16 @@ func wrapBootstrapError(stage protocol.Stage, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
+	var details map[string]any
+	var detailed interface{ Details() map[string]any }
+	if errors.As(err, &detailed) {
+		details = detailed.Details()
+	}
 	return newError(
 		bootstrapErrorCode(err),
 		stage,
 		"uv 准备失败",
-		map[string]any{},
+		details,
 		err,
 	)
 }

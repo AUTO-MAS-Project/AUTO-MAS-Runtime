@@ -3,6 +3,7 @@ package logging
 import (
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -56,8 +57,11 @@ func TestParseRetainedFile_AcceptsOnlyReconstructedLayoutPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RuntimeLogFile() error = %v", err)
 	}
-	aliasPath := switchDriveLetterCase(t, path)
-	if aliasPath == path {
+	aliasPath := path
+	if runtime.GOOS == "windows" {
+		aliasPath = switchDriveLetterCase(t, path)
+	}
+	if runtime.GOOS == "windows" && aliasPath == path {
 		t.Fatalf("switchDriveLetterCase() = input %q, want changed drive letter", path)
 	}
 	file := fakeRetainedFile{name: filepath.Base(path), path: aliasPath}

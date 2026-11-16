@@ -78,6 +78,18 @@ func TestManagedSourceFile_RejectsReparse(t *testing.T) {
 	if _, err := ReadManagedFile(t.Context(), layout, filepath.Join(path, "sentinel"), 10); err == nil {
 		t.Fatal("ReadManagedFile() accepted reparse ancestor")
 	}
+	reader, err := NewManagedSourceReader(t.Context(), layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := reader.Read(t.Context(), filepath.Join(path, "sentinel"), 10); err == nil {
+		t.Fatal("ManagedSourceReader accepted reparse ancestor")
+	}
 	entries, err := os.ReadDir(outside)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("outside entries = %v, %v, want empty", entries, err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -35,13 +36,17 @@ func ProductionProbes() Probes {
 
 // ProductionProbesForLayout 返回使用真实 managed runtime 目录的生产探针。
 func ProductionProbesForLayout(layout *config.Layout) Probes {
-	return Probes{
+	probes := Probes{
 		UVVersionWithLayout: func(ctx context.Context, _ *config.Layout, exePath string) (string, error) {
 			return probeUVVersionWithLayout(ctx, layout, exePath, probeUVTimeout)
 		},
 		DiskFree:   probeDiskFree,
 		FileSystem: filesystem.FileSystemName,
 	}
+	if runtime.GOOS != "windows" {
+		probes.PythonExecutable = probeManagedPythonExecutable
+	}
+	return probes
 }
 
 // probeUVVersion 执行受管 uv.exe --version 并返回规范化输出。
@@ -105,4 +110,25 @@ func probeUVVersionWithLayout(
 		return "", errors.New("uv --version produced no output")
 	}
 	return version, nil
+}
+func probeManagedPythonExecutable(ctx context.Context, layout *config.Layout) (string, error) {
+	executable, err := layout.UVExecutable(uv.FixedVersion)
+	if err != nil {
+		return "", err
+	}
+	runner, err := uv.NewRunner(uv.RunnerConfig{Executable: executable, ProjectDir: layout.AppRoot(), PythonInstallDir: layout.PythonDir(), ProjectEnvDir: layout.VenvDir(), CacheDir: layout.UVCacheDir()})
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(ctx, probeUVTimeout)
+	defer cancel()
+	result, err := runner.Run(ctx, []string{"--no-cache", "python", "find", "--managed-python", "--no-python-downloads", "--no-project"}, uv.RunOptions{Stage: protocol.StagePythonCheck, Environment: map[string]string{"UV_OFFLINE": "1"}})
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimSpace(result.Stdout)
+	if path == "" || !filepath.IsAbs(path) || strings.ContainsAny(path, "\r\n") {
+		return "", errors.New("managed python path is invalid")
+	}
+	return filepath.Clean(path), nil
 }

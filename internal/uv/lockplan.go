@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -62,6 +63,10 @@ type lockArtifactEntry struct {
 // PlanLock 解析锁文本，从根项目（source 为 virtual / editable "."）的 dependencies 出发，
 // 按 marker 求值收集可达包，并为每个包选出本平台制品。
 func PlanLock(lock string, pythonVersion PythonVersion) (LockPlan, error) {
+	return planLockFor(lock, pythonVersion, runtime.GOOS, runtime.GOARCH)
+}
+
+func planLockFor(lock string, pythonVersion PythonVersion, goos, goarch string) (LockPlan, error) {
 	var document lockDocument
 	if _, err := toml.Decode(lock, &document); err != nil {
 		return LockPlan{}, fmt.Errorf("%w: %w", errLockPlan, err)
@@ -89,7 +94,7 @@ func PlanLock(lock string, pythonVersion PythonVersion) (LockPlan, error) {
 		return LockPlan{}, fmt.Errorf("%w: root package is missing", errLockPlan)
 	}
 
-	env := windowsMarkerEnvironment(pythonVersion)
+	env := targetMarkerEnvironment(pythonVersion, goos, goarch)
 	walker := &lockWalker{packages: packages, env: env, visited: make(map[string]map[string]struct{})}
 	walker.visit(root, "", root.Dependencies)
 
@@ -101,7 +106,7 @@ func PlanLock(lock string, pythonVersion PythonVersion) (LockPlan, error) {
 	sort.Strings(names)
 	for _, name := range names {
 		entry := packages[name]
-		artifact, ok, err := selectArtifact(entry, pythonVersion)
+		artifact, ok, err := selectArtifactFor(entry, pythonVersion, goos, goarch)
 		if err != nil {
 			return LockPlan{}, err
 		}
@@ -181,11 +186,14 @@ func (w *lockWalker) visit(from *lockPackage, extra string, edges []lockDependen
 
 // selectArtifact 按增补 2 C18 第 3 条选制品：cp312 > abi3 > py3 的 win_amd64 wheel，其次 none-any，都没有取 sdist。
 func selectArtifact(entry *lockPackage, pythonVersion PythonVersion) (LockArtifact, bool, error) {
+	return selectArtifactFor(entry, pythonVersion, runtime.GOOS, runtime.GOARCH)
+}
+func selectArtifactFor(entry *lockPackage, pythonVersion PythonVersion, goos, goarch string) (LockArtifact, bool, error) {
 	bestScore := 0
 	var best *lockArtifactEntry
 	for index := range entry.Wheels {
 		wheel := &entry.Wheels[index]
-		score := wheelScore(artifactFileName(wheel.URL), pythonVersion)
+		score := wheelScoreFor(artifactFileName(wheel.URL), pythonVersion, goos, goarch)
 		if score > bestScore {
 			bestScore = score
 			best = wheel
@@ -213,6 +221,9 @@ func artifactFileName(rawURL string) string {
 
 // wheelScore 给 wheel 文件名打分，0 表示与 Windows x64 CPython 不兼容。
 func wheelScore(fileName string, pythonVersion PythonVersion) int {
+	return wheelScoreFor(fileName, pythonVersion, runtime.GOOS, runtime.GOARCH)
+}
+func wheelScoreFor(fileName string, pythonVersion PythonVersion, goos, goarch string) int {
 	if !strings.HasSuffix(fileName, ".whl") {
 		return 0
 	}
@@ -228,7 +239,13 @@ func wheelScore(fileName string, pythonVersion PythonVersion) int {
 	for _, tag := range platformTags {
 		switch tag {
 		case "win_amd64":
-			platformScore = max(platformScore, 2)
+			if goos == "windows" && goarch == "amd64" {
+				platformScore = max(platformScore, 2)
+			}
+		default:
+			if targetWheelPlatform(tag, goos, goarch) {
+				platformScore = max(platformScore, 2)
+			}
 		case "any":
 			platformScore = max(platformScore, 1)
 		}
@@ -304,4 +321,22 @@ func toLockArtifact(name string, entry *lockArtifactEntry) (LockArtifact, error)
 		Size:    entry.Size,
 		SHA256:  strings.ToLower(digest),
 	}, nil
+}
+
+func targetWheelPlatform(tag, goos, goarch string) bool {
+	arch := "x86_64"
+	if goarch == "arm64" {
+		arch = "aarch64"
+	}
+	if goos == "linux" {
+		return strings.HasPrefix(tag, "manylinux_") && strings.HasSuffix(tag, "_"+arch) || tag == "linux_"+arch || strings.HasPrefix(tag, "manylinux2014_") && strings.HasSuffix(tag, "_"+arch) || goarch == "amd64" && (tag == "manylinux1_x86_64" || tag == "manylinux2010_x86_64")
+	}
+	if goos == "darwin" {
+		arch = "x86_64"
+		if goarch == "arm64" {
+			arch = "arm64"
+		}
+		return strings.HasPrefix(tag, "macosx_") && (strings.HasSuffix(tag, "_"+arch) || strings.HasSuffix(tag, "_universal2"))
+	}
+	return false
 }

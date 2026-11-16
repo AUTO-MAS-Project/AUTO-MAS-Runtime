@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +46,9 @@ func NewManagedSupervisor(layout *config.Layout, deps Dependencies) (*ManagedSup
 	}
 	if deps.Clock == nil {
 		deps.Clock = time.Now
+	}
+	if deps.WithStartupTimeout == nil {
+		deps.WithStartupTimeout = context.WithTimeoutCause
 	}
 	if deps.ShutdownTimeout <= 0 {
 		deps.ShutdownTimeout = defaultShutdownTimeout
@@ -173,6 +178,10 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if mode != ModeManaged && mode != ModeDevelopment {
 		return newError(protocol.CodeUnsupportedMode, protocol.StageBackendSpawn, "后端运行模式不受支持", map[string]any{"mode": string(mode)}, errors.New("backend mode is unsupported"))
 	}
+	var revision state.Revision
+	defer func() {
+		returnErr = withSupervisionDiagnostics(returnErr, mode, revision)
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -181,6 +190,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		return err
 	}
 	request.Port = port
+	request.startupDeadline = s.deps.Clock().Add(startupWorkBudget)
 	// 回环中继与实测顺序在任何 spawn 之前就位，并随本次监督整体存活（增补 2 C17 第 8 条）。
 	// 后端 Logger 此时还没建立，中继诊断先进缓冲，Logger 建立后 attach 冲刷。
 	s.relayDiagnostics = &relayDiagnostics{}
@@ -208,6 +218,9 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	}
 	if request.Control != nil {
 		return s.superviseControlled(ctx, request)
+	}
+	if request.DeferBusinessStart {
+		return newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "暂缓自动业务需要 stdin 控制通道", nil, nil)
 	}
 
 	locks, err := s.deps.Lock.Acquire(ctx)
@@ -255,7 +268,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if err := validateEnvironmentReady(environment); err != nil {
 		return preferCancellation(ctx, err)
 	}
-	revision, err := s.checkRepository(ctx, environment)
+	revision, err = s.checkRepository(ctx, environment)
 	if err != nil {
 		return preferCancellation(ctx, err)
 	}
@@ -341,7 +354,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 			if proc != nil {
 				cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 				processOwned, txOwned, loggerOwned = false, false, false
-				return errors.Join(cleanup.err, withFailureDetailsExtra(fault, logger, proc, cleanup.details))
+				return cleanup.failure(withFailureDetailsExtra(fault, logger, proc, cleanup.details))
 			}
 			return withFailureDetails(fault, logger, nil)
 		}
@@ -353,7 +366,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 			processOwned, txOwned, loggerOwned = false, false, false
 			primary := withFailureDetailsExtra(spawnFailure, logger, proc, cleanup.details)
-			return errors.Join(cleanup.err, primary)
+			return cleanup.failure(primary)
 		}
 		return withFailureDetails(spawnFailure, logger, proc)
 	}
@@ -367,7 +380,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if fault := gate.Fault(); fault != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		processOwned, txOwned, loggerOwned = false, false, false
-		return errors.Join(cleanup.err, withFailureDetailsExtra(fault, logger, proc, cleanup.details))
+		return cleanup.failure(withFailureDetailsExtra(fault, logger, proc, cleanup.details))
 	}
 
 	if err := s.emitState(request.Emitter, protocol.StageBackendSpawn, protocol.StateStartingBackend, "正在启动后端", map[string]any{}); err != nil {
@@ -381,7 +394,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 			processOwned, txOwned, loggerOwned = false, false, false
-			return errors.Join(cleanup.err, ctxErr)
+			return cleanup.failure(ctxErr)
 		}
 		return s.failAfterStarting(request, proc, tx, logger, gate, newError(protocol.CodeStateWriteFailed, protocol.StageBackendHealth, "后端事务写入失败", nil, err), &processOwned, &txOwned, &loggerOwned)
 	}
@@ -390,7 +403,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	}
 
 	probe := processProbe{process: proc, uvPath: s.deps.UVPath, pythonPaths: append([]string(nil), s.deps.PythonPaths...)}
-	if err := s.deps.Health.Check(ctx, health.Expectation{
+	if err := s.checkStartupHealth(ctx, request, health.Expectation{
 		Mode:     health.ModeManaged,
 		Protocol: protocol.Version,
 		Version:  revision.Version,
@@ -400,12 +413,12 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		if fault := gate.Fault(); fault != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 			processOwned, txOwned, loggerOwned = false, false, false
-			return errors.Join(cleanup.err, withFailureDetailsExtra(fault, logger, proc, cleanup.details))
+			return cleanup.failure(withFailureDetailsExtra(fault, logger, proc, cleanup.details))
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 			processOwned, txOwned, loggerOwned = false, false, false
-			return errors.Join(cleanup.err, ctxErr)
+			return cleanup.failure(ctxErr)
 		}
 		mapped := withFailureDetails(mapDependencyError(protocol.StageBackendHealth, protocol.CodeBackendHealthInvalid, "后端健康检查失败", err), logger, proc)
 		return s.failAfterStarting(request, proc, tx, logger, gate, mapped, &processOwned, &txOwned, &loggerOwned)
@@ -415,7 +428,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 			processOwned, txOwned, loggerOwned = false, false, false
-			return errors.Join(cleanup.err, ctxErr)
+			return cleanup.failure(ctxErr)
 		}
 		return s.failAfterStarting(request, proc, tx, logger, gate, newError(protocol.CodeStateWriteFailed, protocol.StageBackendRun, "后端事务写入失败", nil, err), &processOwned, &txOwned, &loggerOwned)
 	}
@@ -425,7 +438,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		processOwned, txOwned, loggerOwned = false, false, false
-		return errors.Join(cleanup.err, ctxErr)
+		return cleanup.failure(ctxErr)
 	}
 	gate.SetStage(protocol.StageBackendRun)
 	if err := s.emitState(request.Emitter, protocol.StageBackendRun, protocol.StateRunning, "后端已就绪", map[string]any{
@@ -444,7 +457,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		if fault := gate.Fault(); fault != nil {
 			primary = withFailureDetailsExtra(fault, logger, proc, cleanup.details)
 		}
-		return errors.Join(cleanup.err, primary)
+		return cleanup.failure(primary)
 	case <-proc.Exited():
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)
 		processOwned, txOwned, loggerOwned = false, false, false
@@ -454,7 +467,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		} else if ctxErr := ctx.Err(); ctxErr != nil {
 			primary = ctxErr
 		}
-		return errors.Join(cleanup.err, withFailureDetailsExtra(primary, logger, proc, cleanup.details))
+		return cleanup.failure(withFailureDetailsExtra(primary, logger, proc, cleanup.details))
 	}
 }
 
@@ -762,7 +775,7 @@ func (s *ManagedSupervisor) failAfterStarting(
 	primary = withFailureDetailsExtra(primary, logger, proc, cleanup.details)
 	*processOwned, *txOwned, *loggerOwned = false, false, false
 	stateErr := s.emitState(request.Emitter, protocol.StageBackendCleanup, protocol.StateBackendFailed, "后端启动失败", failureDetails(logger, proc, cleanup.details))
-	return errors.Join(cleanup.err, primary, stateErr)
+	return cleanup.failure(primary, stateErr)
 }
 
 func markCommitted(err error) error {
@@ -923,7 +936,7 @@ func (s *ManagedSupervisor) cleanupProcess(ctx context.Context, proc ManagedProc
 			resultErr = errors.Join(resultErr, mapLoggerCleanupError(err))
 		}
 	}
-	outcome.err = withFailureDetailsExtra(resultErr, logger, proc, outcome.details)
+	outcome.err = outcome.failure(withFailureDetailsExtra(resultErr, logger, proc, outcome.details))
 	return outcome
 }
 
@@ -1113,6 +1126,14 @@ func descendantOf(pid, root uint32, snapshot []process.Info) bool {
 }
 
 func sameExecutable(left, right string) bool {
+	if runtime.GOOS != "windows" {
+		if filepath.Clean(left) == filepath.Clean(right) {
+			return true
+		}
+		a, e := os.Stat(left)
+		b, f := os.Stat(right)
+		return e == nil && f == nil && os.SameFile(a, b)
+	}
 	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }
 

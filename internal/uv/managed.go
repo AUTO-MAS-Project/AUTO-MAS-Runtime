@@ -37,6 +37,7 @@ type SupervisionInfrastructure struct {
 
 // ManagedOptions 把通用 uv 选项与长驻监督身份策略分开，避免调用方直接拼受控环境键。
 type ManagedOptions struct {
+	DeferBusinessStart bool
 	RunOptions
 	Identity       *SupervisionIdentity
 	Infrastructure SupervisionInfrastructure
@@ -79,6 +80,9 @@ func (r *UVRunner) StartManaged(
 		autoMASUVExecutable: r.Executable,
 		autoMASProtocol:     "1",
 		autoMASSupervised:   "1",
+	}
+	if options.DeferBusinessStart {
+		supervision[autoMASDeferBusinessStart] = "1"
 	}
 	if options.Identity != nil {
 		if err := validateSupervisionIdentity(*options.Identity); err != nil {

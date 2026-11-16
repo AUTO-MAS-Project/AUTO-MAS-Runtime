@@ -4,12 +4,13 @@ import "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 
 // Error 是 uv、Python 与依赖操作向 CLI 暴露的结构化错误。
 type Error struct {
-	code      protocol.Code
-	stage     protocol.Stage
-	message   string
-	details   map[string]any
-	cause     error
-	committed bool
+	code        protocol.Code
+	stage       protocol.Stage
+	message     string
+	details     map[string]any
+	diagnostics map[string]any
+	cause       error
+	committed   bool
 }
 
 // Error 返回不包含外部命令原文的稳定诊断文本。
@@ -58,6 +59,11 @@ func (e *Error) Details() map[string]any {
 		return map[string]any{}
 	}
 	return cloneDetails(e.details)
+}
+
+// DiagnosticDetails 返回执行诊断副本，不改变协议详情。
+func (e *Error) DiagnosticDetails() map[string]any {
+	return cloneDetails(e.diagnostics)
 }
 
 // Committed 报告错误是否发生在不可逆发布之后。

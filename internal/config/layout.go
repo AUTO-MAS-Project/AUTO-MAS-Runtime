@@ -53,7 +53,7 @@ func (l *Layout) AppRoot() string {
 	return l.appRoot
 }
 
-// IdentityKey 返回平台对应的词法身份键；物理身份仍须由文件系统能力证明。
+// IdentityKey 返回平台规则下的词法身份键；物理身份仍须由文件系统能力证明。
 func (l *Layout) IdentityKey() string {
 	return l.identityKey
 }
@@ -68,6 +68,9 @@ func identityKey(path string) string {
 }
 
 func isVolumeRoot(path string) bool {
+	if runtime.GOOS != "windows" {
+		return filepath.Clean(path) == string(filepath.Separator)
+	}
 	volume := filepath.VolumeName(path)
 	if volume == "" {
 		return filepath.Clean(path) == string(filepath.Separator)

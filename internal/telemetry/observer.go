@@ -13,6 +13,7 @@ import (
 
 // InternalObservation 是允许发送到 Sentry 的失败分类。
 type InternalObservation struct {
+	OperationID       string
 	Command           string
 	Stage             string
 	Code              string
@@ -32,14 +33,14 @@ type StackFrame struct {
 	Lineno   int
 }
 
-// Recorder 是 CLI 消费的最小遥测接口；实现不得把错误返回给业务调用方。
+// Recorder 是 CLI 消费的最小遥测接口；捕获只返回 SDK 接受的事件 ID，不返回错误或投递保证。
 type Recorder interface {
-	CaptureInternal(context.Context, InternalObservation)
+	CaptureInternal(context.Context, InternalObservation) string
 	Close(context.Context)
 }
 
 type provider interface {
-	captureInternal(InternalObservation)
+	captureInternal(InternalObservation) string
 	close(context.Context)
 }
 
@@ -110,14 +111,14 @@ func safeProviderFactory(factory providerFactory, config Config) (candidate prov
 }
 
 // CaptureInternal 记录允许上报的失败分类；名称为既有内部接口，不携带原始错误文本。
-func (o *Observer) CaptureInternal(ctx context.Context, observation InternalObservation) {
+func (o *Observer) CaptureInternal(ctx context.Context, observation InternalObservation) string {
 	if o == nil || ctx == nil || ctx.Err() != nil || !validInternalObservation(observation) {
-		return
+		return ""
 	}
 	o.mu.RLock()
 	if o.closed {
 		o.mu.RUnlock()
-		return
+		return ""
 	}
 	providers := append([]provider(nil), o.providers...)
 	o.mu.RUnlock()
@@ -127,11 +128,15 @@ func (o *Observer) CaptureInternal(ctx context.Context, observation InternalObse
 	closed := o.closed
 	o.mu.RUnlock()
 	if closed {
-		return
+		return ""
 	}
+	receipt := ""
 	for _, candidate := range providers {
-		safeProviderCaptureInternal(candidate, observation)
+		if id := safeProviderCaptureInternal(candidate, observation); id != "" {
+			receipt = id
+		}
 	}
+	return receipt
 }
 
 // Close 在给定上下文截止前尽力收口全部 provider，重复调用安全。
@@ -171,6 +176,9 @@ func (o *Observer) Close(ctx context.Context) {
 }
 
 func validInternalObservation(observation InternalObservation) bool {
+	if observation.OperationID != "" && !validOperationID(observation.OperationID) {
+		return false
+	}
 	if !observation.Panic && len(observation.PanicFrames) > 0 {
 		return false
 	}
@@ -279,11 +287,24 @@ func safeProviderClose(candidate provider, ctx context.Context) {
 	candidate.close(ctx)
 }
 
-func safeProviderCaptureInternal(candidate provider, observation InternalObservation) {
+func safeProviderCaptureInternal(candidate provider, observation InternalObservation) (receipt string) {
 	defer func() { _ = recover() }()
 	if candidate != nil {
-		candidate.captureInternal(observation)
+		return candidate.captureInternal(observation)
 	}
+	return ""
+}
+
+func validOperationID(value string) bool {
+	if len(value) != 26 || value[0] > '7' {
+		return false
+	}
+	for _, character := range value {
+		if !strings.ContainsRune("0123456789ABCDEFGHJKMNPQRSTVWXYZ", character) {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *Observer) flushDuration() time.Duration {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -108,10 +109,10 @@ func TestManaged_WorkingDirOverridesProjectDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := readTestRecord(t, recordPath)
-	if got, want := record["cwd"], filepath.Clean(workingDir); got != want {
+	if got, want := record["cwd"], normalizedTestWorkingDir(workingDir); got != want {
 		t.Fatalf("child cwd = %q, want %q", got, want)
 	}
-	if got := record["cwd"]; got == filepath.Clean(runner.ProjectDir) {
+	if got := record["cwd"]; got == normalizedTestWorkingDir(runner.ProjectDir) {
 		t.Fatalf("child cwd = %q, want a directory other than the project dir", got)
 	}
 }
@@ -147,7 +148,7 @@ func TestManaged_WorkingDirDefaultsToProjectDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := readTestRecord(t, recordPath)
-	if got, want := record["cwd"], filepath.Clean(projectDir); got != want {
+	if got, want := record["cwd"], normalizedTestWorkingDir(projectDir); got != want {
 		t.Fatalf("child cwd = %q, want %q", got, want)
 	}
 }
@@ -390,7 +391,7 @@ func TestManaged_StartFailureIncludesStableDiagnostics(t *testing.T) {
 		details["projectEnvDir"] != runner.ProjectEnvDir {
 		t.Fatalf("StartManaged() details = %#v, want stable start diagnostics", details)
 	}
-	if _, ok := details["windowsError"]; !ok {
+	if _, ok := details["windowsError"]; runtime.GOOS == "windows" && !ok {
 		t.Fatalf("StartManaged() details = %#v, want windowsError", details)
 	}
 }

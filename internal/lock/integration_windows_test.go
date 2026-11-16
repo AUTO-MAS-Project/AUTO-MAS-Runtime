@@ -1062,6 +1062,14 @@ func substAlias(t *testing.T, target string) string {
 	var freeDrives []string
 	for drive := 'Z'; drive >= 'D'; drive-- {
 		driveName := fmt.Sprintf("%c:", drive)
+		// 无介质的光驱已占用盘符，os.Stat 的 not-ready 不能当作空闲盘符错误。
+		drivePath, err := windows.UTF16PtrFromString(driveName + `\`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if windows.GetDriveType(drivePath) != windows.DRIVE_NO_ROOT_DIR {
+			continue
+		}
 		_, statErr := os.Stat(driveName + `\`)
 		switch {
 		case statErr == nil:

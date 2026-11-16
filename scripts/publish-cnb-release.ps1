@@ -212,6 +212,16 @@ $sumsName = "SHA256SUMS.txt"
 if (-not $localFiles.ContainsKey($sumsName)) {
     throw "GitHub release $Tag does not contain $sumsName"
 }
+$posixAssets = @($localFiles.Keys | Where-Object { $_ -cmatch '^auto-mas-runtime_.+_(linux|darwin)_(amd64|arm64)$' })
+if ($posixAssets.Count -gt 0) {
+    $expectedAssets = @("auto-mas-runtime-$Tag.exe", $sumsName)
+    foreach ($os in @('linux','darwin')) {
+        foreach ($arch in @('amd64','arm64')) { $expectedAssets += "auto-mas-runtime_${Tag}_${os}_${arch}" }
+    }
+    if ($localFiles.Count -ne 6 -or @(Compare-Object ($expectedAssets | Sort-Object) (@($localFiles.Keys) | Sort-Object)).Count -ne 0) {
+        throw 'multi-platform release asset matrix is incomplete'
+    }
+}
 # dry-run 不落盘，改用 API 侧已知值；真实运行从文件读取。
 $sumsLines = if ($DryRun) {
     @()
@@ -226,7 +236,10 @@ foreach ($line in $sumsLines) {
     if ($parts.Count -ne 2) {
         throw "checksum line is malformed: $line"
     }
-    $sumsMap[$parts[1].TrimStart("*")] = $parts[0]
+    $entryName = $parts[1].TrimStart("*")
+    Assert-Sha256Hex -Value $parts[0]
+    if ($sumsMap.ContainsKey($entryName)) { throw "duplicate checksum entry: $entryName" }
+    $sumsMap[$entryName] = $parts[0]
 }
 # dry-run 下校验和文件的内容与 GitHub digest 一致才继续（用 API 的 size 佐证弱校验）。
 if (-not $DryRun) {

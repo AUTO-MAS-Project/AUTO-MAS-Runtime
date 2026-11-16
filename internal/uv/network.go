@@ -93,17 +93,21 @@ func (e *networkExecutor) run(
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 			return result, runErr
 		}
-		return result, newError(
+		failure := newError(
 			protocol.CodeNetworkUnavailable,
 			options.Stage,
 			"离线缓存不足，操作需要网络",
 			map[string]any{"sourceKind": kind.String(), "exitCode": result.ExitCode},
 			nonNilRunError(runErr),
 		)
+		failure.diagnostics = networkExecutionDiagnostics(result, runErr, options)
+		failure.diagnostics["attemptCount"] = 1
+		return result, failure
 	}
 
 	var lastResult UVResult
-	_, err = e.rotator.Run(ctx, plan, target, func(attemptCtx context.Context, attempt mirror.Attempt) mirror.AttemptOutcome {
+	var lastErr error
+	rotation, err := e.rotator.Run(ctx, plan, target, func(attemptCtx context.Context, attempt mirror.Attempt) mirror.AttemptOutcome {
 		attemptArgs := append([]string(nil), args...)
 		attemptOptions := cloneRunOptions(options)
 		switch kind {
@@ -121,6 +125,7 @@ func (e *networkExecutor) run(
 		}
 		result, runErr := runner.Run(attemptCtx, attemptArgs, attemptOptions)
 		lastResult = result
+		lastErr = runErr
 		if runErr == nil && result.ExitCode == 0 {
 			return mirror.AttemptOutcome{Kind: mirror.OutcomeSucceeded}
 		}
@@ -143,13 +148,20 @@ func (e *networkExecutor) run(
 		if code == protocol.CodeMirrorExhausted {
 			message = "所有镜像源均不可用"
 		}
-		return lastResult, newError(
+		failure := newError(
 			code,
 			options.Stage,
 			message,
 			map[string]any{"sourceKind": kind.String(), "exitCode": lastResult.ExitCode},
 			err,
 		)
+		failure.diagnostics = networkExecutionDiagnostics(lastResult, lastErr, options)
+		failure.diagnostics["attemptCount"] = len(rotation.Reports)
+		failure.diagnostics["attempts"] = networkAttemptDiagnostics(rotation.Reports)
+		if len(rotation.Reports) > maxNetworkDiagnosticAttempts {
+			failure.diagnostics["truncated"] = true
+		}
+		return lastResult, failure
 	}
 	return lastResult, err
 }

@@ -201,7 +201,7 @@ func (s *Swapper) Swap(ctx context.Context, request SwapRequest) (SwapResult, er
 		})
 		result.MutationApplied = renameResult.MutationApplied
 		if renameErr != nil {
-			return result, mapRenameFailure(ctx, renameErr, renameResult.MutationApplied, false)
+			return result, withRepositoryRenameDiagnostics(mapRenameFailure(ctx, renameErr, renameResult.MutationApplied, false), filesystem.RenameRepositoryToRetired, renameResult)
 		}
 		if !renameResult.MutationApplied {
 			return result, swapFailureError(protocol.StageWorkspaceSwap, errSwapNotApplied)
@@ -219,7 +219,7 @@ func (s *Swapper) Swap(ctx context.Context, request SwapRequest) (SwapResult, er
 	result.MutationApplied = result.MutationApplied || renameResult.MutationApplied
 	result.RepositoryActivated = renameResult.MutationApplied
 	if renameErr != nil {
-		return result, mapRenameFailure(ctx, renameErr, renameResult.MutationApplied, renameResult.MutationApplied)
+		return result, withRepositoryRenameDiagnostics(mapRenameFailure(ctx, renameErr, renameResult.MutationApplied, renameResult.MutationApplied), filesystem.RenameUpdateToRepository, renameResult)
 	}
 	if !renameResult.MutationApplied {
 		return result, swapFailureError(protocol.StageWorkspaceSwap, errSwapNotApplied)
@@ -412,20 +412,20 @@ func mapRetiredCleanupFailure(
 			result.AuditCompleted,
 		)
 	}
-	return newError(
+	return withRepositoryCleanupDiagnostics(newError(
 		protocol.CodeGitRepoCleanupFailed,
 		protocol.StageWorkspaceCleanup,
 		messageForCode(protocol.CodeGitRepoCleanupFailed),
 		map[string]any{},
 		cause,
-	)
+	), filesystem.DeleteRepositoryRetired, result)
 }
 
 func mapCommittedRetiredCleanupFailure(
 	result filesystem.DeleteResult,
 	cause error,
 ) *Error {
-	return mapCommittedCleanupFailure(result, cause)
+	return withRepositoryCleanupDiagnostics(mapCommittedCleanupFailure(result, cause), filesystem.DeleteRepositoryRetired, result)
 }
 
 func mapCommittedCleanupFailure(
@@ -439,13 +439,13 @@ func mapCommittedCleanupFailure(
 			result.AuditCompleted,
 		)
 	}
-	return newCommittedError(
+	return withRepositoryCleanupDiagnostics(newCommittedError(
 		protocol.CodeGitRepoCleanupFailed,
 		protocol.StageWorkspaceCleanup,
 		messageForCode(protocol.CodeGitRepoCleanupFailed),
 		map[string]any{},
 		cause,
-	)
+	), "", result)
 }
 
 func isCancellation(ctx context.Context, cause error) bool {

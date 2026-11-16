@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	defaultSentryRelease = "auto-mas-runtime"
-	sentryServerName     = "auto-mas-runtime"
-	maxSentryStackFrames = 64
+	defaultSentryRelease    = "auto-mas-runtime"
+	sentryApplicationModule = "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime"
+	sentryServerName        = "auto-mas-runtime"
+	maxSentryStackFrames    = 64
 
 	sentryObservationTag      = "_auto_mas_observation"
 	sentryObservationInternal = "internal_error"
@@ -114,9 +115,9 @@ func newSentryProviderWithTransport(config Config, transport sentry.Transport) (
 	}, nil
 }
 
-func (p *sentryProvider) captureInternal(observation InternalObservation) {
+func (p *sentryProvider) captureInternal(observation InternalObservation) string {
 	if p == nil || !validInternalObservation(observation) {
-		return
+		return ""
 	}
 
 	kind := sentryObservationInternal
@@ -145,6 +146,9 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 	}
 	if observation.Reason != "" {
 		event.Tags["reason"] = observation.Reason
+	}
+	if observation.OperationID != "" {
+		event.Tags["operation_id"] = observation.OperationID
 	}
 	if kind == sentryObservationFailure && len(observation.DiagnosticDetails) > 0 {
 		event.Contexts = map[string]sentry.Context{"diagnostics": {
@@ -177,9 +181,12 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed || p.hub == nil {
-		return
+		return ""
 	}
-	p.hub.CaptureEvent(event)
+	if id := p.hub.CaptureEvent(event); id != nil {
+		return string(*id)
+	}
+	return ""
 }
 
 func (p *sentryProvider) close(ctx context.Context) {
@@ -251,6 +258,10 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		mechanism.SetUnhandled()
 	}
 
+	exceptionValue := message
+	if kind == sentryObservationFailure {
+		exceptionValue += ": " + string(code)
+	}
 	sanitized := &sentry.Event{
 		EventID:     event.EventID,
 		Timestamp:   event.Timestamp,
@@ -263,13 +274,22 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		Tags:        sanitizeSentryTags(event.Tags),
 		Exception: []sentry.Exception{{
 			Type:       sentryExceptionType,
-			Value:      message,
+			Value:      exceptionValue,
 			Module:     "auto-mas-runtime",
 			Stacktrace: sanitizeSentryStacktrace(firstSentryStacktrace(event.Exception)),
 			Mechanism:  mechanism,
 		}},
 	}
 	if kind == sentryObservationFailure {
+		// 仅从净化后的稳定分类派生，不能复制可能携带自由文本的输入 fingerprint。
+		sanitized.Fingerprint = []string{defaultSentryRelease, sentryObservationFailure}
+		for _, key := range []string{"command", "stage", "code"} {
+			value := sanitized.Tags[key]
+			if value == "" {
+				value = "unknown"
+			}
+			sanitized.Fingerprint = append(sanitized.Fingerprint, value)
+		}
 		if diagnostics := sanitizeSentryDiagnostics(event.Contexts); diagnostics != nil {
 			sanitized.Contexts = map[string]sentry.Context{"diagnostics": diagnostics}
 		}
@@ -291,7 +311,7 @@ func sanitizeSentryDiagnostics(contexts map[string]sentry.Context) sentry.Contex
 }
 
 func sanitizeSentryTags(tags map[string]string) map[string]string {
-	allowed := [...]string{"command", "stage", "code", "reason", "runtime_version", "protocol_version", "platform"}
+	allowed := [...]string{"command", "stage", "code", "reason", "runtime_version", "protocol_version", "platform", "operation_id"}
 	clean := make(map[string]string, len(allowed))
 	for _, key := range allowed {
 		value := strings.TrimSpace(tags[key])
@@ -307,6 +327,8 @@ func validSentryTag(key, value string) bool {
 		return false
 	}
 	switch key {
+	case "operation_id":
+		return validOperationID(value)
 	case "command":
 		return validCommand(value)
 	case "stage":
@@ -365,7 +387,8 @@ func sanitizeSentryStacktrace(stacktrace *sentry.Stacktrace) *sentry.Stacktrace 
 		if function == "" && module == "" && line == 0 {
 			continue
 		}
-		frames = append(frames, sentry.Frame{Function: function, Module: module, Lineno: line})
+		inApp := module == "main" || module == sentryApplicationModule || strings.HasPrefix(module, sentryApplicationModule+"/")
+		frames = append(frames, sentry.Frame{Function: function, Module: module, Lineno: line, InApp: inApp})
 	}
 	if len(frames) == 0 {
 		return nil

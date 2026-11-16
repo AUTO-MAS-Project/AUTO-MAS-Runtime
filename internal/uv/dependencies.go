@@ -414,36 +414,30 @@ func dependencySyncError(result UVResult, cause error) error {
 	if cause == nil {
 		cause = errors.New("uv sync exited with a non-zero status")
 	}
-	return newError(
+	failure := newError(
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesSync,
 		"Python 依赖同步失败",
 		uvFailureDetails(result, "dependency_sync_nonzero"),
 		cause,
 	)
+	failure.diagnostics = executionDiagnostics(result, cause, "dependency_sync")
+	return failure
 }
 
 func dependencyCheckError(result UVResult, cause error) error {
 	if cause == nil {
 		cause = errors.New("uv sync check exited with a non-zero status")
 	}
-	return newError(
+	failure := newError(
 		protocol.CodeDependencySyncFailed,
 		protocol.StageDependenciesCheck,
 		"主项目依赖环境未同步",
 		uvFailureDetails(result, "dependency_check_nonzero"),
 		cause,
 	)
-}
-
-func uvFailureDetails(result UVResult, failureKind string) map[string]any {
-	return map[string]any{
-		"failureKind":         failureKind,
-		"exitCode":            result.ExitCode,
-		"durationMs":          result.Duration.Milliseconds(),
-		"capturedStdoutBytes": len(result.Stdout),
-		"capturedStderrBytes": len(result.Stderr),
-	}
+	failure.diagnostics = executionDiagnostics(result, cause, "dependency_check")
+	return failure
 }
 
 func containsNUL(value string) bool {

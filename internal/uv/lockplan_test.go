@@ -13,9 +13,9 @@ func TestPlanLock_RealDevLockTotalsWindowsArtifacts(t *testing.T) {
 	t.Parallel()
 
 	lock := readLockFixture(t, "dev-cca4ac486.lock")
-	plan, err := PlanLock(lock, PythonVersion{Major: 3, Minor: 12, Patch: 13})
+	plan, err := windowsTestPlanLock(lock, PythonVersion{Major: 3, Minor: 12, Patch: 13})
 	if err != nil {
-		t.Fatalf("PlanLock() error = %v", err)
+		t.Fatalf("windowsTestPlanLock() error = %v", err)
 	}
 	names := make(map[string]LockArtifact, len(plan.Items))
 	for _, item := range plan.Items {
@@ -81,9 +81,9 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/beta-1.0.0-py3-none-any.whl", hash = "sha256:` + strings.Repeat("b", 64) + `", size = 20 },
 ]
 `
-	plan, err := PlanLock(lock, PythonVersion{Major: 3, Minor: 12, Patch: 13})
+	plan, err := windowsTestPlanLock(lock, PythonVersion{Major: 3, Minor: 12, Patch: 13})
 	if err != nil {
-		t.Fatalf("PlanLock() error = %v", err)
+		t.Fatalf("windowsTestPlanLock() error = %v", err)
 	}
 	if len(plan.Items) != 1 || plan.Items[0].Package != "alpha" {
 		t.Fatalf("Items = %+v, want only alpha", plan.Items)
@@ -144,9 +144,9 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ee/h2-1.0.0-py3-none-any.whl", hash = "sha256:` + strings.Repeat("e", 64) + `", size = 50 },
 ]
 `
-	plan, err := PlanLock(lock, PythonVersion{Major: 3, Minor: 12, Patch: 13})
+	plan, err := windowsTestPlanLock(lock, PythonVersion{Major: 3, Minor: 12, Patch: 13})
 	if err != nil {
-		t.Fatalf("PlanLock() error = %v", err)
+		t.Fatalf("windowsTestPlanLock() error = %v", err)
 	}
 	got := make(map[string]bool, len(plan.Items))
 	for _, item := range plan.Items {
@@ -189,9 +189,9 @@ func TestPlanLock_WheelSelection(t *testing.T) {
 				builder.WriteString("    { url = \"https://files.pythonhosted.org/packages/wh/" + file + "\", hash = \"sha256:" + strings.Repeat("d", 64) + "\", size = 7 },\n")
 			}
 			builder.WriteString("]\n")
-			plan, err := PlanLock(builder.String(), PythonVersion{Major: 3, Minor: 12, Patch: 13})
+			plan, err := windowsTestPlanLock(builder.String(), PythonVersion{Major: 3, Minor: 12, Patch: 13})
 			if err != nil {
-				t.Fatalf("PlanLock() error = %v", err)
+				t.Fatalf("windowsTestPlanLock() error = %v", err)
 			}
 			if len(plan.Items) != 1 {
 				t.Fatalf("Items = %+v, want one", plan.Items)
@@ -208,11 +208,11 @@ func TestPlanLock_RejectsUnparsableLock(t *testing.T) {
 	t.Parallel()
 
 	version := PythonVersion{Major: 3, Minor: 12, Patch: 13}
-	if _, err := PlanLock("this is not toml = = =", version); err == nil {
-		t.Fatal("PlanLock(garbage) error = nil, want error")
+	if _, err := windowsTestPlanLock("this is not toml = = =", version); err == nil {
+		t.Fatal("windowsTestPlanLock(garbage) error = nil, want error")
 	}
-	if _, err := PlanLock("version = 1\n", version); err == nil {
-		t.Fatal("PlanLock(no root) error = nil, want error")
+	if _, err := windowsTestPlanLock("version = 1\n", version); err == nil {
+		t.Fatal("windowsTestPlanLock(no root) error = nil, want error")
 	}
 }
 
@@ -228,4 +228,8 @@ func readLockFixture(t *testing.T, name string) string {
 		t.Fatalf("read lock fixture %s: %v", name, err)
 	}
 	return string(content)
+}
+
+func windowsTestPlanLock(lock string, version PythonVersion) (LockPlan, error) {
+	return planLockFor(lock, version, "windows", "amd64")
 }

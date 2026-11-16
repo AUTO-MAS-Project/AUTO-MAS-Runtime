@@ -39,7 +39,8 @@ func TestReleaseWorkflow_SigningContract(t *testing.T) {
 			t.Errorf("got workflow without %q, want signing gate", want)
 		}
 	}
-	if strings.Contains(source, "intentionally unsigned") || strings.Contains(source, "go build -trimpath") {
+	windowsPackage, _, _ := strings.Cut(source, "  publish:")
+	if strings.Contains(windowsPackage, "intentionally unsigned") || strings.Contains(windowsPackage, "go build -trimpath") {
 		t.Fatal("got unsigned local build path, want main-repository signed artifact only")
 	}
 }

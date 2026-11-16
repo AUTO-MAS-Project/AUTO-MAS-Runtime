@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -149,6 +150,9 @@ func TestSentry_CapturesExpectedFailureWithReason(t *testing.T) {
 	if len(events) != 1 || events[0].Tags["reason"] != "repository_unknown" {
 		t.Fatalf("events = %#v, want expected failure reason", events)
 	}
+	if events[0].Exception[0].Value != "runtime operation failed: UPDATE_STATE_AMBIGUOUS" || events[0].Message != sentryFailureMessage {
+		t.Fatalf("exception/message = %q/%q, want classified title and fixed message", events[0].Exception[0].Value, events[0].Message)
+	}
 	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
@@ -188,6 +192,98 @@ func TestSentry_RemoteFailureDiagnostics(t *testing.T) {
 		if bytes.Contains(encoded, []byte(forbidden)) {
 			t.Errorf("diagnostics = %s, want no %q", encoded, forbidden)
 		}
+	}
+}
+
+func TestSentry_OperationalFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Command = "bootstrap"
+	observation.Stage = string(protocol.StageBootstrap)
+	observation.Code = string(protocol.CodeMutexOperationFailed)
+	observation.DiagnosticDetails = map[string]any{
+		"mutex": map[string]any{"component": "mutation", "operation": "create-mutex", "windowsError": 5, "name": "private-lock-name", "error": "private cause"},
+		"directories": []map[string]any{
+			{"component": "repo", "state": "valid", "version": "v5.8.0", "commit": strings.Repeat("a", 40), "password": "private-secret"},
+			{"component": "update", "state": "unknown"},
+			{"component": "previous", "state": "not_observed"},
+		},
+		"failureKind": "output_read_failed", "exitCode": 0,
+	}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %#v, want one", events)
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"mutex"`, `"windowsError":5`, `"directories"`, `"component":"previous"`, `"state":"not_observed"`, `"failureKind":"output_read_failed"`, `"exitCode":0`} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Errorf("diagnostics = %s, want %s", encoded, required)
+		}
+	}
+	if bytes.Contains(encoded, []byte("private")) {
+		t.Fatalf("private diagnostics escaped sanitization: %s", encoded)
+	}
+}
+
+func TestSentry_RepositoryFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = string(protocol.CodeGitRepoCleanupFailed)
+	observation.DiagnosticDetails = map[string]any{"repository": map[string]any{
+		"operation": "remove_tree", "phase": "repository_to_retired", "sourceRole": "repo", "destinationRole": "previous",
+		"component": "previous", "committed": true, "removed": false, "partial": true, "auditCompleted": true,
+		"primary": map[string]any{"operation": "remove-tree", "windowsError": 5, "cause": "private cause"},
+		"target":  "private path", "password": "private password",
+	}}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"repository"`, `"sourceRole":"repo"`, `"destinationRole":"previous"`, `"auditCompleted":true`, `"windowsError":5`} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Fatalf("diagnostics = %s, want %s", encoded, required)
+		}
+	}
+	if bytes.Contains(encoded, []byte("private")) {
+		t.Fatalf("private data escaped: %s", encoded)
+	}
+}
+
+func TestSentry_StateFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = string(protocol.CodeStateWriteFailed)
+	observation.DiagnosticDetails = map[string]any{"persistence": map[string]any{
+		"component": "mutation", "phase": "finalize", "mutationApplied": true, "recoveryRequired": true,
+		"primary": map[string]any{"operation": "classic-unlink", "windowsError": uint64(5), "error": "private cause"},
+		"cleanup": map[string]any{"operation": "close", "windowsError": uint64(6), "password": "private password"},
+		"causes":  []string{"private local cause"},
+	}}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	encoded, err := json.Marshal(events[0].Contexts["diagnostics"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"persistence"`, `"component":"mutation"`, `"mutationApplied":true`, `"recoveryRequired":true`, `"primary"`, `"cleanup"`, `"windowsError":5`, `"windowsError":6`} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Fatalf("diagnostics = %s, want %s", encoded, required)
+		}
+	}
+	if bytes.Contains(encoded, []byte("private")) || bytes.Contains(encoded, []byte("causes")) {
+		t.Fatalf("private data escaped: %s", encoded)
 	}
 }
 
@@ -306,7 +402,12 @@ func TestSentry_BeforeSendRejectsCancelledAndMismatchedFailureKinds(t *testing.T
 
 func TestSentry_CapturesUnexpectedPanicWithoutPanicValue(t *testing.T) {
 	provider, transport := newSentryTestProvider(t)
-	provider.captureInternal(validSentryObservation(true))
+	observation := validSentryObservation(true)
+	observation.PanicFrames = []StackFrame{
+		{Function: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli.run", Module: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/cli", Lineno: 42},
+		{Function: "runtime.gopanic", Module: "runtime", Lineno: 99},
+	}
+	provider.captureInternal(observation)
 
 	_, events, _, _ := transport.snapshot()
 	if len(events) != 1 {
@@ -324,6 +425,87 @@ func TestSentry_CapturesUnexpectedPanicWithoutPanicValue(t *testing.T) {
 	}
 	if event.Exception[0].Mechanism.Handled == nil || *event.Exception[0].Mechanism.Handled {
 		t.Fatalf("panic handled flag = %v, want false", event.Exception[0].Mechanism.Handled)
+	}
+	stack := event.Exception[0].Stacktrace
+	if stack == nil || len(stack.Frames) != 2 || !stack.Frames[0].InApp || stack.Frames[1].InApp {
+		t.Fatalf("panic stack = %#v, want application frame followed by system frame", stack)
+	}
+}
+
+func TestSentry_GroupsFailuresByValidatedClassification(t *testing.T) {
+	_, transport := newSentryTestProvider(t)
+	options, _, _, _ := transport.snapshot()
+	cases := []struct {
+		name, kind, code, command, stage, version string
+		want                                      []string
+	}{
+		{name: "timeout", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "backend supervise", stage: "backend.health", version: "v0.1.28", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.health", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "another runtime release", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "backend supervise", stage: "backend.health", version: "v0.1.17", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.health", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "another code", kind: sentryObservationFailure, code: "BACKEND_EXITED_BEFORE_READY", command: "backend supervise", stage: "backend.health", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.health", "BACKEND_EXITED_BEFORE_READY"}},
+		{name: "another stage", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "backend supervise", stage: "backend.restart", want: []string{"auto-mas-runtime", "failure", "backend supervise", "backend.restart", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "invalid dimensions", kind: sentryObservationFailure, code: "BACKEND_HEALTH_TIMEOUT", command: "private-command", stage: "private-stage", want: []string{"auto-mas-runtime", "failure", "unknown", "unknown", "BACKEND_HEALTH_TIMEOUT"}},
+		{name: "internal keeps stack grouping", kind: sentryObservationInternal, code: "INTERNAL_ERROR"},
+		{name: "panic keeps stack grouping", kind: sentryObservationPanic, code: "INTERNAL_ERROR"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			event := sentry.NewEvent()
+			event.Tags = map[string]string{sentryObservationTag: test.kind, "code": test.code, "command": test.command, "stage": test.stage, "runtime_version": test.version}
+			event.Fingerprint = []string{"secret fingerprint"}
+			clean := options.BeforeSend(event, nil)
+			if clean == nil {
+				t.Fatal("BeforeSend() = nil, want reportable event")
+			}
+			if !slices.Equal(clean.Fingerprint, test.want) {
+				t.Fatalf("fingerprint = %v, want %v", clean.Fingerprint, test.want)
+			}
+		})
+	}
+}
+
+func TestSentry_ClassifiesApplicationFrames(t *testing.T) {
+	for _, test := range []struct {
+		module string
+		want   bool
+	}{
+		{module: "main", want: true},
+		{module: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/backend", want: true},
+		{module: "github.com/spf13/cobra", want: false},
+		{module: "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime-other/internal/backend", want: false},
+	} {
+		t.Run(test.module, func(t *testing.T) {
+			stack := sanitizeSentryStacktrace(&sentry.Stacktrace{Frames: []sentry.Frame{{Module: test.module, Function: "run", Lineno: 1, InApp: !test.want}}})
+			if stack == nil || len(stack.Frames) != 1 || stack.Frames[0].InApp != test.want {
+				t.Fatalf("sanitized stack = %#v, want in_app=%t", stack, test.want)
+			}
+		})
+	}
+}
+
+func TestSentry_BackendFailureDiagnostics(t *testing.T) {
+	provider, transport := newSentryTestProvider(t)
+	observation := validSentryObservation(false)
+	observation.Code = "STATE_WRITE_FAILED"
+	observation.Stage = "backend.cleanup"
+	observation.DiagnosticDetails = map[string]any{
+		"terminationRequested": true,
+		"failures": []map[string]any{
+			{"phase": "primary", "code": "BACKEND_HEALTH_TIMEOUT", "stage": "backend.health"},
+			{"phase": "cleanup", "code": "STATE_WRITE_FAILED", "stage": "private-stage"},
+		},
+	}
+	provider.captureInternal(observation)
+	_, events, _, _ := transport.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	details := events[0].Contexts["diagnostics"]["details"].(map[string]any)
+	failures := details["failures"].([]any)
+	if details["terminationRequested"] != true || failures[0].(map[string]any)["stage"] != "backend.health" {
+		t.Fatalf("diagnostics = %#v, want termination request and primary stage", details)
+	}
+	if _, exists := failures[1].(map[string]any)["stage"]; exists {
+		t.Fatalf("diagnostics = %#v, want unknown stage removed", details)
 	}
 }
 

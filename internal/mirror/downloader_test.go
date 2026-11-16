@@ -2680,9 +2680,7 @@ func TestDownloader_ComponentPartIdentityCannotBeReplaced(t *testing.T) {
 func TestDownloader_ComponentJunctionAtEveryAncestorFailsBeforeNetwork(
 	t *testing.T,
 ) {
-	if runtime.GOOS != "windows" {
-		t.Fatal("ordinary Junction acceptance must run on Windows")
-	}
+
 	cases := []struct {
 		name string
 		path func(*config.Layout) string
@@ -2775,6 +2773,15 @@ func TestDownloader_ComponentJunctionAtEveryAncestorFailsBeforeNetwork(
 }
 
 func createOrdinaryJunction(t *testing.T, link, target string) {
+	if runtime.GOOS != "windows" {
+		if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	t.Helper()
 	const script = `
 $ErrorActionPreference = "Stop"
@@ -2847,9 +2854,7 @@ func TestDownloader_ComponentRejects206AndCleansPart(t *testing.T) {
 func TestDownloader_ComponentTLSChecksumMismatchCleansRealPart(
 	t *testing.T,
 ) {
-	if runtime.GOOS != "windows" {
-		t.Fatal("real DownloadFiles acceptance must run on Windows")
-	}
+
 	content := []byte("checksum-mismatch-content")
 	server := tlsArtifactServer(t, content)
 	defer server.Close()

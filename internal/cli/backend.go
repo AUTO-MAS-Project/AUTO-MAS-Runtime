@@ -38,6 +38,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 	var repo string
 	var shutdownTimeout string
 	var port string
+	var deferBusinessStart bool
 	command := &cobra.Command{
 		Use:   "supervise",
 		Short: "启动并监督后端进程",
@@ -128,16 +129,18 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 						}
 					}
 					if err := service.Supervise(ctx, backend.Request{
-						OperationID:        emitter.OperationID(),
-						RuntimePID:         uint32(pid),
-						Mode:               backend.Mode(mode),
-						DevelopmentRepo:    repo,
-						ShutdownTimeout:    shutdownBudget,
-						Port:               supervisedPort,
-						Emitter:            &backendEventEmitter{emitter: emitter, control: control},
-						Control:            mailbox,
-						BeforeShutdown:     mailbox.BeforeShutdown,
-						BeforeControlClose: control.BeforeControlClose,
+						OperationID:              emitter.OperationID(),
+						RuntimePID:               uint32(pid),
+						Mode:                     backend.Mode(mode),
+						DevelopmentRepo:          repo,
+						ShutdownTimeout:          shutdownBudget,
+						Port:                     supervisedPort,
+						DeferBusinessStart:       deferBusinessStart || os.Getenv("AUTO_MAS_RUNTIME_DEFER_BUSINESS_START") == "1",
+						AllowLegacyBusinessStart: !deferBusinessStart,
+						Emitter:                  &backendEventEmitter{emitter: emitter, control: control},
+						Control:                  mailbox,
+						BeforeShutdown:           mailbox.BeforeShutdown,
+						BeforeControlClose:       control.BeforeControlClose,
 					}); err != nil {
 						return sessionSuccess{}, err
 					}
@@ -153,6 +156,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 	}
 	command.Flags().StringVar(&mode, "mode", "", "后端运行模式：managed 或 development")
 	command.Flags().StringVar(&repo, "repo", "", "development 模式源码目录")
+	command.Flags().BoolVar(&deferBusinessStart, "defer-business-start", false, "等待桌面确认后放行自动业务")
 	command.Flags().StringVar(
 		&shutdownTimeout,
 		"shutdown-timeout",
@@ -243,7 +247,9 @@ func runBackendSuperviseSession(
 				exitCode, telemetryState.terminalWritten = safeEmitPanicFailure(deps, emitter, stage, failure)
 			}
 		}
+		deps.sessionLog.finish(exitCode)
 		telemetryState.finish()
+		deps.sessionLog.close()
 	}()
 
 	output, err := newProcessOutput(deps)
@@ -261,6 +267,7 @@ func runBackendSuperviseSession(
 			string(protocol.CapabilityLogStream),
 			string(protocol.CapabilityStdinShutdown),
 			string(protocol.CapabilityStdinStatus),
+			string(protocol.CapabilityStdinActivate),
 		},
 		protocol.WithClock(deps.options.clock),
 	)
@@ -294,6 +301,7 @@ func runBackendSuperviseSession(
 		protocol.ControlCancel,
 		protocol.ControlShutdown,
 		protocol.ControlStatus,
+		protocol.ControlActivate,
 	)
 	if err != nil {
 		failure := backendControlInfrastructureError(stage, err)
@@ -403,6 +411,9 @@ func newBackendControl(mailbox *backend.ControlMailbox, stage protocol.Stage, su
 }
 
 func (c *backendControl) PrepareControl(command protocol.ControlCommand) (protocol.ControlDisposition, protocol.ControlAction, error) {
+	if command.Command == protocol.ControlActivate && c.CurrentControlStage() != protocol.StageBackendRun {
+		return protocol.ControlNotApplicable, nil, nil
+	}
 	return protocol.ControlAccepted, func() error {
 		if err := c.submit(command); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

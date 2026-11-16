@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -18,13 +19,16 @@ const (
 	StreamStderr = "stderr"
 )
 
-// StartSpec 描述一个必须先加入 Job 才能恢复执行的进程。
+// StartSpec 描述一个必须先建立受管回收边界才允许执行的进程。
 type StartSpec struct {
 	Executable string
 	Args       []string
 	Dir        string
 	Env        []string
 	Sink       StreamSink
+	// ReadStream 供 POSIX 工具执行层使用有界原始解析器；不得与 Sink 同时使用。
+	// Windows 工具执行器仍使用既有管道路径，传入此字段会失败关闭。
+	ReadStream func(context.Context, string, io.Reader) error
 }
 
 // StreamRecord 是交给日志层的不可变流片段。
@@ -41,7 +45,7 @@ type StreamRecord struct {
 // StreamSink 按每个流的原始顺序接收规范化文本片段，并必须在 ctx 取消后有界返回。
 type StreamSink func(ctx context.Context, record StreamRecord) error
 
-// Info 描述 Job 内一个进程的稳定诊断身份。
+// Info 描述受管边界内一个进程的稳定诊断身份。
 type Info struct {
 	PID        uint32
 	ParentPID  uint32
@@ -60,7 +64,7 @@ type managedJob interface {
 	waitEmpty(context.Context) error
 }
 
-// ManagedProcess 持有根进程、Job 和两个输出 reader 的唯一生命周期。
+// ManagedProcess 持有根进程、平台回收边界和两个输出 reader 的唯一生命周期。
 type ManagedProcess struct {
 	process *os.Process
 	job     managedJob
@@ -147,7 +151,7 @@ func (p *ManagedProcess) cachedResult() (ExitResult, error) {
 	return p.result, errors.Join(p.sinkErr, p.waitErr, p.cancelErr)
 }
 
-// Snapshot 返回仍属于本 Job 的进程树快照。
+// Snapshot 返回仍属于受管边界的进程树快照。
 func (p *ManagedProcess) Snapshot() ([]Info, error) {
 	if p == nil || p.job == nil {
 		return nil, errors.New("managed process job is unavailable")
@@ -155,7 +159,7 @@ func (p *ManagedProcess) Snapshot() ([]Info, error) {
 	return p.job.snapshot()
 }
 
-// Terminate 终止 Job 内全部进程，但保留 Job handle 供 WaitEmpty 证明。
+// Terminate 终止受管边界内全部进程，保留平台资源供 WaitEmpty 复验。
 func (p *ManagedProcess) Terminate(exitCode uint32) error {
 	if p == nil || p.job == nil {
 		return errors.New("managed process job is unavailable")
@@ -163,7 +167,7 @@ func (p *ManagedProcess) Terminate(exitCode uint32) error {
 	return p.job.Terminate(exitCode)
 }
 
-// WaitEmpty 在 Job handle 仍有效时确认进程树为空。
+// WaitEmpty 在平台资源仍有效时确认受管进程树为空。
 func (p *ManagedProcess) WaitEmpty(ctx context.Context) error {
 	if p == nil || p.job == nil {
 		return errors.New("managed process job is unavailable")
@@ -184,7 +188,7 @@ func (p *ManagedProcess) WaitEmpty(ctx context.Context) error {
 	return nil
 }
 
-// Close 幂等关闭 Job handle；调用前应先用 WaitEmpty 证明树为空。
+// Close 幂等关闭平台监督资源；调用前应先用 WaitEmpty 证明树为空。
 func (p *ManagedProcess) Close() error {
 	if p == nil || p.job == nil {
 		return nil

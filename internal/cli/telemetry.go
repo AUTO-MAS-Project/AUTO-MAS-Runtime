@@ -13,6 +13,7 @@ import (
 type telemetryFactory func(telemetry.Config) telemetry.Recorder
 
 type sessionTelemetryState struct {
+	deps            *deps
 	recorder        telemetry.Recorder
 	command         string
 	stage           protocol.Stage
@@ -36,7 +37,7 @@ func WithTelemetryFactory(factory telemetryFactory) Option {
 }
 
 func newTelemetryRecorder(deps *deps, runtimeVersion string) telemetry.Recorder {
-	if deps == nil || runtime.GOOS != "windows" {
+	if deps == nil || runtime.GOOS != "windows" && runtime.GOOS != "linux" {
 		return nil
 	}
 	config := telemetry.LoadConfig()
@@ -71,9 +72,11 @@ func recordSessionTelemetry(
 	operationErr error,
 	panicked bool,
 	panicFrames []telemetry.StackFrame,
-) {
+	operationID string,
+	fileSystem string,
+) string {
 	if recorder == nil {
-		return
+		return ""
 	}
 	if recoveredFrames, recovered := recoveredControlReaderPanic(operationErr); recovered {
 		panicked = true
@@ -91,6 +94,10 @@ func recordSessionTelemetry(
 		stage = classifiedStage
 		reason = telemetryReason(details)
 		if telemetry.IsReportableFailure(code) && code != protocol.CodeInternalError {
+			details = failureTelemetryDetails(operationErr, code, stage, details)
+			if command == "backend supervise" {
+				details = backendTelemetryDetails(operationErr, details)
+			}
 			diagnosticDetails = telemetry.SanitizeDiagnostics(details)
 		}
 	}
@@ -99,7 +106,12 @@ func recordSessionTelemetry(
 		diagnosticDetails = map[string]any{}
 	}
 	if telemetry.IsReportableFailure(code) {
-		safeTelemetryCaptureInternal(recorder, telemetry.InternalObservation{
+		if code != protocol.CodeInternalError {
+			diagnosticDetails["fileSystem"] = fileSystem
+			diagnosticDetails = telemetry.SanitizeDiagnostics(diagnosticDetails)
+		}
+		receipt := safeTelemetryCaptureInternal(recorder, telemetry.InternalObservation{
+			OperationID:       operationID,
 			Command:           command,
 			Stage:             string(stage),
 			Code:              string(code),
@@ -111,8 +123,89 @@ func recordSessionTelemetry(
 			Panic:             panicked,
 			PanicFrames:       append([]telemetry.StackFrame(nil), panicFrames...),
 		})
+		safeTelemetryClose(recorder)
+		return receipt
 	}
 	safeTelemetryClose(recorder)
+	return ""
+}
+
+// failureTelemetryDetails 合并专用诊断副本，外层事实优先，协议 details 只作回退。
+func failureTelemetryDetails(err error, code protocol.Code, stage protocol.Stage, selected map[string]any) map[string]any {
+	details := make(map[string]any, len(selected)+4)
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		// 不匹配的分类分支连同其底层诊断一起跳过，避免次要错误污染终态事实。
+		if failure, ok := current.(operationError); ok && (failure.Code() != code || failure.Stage() != stage) {
+			return
+		}
+		if failure, ok := current.(interface{ Code() protocol.Code }); ok && failure.Code() != code {
+			return
+		}
+		if diagnostic, ok := current.(interface{ DiagnosticDetails() map[string]any }); ok {
+			for key, value := range diagnostic.DiagnosticDetails() {
+				if _, exists := details[key]; !exists {
+					details[key] = value
+				}
+			}
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+		} else if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			visit(wrapped.Unwrap())
+		}
+	}
+	visit(err)
+	for key, value := range selected {
+		if _, exists := details[key]; !exists {
+			details[key] = value
+		}
+	}
+	return details
+}
+
+// backendTelemetryDetails 保留被清理错误遮盖的分类，不改变 result 的错误优先级。
+func backendTelemetryDetails(err error, selected map[string]any) map[string]any {
+	details := make(map[string]any, len(selected)+1)
+	for key, value := range selected {
+		details[key] = value
+	}
+	var primary, cleanup operationError
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		if failure, ok := current.(operationError); ok && telemetry.IsReportableFailure(failure.Code()) {
+			if failure.Stage() == protocol.StageBackendCleanup {
+				if cleanup == nil {
+					cleanup = failure
+				}
+			} else if strings.HasPrefix(string(failure.Stage()), "backend.") {
+				primary = failure
+			}
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+		} else if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			visit(wrapped.Unwrap())
+		}
+	}
+	visit(err)
+	if primary != nil && cleanup != nil {
+		details["failures"] = []map[string]any{
+			{"phase": "primary", "code": string(primary.Code()), "stage": string(primary.Stage())},
+			{"phase": "cleanup", "code": string(cleanup.Code()), "stage": string(cleanup.Stage())},
+		}
+	}
+	return details
 }
 
 func telemetryReason(details map[string]any) string {
@@ -138,6 +231,7 @@ func newSessionTelemetryState(
 	panicFrames []telemetry.StackFrame,
 ) *sessionTelemetryState {
 	return &sessionTelemetryState{
+		deps:           deps,
 		recorder:       newTelemetryRecorder(deps, runtimeVersion),
 		command:        command,
 		stage:          stage,
@@ -152,7 +246,17 @@ func (s *sessionTelemetryState) finish() {
 		return
 	}
 	if s.terminalWritten || (!s.sessionStarted && s.panicked) {
-		recordSessionTelemetry(
+		operationID, fileSystem := "", "unknown"
+		if s.deps != nil && s.deps.sessionLog != nil {
+			log := s.deps.sessionLog
+			log.observe(func() {
+				operationID = log.operationID
+				if log.logger != nil {
+					fileSystem = log.logger.FileSystem()
+				}
+			})
+		}
+		receipt := recordSessionTelemetry(
 			s.recorder,
 			s.command,
 			s.stage,
@@ -160,7 +264,13 @@ func (s *sessionTelemetryState) finish() {
 			s.operationErr,
 			s.panicked,
 			s.panicFrames,
+			operationID,
+			fileSystem,
 		)
+		if receipt != "" && s.deps != nil && s.deps.sessionLog != nil {
+			log := s.deps.sessionLog
+			log.observe(func() { log.record("telemetry.accepted", map[string]any{"sentryEventId": receipt, "accepted": true}) })
+		}
 		return
 	}
 	safeTelemetryClose(s.recorder)
@@ -219,11 +329,12 @@ func telemetryOutputFailure(stage protocol.Stage) error {
 	}
 }
 
-func safeTelemetryCaptureInternal(recorder telemetry.Recorder, observation telemetry.InternalObservation) {
+func safeTelemetryCaptureInternal(recorder telemetry.Recorder, observation telemetry.InternalObservation) (receipt string) {
 	defer func() { _ = recover() }()
 	if recorder != nil {
-		recorder.CaptureInternal(context.Background(), observation)
+		return recorder.CaptureInternal(context.Background(), observation)
 	}
+	return ""
 }
 
 func safeTelemetryClose(recorder telemetry.Recorder) {
@@ -305,8 +416,16 @@ func capturePanicFrames() []telemetry.StackFrame {
 	for {
 		frame, more := frames.Next()
 		if frame.Function != "" {
+			// Go 完整函数名的包分隔点位于最后一个路径分隔符之后。
+			packageNameStart := strings.LastIndex(frame.Function, "/") + 1
+			packageSeparator := strings.Index(frame.Function[packageNameStart:], ".")
+			module := ""
+			if packageSeparator >= 0 {
+				module = frame.Function[:packageNameStart+packageSeparator]
+			}
 			result = append(result, telemetry.StackFrame{
 				Function: frame.Function,
+				Module:   module,
 				Lineno:   frame.Line,
 			})
 		}

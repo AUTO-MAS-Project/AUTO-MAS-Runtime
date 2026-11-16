@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -160,6 +161,9 @@ func TestFilesystemLogFiles_TwoInstancesAppendAndDenyDeleteSharing(t *testing.T)
 
 	path := firstWriter.Path()
 	assertRenameBlocked := func(stage string) {
+		if runtime.GOOS != "windows" {
+			return
+		}
 		t.Helper()
 		moved := path + ".sharing-check"
 		if err := os.Rename(path, moved); err != nil {

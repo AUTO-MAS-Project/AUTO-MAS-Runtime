@@ -3,8 +3,14 @@ package config
 import (
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// BackendCapabilitiesFile 返回所选源码仓库的 Runtime 能力清单路径。
+func BackendCapabilitiesFile(repoDir string) string {
+	return filepath.Join(repoDir, "res", "runtime-capabilities.json")
+}
 
 // RepositoryFile 返回 Git tree 中普通跟踪文件的受管路径，禁止访问 Git 元数据和根外路径。
 func (l *Layout) RepositoryFile(name string) (string, error) {
@@ -77,9 +83,9 @@ func newLayoutPaths(root string) layoutPaths {
 		runtimeDir:           runtimeDir,
 		uvToolsDir:           filepath.Join(runtimeDir, "tools", "uv"),
 		pythonDir:            pythonDir,
-		pythonExecutable:     filepath.Join(pythonDir, "python.exe"),
+		pythonExecutable:     managedPythonExecutable(pythonDir),
 		venvDir:              filepath.Join(environmentDir, "venv"),
-		venvPythonExecutable: filepath.Join(environmentDir, "venv", "Scripts", "python.exe"),
+		venvPythonExecutable: PythonExecutableInVenv(filepath.Join(environmentDir, "venv")),
 		venvConfigFile:       filepath.Join(environmentDir, "venv", "pyvenv.cfg"),
 		runtimeCacheDir:      cacheDir,
 		uvCacheDir:           filepath.Join(cacheDir, "uv"),
@@ -149,8 +155,11 @@ func (l *Layout) VenvDir() string { return l.paths.venvDir }
 // VenvPythonExecutable 返回受管项目虚拟环境的 Python 解释器路径。
 func (l *Layout) VenvPythonExecutable() string { return l.paths.venvPythonExecutable }
 
-// PythonExecutableInVenv 返回指定 Windows 虚拟环境的解释器路径。
+// PythonExecutableInVenv 返回指定虚拟环境的本机解释器路径。
 func PythonExecutableInVenv(venvDir string) string {
+	if runtime.GOOS != "windows" {
+		return filepath.Join(venvDir, "bin", "python")
+	}
 	return filepath.Join(venvDir, "Scripts", "python.exe")
 }
 
@@ -200,3 +209,23 @@ func (l *Layout) DebugDir() string { return l.paths.debugDir }
 
 // PluginsDir 返回插件目录。
 func (l *Layout) PluginsDir() string { return l.paths.pluginsDir }
+
+func managedPythonExecutable(directory string) string {
+	if runtime.GOOS != "windows" {
+		return filepath.Join(directory, "bin", "python3")
+	}
+	return filepath.Join(directory, "python.exe")
+}
+
+// UVExecutableName 返回平台原生的 uv 可执行文件名。
+func UVExecutableName() string {
+	if runtime.GOOS == "windows" {
+		return "uv.exe"
+	}
+	return "uv"
+}
+
+// DevelopmentPythonExecutable 返回外部源码仓库虚拟环境的本机解释器路径。
+func DevelopmentPythonExecutable(repo string) string {
+	return PythonExecutableInVenv(filepath.Join(repo, ".venv"))
+}

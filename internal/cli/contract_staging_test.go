@@ -111,6 +111,7 @@ func TestWorkspaceRemote_FailureDiagnostics(t *testing.T) {
 	}
 	observations, _, _ := recorder.snapshot()
 	wantDiagnostics := telemetry.SanitizeDiagnostics(map[string]any{"attempts": attempts})
+	wantDiagnostics["fileSystem"] = expectedSessionFileSystem(t, observations)
 	if len(observations) != 1 || observations[0].Command != "workspace check" ||
 		observations[0].Stage != string(protocol.StageWorkspaceCheck) ||
 		!reflect.DeepEqual(observations[0].DiagnosticDetails, wantDiagnostics) {

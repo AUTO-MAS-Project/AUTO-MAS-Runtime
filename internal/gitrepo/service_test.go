@@ -631,6 +631,7 @@ func (l *serviceTestLocks) AcquireMutation(context.Context) (mutationLease, erro
 	}
 	return l.lease, nil
 }
+
 func (l *serviceTestLocks) Close() error { l.closed = true; return nil }
 
 type serviceTestLease struct{ closed bool }
@@ -639,7 +640,8 @@ func (l *serviceTestLease) Close() error { l.closed = true; return nil }
 
 type serviceCodedError struct{ code protocol.Code }
 
-func (e serviceCodedError) Error() string       { return string(e.code) }
+func (e serviceCodedError) Error() string { return string(e.code) }
+
 func (e serviceCodedError) Code() protocol.Code { return e.code }
 
 type serviceTestRuntime struct {
@@ -675,9 +677,11 @@ func (r *serviceTestRuntime) Recover(ctx context.Context, request RecoveryReques
 	}
 	return RecoveryResult{}, nil
 }
+
 func (r *serviceTestRuntime) ReadEnvironment(context.Context) (state.EnvironmentState, error) {
 	return r.environment, r.readEnvironmentErr
 }
+
 func (r *serviceTestRuntime) NewTransaction(_ state.TransactionKind, input state.TransactionInput) (state.TransactionState, error) {
 	r.newTransactionCalls++
 	if r.newTransactionErr != nil {
@@ -685,6 +689,7 @@ func (r *serviceTestRuntime) NewTransaction(_ state.TransactionKind, input state
 	}
 	return state.TransactionState{SchemaVersion: state.SchemaVersion, OperationID: input.OperationID, Command: input.Command, PID: input.PID, StartedAt: time.Now().UTC(), TargetVersion: input.TargetVersion, Stage: input.Stage}, nil
 }
+
 func (r *serviceTestRuntime) WriteTransaction(_ context.Context, _ state.TransactionKind, value state.TransactionState) error {
 	r.writeTransactionCalls++
 	if err := r.writeTransactionErrByStage[value.Stage]; err != nil {
@@ -692,17 +697,21 @@ func (r *serviceTestRuntime) WriteTransaction(_ context.Context, _ state.Transac
 	}
 	return r.writeTransactionErr
 }
+
 func (r *serviceTestRuntime) ReadTransaction(context.Context, state.TransactionKind) (state.TransactionSnapshot, error) {
 	return state.TransactionSnapshot{}, nil
 }
+
 func (r *serviceTestRuntime) RemoveTransaction(_ context.Context, snapshot state.TransactionSnapshot) error {
 	r.updateRemovals++
 	return nil
 }
+
 func (r *serviceTestRuntime) Fetch(context.Context, FetchRequest) (FetchResult, error) {
 	r.fetchCalls++
 	return r.fetchResult, nil
 }
+
 func (r *serviceTestRuntime) Swap(ctx context.Context, request SwapRequest) (SwapResult, error) {
 	r.swapCalls++
 	var result SwapResult
@@ -721,9 +730,11 @@ func (r *serviceTestRuntime) Swap(ctx context.Context, request SwapRequest) (Swa
 	}
 	return result, err
 }
+
 func (r *serviceTestRuntime) NewBrokenEnvironment(last state.Revision, broken state.BrokenEnvironment) (state.EnvironmentState, error) {
 	return state.EnvironmentState{SchemaVersion: state.SchemaVersion, Status: protocol.StateEnvironmentBroken, LastSuccessful: last, Broken: &broken}, nil
 }
+
 func (r *serviceTestRuntime) WriteEnvironment(ctx context.Context, value state.EnvironmentState) error {
 	r.writeEnvironmentCalls++
 	if r.writeEnvironment != nil {
@@ -732,12 +743,14 @@ func (r *serviceTestRuntime) WriteEnvironment(ctx context.Context, value state.E
 	r.writtenEnvironment = value
 	return r.writeEnvironmentErr
 }
+
 func (r *serviceTestRuntime) Close() error { return nil }
 
 type serviceTestLogger struct{}
 
 func (serviceTestLogger) LogPath() string { return filepath.Join("C:\\runtime", "workspace-sync.log") }
-func (serviceTestLogger) Close() error    { return nil }
+
+func (serviceTestLogger) Close() error { return nil }
 
 type serviceTestAuditor struct{}
 
@@ -748,7 +761,8 @@ func (serviceTestAuditor) RecordDeletion(context.Context, filesystem.DeleteAudit
 type serviceTestEmitter struct{}
 
 func (serviceTestEmitter) EmitProgress(protocol.ProgressEvent) error { return nil }
-func (serviceTestEmitter) EmitState(protocol.StateEvent) error       { return nil }
+
+func (serviceTestEmitter) EmitState(protocol.StateEvent) error { return nil }
 
 type recordingServiceEmitter struct {
 	states []protocol.StateEvent

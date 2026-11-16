@@ -3,9 +3,6 @@ package filesystem
 import (
 	"errors"
 	"fmt"
-	"sync"
-
-	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
 // ErrStateGuardTimeout 表示状态守卫在独立获取预算内一直被占用。
@@ -69,23 +66,6 @@ type stateFileOwner struct {
 	marker byte
 }
 
-// StateFiles 表示受管状态目录能力。
-type StateFiles struct {
-	mu sync.RWMutex // 保护 closed、closeErr、pins、probePassed、classicUnlink 与操作/关闭的句柄生命周期。
-
-	layout              *config.Layout
-	api                 pathAPI
-	waitGate            WaitFunc
-	fillNonce           func([]byte) error
-	afterUnlinkVerified func(string)
-	owner               *stateFileOwner
-	pins                [2]pinnedObject
-	probePassed         map[StateFileKind]bool
-	classicUnlink       bool
-	closed              bool
-	closeErr            error
-}
-
 // StateFileSnapshot 绑定读取内容与其物理文件身份。
 type StateFileSnapshot struct {
 	owner        *stateFileOwner
@@ -121,6 +101,7 @@ type StateRemoveResult struct {
 
 // StateWriteError 保存写入阶段、主因和独立清理错误。
 type StateWriteError struct {
+	UnlinkMode       string
 	Phase            StateWritePhase
 	MutationApplied  bool
 	RecoveryRequired bool
@@ -154,6 +135,7 @@ func (e *StateWriteError) Unwrap() []error {
 
 // StateRemoveError 分离条件删除的主因和独立清理错误。
 type StateRemoveError struct {
+	UnlinkMode   string
 	Cause        error
 	CleanupError error
 }

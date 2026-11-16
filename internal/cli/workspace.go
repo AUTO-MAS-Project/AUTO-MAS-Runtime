@@ -104,6 +104,7 @@ func workspaceStageCommand(deps *deps) *cobra.Command {
 							logger, loggerErr := deps.options.workspaceLoggerFactory(loggerContext, deps.global.layout, deps.io.Err, command, operationID, deps.options.clock)
 							if loggerErr == nil {
 								binding.Set(logger)
+								deps.opLog.Set(logger)
 							}
 							return logger, loggerErr
 						},
@@ -229,6 +230,7 @@ func runWorkspaceSync(
 			)
 			if loggerErr == nil {
 				binding.Set(logger)
+				deps.opLog.Set(logger)
 			}
 			return logger, loggerErr
 		},

@@ -29,8 +29,16 @@ func TestBackendDevelopment_RequiresOnlyExplicitRepoContract(t *testing.T) {
 	go func() { done <- f.supervisor().Supervise(ctx, developmentRequest(f.request(), repo)) }()
 	waitFor(t, f.emitter.running)
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Supervise() error = %v, want context.Canceled", err)
+	}
+	var diagnostic interface{ DiagnosticDetails() map[string]any }
+	if !errors.As(err, &diagnostic) || diagnostic.DiagnosticDetails()["mode"] != "development" {
+		t.Fatalf("diagnostics = %#v, want development mode", diagnostic)
+	}
+	if len(diagnostic.DiagnosticDetails()) != 1 {
+		t.Fatalf("development identity = %#v, want no invented revision", diagnostic.DiagnosticDetails())
 	}
 	if f.state.readCalls != 0 {
 		t.Fatalf("ReadEnvironment calls = %d, want 0", f.state.readCalls)

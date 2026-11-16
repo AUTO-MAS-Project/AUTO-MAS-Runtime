@@ -1,21 +1,40 @@
-//go:build !windows
+//go:build linux || darwin
 
-package config
+package config_test
 
 import (
 	"errors"
 	"testing"
+
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 )
 
-func TestLayout_POSIXIdentity(t *testing.T) {
-	if _, err := NewLayout("/", "/tmp"); !errors.Is(err, ErrAppRootIsRoot) {
-		t.Fatalf("got %v, want ErrAppRootIsRoot", err)
+func TestPOSIXLayout_RootAndCase(t *testing.T) {
+	if _, err := config.NewLayout("/", "/"); !errors.Is(err, config.ErrAppRootIsRoot) {
+		t.Fatalf("got %v, want root rejected", err)
 	}
-	upper, err := NewLayout("/tmp/AUTO-MAS", "/tmp")
+	a, err := config.NewLayout("/tmp/MAS", "/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
-	lower, err := NewLayout("/tmp/auto-mas", "/tmp")
+	b, err := config.NewLayout("/tmp/mas", "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.IdentityKey() == b.IdentityKey() {
+		t.Fatal("got folded case, want distinct lexical identity")
+	}
+}
+
+func TestLayout_POSIXIdentity(t *testing.T) {
+	if _, err := config.NewLayout("/", "/tmp"); !errors.Is(err, config.ErrAppRootIsRoot) {
+		t.Fatalf("got %v, want ErrAppRootIsRoot", err)
+	}
+	upper, err := config.NewLayout("/tmp/AUTO-MAS", "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lower, err := config.NewLayout("/tmp/auto-mas", "/tmp")
 	if err != nil {
 		t.Fatal(err)
 	}

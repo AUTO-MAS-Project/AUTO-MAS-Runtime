@@ -328,7 +328,7 @@ func (f *StateFiles) WriteAtomic(
 	ctx context.Context,
 	kind StateFileKind,
 	payload []byte,
-) (WriteAtomicResult, error) {
+) (result WriteAtomicResult, operationErr error) {
 	if ctx == nil {
 		return WriteAtomicResult{}, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
 	}
@@ -342,6 +342,13 @@ func (f *StateFiles) WriteAtomic(
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.unlinkMode = "unknown"
+	defer func() {
+		var failure *StateWriteError
+		if errors.As(operationErr, &failure) {
+			failure.UnlinkMode = f.unlinkMode
+		}
+	}()
 	if f.closed {
 		return WriteAtomicResult{}, ErrClosed
 	}
@@ -388,7 +395,7 @@ func (f *StateFiles) WriteAtomic(
 func (f *StateFiles) RemoveTransactionIfUnchanged(
 	ctx context.Context,
 	snapshot StateFileSnapshot,
-) (StateRemoveResult, error) {
+) (result StateRemoveResult, operationErr error) {
 	if ctx == nil {
 		return StateRemoveResult{}, fmt.Errorf("%w: context is nil", ErrInvalidArgument)
 	}
@@ -401,6 +408,21 @@ func (f *StateFiles) RemoveTransactionIfUnchanged(
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.unlinkMode = "unknown"
+	defer func() {
+		var failure *StateRemoveError
+		if operationErr == nil {
+			return
+		}
+		if !errors.As(operationErr, &failure) {
+			if f.unlinkMode == "unknown" {
+				return
+			}
+			failure = &StateRemoveError{Cause: operationErr}
+			operationErr = failure
+		}
+		failure.UnlinkMode = f.unlinkMode
+	}()
 	if f.closed {
 		return StateRemoveResult{}, ErrClosed
 	}
@@ -1885,7 +1907,9 @@ func (f *StateFiles) unlinkStateObject(
 	objectPath := object.path.String()
 	disposition := statePOSIXDispositionSpec()
 	operation := "posix-unlink"
+	f.unlinkMode = "posix"
 	if f.classicUnlink {
+		f.unlinkMode = "classic"
 		disposition = stateClassicDispositionSpec()
 		operation = "classic-unlink"
 	}

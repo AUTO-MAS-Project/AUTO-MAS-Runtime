@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
@@ -231,6 +232,110 @@ func TestDependencies_RelayFailuresMapToMirrorExhausted(t *testing.T) {
 	_, err = plain.service.Sync(t.Context(), plain.request(t, mirror.PolicySpec{}))
 	if !errors.As(err, &structured) || structured.Code() != protocol.CodeDependencySyncFailed {
 		t.Fatalf("Sync() error = %v, want DEPENDENCY_SYNC_FAILED without relay failures", err)
+	}
+}
+
+func TestDependencies_RelayPreservesExecutionDiagnostics(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		cause    error
+		exitCode int
+		wantKind string
+	}{
+		{name: "read failure after successful exit", cause: newError(protocol.CodeUVExecFailed, protocol.StageDependenciesSync, "读取失败", map[string]any{"failureKind": "output_read_failed", "operation": "read", "windowsError": uint64(6)}, errors.New("private cause")), wantKind: "output_read_failed"},
+		{name: "unknown failure after successful exit", cause: errors.New("private cause"), wantKind: "dependency_sync_failed"},
+		{name: "nonzero exit", cause: errors.New("private cause"), exitCode: 2, wantKind: "dependency_sync_nonzero"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := &fakeRelaySession{baseURL: "http://127.0.0.1:39171"}
+			fixture := newRelayFixture(t, &fakeRelayFactory{session: session})
+			fixture.runner.responses = []fakeRunnerResponse{{}, {
+				result: UVResult{ExitCode: test.exitCode, Stderr: "private stderr", Duration: 125 * time.Millisecond}, err: test.cause,
+			}}
+			_, err := fixture.service.Sync(t.Context(), fixture.request(t, mirror.PolicySpec{}))
+			assertPythonCode(t, err, protocol.CodeDependencySyncFailed)
+			if !errors.Is(err, test.cause) {
+				t.Fatalf("Sync() error = %v, want original cause", err)
+			}
+			var diagnostic interface{ DiagnosticDetails() map[string]any }
+			if !errors.As(err, &diagnostic) {
+				t.Fatalf("error = %v, want execution diagnostics", err)
+			}
+			details := diagnostic.DiagnosticDetails()
+			if details["failureKind"] != test.wantKind || details["exitCode"] != test.exitCode || details["durationMs"] != int64(125) {
+				t.Fatalf("diagnostics = %#v, want %s and original execution facts", details, test.wantKind)
+			}
+			if test.wantKind == "output_read_failed" && (details["operation"] != "read" || details["windowsError"] != uint64(6)) {
+				t.Fatalf("diagnostics = %#v, want structured low-level facts", details)
+			}
+			var failure *Error
+			if !errors.As(err, &failure) || failure.Details()["failureKind"] != "dependency_sync_nonzero" {
+				t.Fatalf("protocol details changed: %v", err)
+			}
+			if session.closed != 1 {
+				t.Fatalf("relay closes = %d, want 1", session.closed)
+			}
+			fixture.assertNoStagingLeftovers(t)
+		})
+	}
+}
+
+func TestDependencies_MirrorFallbackPreservesExecutionDiagnostics(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mirrorOnly bool
+		wantCode   protocol.Code
+	}{
+		{name: "official fallback", wantCode: protocol.CodeDependencySyncFailed},
+		{name: "mirror only", mirrorOnly: true, wantCode: protocol.CodeMirrorExhausted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			factory := &fakeRelayFactory{err: errors.New("relay unavailable")}
+			fixture := newRelayFixture(t, factory)
+			request := fixture.request(t, mirror.PolicySpec{MirrorOnly: test.mirrorOnly})
+			plan, err := fixture.service.buildPackageIndexPlan(t.Context(), request.MirrorPolicy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sources := plan.Sources()
+			lastCause := newError(protocol.CodeUVExecFailed, protocol.StageDependenciesSync, "读取失败", map[string]any{
+				"failureKind": "output_read_failed", "operation": "read", "windowsError": uint64(6),
+			}, errors.New("private cause"))
+			fixture.runner.responses = []fakeRunnerResponse{{}}
+			for index := range sources {
+				response := fakeRunnerResponse{result: UVResult{ExitCode: 2}, err: newError(
+					protocol.CodeUVExecFailed, protocol.StageDependenciesSync, "执行失败",
+					map[string]any{"failureKind": "nonzero_exit", "exitCode": 2}, errors.New("earlier failure"),
+				)}
+				if index == len(sources)-1 {
+					response = fakeRunnerResponse{result: UVResult{ExitCode: 0, Stderr: "private stderr", Duration: 125 * time.Millisecond}, err: lastCause}
+				}
+				fixture.runner.responses = append(fixture.runner.responses, response)
+			}
+
+			_, err = fixture.service.Sync(t.Context(), request)
+			assertPythonCode(t, err, test.wantCode)
+			if !errors.Is(err, lastCause) {
+				t.Fatalf("Sync() error = %v, want last execution cause", err)
+			}
+			var failure *Error
+			if !errors.As(err, &failure) {
+				t.Fatalf("Sync() error = %v, want structured error", err)
+			}
+			wantProtocol := map[string]any{"sourceKind": "package-index", "attemptCount": len(sources), "exitCode": 0}
+			if got := failure.Details(); !reflect.DeepEqual(got, wantProtocol) {
+				t.Fatalf("protocol details = %#v, want %#v", got, wantProtocol)
+			}
+			diagnostics := failure.DiagnosticDetails()
+			if diagnostics["failureKind"] != "output_read_failed" || diagnostics["exitCode"] != 0 || diagnostics["durationMs"] != int64(125) || diagnostics["windowsError"] != uint64(6) {
+				t.Fatalf("diagnostics = %#v, want last execution facts", diagnostics)
+			}
+			if factory.starts != 1 || len(fixture.runner.calls) != len(sources)+1 || len(fixture.attempts) != len(sources) {
+				t.Fatalf("relay starts / calls / attempts = %d / %d / %d, want one startup and one execution per source", factory.starts, len(fixture.runner.calls), len(fixture.attempts))
+			}
+			fixture.assertRepositoryUntouched(t)
+			fixture.assertNoStagingLeftovers(t)
+		})
 	}
 }
 

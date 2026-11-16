@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
@@ -135,7 +136,7 @@ func developmentPathReason(err error) string {
 }
 
 func developmentPythonPath(repo string) string {
-	return filepath.Join(repo, ".venv", "Scripts", "python.exe")
+	return config.DevelopmentPythonExecutable(repo)
 }
 
 func developmentProjectEnv(repo string) string {

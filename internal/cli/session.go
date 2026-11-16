@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
@@ -89,7 +90,9 @@ func runOperationSession(
 				exitCode, telemetryState.terminalWritten = safeEmitPanicFailure(deps, emitter, stage, failure)
 			}
 		}
+		deps.sessionLog.finish(exitCode)
 		telemetryState.finish()
+		deps.sessionLog.close()
 	}()
 
 	output, err := newProcessOutput(deps)
@@ -181,6 +184,28 @@ func runOperationSession(
 		if panicked {
 			telemetryState.addPanic(err, panicFrames)
 		}
+		// 独立终态 writer 记录命令收尾和业务日志建立前的错误。
+		failureCode, _, _, _ := classifyFailure(err, stage)
+		if sessionRecordsFailure(failureCode) && (deps.opLog.Get() != nil || deps.sessionLog != nil) {
+			deps.opLog.Set(nil)
+			logContext, cancelLog := context.WithTimeout(context.WithoutCancel(ctx), m5TransactionCleanupTimeout)
+			defer cancelLog()
+			failureLogger, logErr := deps.options.workspaceLoggerFactory(
+				// 磁盘诊断已经在首次打开时写过 stderr，终态追加不重复播报。
+				logContext, deps.global.layout, io.Discard, command, emitter.OperationID(), deps.options.clock,
+			)
+			if logErr != nil {
+				writeDiagnostic(deps.io, logErr)
+			} else {
+				deps.opLog.Set(failureLogger)
+				defer func() {
+					deps.opLog.Set(nil)
+					if closeErr := failureLogger.Close(); closeErr != nil {
+						writeDiagnostic(deps.io, closeErr)
+					}
+				}()
+			}
+		}
 		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
 		return exitCode
 	}
@@ -211,18 +236,21 @@ func helloRuntimeVersion(ctx context.Context, source versionSourceFunc) string {
 }
 
 func newProcessOutput(deps *deps) (*protocol.ProcessOutput, error) {
+	var renderer protocol.EventRenderer
+	var err error
 	switch deps.global.output {
 	case outputNDJSON:
-		return protocol.NewProcessOutput(deps.io.Out)
+		renderer, err = protocol.NewNDJSONRenderer(deps.io.Out)
 	case outputHuman:
-		renderer, err := protocol.NewHumanRenderer(deps.io.Out, deps.io.Err)
-		if err != nil {
-			return nil, err
-		}
-		return protocol.NewProcessOutputWithRenderer(renderer)
+		renderer, err = protocol.NewHumanRenderer(deps.io.Out, deps.io.Err)
 	default:
 		return nil, fmt.Errorf("unsupported output mode %q", deps.global.output)
 	}
+	if err != nil {
+		return nil, err
+	}
+	deps.sessionLog = &sessionDiagnostics{EventRenderer: renderer, deps: deps}
+	return protocol.NewProcessOutputWithRenderer(deps.sessionLog)
 }
 
 // sessionSetupFailure 发生在协议会话建立阶段，此时只能写 stderr 诊断。
@@ -246,6 +274,9 @@ func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, su
 
 func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.Stage, err error) (int, bool) {
 	code, stage, message, details := classifyFailure(err, fallbackStage)
+	if deps.sessionLog != nil && sessionRecordsFailure(code) {
+		deps.sessionLog.observe(func() { deps.sessionLog.open() })
+	}
 	recordOperationFailure(deps, code, stage, message, details, err)
 	errorEvent, eventErr := protocol.NewErrorEvent(code, stage, message, details)
 	if eventErr != nil {
@@ -310,6 +341,16 @@ func classifyFailure(err error, fallbackStage protocol.Stage) (protocol.Code, pr
 		if !errors.As(err, &primary) || primary.Code() == protocol.CodeGitRepoCleanupFailed {
 			return cleanupErr.Code(), cleanupErr.Stage(), cleanupErr.Message(), cleanupErr.Details()
 		}
+	}
+	var internalDeadline interface {
+		operationError
+		InternalDeadline() bool
+	}
+	if errors.As(err, &internalDeadline) && internalDeadline.InternalDeadline() {
+		// 外层错误带有进程/清理诊断；内部预算标记只负责与调用方取消区分。
+		var primary operationError
+		errors.As(err, &primary)
+		return primary.Code(), primary.Stage(), primary.Message(), primary.Details()
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		stage := fallbackStage
@@ -429,9 +470,9 @@ func exitCodeFor(code protocol.Code) int {
 // 操作日志此前只有 uv 输出透传与清理审计，全是 info：真机上取到 2468 行日志零 warn
 // 零 error，失败本身、错误码与 stage 一条都不落盘，用户报上来无从查起。这里在失败的
 // 唯一出口补一条 error 记录。状态写入失败另在本地日志保留底层 cause，
-// 以便区分文件系统能力、占用与权限；协议事件仍只含稳定字段。
+// 以便区分文件系统能力、占用与权限；其他失败也保留有界错误链，协议仍只含稳定字段。
 //
-// 日志器尚未打开时，状态写入失败把 cause 写到 stderr，其余失败静默跳过；
+// 日志器不可用时，状态写入失败把有界错误链写到 stderr，其余失败静默跳过；
 // 写日志失败不改变命令结局。
 func recordOperationFailure(
 	deps *deps,
@@ -445,10 +486,17 @@ func recordOperationFailure(
 		return
 	}
 	logger := deps.opLog.Get()
+	if logger == nil && code == protocol.CodeStateWriteFailed && cause != nil {
+		writeStateFailureDiagnostic(deps.io, cause)
+	}
+	if logger == nil && deps.sessionLog != nil {
+		deps.sessionLog.observe(func() {
+			if deps.sessionLog.logger != nil {
+				logger = deps.sessionLog.logger
+			}
+		})
+	}
 	if logger == nil {
-		if code == protocol.CodeStateWriteFailed && cause != nil {
-			writeDiagnostic(deps.io, cause)
-		}
 		return
 	}
 	entry := make(map[string]any, len(details)+2)
@@ -457,12 +505,16 @@ func recordOperationFailure(
 	}
 	entry["code"] = string(code)
 	entry["stage"] = string(stage)
+	for key, value := range failureTelemetryDetails(cause, code, stage, nil) {
+		entry[key] = value
+	}
 	if code == protocol.CodeStateWriteFailed {
 		var commandErr *commandError
 		if errors.As(cause, &commandErr) && commandErr.cause != nil {
 			entry["cause"] = commandErr.cause.Error()
 		}
 	}
+	entry["causes"], entry["causesTruncated"] = localStateErrorChain(cause)
 	ctx := deps.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -470,5 +522,10 @@ func recordOperationFailure(
 	// 取消导致的失败同样要落盘，所以剥掉取消信号再写。
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m5TransactionCleanupTimeout)
 	defer cancel()
-	_, _ = logger.Record(ctx, logging.LevelError, message, entry)
+	if _, err := logger.Record(ctx, logging.LevelError, message, entry); err != nil {
+		writeDiagnostic(deps.io, err)
+		if code == protocol.CodeStateWriteFailed {
+			writeStateFailureDiagnostic(deps.io, cause)
+		}
+	}
 }

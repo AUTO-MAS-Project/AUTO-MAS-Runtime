@@ -93,7 +93,7 @@ func healthyFixture(t *testing.T) (*config.Layout, string) {
 		t.Fatalf("NewLayout() error = %v", err)
 	}
 	writeJSONFile(t, layout.RepoVersionFile(), map[string]string{"version": "v5.4.0-beta.1"})
-	writeFile(t, filepath.Join(layout.PythonDir(), "python.exe"), nil)
+	writeFile(t, layout.PythonExecutable(), nil)
 	// 健康夹具必须铺出结构完整的 venv：pyvenv.cfg 缺失时 CPython 一启动就退出，
 	// 这种 venv 不该被算作健康。
 	writeFile(t, layout.VenvPythonExecutable(), nil)
@@ -102,7 +102,7 @@ func healthyFixture(t *testing.T) (*config.Layout, string) {
 	if err != nil {
 		t.Fatalf("UVVersionDir() error = %v", err)
 	}
-	writeFile(t, filepath.Join(uvDir, "uv.exe"), nil)
+	writeFile(t, filepath.Join(uvDir, config.UVExecutableName()), nil)
 	if err := os.MkdirAll(layout.LogsDir(), 0o755); err != nil {
 		t.Fatalf("MkdirAll(logs) error = %v", err)
 	}
@@ -675,7 +675,7 @@ func TestService_UVCheckHonoursTotalBudget(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UVVersionDir() error = %v", err)
 		}
-		writeFile(t, filepath.Join(uvDir, "uv.exe"), nil)
+		writeFile(t, filepath.Join(uvDir, config.UVExecutableName()), nil)
 	}
 
 	var calls int

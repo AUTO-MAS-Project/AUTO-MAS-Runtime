@@ -63,6 +63,40 @@ func TestBootstrap_CacheHitAndVersionVerification(t *testing.T) {
 	}
 }
 
+func TestBootstrap_CachedExecutableFailurePreservesDiagnostics(t *testing.T) {
+	layout := newUVTestLayout(t)
+	artifact := testArtifact("cached archive")
+	executable, err := layout.UVExecutable(artifact.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("fake uv"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("executable access denied")
+	checker := &fakeVersionChecker{err: newError(
+		protocol.CodeUVExecFailed, protocol.StageUVVerify, "uv 执行失败",
+		map[string]any{"failureKind": "start_failed", "windowsError": uint64(5)}, cause,
+	)}
+	bootstrapper := newTestBootstrapper(t, layout, artifact, &fakeDownloader{}, checker, nil, nil)
+
+	_, err = bootstrapper.Ensure(t.Context(), testOperationID, testMirrorPolicy(t))
+	var failure *Error
+	if !errors.As(err, &failure) || !errors.Is(err, cause) {
+		t.Fatalf("Ensure() error = %v, want original execution failure", err)
+	}
+	if failure.Code() != protocol.CodeUVExecFailed || failure.Stage() != protocol.StageUVVerify {
+		t.Fatalf("failure = %s/%s, want UV_EXEC_FAILED/uv.verify", failure.Code(), failure.Stage())
+	}
+	details := failure.Details()
+	if details["failureKind"] != "start_failed" || details["windowsError"] != uint64(5) {
+		t.Fatalf("failure details = %#v, want start_failed and windowsError=5", details)
+	}
+}
+
 func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
 	layout := newUVTestLayout(t)
 	archiveBytes := makeUVArchive(t)

@@ -13,6 +13,11 @@ import (
 
 var errDarwinCoordinatorTimeout = errors.New("flock coordinator wait budget exceeded")
 
+const (
+	darwinInitializationAttempts = 16
+	darwinInitializationRetry    = 2 * time.Millisecond
+)
+
 func (s *Set) coordinated(ctx context.Context, create bool, run func() error) (returnErr error) {
 	if err := s.prepareState(ctx, create); err != nil {
 		return darwinLockError("open-lock-directory", "", "", err)
@@ -113,6 +118,23 @@ func (s *Set) verifyGate(ctx context.Context, gate *os.File) error {
 }
 
 func (s *Set) openCoordinator(ctx context.Context, create bool) (*os.File, error) {
+	attempts := 1
+	if create {
+		attempts = darwinInitializationAttempts
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		gate, err := s.openCoordinatorOnce(ctx, create)
+		if err == nil || gate != nil || !errors.Is(err, os.ErrNotExist) || attempt == attempts-1 {
+			return gate, err
+		}
+		if err := waitDarwinRetry(ctx, darwinInitializationRetry); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (s *Set) openCoordinatorOnce(ctx context.Context, create bool) (*os.File, error) {
 	gate, err := s.openKnown(ctx, s.gate, false)
 	if err != nil || gate != nil {
 		return gate, err
@@ -139,6 +161,17 @@ func (s *Set) openCoordinator(ctx context.Context, create bool) (*os.File, error
 		return nil, nil
 	}
 	return s.openKnown(ctx, s.gate, true)
+}
+
+func waitDarwinRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *Set) rememberDirectoryFailure(err error) error {

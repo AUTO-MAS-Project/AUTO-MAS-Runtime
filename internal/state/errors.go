@@ -141,6 +141,7 @@ func (e *ReadError) Unwrap() error {
 
 // WriteError 表示持久化写入或条件删除故障。
 type WriteError struct {
+	UnlinkMode       string
 	File             string
 	Phase            WritePhase
 	MutationApplied  bool

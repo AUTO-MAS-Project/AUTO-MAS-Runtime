@@ -95,7 +95,7 @@ func (l *Layout) UVExecutable(version string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(directory, "uv.exe"), nil
+	return filepath.Join(directory, UVExecutableName()), nil
 }
 
 // DownloadFile 返回下载缓存中指定文件的路径。

@@ -4,7 +4,7 @@ import "github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 
 // platformCommandError 在原生安全机制通过前关闭未实现的命令，必须先于业务工厂运行。
 func platformCommandError(goos, command string, stage protocol.Stage) error {
-	if goos == "windows" || command == "version" {
+	if goos == "windows" || goos == "linux" || command == "version" {
 		return nil
 	}
 	return &commandError{

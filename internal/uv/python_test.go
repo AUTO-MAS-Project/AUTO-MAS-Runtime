@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -549,7 +550,7 @@ func TestPython_ProbePathFromUVJSON(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			runner := &fakePythonRunner{listOutput: test.output}
-			got, err := pythonDownloadPath(context.Background(), runner, RunOptions{Stage: protocol.StagePythonInstall}, version)
+			got, err := pythonDownloadPathFor(context.Background(), runner, RunOptions{Stage: protocol.StagePythonInstall}, version, "windows", "amd64")
 			if test.wantErr {
 				if err == nil {
 					t.Fatalf("pythonDownloadPath() = %q, want error", got)
@@ -587,7 +588,7 @@ func pythonRelayFixture(t *testing.T, factory *fakeRelayFactory, listOutput stri
 	return service, runner, projectDir
 }
 
-const pythonRelayListOutput = `[{"version":"3.12.13","url":"https://releases.astral.sh/github/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz","os":"windows","arch":"x86_64"}]`
+var pythonRelayListOutput = nativePythonListFixture(`[{"version":"3.12.13","url":"https://releases.astral.sh/github/python-build-standalone/releases/download/20260807/cpython-3.12.13%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz","os":"windows","arch":"x86_64"}]`)
 
 // TestPython_InstallUsesRelayMirror 锁定增补 2 C17 第 3 条：uv python install 的镜像指向回环中继，
 // 只跑一次，环境带 UV_HTTP_TIMEOUT，上游是 python 源的实测顺序，探针目标登记到测速器。
@@ -700,3 +701,15 @@ func (f *fakeSourceIntel) SetTarget(kind mirror.Kind, target mirror.ProbeTarget)
 }
 
 func (f *fakeSourceIntel) Results(mirror.Kind) []mirror.ProbeResult { return nil }
+
+func nativePythonListFixture(input string) string {
+	goos := runtime.GOOS
+	if goos == "darwin" {
+		goos = "macos"
+	}
+	input = strings.ReplaceAll(input, `"os":"windows"`, `"os":"`+goos+`"`)
+	if runtime.GOARCH == "arm64" {
+		input = strings.ReplaceAll(input, `"arch":"x86_64"`, `"arch":"aarch64"`)
+	}
+	return input
+}

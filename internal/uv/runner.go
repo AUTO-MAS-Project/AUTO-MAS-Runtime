@@ -35,12 +35,13 @@ const (
 	// noProxyEnv 是 Runtime 唯一会改写的宿主代理变量：uv（reqwest）会把发往 127.0.0.1 回环中继的
 	// 请求也送进 HTTP(S)_PROXY / ALL_PROXY，而 NO_PROXY=localhost 并不豁免 127.0.0.1（uv 0.12.3 实测），
 	// 所以宿主值原样保留、缺的回环项补齐后以规范大写键下发。
-	noProxyEnv          = "NO_PROXY"
-	autoMASUVExecutable = "AUTO_MAS_UV_EXE"
-	autoMASProtocol     = "AUTO_MAS_RUNTIME_PROTOCOL"
-	autoMASVersion      = "AUTO_MAS_EXPECTED_VERSION"
-	autoMASCommit       = "AUTO_MAS_EXPECTED_COMMIT"
-	autoMASSupervised   = "AUTO_MAS_SUPERVISED"
+	noProxyEnv                = "NO_PROXY"
+	autoMASUVExecutable       = "AUTO_MAS_UV_EXE"
+	autoMASProtocol           = "AUTO_MAS_RUNTIME_PROTOCOL"
+	autoMASVersion            = "AUTO_MAS_EXPECTED_VERSION"
+	autoMASCommit             = "AUTO_MAS_EXPECTED_COMMIT"
+	autoMASSupervised         = "AUTO_MAS_SUPERVISED"
+	autoMASDeferBusinessStart = "AUTO_MAS_DEFER_BUSINESS_START"
 	// 以下四个键按增补 1 C11 下发受管基础设施与有序镜像源，与上面五个身份键
 	// 同属受监督进程的环境契约：宿主同名变量被清除，调用方也不能经
 	// RunOptions.Environment 覆盖。
@@ -110,6 +111,13 @@ type UVResult struct {
 	Duration time.Duration
 }
 
+// runnerJob 是一次性 uv 命令消费的最小进程隔离能力。
+type runnerJob interface {
+	Assign(uint32) error
+	Terminate(uint32) error
+	Close() error
+}
+
 // UVRunner 是 Runtime 唯一的 uv 子进程执行入口。
 type UVRunner struct {
 	Executable       string
@@ -118,6 +126,8 @@ type UVRunner struct {
 	ProjectEnvDir    string
 	CacheDir         string
 	Clock            func() time.Time
+	newJob           func() (runnerJob, error)
+	resumeProcess    func(*os.Process) error
 }
 
 // NewRunner 创建固定可执行文件的 uv 执行器。
@@ -175,6 +185,9 @@ func (r *UVRunner) Run(
 			map[string]any{"failureKind": "path_invalid"},
 			err,
 		)
+	}
+	if native, ok := r.runNative(ctx, args, options, resolved); ok {
+		return native.result, native.err
 	}
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
@@ -241,7 +254,11 @@ func (r *UVRunner) Run(
 			closeWriteErr,
 		)
 	}
-	job, jobErr := process.NewJob()
+	newJob := r.newJob
+	if newJob == nil {
+		newJob = func() (runnerJob, error) { return process.NewJob() }
+	}
+	job, jobErr := newJob()
 	if errors.Is(jobErr, process.ErrUnsupported) {
 		_ = command.Process.Kill()
 		_ = command.Wait()
@@ -255,28 +272,63 @@ func (r *UVRunner) Run(
 	}
 	if jobErr != nil {
 		_ = command.Process.Kill()
-		_ = command.Wait()
-		return UVResult{}, newError(
+		waitErr := command.Wait()
+		failure := newError(
 			protocol.CodeUVExecFailed,
 			options.Stage,
 			"uv 进程隔离失败",
 			map[string]any{"failureKind": "process_isolation_failed"},
 			jobErr,
 		)
+		failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "create_job", jobErr)
+		return UVResult{}, failure
 	}
 	if job != nil {
 		if err := job.Assign(uint32(command.Process.Pid)); err != nil {
 			_ = command.Process.Kill()
-			_ = command.Wait()
+			waitErr := command.Wait()
 			_ = job.Close()
-			return UVResult{}, newError(
+			failure := newError(
 				protocol.CodeUVExecFailed,
 				options.Stage,
 				"uv 进程隔离失败",
 				map[string]any{"failureKind": "process_isolation_failed"},
 				err,
 			)
+			failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "assign_job", err)
+			return UVResult{}, failure
 		}
+	}
+	// 挂起创建阻止短命探针先于 Assign 退出，也阻止未纳管的后代逃出 Job。
+	// 取消先于恢复检查，避免退出期间再开始 uv 的业务工作。
+	if err := ctx.Err(); err != nil {
+		killErr := command.Process.Kill()
+		waitErr := command.Wait()
+		var closeErr error
+		if job != nil {
+			closeErr = job.Close()
+		}
+		return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(err, killErr, waitErr, closeErr))
+	}
+	resumeProcess := r.resumeProcess
+	if resumeProcess == nil {
+		resumeProcess = process.ResumeSuspended
+	}
+	if err := resumeProcess(command.Process); err != nil {
+		killErr := command.Process.Kill()
+		waitErr := command.Wait()
+		var closeErr error
+		if job != nil {
+			closeErr = job.Close()
+		}
+		// CommandContext 可能在上次检查后结束挂起进程，线程恢复失败仍应保留取消语义。
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return UVResult{}, runnerCancellationError(options.Stage, map[string]any{}, errors.Join(cancelErr, err, killErr, waitErr, closeErr))
+		}
+		failure := newError(protocol.CodeUVExecFailed, options.Stage, "uv 进程隔离失败",
+			map[string]any{"failureKind": "process_isolation_failed"}, errors.Join(err, killErr, waitErr, closeErr))
+		failure.diagnostics = isolationDiagnostics(UVResult{ExitCode: exitCode(waitErr), Duration: clock().Sub(started)}, resolved, "resume_process", err)
+		return UVResult{}, failure
 	}
 	jobStop := make(chan struct{})
 	jobDone := make(chan struct{})
@@ -643,6 +695,7 @@ func canonicalSupervisionEnvironmentKey(key string) (string, bool) {
 		autoMASVersion,
 		autoMASCommit,
 		autoMASSupervised,
+		autoMASDeferBusinessStart,
 		autoMASUVCacheDir,
 		autoMASUVPythonInstallDir,
 		autoMASMirrorPackageIndex,
@@ -664,6 +717,7 @@ func isSupervisionEnvironmentKey(key string) bool {
 // isRuntimeOnlyEnvironmentKey 阻止仅供 Runtime 配置的观测键跨越 uv/Python 进程边界。
 func isRuntimeOnlyEnvironmentKey(key string) bool {
 	return strings.EqualFold(key, autoMASTelemetry) ||
+		strings.EqualFold(key, "AUTO_MAS_RUNTIME_DEFER_BUSINESS_START") ||
 		strings.EqualFold(key, autoMASSentryDSN) ||
 		strings.EqualFold(key, autoMASSentryEnv) ||
 		strings.EqualFold(key, autoMASSentryRelease)

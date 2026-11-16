@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -129,6 +130,16 @@ func findItem(t *testing.T, report Report, id string) Item {
 // mustCreateJunction 用 pwsh 创建目录 Junction，只移除链接本身。
 func mustCreateJunction(t *testing.T, link, target string) {
 	t.Helper()
+	if runtime.GOOS != "windows" {
+		if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(link) })
+		return
+	}
 	script := `$ErrorActionPreference = 'Stop'
 $target = $env:AUTO_MAS_CLEANUP_JUNCTION_TARGET
 $path = $env:AUTO_MAS_CLEANUP_JUNCTION_PATH
@@ -166,6 +177,21 @@ New-Item -ItemType Junction -Path $path -Target $target -ErrorAction Stop |
 // deadPID 返回一个已确认退出的进程 PID。
 func deadPID(t *testing.T) uint32 {
 	t.Helper()
+	if runtime.GOOS != "windows" {
+		trueExecutable, err := exec.LookPath("true")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), trueExecutable)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		pid := uint32(cmd.Process.Pid)
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		return pid
+	}
 	command := exec.CommandContext(
 		t.Context(),
 		"pwsh",

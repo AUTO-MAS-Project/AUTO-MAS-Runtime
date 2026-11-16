@@ -44,8 +44,9 @@ if ($ManifestPath) {
     }
 }
 if ($ChecksumsPath) {
-    $line = (Get-Content -LiteralPath $ChecksumsPath -Raw).TrimEnd("`r", "`n")
-    if ($line -cne "$hash  $(Split-Path -Leaf $binary)") { throw 'runtime release checksum mismatch' }
+    $expectedLine = "$hash  $(Split-Path -Leaf $binary)"
+    $matching = @(Get-Content -LiteralPath $ChecksumsPath | Where-Object { $_ -ceq $expectedLine })
+    if ($matching.Count -ne 1) { throw 'runtime release checksum mismatch' }
 }
 $metadata = [Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
 if ($metadata.ProductName -cne 'AUTO-MAS Runtime' -or $metadata.ProductVersion -cne $Tag -or

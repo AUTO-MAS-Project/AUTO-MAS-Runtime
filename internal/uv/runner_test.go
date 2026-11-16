@@ -9,14 +9,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
+
+func normalizedTestWorkingDir(path string) string {
+	return config.SystemPath(filepath.Clean(path))
+}
 
 func telemetryEnvironmentKeysForTest() []string {
 	return []string{
@@ -28,7 +34,7 @@ func telemetryEnvironmentKeysForTest() []string {
 }
 
 // TestRunner_WorkingDirDefaultsToProjectDir 覆盖一次性 uv 命令：所有既有调用方
-// 都不传 WorkingDir，它们的 cwd 必须逐字节保持为 ProjectDir（C6 只改 managed 后端）。
+// 都不传 WorkingDir，它们的 cwd 必须规范化为相同的 ProjectDir（C6 只改 managed 后端）。
 func TestRunner_WorkingDirDefaultsToProjectDir(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -39,14 +45,14 @@ func TestRunner_WorkingDirDefaultsToProjectDir(t *testing.T) {
 			name:       "empty falls back to project dir",
 			workingDir: func(*testing.T) string { return "" },
 			want: func(_ *testing.T, runner *UVRunner, _ string) string {
-				return filepath.Clean(runner.ProjectDir)
+				return normalizedTestWorkingDir(runner.ProjectDir)
 			},
 		},
 		{
 			name:       "explicit value wins",
 			workingDir: func(t *testing.T) string { return t.TempDir() },
 			want: func(_ *testing.T, _ *UVRunner, workingDir string) string {
-				return filepath.Clean(workingDir)
+				return normalizedTestWorkingDir(workingDir)
 			},
 		},
 	}
@@ -565,7 +571,7 @@ func TestUVRunner_StartFailureIncludesStableDiagnostics(t *testing.T) {
 		details["projectEnvDir"] != filepath.Join(missing, ".venv") {
 		t.Fatalf("Run() details = %#v, want stable start diagnostics", details)
 	}
-	if _, ok := details["windowsError"]; !ok {
+	if _, ok := details["windowsError"]; runtime.GOOS == "windows" && !ok {
 		t.Fatalf("Run() details = %#v, want windowsError", details)
 	}
 }
