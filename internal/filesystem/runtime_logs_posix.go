@@ -133,12 +133,23 @@ func (f *RuntimeLogFiles) List(ctx context.Context) ([]RuntimeLogFile, error) {
 		if err != nil {
 			return nil, err
 		}
-		id, err := posixIdentity(file)
+		var st unix.Stat_t
+		err = unix.Fstat(int(file.Fd()), &st)
 		err = errors.Join(err, file.Close())
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, RuntimeLogFile{owner: f.owner, path: filepath.Join(f.layout.RuntimeLogDir(), name), name: name, volumeSerial: id.volumeSerial, fileID: id.fileID})
+		id := posixIdentityFromStat(&st)
+		result = append(result, RuntimeLogFile{
+			owner:                 f.owner,
+			path:                  filepath.Join(f.layout.RuntimeLogDir(), name),
+			name:                  name,
+			volumeSerial:          id.directory.volumeSerial,
+			fileID:                id.directory.fileID,
+			changeTimeSeconds:     id.changeTimeSeconds,
+			changeTimeNanoseconds: id.changeTimeNanoseconds,
+			generation:            id.generation,
+		})
 	}
 	return result, nil
 }
@@ -157,11 +168,22 @@ func (f *RuntimeLogFiles) Remove(ctx context.Context, token RuntimeLogFile) (Rem
 	if err := c.verify(ctx); err != nil {
 		return RemoveResult{}, err
 	}
-	id, exists, err := posixEntryIdentity(c.leaf(), token.name)
+	var st unix.Stat_t
+	err := unix.Fstatat(int(c.leaf().Fd()), token.name, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return RemoveResult{}, ErrIdentityChanged
+	}
 	if err != nil {
 		return RemoveResult{}, err
 	}
-	if !exists || id.volumeSerial != token.volumeSerial || id.fileID != token.fileID || id.attributes&unix.S_IFMT != unix.S_IFREG || id.numberOfLinks != 1 {
+	id := posixIdentityFromStat(&st)
+	if id.directory.volumeSerial != token.volumeSerial ||
+		id.directory.fileID != token.fileID ||
+		id.directory.attributes&unix.S_IFMT != unix.S_IFREG ||
+		id.directory.numberOfLinks != 1 ||
+		id.changeTimeSeconds != token.changeTimeSeconds ||
+		id.changeTimeNanoseconds != token.changeTimeNanoseconds ||
+		id.generation != token.generation {
 		return RemoveResult{}, ErrIdentityChanged
 	}
 	err = unix.Unlinkat(int(c.leaf().Fd()), token.name, 0)

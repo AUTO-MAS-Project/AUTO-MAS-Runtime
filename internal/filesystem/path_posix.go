@@ -66,14 +66,32 @@ func within(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	return err == nil && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
+
+type posixObjectIdentity struct {
+	directory             DirectoryIdentity
+	changeTimeSeconds     int64
+	changeTimeNanoseconds int32
+	generation            uint32
+}
+
+func posixIdentityFromStat(st *unix.Stat_t) posixObjectIdentity {
+	id := DirectoryIdentity{volumeSerial: uint64(st.Dev), numberOfLinks: uint32(st.Nlink), size: st.Size, attributes: uint32(st.Mode)}
+	binary.LittleEndian.PutUint64(id.fileID[:8], uint64(st.Ino))
+	seconds, nanoseconds := posixStatChangeTime(st)
+	return posixObjectIdentity{
+		directory:             id,
+		changeTimeSeconds:     seconds,
+		changeTimeNanoseconds: nanoseconds,
+		generation:            posixStatGeneration(st),
+	}
+}
+
 func posixIdentity(file *os.File) (DirectoryIdentity, error) {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &st); err != nil {
 		return DirectoryIdentity{}, err
 	}
-	id := DirectoryIdentity{volumeSerial: uint64(st.Dev), numberOfLinks: uint32(st.Nlink), size: st.Size, attributes: uint32(st.Mode)}
-	binary.LittleEndian.PutUint64(id.fileID[:8], uint64(st.Ino))
-	return id, nil
+	return posixIdentityFromStat(&st).directory, nil
 }
 
 // posixChain 同时保留所有祖先；每次变更前重新复核目录条目身份。

@@ -4,7 +4,6 @@ package filesystem
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -106,9 +105,7 @@ func posixEntryIdentity(parent *os.File, name string) (DirectoryIdentity, bool, 
 	if err != nil {
 		return DirectoryIdentity{}, false, err
 	}
-	id := DirectoryIdentity{volumeSerial: uint64(st.Dev), attributes: uint32(st.Mode), numberOfLinks: uint32(st.Nlink), size: st.Size}
-	binary.LittleEndian.PutUint64(id.fileID[:8], uint64(st.Ino))
-	return id, true, nil
+	return posixIdentityFromStat(&st).directory, true, nil
 }
 func removePOSIXTree(ctx context.Context, parent *os.File, name string, expected DirectoryIdentity, device uint64, verify func() error) error {
 	if err := verify(); err != nil {
