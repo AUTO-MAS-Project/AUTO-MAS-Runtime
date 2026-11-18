@@ -28,6 +28,8 @@ type Request struct {
 	RuntimePID               uint32
 	Mode                     Mode
 	DevelopmentRepo          string
+	// ReuseManagedEnvironment 使用同一 app-root 已存在的受管 venv 启动开发源码。
+	ReuseManagedEnvironment bool
 	// ShutdownTimeout 是从发出 POST /api/core/close 到进程退出的等待上限，
 	// 超时才收 Job（增补 1 C9）。CLI 由 --shutdown-timeout 提供，取值 1~120 秒；
 	// 为零或负数时回退 Dependencies.ShutdownTimeout。
