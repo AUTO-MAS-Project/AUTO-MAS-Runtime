@@ -38,6 +38,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 	var shutdownTimeout string
 	var port string
 	var deferBusinessStart bool
+	var reuseManagedEnvironment bool
 	command := &cobra.Command{
 		Use:   "supervise",
 		Short: "启动并监督后端进程",
@@ -90,6 +91,13 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 							cause:   errors.New("managed mode does not accept development repository"),
 						}
 					}
+					if reuseManagedEnvironment && mode != backendModeDevelopment {
+						return sessionSuccess{}, &commandError{
+							code: protocol.CodeInvalidArgument, stage: protocol.StageBackendSpawn,
+							message: "--reuse-managed-environment 仅用于 development 模式",
+							details: map[string]any{"field": "reuse-managed-environment"},
+						}
+					}
 					shutdownBudget, err := parseBackendShutdownTimeout(shutdownTimeout)
 					if err != nil {
 						return sessionSuccess{}, err
@@ -132,6 +140,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 						RuntimePID:               uint32(pid),
 						Mode:                     backend.Mode(mode),
 						DevelopmentRepo:          repo,
+						ReuseManagedEnvironment:  reuseManagedEnvironment,
 						ShutdownTimeout:          shutdownBudget,
 						Port:                     supervisedPort,
 						DeferBusinessStart:       deferBusinessStart || os.Getenv("AUTO_MAS_RUNTIME_DEFER_BUSINESS_START") == "1",
@@ -155,6 +164,7 @@ func backendSuperviseCommand(deps *deps) *cobra.Command {
 	}
 	command.Flags().StringVar(&mode, "mode", "", "后端运行模式：managed 或 development")
 	command.Flags().StringVar(&repo, "repo", "", "development 模式源码目录")
+	command.Flags().BoolVar(&reuseManagedEnvironment, "reuse-managed-environment", false, "development 模式复用 app-root 已初始化的受管虚拟环境")
 	command.Flags().BoolVar(&deferBusinessStart, "defer-business-start", false, "等待桌面确认后放行自动业务")
 	command.Flags().StringVar(
 		&shutdownTimeout,

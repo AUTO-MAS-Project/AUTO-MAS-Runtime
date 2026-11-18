@@ -1139,10 +1139,17 @@ func (s *ManagedSupervisor) controlPreflight(ctx context.Context, request Reques
 		return state.EnvironmentState{}, state.Revision{}, err
 	}
 	if modeForRequest(request) == ModeDevelopment {
+		if request.ReuseManagedEnvironment {
+			for _, path := range []string{s.layout.VenvConfigFile(), s.layout.VenvPythonExecutable()} {
+				if err := inspectDevelopmentObject(ctx, path, false); err != nil {
+					return state.EnvironmentState{}, state.Revision{}, newError(protocol.CodeEnvironmentBroken, protocol.StageBackendSpawn, "发行版虚拟环境不可用，请先正常启动发行版完成初始化", map[string]any{"field": "managed_venv", "reason": developmentPathReason(err)}, err)
+				}
+			}
+		}
 		if err := s.deps.UV.Check(ctx, uv.RunOptions{
 			Stage:         protocol.StageBackendSpawn,
 			ProjectDir:    request.DevelopmentRepo,
-			ProjectEnvDir: developmentProjectEnv(request.DevelopmentRepo),
+			ProjectEnvDir: s.developmentProjectEnv(request),
 		}); err != nil {
 			return state.EnvironmentState{}, state.Revision{}, mapDependencyError(protocol.StageBackendSpawn, protocol.CodeUVExecFailed, "开发模式 uv 校验失败", err)
 		}
@@ -1328,8 +1335,10 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 	pythonPaths := append([]string(nil), s.deps.PythonPaths...)
 	if mode == ModeDevelopment {
 		projectDir = request.DevelopmentRepo
-		projectEnvDir = developmentProjectEnv(projectDir)
-		pythonPaths = []string{developmentPythonPath(projectDir)}
+		projectEnvDir = s.developmentProjectEnv(request)
+		if !request.ReuseManagedEnvironment {
+			pythonPaths = []string{s.developmentPythonPath(request)}
+		}
 		workingDir = ""
 		entryArgument = developmentEntryArgument
 	} else {
@@ -1400,9 +1409,16 @@ func (s *ManagedSupervisor) startControlAttempt(ctx context.Context, request Req
 		)
 		return nil, errors.Join(ctxErr, cleanupErr)
 	}
-	proc, err := s.deps.UV.StartManaged(ctx, []string{"run", "--project", projectDir, "--no-sync", entryArgument}, uv.ManagedOptions{
+	args := []string{"run", "--project", projectDir, "--no-sync", entryArgument}
+	runOptions := uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir}
+	if request.ReuseManagedEnvironment && mode == ModeDevelopment {
+		// 避免 uv 因开发项目的 Python 版本要求变化而替换发行环境。
+		args = []string{"run", "--no-project", "--no-python-downloads", "--python", s.layout.VenvPythonExecutable(), "python", entryArgument}
+		runOptions.Environment = map[string]string{"PYTHONDONTWRITEBYTECODE": "1"}
+	}
+	proc, err := s.deps.UV.StartManaged(ctx, args, uv.ManagedOptions{
 		DeferBusinessStart: request.DeferBusinessStart,
-		RunOptions:         uv.RunOptions{Stage: protocol.StageBackendSpawn, WorkingDir: workingDir, ProjectDir: projectDir, ProjectEnvDir: projectEnvDir},
+		RunOptions:         runOptions,
 		Identity:           identity,
 		Infrastructure:     s.infrastructure,
 		Port:               request.Port,

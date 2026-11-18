@@ -27,6 +27,7 @@ func TestBackendSupervise_RequiresExplicitManagedMode(t *testing.T) {
 	}{
 		{name: "missing", wantCode: protocol.CodeInvalidArgument},
 		{name: "development requires repo", modeArgs: []string{"--mode", "development"}, wantCode: protocol.CodeInvalidArgument},
+		{name: "reuse flag is development only", modeArgs: []string{"--mode", "managed", "--reuse-managed-environment"}, wantCode: protocol.CodeInvalidArgument},
 		{name: "unknown", modeArgs: []string{"--mode", "future"}, wantCode: protocol.CodeUnsupportedMode},
 	}
 	for _, test := range tests {

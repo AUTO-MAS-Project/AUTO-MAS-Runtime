@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
 )
@@ -87,7 +88,27 @@ func (s *ManagedSupervisor) normalizeDevelopmentRequest(ctx context.Context, req
 			"reason": developmentPathReason(err),
 		}, err)
 	}
-	if err := inspectDevelopmentObject(ctx, filepath.Join(repo, ".venv"), true); err != nil {
+	request.DevelopmentRepo = repo
+	// 受管环境在监督锁内检查。预先拒绝把受管源码目录用作开发数据根。
+	if request.ReuseManagedEnvironment {
+		managedRepo, err := filesystem.InspectExternalPath(ctx, s.layout.RepoDir(), true)
+		if err != nil {
+			return request, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "开发源码必须与发行后端目录分开", map[string]any{"field": "repo"}, err)
+		}
+		if managedRepo.Exists {
+			insideManagedRepo, err := filesystem.PathContains(ctx, s.layout.RepoDir(), repo)
+			if err != nil || insideManagedRepo {
+				return request, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "开发源码必须与发行后端目录分开", map[string]any{"field": "repo"}, err)
+			}
+		}
+		for _, name := range []string{"config", "data", "plugins"} {
+			if _, err := filesystem.InspectExternalPath(ctx, filepath.Join(repo, name), true); err != nil {
+				return request, newError(protocol.CodeInvalidArgument, protocol.StageBackendSpawn, "开发数据目录必须独立且不能使用目录链接", map[string]any{"field": name}, err)
+			}
+		}
+		return request, nil
+	}
+	if err := inspectDevelopmentObject(ctx, s.developmentProjectEnv(request), true); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return request, ctxErr
 		}
@@ -96,7 +117,6 @@ func (s *ManagedSupervisor) normalizeDevelopmentRequest(ctx context.Context, req
 			"reason": developmentPathReason(err),
 		}, err)
 	}
-	request.DevelopmentRepo = repo
 	return request, nil
 }
 
@@ -134,10 +154,13 @@ func developmentPathReason(err error) string {
 	}
 }
 
-func developmentPythonPath(repo string) string {
-	return filepath.Join(repo, ".venv", "Scripts", "python.exe")
+func (s *ManagedSupervisor) developmentPythonPath(request Request) string {
+	return config.PythonExecutableInVenv(s.developmentProjectEnv(request))
 }
 
-func developmentProjectEnv(repo string) string {
-	return filepath.Join(repo, ".venv")
+func (s *ManagedSupervisor) developmentProjectEnv(request Request) string {
+	if request.ReuseManagedEnvironment {
+		return s.layout.VenvDir()
+	}
+	return filepath.Join(request.DevelopmentRepo, ".venv")
 }
