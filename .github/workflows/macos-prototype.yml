@@ -45,7 +45,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
           cache: true
 
       - name: Record and verify native environment
@@ -97,7 +97,7 @@ jobs:
 
       - name: Run Darwin filesystem capability tests
         run: |
-          go test -race -v ./internal/filesystem -run '^TestDarwin' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/filesystem-capabilities.txt
+          go test -race -v ./internal/filesystem -run '^(TestDarwin|TestPOSIXIO_DownloadAndLog$|TestRuntimeLogFiles_RemoveRejectsChangedInodeGeneration$)' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/filesystem-capabilities.txt
           if ($LASTEXITCODE -ne 0) { throw 'filesystem capabilities failed' }
 
       - name: Run rooted Git capability tests
@@ -131,7 +131,7 @@ jobs:
             $env:AUTO_MAS_PROBE_CASE_SENSITIVE = 'true'
             go test -race -v ./internal/macosprobe -run '^TestRoot_' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive.txt
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS probes failed' }
-            go test -race -v ./internal/filesystem -run '^TestDarwin' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-capabilities.txt
+            go test -race -v ./internal/filesystem -run '^(TestDarwin|TestPOSIXIO_DownloadAndLog$|TestRuntimeLogFiles_RemoveRejectsChangedInodeGeneration$)' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-capabilities.txt
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS capabilities failed' }
             go test -race -v ./internal/gitrepo -run '^(TestDarwinGitFS_|TestDarwinRepository_|TestDarwinSourceRestore_|TestRestoreTrackedFiles_|TestComponent_AlphaDevIdentity$)' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-rooted-git.txt
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS rooted Git capabilities failed' }
