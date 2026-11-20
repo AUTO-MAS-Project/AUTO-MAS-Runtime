@@ -218,7 +218,13 @@ func TestWorkspaceSyncCommand_JoinsClosableControlReader(t *testing.T) {
 		)
 	}()
 
-	<-input.closeCalled
+	select {
+	case <-input.closeCalled:
+	case code := <-done:
+		t.Fatalf("Execute() returned %d before control input closed; stderr = %q", code, stderr.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for control input to close")
+	}
 	close(input.allowCloseReturn)
 	select {
 	case code := <-done:
