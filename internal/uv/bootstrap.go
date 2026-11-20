@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -340,7 +341,12 @@ func (b *Bootstrapper) ensure(
 		observation.Cached = &cached
 	}
 	if !cached {
+		started := time.Now()
 		downloadResult, downloadErr := b.download(ctx, policy, spec, progress)
+		if observation != nil {
+			elapsed := time.Since(started)
+			observation.Download = &elapsed
+		}
 		if downloadErr != nil {
 			return "", downloadErr
 		}

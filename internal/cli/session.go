@@ -265,6 +265,9 @@ func archiveDetails(deps *deps, details map[string]any) map[string]any {
 		return details
 	}
 	sample := map[string]any{"cached": *a.Cached}
+	if a.Download != nil {
+		sample["downloadMs"] = a.Download.Milliseconds()
+	}
 	if a.Verify != nil {
 		sample["verifyMs"] = a.Verify.Milliseconds()
 	}

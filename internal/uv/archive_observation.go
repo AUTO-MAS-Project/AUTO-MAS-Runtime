@@ -7,8 +7,8 @@ import (
 
 // ArchiveObservation 保存本次串行准备操作的归档事实，随终态在本机返回桌面。
 type ArchiveObservation struct {
-	Cached         *bool
-	Verify, Unpack *time.Duration
+	Cached                   *bool
+	Verify, Unpack, Download *time.Duration
 }
 type archiveObservationKey struct{}
 

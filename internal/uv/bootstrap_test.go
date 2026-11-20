@@ -117,9 +117,10 @@ func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
 		&fakePublisher{},
 	)
 	got := make([]mirror.DownloadProgress, 0, len(want))
+	observation := new(ArchiveObservation)
 
 	_, err := bootstrapper.EnsureWithProgress(
-		t.Context(),
+		WithArchiveObservation(t.Context(), observation),
 		testOperationID,
 		testMirrorPolicy(t),
 		nil,
@@ -130,6 +131,9 @@ func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("EnsureWithProgress() error = %v", err)
+	}
+	if observation.Cached == nil || *observation.Cached || observation.Download == nil || observation.Verify == nil || observation.Unpack == nil {
+		t.Fatalf("archive observation = %+v, want completed download, verification and unpack", observation)
 	}
 	if len(got) != len(want) {
 		t.Fatalf("progress events = %#v, want %#v", got, want)
