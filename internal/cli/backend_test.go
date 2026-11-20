@@ -242,6 +242,10 @@ func (f backendServiceFunc) Supervise(ctx context.Context, request backend.Reque
 	return f(ctx, request)
 }
 
+// controlJoinTestBound 必须大于生产 join 超时：两者相等时，Windows CI 的调度抖动
+// 会让 join 在测试计时之后才完成，被误判为未收口。
+const controlJoinTestBound = 3 * workspaceControlJoinTimeout
+
 func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 	// 增补 1 C13：stdin 读取出错等价于宿主断开，走隐式 shutdown 而不是 INTERNAL_ERROR，
 	// 但 Execute 仍必须在有限时间内收口。
@@ -281,7 +285,7 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 			if code != protocol.ExitCodeSuccess {
 				t.Fatalf("Execute() exit code = %d, want 0; stderr=%q", code, stderr.String())
 			}
-		case <-time.After(time.Second):
+		case <-time.After(controlJoinTestBound):
 			t.Fatal("Execute() did not join failed control reader")
 		}
 		events := parseNDJSON(t, stdout.String())
@@ -395,7 +399,7 @@ func TestBackend_ControlReaderJoinAndReadFailure(t *testing.T) {
 			if code != protocol.ExitCodeOperationCancelled {
 				t.Fatalf("Execute() exit code = %d, want %d; stderr=%q", code, protocol.ExitCodeOperationCancelled, stderr.String())
 			}
-		case <-time.After(time.Second):
+		case <-time.After(controlJoinTestBound):
 			t.Fatal("Execute() did not join external cancellation")
 		}
 	})
