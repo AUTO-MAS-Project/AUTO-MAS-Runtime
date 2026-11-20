@@ -10,6 +10,13 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
 )
 
+func startupCapabilities(capabilities []string) []string {
+	if telemetry.StartupSampleInvitation() != "" {
+		return append(capabilities, string(protocol.CapabilityStartupResources))
+	}
+	return capabilities
+}
+
 type telemetryFactory func(telemetry.Config) telemetry.Recorder
 
 type sessionTelemetryState struct {

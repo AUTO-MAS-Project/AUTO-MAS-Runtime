@@ -101,7 +101,7 @@ func runOperationSession(
 	emitter, err = output.NewEmitter(
 		runtimeVersion,
 		command,
-		capabilities,
+		startupCapabilities(capabilities),
 		protocol.WithClock(deps.options.clock),
 	)
 	if err != nil {

@@ -713,7 +713,7 @@ func isSupervisionEnvironmentKey(key string) bool {
 
 // isRuntimeOnlyEnvironmentKey 阻止仅供 Runtime 配置的观测键跨越 uv/Python 进程边界。
 func isRuntimeOnlyEnvironmentKey(key string) bool {
-	return strings.EqualFold(key, autoMASTelemetry) ||
+	return strings.EqualFold(key, "AUTO_MAS_STARTUP_SAMPLE") || strings.EqualFold(key, autoMASTelemetry) ||
 		strings.EqualFold(key, "AUTO_MAS_RUNTIME_DEFER_BUSINESS_START") ||
 		strings.EqualFold(key, autoMASSentryDSN) ||
 		strings.EqualFold(key, autoMASSentryEnv) ||

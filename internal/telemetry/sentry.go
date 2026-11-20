@@ -155,6 +155,15 @@ func (p *sentryProvider) captureInternal(observation InternalObservation) string
 			"details": observation.DiagnosticDetails,
 		}}
 	}
+	if observation.StartupResources == nil {
+		observation.StartupResources = readStartupResources()
+	}
+	if resources := sanitizeStartupResources(observation.StartupResources); len(resources) > 0 {
+		if event.Contexts == nil {
+			event.Contexts = make(map[string]sentry.Context)
+		}
+		event.Contexts["startup_resources"] = resources
+	}
 	stacktrace := sentry.NewStacktrace()
 	if len(observation.PanicFrames) > 0 {
 		frames := make([]sentry.Frame, 0, len(observation.PanicFrames))
@@ -293,6 +302,12 @@ func sanitizeSentryEvent(event *sentry.Event, release, environment string) *sent
 		if diagnostics := sanitizeSentryDiagnostics(event.Contexts); diagnostics != nil {
 			sanitized.Contexts = map[string]sentry.Context{"diagnostics": diagnostics}
 		}
+	}
+	if resources := sanitizeStartupResources(event.Contexts["startup_resources"]); len(resources) > 0 {
+		if sanitized.Contexts == nil {
+			sanitized.Contexts = make(map[string]sentry.Context)
+		}
+		sanitized.Contexts["startup_resources"] = resources
 	}
 	return sanitized
 }

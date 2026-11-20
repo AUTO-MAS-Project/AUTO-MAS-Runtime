@@ -19,6 +19,7 @@ type InternalObservation struct {
 	Code              string
 	Reason            string
 	DiagnosticDetails map[string]any
+	StartupResources  map[string]any
 	RuntimeVersion    string
 	ProtocolVersion   int
 	Platform          string
