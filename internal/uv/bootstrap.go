@@ -341,10 +341,13 @@ func (b *Bootstrapper) ensure(
 		observation.Cached = &cached
 	}
 	if !cached {
-		started := time.Now()
+		var started time.Time
+		if observation != nil {
+			started = observation.clock()
+		}
 		downloadResult, downloadErr := b.download(ctx, policy, spec, progress)
 		if observation != nil {
-			elapsed := time.Since(started)
+			elapsed := observation.clock().Sub(started)
 			observation.Download = &elapsed
 		}
 		if downloadErr != nil {

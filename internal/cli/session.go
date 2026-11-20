@@ -120,7 +120,7 @@ func runOperationSession(
 		return exitCode
 	}
 	if telemetry.StartupSampleRequested() {
-		deps.archive = &uv.ArchiveObservation{}
+		deps.archive = uv.NewArchiveObservation(deps.options.clock)
 		ctx = uv.WithArchiveObservation(ctx, deps.archive)
 	}
 	operationContext := ctx

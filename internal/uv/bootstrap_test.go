@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/mirror"
@@ -117,7 +118,8 @@ func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
 		&fakePublisher{},
 	)
 	got := make([]mirror.DownloadProgress, 0, len(want))
-	observation := new(ArchiveObservation)
+	clock := time.Unix(100, 0)
+	observation := NewArchiveObservation(func() time.Time { clock = clock.Add(3 * time.Millisecond); return clock })
 
 	_, err := bootstrapper.EnsureWithProgress(
 		WithArchiveObservation(t.Context(), observation),
@@ -132,7 +134,7 @@ func TestBootstrap_ForwardsDownloadProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureWithProgress() error = %v", err)
 	}
-	if observation.Cached == nil || *observation.Cached || observation.Download == nil || observation.Verify == nil || observation.Unpack == nil {
+	if observation.Cached == nil || *observation.Cached || observation.Download == nil || observation.Verify == nil || observation.Unpack == nil || *observation.Download != 3*time.Millisecond || *observation.Verify != 3*time.Millisecond || *observation.Unpack != 3*time.Millisecond {
 		t.Fatalf("archive observation = %+v, want completed download, verification and unpack", observation)
 	}
 	if len(got) != len(want) {
