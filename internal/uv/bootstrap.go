@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
@@ -334,8 +335,21 @@ func (b *Bootstrapper) ensure(
 	if err != nil {
 		return "", wrapBootstrapError(protocol.StageUVDownload, err)
 	}
-	if !regularFile(archivePath) {
+	observation, _ := ctx.Value(archiveObservationKey{}).(*ArchiveObservation)
+	cached := regularFile(archivePath)
+	if observation != nil {
+		observation.Cached = &cached
+	}
+	if !cached {
+		var started time.Time
+		if observation != nil {
+			started = observation.clock()
+		}
 		downloadResult, downloadErr := b.download(ctx, policy, spec, progress)
+		if observation != nil {
+			elapsed := observation.clock().Sub(started)
+			observation.Download = &elapsed
+		}
 		if downloadErr != nil {
 			return "", downloadErr
 		}
@@ -352,7 +366,7 @@ func (b *Bootstrapper) ensure(
 			}
 		}
 	}()
-	if err := verifySHA256(ctx, archivePath, spec.SHA256); err != nil {
+	if err := observation.measure("verify", func() error { return verifySHA256(ctx, archivePath, spec.SHA256) }); err != nil {
 		if errors.Is(err, errChecksumMismatch) {
 			if removeErr := invalidateDownloadCache(ctx, b.layout, archivePath); removeErr != nil {
 				err = errors.Join(err, removeErr)
@@ -395,7 +409,7 @@ func (b *Bootstrapper) ensure(
 			}
 		}
 	}()
-	if err := b.extractor.Extract(ctx, archivePath, staging); err != nil {
+	if err := observation.measure("unpack", func() error { return b.extractor.Extract(ctx, archivePath, staging) }); err != nil {
 		return "", wrapBootstrapError(protocol.StageUVDownload, err)
 	}
 	sourceIdentity := stagingLease.Identity()

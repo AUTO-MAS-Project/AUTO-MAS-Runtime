@@ -19,11 +19,12 @@ type InternalObservation struct {
 	Code              string
 	Reason            string
 	DiagnosticDetails map[string]any
-	RuntimeVersion    string
-	ProtocolVersion   int
-	Platform          string
-	Panic             bool
-	PanicFrames       []StackFrame
+
+	RuntimeVersion  string
+	ProtocolVersion int
+	Platform        string
+	Panic           bool
+	PanicFrames     []StackFrame
 }
 
 // StackFrame 是允许附带到 panic 观测的最小栈帧；不包含源文件路径或局部变量。

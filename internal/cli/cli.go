@@ -149,6 +149,7 @@ func applyOptions(values ...Option) (options, error) {
 
 // deps 保存单次 Execute 的执行状态；Execute 每次调用创建独立实例。
 type deps struct {
+	archive *uv.ArchiveObservation
 	ctx     context.Context
 	io      IO
 	options options

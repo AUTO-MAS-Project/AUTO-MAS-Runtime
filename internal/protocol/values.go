@@ -152,9 +152,10 @@ type Capability string
 
 // 协议 v1 的能力标识全集，逐项含义见 doc/架构设计.md「能力标识全集」。
 const (
-	CapabilityStdinCancel Capability = "stdin.cancel"
-	CapabilityStateV1     Capability = "state.v1"
-	CapabilityLogStream   Capability = "log.stream"
+	CapabilityStartupResources Capability = "startup.resources.v1"
+	CapabilityStdinCancel      Capability = "stdin.cancel"
+	CapabilityStateV1          Capability = "state.v1"
+	CapabilityLogStream        Capability = "log.stream"
 	// CapabilityStdinShutdown 与 CapabilityStdinStatus 是 backend supervise 早已
 	// 接受、却一直没有公告的两条 stdin 控制命令。README 与架构文档都规定
 	// 「实际可用命令以 hello.capabilities 为准」，不公告等于让守规矩的调用方
@@ -171,6 +172,7 @@ var knownCapabilities = []Capability{
 	CapabilityStdinShutdown,
 	CapabilityStdinStatus,
 	CapabilityStdinActivate,
+	CapabilityStartupResources,
 }
 
 // AllCapabilities 按文档顺序返回全部稳定能力标识的防御性副本。

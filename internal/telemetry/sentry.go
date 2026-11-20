@@ -89,7 +89,16 @@ func newSentryProviderWithTransport(config Config, transport sentry.Transport) (
 			QueryParams: &sentry.KeyValueCollectionBehavior{Mode: sentry.CollectionOff},
 		},
 		BeforeSend: func(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
-			return sanitizeSentryEvent(event, release, environment)
+			clean := sanitizeSentryEvent(event, release, environment)
+			if clean != nil {
+				if fields := readStartupResources(); len(fields) > 0 {
+					if clean.Contexts == nil {
+						clean.Contexts = make(map[string]sentry.Context)
+					}
+					clean.Contexts["startup_resources"] = fields
+				}
+			}
+			return clean
 		},
 	}
 	if transport != nil {

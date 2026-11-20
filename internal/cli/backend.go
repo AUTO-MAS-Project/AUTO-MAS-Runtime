@@ -270,14 +270,14 @@ func runBackendSuperviseSession(
 		command,
 		// backend supervise 的 ControlReader 注册了 cancel/shutdown/status 三条命令，
 		// 公告必须与之一致：调用方按契约只信 hello.capabilities。
-		[]string{
+		startupCapabilities([]string{
 			string(protocol.CapabilityStdinCancel),
 			string(protocol.CapabilityStateV1),
 			string(protocol.CapabilityLogStream),
 			string(protocol.CapabilityStdinShutdown),
 			string(protocol.CapabilityStdinStatus),
 			string(protocol.CapabilityStdinActivate),
-		},
+		}),
 		protocol.WithClock(deps.options.clock),
 	)
 	if err != nil {
