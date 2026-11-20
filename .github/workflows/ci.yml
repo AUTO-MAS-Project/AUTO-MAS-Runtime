@@ -33,8 +33,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          $goFiles = Get-ChildItem -LiteralPath . -Recurse -Filter "*.go" -File
-          $formatDiff = gofmt -d $goFiles.FullName
+          $formatDiff = gofmt -d .
           if ($LASTEXITCODE -ne 0) { throw "gofmt failed" }
           if ($formatDiff) {
             $formatDiff
