@@ -177,6 +177,151 @@ func TestDarwinLock_ReadOnlyProbeAndCancel(t *testing.T) {
 }
 
 const darwinHolderRoot = "AUTO_MAS_DARWIN_LOCK_HOLDER_ROOT"
+const darwinFirstAcquireRoot = "AUTO_MAS_DARWIN_FIRST_ACQUIRE_ROOT"
+
+func TestDarwinLock_IndependentFirstAcquire(t *testing.T) {
+	if root := os.Getenv(darwinFirstAcquireRoot); root != "" {
+		runDarwinFirstAcquire(t, root)
+		return
+	}
+	layout := darwinLockLayout(t)
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	type process struct {
+		cmd    *exec.Cmd
+		input  io.WriteCloser
+		output *bufio.Scanner
+	}
+	var children [2]process
+	for i := range children {
+		cmd := exec.CommandContext(ctx, bin, "-test.run=^TestDarwinLock_IndependentFirstAcquire$")
+		cmd.Env = append(os.Environ(), darwinFirstAcquireRoot+"="+layout.AppRoot())
+		input, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		output, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		children[i] = process{cmd: cmd, input: input, output: bufio.NewScanner(output)}
+		t.Cleanup(func() {
+			if cmd.ProcessState == nil {
+				if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					t.Error(err)
+				}
+				var exit *exec.ExitError
+				if err := cmd.Wait(); err != nil && !errors.As(err, &exit) {
+					t.Error(err)
+				}
+			}
+		})
+		if !children[i].output.Scan() || children[i].output.Text() != "ready" {
+			t.Fatalf("child readiness = %q, %v", children[i].output.Text(), children[i].output.Err())
+		}
+	}
+	for _, child := range children {
+		if _, err := io.WriteString(child.input, "start\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	winner := -1
+	for i, child := range children {
+		if !child.output.Scan() {
+			t.Fatalf("child result: %v", child.output.Err())
+		}
+		switch child.output.Text() {
+		case "acquired":
+			if winner != -1 {
+				t.Fatal("both children acquired the lock")
+			}
+			winner = i
+		case "conflict":
+		default:
+			line := child.output.Text()
+			var rest []string
+			for child.output.Scan() {
+				rest = append(rest, child.output.Text())
+			}
+			t.Fatalf("child result = %q, remaining output %q, want acquired or conflict", line, rest)
+		}
+	}
+	if winner == -1 {
+		t.Fatal("no child acquired the lock")
+	}
+	path := layout.DarwinLockPaths().Backend
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := darwinTestSet(t, layout)
+	result, err := observer.AcquireBackend(t.Context())
+	if result.Lease() != nil {
+		t.Fatal("observer acquired a held lock")
+	}
+	assertDarwinLockConflict(t, err, protocol.CodeBackendAlreadyRunning)
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("lock identity while held = %v, %v", after, err)
+	}
+	if err := children[winner].cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	var exit *exec.ExitError
+	if err := children[winner].cmd.Wait(); !errors.As(err, &exit) {
+		t.Fatalf("winner wait = %v, want killed process", err)
+	}
+	result, err = observer.AcquireBackend(t.Context())
+	if err != nil || result.Lease() == nil || result.Recovered() {
+		t.Fatalf("acquire after kill = %#v, %v, want ordinary lease", result, err)
+	}
+	after, err = os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("lock identity after kill = %v, %v", after, err)
+	}
+}
+
+func runDarwinFirstAcquire(t *testing.T, root string) {
+	t.Helper()
+	layout, err := config.NewLayout(root, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := darwinTestSet(t, layout)
+	if _, err := io.WriteString(os.Stdout, "ready\n"); err != nil {
+		t.Fatal(err)
+	}
+	input := bufio.NewReader(os.Stdin)
+	if _, err := input.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	result, err := set.AcquireBackend(t.Context())
+	if err != nil {
+		assertDarwinLockConflict(t, err, protocol.CodeBackendAlreadyRunning)
+		if _, err := io.WriteString(os.Stdout, "conflict\n"); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if result.Lease() == nil {
+		t.Fatal("acquire returned no lease")
+	}
+	if _, err := io.WriteString(os.Stdout, "acquired\n"); err != nil {
+		t.Fatal(err)
+	}
+	// 父进程结束测试或强杀持有者时退出。
+	if _, err := io.Copy(io.Discard, input); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestDarwinLock_HolderCrash(t *testing.T) {
 	if root := os.Getenv(darwinHolderRoot); root != "" {
