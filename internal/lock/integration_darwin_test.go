@@ -189,8 +189,11 @@ func TestDarwinLock_IndependentFirstAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-	defer cancel()
+	// 子进程生命周期不能挂在 t.Context() 上：后者在 Cleanup 之前就被取消，
+	// 会让清理阶段的 cmd.Wait 返回 context canceled 而不是真实退出状态。
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 注册为最后执行的 Cleanup，确保子进程回收早于 ctx 取消。
+	t.Cleanup(cancel)
 	type process struct {
 		cmd    *exec.Cmd
 		input  io.WriteCloser
@@ -334,8 +337,10 @@ func TestDarwinLock_HolderCrash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
+	// 同上：清理子进程时 ctx 必须仍然有效。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 同上。
+	t.Cleanup(cancel)
 	child := exec.CommandContext(ctx, bin, "-test.run=^TestDarwinLock_HolderCrash$")
 	child.Env = append(os.Environ(), darwinHolderRoot+"="+layout.AppRoot())
 	stdin, err := child.StdinPipe()
