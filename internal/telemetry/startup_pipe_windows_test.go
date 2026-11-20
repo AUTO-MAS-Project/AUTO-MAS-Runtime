@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
-	"github.com/Microsoft/go-winio"
 	"testing"
+	"time"
+
+	"github.com/Microsoft/go-winio"
 )
 
-// 桌面端测试替身只通过一次性本机管道提供摘要，不触碰生产遥测。
-func TestStartupResources_DesktopPipe(t *testing.T) {
+func serveStartupSample(t *testing.T, json string) {
+	t.Helper()
 	var secret [32]byte
 	if _, err := rand.Read(secret[:]); err != nil {
 		t.Fatal(err)
@@ -20,27 +22,27 @@ func TestStartupResources_DesktopPipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
-	done := make(chan error, 1)
+	t.Cleanup(func() { listener.Close() })
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
-			done <- err
 			return
 		}
 		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(time.Second))
 		request, err := bufio.NewReader(conn).ReadString('\n')
 		if err == nil && request == token[32:]+"\n" {
-			_, err = conn.Write([]byte(`{"cpu_peak":"90-100%","path":"private"}`))
+			_, _ = conn.Write([]byte(json))
 		}
-		done <- err
 	}()
-	fields := readStartupResources()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if len(fields) != 1 || fields["cpu_peak"] != "90-100%" {
-		t.Fatalf("fields = %v, want allowed CPU band", fields)
+}
+
+func TestStartupResources_NoActiveSample(t *testing.T) {
+	for _, body := range []string{`{}`, `{"sample_age":"60s+","coverage":"sampled","cpu_peak":"90-100%"}`, `{"sample_age":"<1s","coverage":"insufficient"}`} {
+		serveStartupSample(t, body)
+		if got := readStartupResources(); len(got) != 0 {
+			t.Fatalf("resources = %v, want none for %s", got, body)
+		}
 	}
 	t.Setenv("AUTO_MAS_STARTUP_SAMPLE", "not-an-invitation")
 	if got := readStartupResources(); len(got) != 0 {

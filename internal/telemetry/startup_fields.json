@@ -72,7 +72,9 @@
       "amd-ryzen-9",
       "amd-epyc",
       "amd-other",
-      "other"
+      "other",
+      "apple",
+      "qualcomm"
     ],
     "arch": [
       "x64",
@@ -90,7 +92,8 @@
       "radeon-other",
       "intel-arc",
       "intel-other",
-      "other"
+      "other",
+      "apple"
     ],
     "kind": [
       "integrated",
@@ -151,6 +154,13 @@
       "16-128MiB",
       "128-1024MiB",
       "1GiB+"
+    ],
+    "graphics": [
+      "integrated-only",
+      "discrete-only",
+      "mixed",
+      "software-only",
+      "no-adapter"
     ]
   },
   "fields": {
@@ -335,6 +345,50 @@
     "gpu3_vram": "gib",
     "gpu3_busy_peak": "percent",
     "gpu3_dedicated": "gib",
-    "gpu3_shared": "gib"
+    "gpu3_shared": "gib",
+    "virtual_adapters": "count",
+    "runtime_build_media": "media",
+    "runtime_build_bus": "bus",
+    "runtime_build_fs": "fs",
+    "runtime_build_capacity": "gib",
+    "runtime_build_location": "relation",
+    "runtime_build_used": "percent",
+    "runtime_build_free": "gib",
+    "runtime_build_busy_avg": "percent",
+    "runtime_build_busy_peak": "percent",
+    "runtime_build_busy_last": "percent",
+    "runtime_build_busy_high": "duration",
+    "runtime_build_read_latency": "latency",
+    "runtime_build_write_latency": "latency",
+    "runtime_build_read_speed": "speed",
+    "runtime_build_write_speed": "speed",
+    "runtime_build_iops": "iops",
+    "runtime_build_queue": "count",
+    "runtime_download_media": "media",
+    "runtime_download_bus": "bus",
+    "runtime_download_fs": "fs",
+    "runtime_download_capacity": "gib",
+    "runtime_download_location": "relation",
+    "runtime_download_used": "percent",
+    "runtime_download_free": "gib",
+    "runtime_download_busy_avg": "percent",
+    "runtime_download_busy_peak": "percent",
+    "runtime_download_busy_last": "percent",
+    "runtime_download_busy_high": "duration",
+    "runtime_download_read_latency": "latency",
+    "runtime_download_write_latency": "latency",
+    "runtime_download_read_speed": "speed",
+    "runtime_download_write_speed": "speed",
+    "runtime_download_iops": "iops",
+    "runtime_download_queue": "count",
+    "download_time": "duration",
+    "verify_time": "duration",
+    "unpack_time": "duration",
+    "dependencies_time": "duration",
+    "workspace_time": "duration",
+    "python_time": "duration",
+    "backend_time": "duration",
+    "other_time": "duration",
+    "graphics_layout": "graphics"
   }
 }

@@ -8,6 +8,8 @@ import (
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/logging"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/protocol"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/telemetry"
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/uv"
 )
 
 type workspaceControlContextKey struct{}
@@ -116,6 +118,10 @@ func runOperationSession(
 		telemetryState.operationErr = err
 		exitCode, telemetryState.terminalWritten = emitFailure(deps, emitter, stage, err)
 		return exitCode
+	}
+	if telemetry.StartupSampleRequested() {
+		deps.archive = &uv.ArchiveObservation{}
+		ctx = uv.WithArchiveObservation(ctx, deps.archive)
 	}
 	operationContext := ctx
 	var cancelOperation context.CancelFunc
@@ -253,12 +259,31 @@ func sessionSetupFailure(deps *deps, err error) int {
 	return protocol.ExitCodePreconditionFailed
 }
 
+func archiveDetails(deps *deps, details map[string]any) map[string]any {
+	a := deps.archive
+	if a == nil || a.Cached == nil {
+		return details
+	}
+	sample := map[string]any{"cached": *a.Cached}
+	if a.Verify != nil {
+		sample["verifyMs"] = a.Verify.Milliseconds()
+	}
+	if a.Unpack != nil {
+		sample["unpackMs"] = a.Unpack.Milliseconds()
+	}
+	if details == nil {
+		details = map[string]any{}
+	}
+	details["startupArchive"] = sample
+	return details
+}
+
 func emitSuccess(deps *deps, emitter *protocol.Emitter, stage protocol.Stage, success sessionSuccess) (int, bool) {
 	status := success.status
 	if status == "" {
 		status = "succeeded"
 	}
-	result := protocol.NewSuccessResult(stage, status, success.message, success.details)
+	result := protocol.NewSuccessResult(stage, status, success.message, archiveDetails(deps, success.details))
 	if err := emitter.EmitResult(result); err != nil {
 		writeDiagnostic(deps.io, err)
 		return protocol.ExitCodePreconditionFailed, false
@@ -293,7 +318,7 @@ func emitFailure(deps *deps, emitter *protocol.Emitter, fallbackStage protocol.S
 			}
 		}
 	}
-	result := protocol.NewFailureResult(errorEvent, status, message, details)
+	result := protocol.NewFailureResult(errorEvent, status, message, archiveDetails(deps, details))
 	if emitErr := emitter.EmitResult(result); emitErr != nil {
 		writeDiagnostic(deps.io, emitErr)
 		return exitCodeFor(code), false
