@@ -2859,6 +2859,9 @@ func TestDownloader_ComponentTLSChecksumMismatchCleansRealPart(
 	server := tlsArtifactServer(t, content)
 	defer server.Close()
 	layout := newComponentLayout(t)
+	if err := os.MkdirAll(layout.DownloadCacheDir(), 0o700); err != nil {
+		t.Fatalf("MkdirAll(download cache) error = %v", err)
+	}
 	downloader := newFilesystemDownloader(
 		t,
 		layout,

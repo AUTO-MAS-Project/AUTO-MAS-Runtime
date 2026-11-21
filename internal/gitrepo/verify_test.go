@@ -23,12 +23,14 @@ func TestVerifier_AcceptsVerifiedShallowRepository(t *testing.T) {
 	source := plan.Sources()[0]
 	repositoryPath, commit := createVerifiedRepository(t, target.Version(), source.BaseURL())
 	verifier := NewVerifier()
+	access := testRepositoryAccess(t, repositoryPath)
 
 	revision, err := verifier.Verify(t.Context(), VerificationRequest{
 		RepositoryPath: repositoryPath,
 		Target:         target,
 		Source:         source,
 		AllowedSources: plan.Sources(),
+		lease:          access.lease,
 	})
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
