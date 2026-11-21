@@ -17,7 +17,7 @@ import (
 
 func TestExecute_PlatformBoundary(t *testing.T) {
 	t.Setenv("AUTO_MAS_TELEMETRY", "enabled")
-	for _, command := range [][]string{{"version"}, {"doctor"}, {"bootstrap"}, {"workspace", "check"}, {"workspace", "check", "--remote"}, {"workspace", "sync", "--version", "v1.0.0"}, {"workspace", "stage", "--version", "v1.0.0"}, {"environment", "check"}, {"environment", "ensure"}, {"environment", "repair"}, {"dependencies", "sync"}, {"dependencies", "check"}, {"dependencies", "rebuild"}, {"backend", "supervise", "--mode", "managed"}, {"repair"}, {"cleanup"}} {
+	for _, command := range [][]string{{"version"}, {"doctor"}, {"bootstrap"}, {"workspace", "check", "--remote"}, {"workspace", "sync", "--version", "v1.0.0"}, {"workspace", "stage", "--version", "v1.0.0"}, {"environment", "check"}, {"environment", "ensure"}, {"environment", "repair"}, {"dependencies", "sync"}, {"dependencies", "check"}, {"dependencies", "rebuild"}, {"backend", "supervise", "--mode", "managed"}, {"repair"}, {"cleanup"}} {
 		t.Run(strings.Join(command, "_"), func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "尚未创建")
 			var stdout, stderr bytes.Buffer
@@ -67,5 +67,28 @@ func TestExecute_PlatformBoundary(t *testing.T) {
 				t.Fatalf("got root stat %v, want no directory created", err)
 			}
 		})
+	}
+}
+
+func TestExecute_DarwinLocalWorkspaceCheck(t *testing.T) {
+	t.Setenv("AUTO_MAS_TELEMETRY", "disabled")
+	root := filepath.Join(t.TempDir(), "missing")
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--output", "ndjson", "--app-root", root, "workspace", "check"},
+		IO{In: strings.NewReader(""), Out: &stdout, Err: &stderr})
+	if code != 0 {
+		t.Fatalf("exit = %d, stdout = %s, stderr = %s", code, stdout.String(), stderr.String())
+	}
+	lines := bytes.Split(bytes.TrimSpace(stdout.Bytes()), []byte{'\n'})
+	var result map[string]any
+	if err := json.Unmarshal(lines[len(lines)-1], &result); err != nil {
+		t.Fatal(err)
+	}
+	details, ok := result["details"].(map[string]any)
+	if result["type"] != "result" || result["success"] != true || !ok || details["reason"] != "missing" {
+		t.Fatalf("result = %v, want successful missing repository", result)
+	}
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("root stat = %v, want missing", err)
 	}
 }

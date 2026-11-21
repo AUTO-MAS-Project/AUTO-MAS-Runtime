@@ -24,6 +24,8 @@ if [[ "$(go env GOOS)" == "darwin" ]]; then
   go test ./internal/config ./internal/protocol ./internal/protocol/contracttest ./internal/release ./internal/version -count=1
   go test ./internal/lock -run '^TestDarwinLock_' -count=1
   go test -race ./internal/lock -run '^TestDarwinLock_' -count=1
+  go test -race ./internal/filesystem -run '^TestPOSIXState_' -count=1
+  go test -race ./internal/state -count=1
 else
   go test ./... -count=1
   if [[ -n "${AUTO_MAS_UV_INTEGRATION_ARCHIVE:-}" ]]; then

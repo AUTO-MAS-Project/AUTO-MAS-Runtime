@@ -93,6 +93,13 @@ func TestDarwinRuntimeLogs_ConcurrentWritersAndActiveRemoval(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if result, err := files.Remove(t.Context(), tokens[0]); !errors.Is(err, ErrIdentityChanged) || result.MutationApplied {
+		t.Fatalf("Remove(stale token) = %#v, %v, want identity rejection", result, err)
+	}
+	tokens, err = files.List(t.Context())
+	if err != nil || len(tokens) != 1 {
+		t.Fatalf("List(after writers close) = %v, %v, want one token", tokens, err)
+	}
 	if result, err := files.Remove(t.Context(), tokens[0]); err != nil || !result.MutationApplied {
 		t.Fatalf("Remove(after writers close) = %#v, %v, want removed", result, err)
 	}
