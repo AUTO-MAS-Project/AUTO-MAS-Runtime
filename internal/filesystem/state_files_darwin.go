@@ -260,6 +260,9 @@ func (f *StateFiles) RemoveTransactionIfUnchanged(ctx context.Context, snapshot 
 		return StateRemoveResult{}, err
 	}
 	actual, err := f.readDarwin(ctx, directory, name, snapshot.kind, MaxStateFileBytes)
+	if errors.Is(err, ErrStateFileNotFound) {
+		return StateRemoveResult{}, closeDarwinStateDirectory(directory)
+	}
 	if err == nil && (actual.volumeSerial != snapshot.volumeSerial || actual.fileID != snapshot.fileID || actual.digest != snapshot.digest) {
 		err = ErrIdentityChanged
 	}
