@@ -90,7 +90,7 @@ jobs:
         run: |
           go test -race ./internal/protocol/... ./internal/health ./internal/version -count=1
           if ($LASTEXITCODE -ne 0) { throw 'shared protocol tests failed' }
-          $platformOutput = & go test -v ./internal/cli ./internal/config ./internal/doctor -run '^(TestExecute_PlatformBoundary|TestPlatformCommandError|TestLayout_POSIXIdentity|TestContract_RegisterVersion|TestProbeDiskFree_Production|TestProbeDiskFree_RejectsEmptyPath)$' -count=1 2>&1
+          $platformOutput = & go test -v ./internal/cli ./internal/config ./internal/doctor -run '^(TestExecute_PlatformBoundary|TestExecute_DarwinLocalWorkspaceCheck|TestPlatformCommandError|TestLayout_POSIXIdentity|TestContract_RegisterVersion|TestProbeDiskFree_Production|TestProbeDiskFree_RejectsEmptyPath)$' -count=1 2>&1
           $platformExit = $LASTEXITCODE
           $platformOutput | Tee-Object -FilePath artifacts/platform-tests.txt
           if ($platformExit -ne 0 -or ($platformOutput -match '\[no tests to run\]') -or -not ($platformOutput -match '--- PASS:')) { throw 'scoped platform tests failed' }

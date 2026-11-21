@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -29,13 +30,18 @@ func workspaceCheckCommand(deps *deps) *cobra.Command {
 				commandPath(cmd),
 				protocol.StageWorkspaceCheck,
 				func(ctx context.Context, _ *protocol.Emitter) (sessionSuccess, error) {
-					service, err := deps.options.workspaceFactory(deps.global.layout)
-					if err != nil {
-						return sessionSuccess{}, err
-					}
 					remoteRequested, flagErr := cmd.Flags().GetBool("remote")
 					if flagErr != nil {
 						return sessionSuccess{}, flagErr
+					}
+					if remoteRequested {
+						if failure := platformCommandError(runtime.GOOS, "workspace check --remote", protocol.StageWorkspaceCheck); failure != nil {
+							return sessionSuccess{}, failure
+						}
+					}
+					service, err := deps.options.workspaceFactory(deps.global.layout)
+					if err != nil {
+						return sessionSuccess{}, err
 					}
 					if remoteRequested {
 						checker, ok := service.(remoteWorkspaceService)
