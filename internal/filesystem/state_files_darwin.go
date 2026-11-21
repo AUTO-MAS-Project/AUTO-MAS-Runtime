@@ -113,8 +113,18 @@ func (f *StateFiles) open(ctx context.Context, kind StateFileKind) (*darwinDirec
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	f.traceState("wait")
+	turn := darwinStateTurns.enqueue(darwinStateQueueKey{volume: directory.identity.volumeSerial, fileID: directory.identity.fileID})
+	if err := darwinStateTurns.wait(waitCtx, turn); err != nil {
+		f.traceState("wait-failed")
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			err = errors.Join(ErrStateGuardTimeout, err)
+		}
+		return nil, "", errors.Join(err, directory.file.Close())
+	}
+	directory.stateTurn = turn
 	if err := lockDarwinStateDirectory(waitCtx, ctx, directory); err != nil {
 		f.traceState("wait-failed")
+		darwinStateTurns.release(turn)
 		return nil, "", errors.Join(err, directory.file.Close())
 	}
 	f.traceState("acquired")
@@ -146,6 +156,12 @@ func (f *StateFiles) traceState(event string) {
 // lockDarwinStateDirectory 在预算内独占目录 inode，超时映射为守卫占用。
 func lockDarwinStateDirectory(waitCtx, requestCtx context.Context, directory *darwinDirectory) error {
 	for {
+		if err := waitCtx.Err(); err != nil {
+			if requestCtx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				return errors.Join(ErrStateGuardTimeout, err)
+			}
+			return err
+		}
 		err := unix.Flock(int(directory.file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			return nil
@@ -164,7 +180,12 @@ func lockDarwinStateDirectory(waitCtx, requestCtx context.Context, directory *da
 
 // closeDarwinStateDirectory 释放目录锁并关闭句柄。
 func closeDarwinStateDirectory(directory *darwinDirectory) error {
-	return errors.Join(unix.Flock(int(directory.file.Fd()), unix.LOCK_UN), directory.file.Close())
+	err := errors.Join(unix.Flock(int(directory.file.Fd()), unix.LOCK_UN), directory.file.Close())
+	if directory.stateTurn != nil {
+		darwinStateTurns.release(directory.stateTurn)
+		directory.stateTurn = nil
+	}
+	return err
 }
 
 // verifyDarwinStateDirectory 复核目录句柄仍指向构造时固定的对象。

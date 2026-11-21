@@ -25,9 +25,10 @@ type DirectoryInspection struct {
 }
 
 type darwinDirectory struct {
-	file     *os.File
-	path     string
-	identity DirectoryIdentity
+	file      *os.File
+	path      string
+	identity  DirectoryIdentity
+	stateTurn *darwinStateWaiter
 }
 
 // Canonicalize 只解析系统固定别名；任意应用目录链接仍由 FD 遍历拒绝。
