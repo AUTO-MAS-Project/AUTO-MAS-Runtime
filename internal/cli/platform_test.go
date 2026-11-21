@@ -11,7 +11,7 @@ func TestPlatformCommandError(t *testing.T) {
 		for _, command := range []string{"version", "doctor", "bootstrap", "workspace check", "workspace sync", "workspace stage", "environment check", "environment prepare", "dependencies check", "dependencies sync", "dependencies rebuild", "backend supervise", "repair", "cleanup"} {
 			t.Run(goos+"/"+command, func(t *testing.T) {
 				err := platformCommandError(goos, command, protocol.StageBootstrap)
-				if goos == "windows" || goos == "linux" || command == "version" {
+				if goos == "windows" || goos == "linux" || command == "version" || (goos == "darwin" && command == "workspace check") {
 					if err != nil {
 						t.Fatalf("got %v, want nil", err)
 					}

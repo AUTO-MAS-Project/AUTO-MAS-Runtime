@@ -113,11 +113,16 @@ func (f *RuntimeLogFiles) List(ctx context.Context) ([]RuntimeLogFile, error) {
 			if err != nil {
 				return err
 			}
+			var stat unix.Stat_t
+			if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+				return errors.Join(err, file.Close())
+			}
 			if err := file.Close(); err != nil {
 				return err
 			}
 			result = append(result, RuntimeLogFile{owner: f.owner, name: entry.Name(),
-				path: filepath.Join(f.layout.RuntimeLogDir(), entry.Name()), volumeSerial: identity.volumeSerial, fileID: identity.fileID})
+				path: filepath.Join(f.layout.RuntimeLogDir(), entry.Name()), volumeSerial: identity.volumeSerial, fileID: identity.fileID,
+				changeTimeSeconds: stat.Ctim.Sec, changeTimeNanoseconds: int32(stat.Ctim.Nsec), generation: stat.Gen})
 		}
 		return nil
 	})
@@ -155,6 +160,13 @@ func (f *RuntimeLogFiles) Remove(ctx context.Context, token RuntimeLogFile) (Rem
 		}
 		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 			return errors.Join(err, file.Close())
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if stat.Ctim.Sec != token.changeTimeSeconds || int32(stat.Ctim.Nsec) != token.changeTimeNanoseconds || stat.Gen != token.generation {
+			return errors.Join(ErrIdentityChanged, file.Close())
 		}
 		if err := ctx.Err(); err != nil {
 			return errors.Join(err, file.Close())
