@@ -27,6 +27,7 @@ type StateFiles struct {
 	identity DirectoryIdentity
 	owner    *stateFileOwner
 	closed   bool
+	trace    func(string) // 仅供同包测试采集单次操作的锁时间线，由 mu 保护。
 }
 
 // NewStateFiles 准备 state 目录并固定其物理身份，不跟随任何目录链接。
@@ -111,11 +112,16 @@ func (f *StateFiles) open(ctx context.Context, kind StateFileKind) (*darwinDirec
 	// 锁目录 inode 而非可替换的守卫文件，跨进程事务始终落在同一物理对象。
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	f.traceState("wait")
 	if err := lockDarwinStateDirectory(waitCtx, ctx, directory); err != nil {
+		f.traceState("wait-failed")
 		return nil, "", errors.Join(err, directory.file.Close())
 	}
+	f.traceState("acquired")
 	if err := verifyDarwinStateDirectory(directory, f.identity); err != nil {
-		return nil, "", errors.Join(err, closeDarwinStateDirectory(directory))
+		closeErr := closeDarwinStateDirectory(directory)
+		f.traceState("released")
+		return nil, "", errors.Join(err, closeErr)
 	}
 	var path string
 	switch kind {
@@ -129,6 +135,12 @@ func (f *StateFiles) open(ctx context.Context, kind StateFileKind) (*darwinDirec
 		path = f.layout.EnvironmentStateFile()
 	}
 	return directory, filepath.Base(path), nil
+}
+
+func (f *StateFiles) traceState(event string) {
+	if f.trace != nil {
+		f.trace(event)
+	}
 }
 
 // lockDarwinStateDirectory 在预算内独占目录 inode，超时映射为守卫占用。
@@ -235,7 +247,10 @@ func (f *StateFiles) WriteAtomic(ctx context.Context, kind StateFileKind, data [
 		return WriteAtomicResult{}, err
 	}
 	applied, writeErr := replaceDarwin(ctx, directory, name, data)
-	err = errors.Join(writeErr, closeDarwinStateDirectory(directory))
+	f.traceState("write-finished")
+	closeErr := closeDarwinStateDirectory(directory)
+	f.traceState("released")
+	err = errors.Join(writeErr, closeErr)
 	result := WriteAtomicResult{MutationApplied: applied, RecoveryRequired: applied && err != nil}
 	if err != nil {
 		return result, &StateWriteError{

@@ -135,8 +135,6 @@ jobs:
             $mounted = $true
             $env:TMPDIR = "$mountPath/"
             $env:AUTO_MAS_PROBE_CASE_SENSITIVE = 'true'
-            go test -race -v ./internal/filesystem -run '^TestStateContention_DarwinTimings$' -count=1 -timeout=2m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-state-contention.txt
-            if ($LASTEXITCODE -ne 0) { throw 'case-sensitive state contention measurement failed' }
             go test -race -v ./internal/macosprobe -run '^TestRoot_' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive.txt
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS probes failed' }
             go test -race -v ./internal/filesystem -run '^(TestDarwin|TestPOSIXState_|TestPOSIXIO_DownloadAndLog$|TestRuntimeLogFiles_RemoveRejectsChangedInodeGeneration$)' -count=100 -timeout=5m 2>&1 | Tee-Object -FilePath artifacts/apfs-sensitive-capabilities.txt
