@@ -145,8 +145,16 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'case-sensitive APFS lock capabilities failed' }
           } finally {
             if ($mounted) {
-              hdiutil detach $mountPath
-              if ($LASTEXITCODE -ne 0) { throw 'APFSX detach failed' }
+              $detached = $false
+              for ($attempt = 1; $attempt -le 5; $attempt++) {
+                hdiutil detach $mountPath
+                if ($LASTEXITCODE -eq 0) { $detached = $true; break }
+                if ($attempt -lt 5) { Start-Sleep -Seconds 2 }
+              }
+              if (-not $detached) {
+                & lsof +D $mountPath 2>&1 | Tee-Object -FilePath artifacts/apfs-detach-open-files.txt
+                throw 'APFSX detach failed after 5 attempts'
+              }
             }
           }
 
