@@ -6,9 +6,12 @@ import (
 	"strings"
 )
 
+// BackendCapabilitiesPath 是当前提交中可选的启动能力声明。
+const BackendCapabilitiesPath = "res/runtime-capabilities.json"
+
 // BackendCapabilitiesFile 返回所选源码仓库的 Runtime 能力清单路径。
 func BackendCapabilitiesFile(repoDir string) string {
-	return filepath.Join(repoDir, "res", "runtime-capabilities.json")
+	return filepath.Join(repoDir, BackendCapabilitiesPath)
 }
 
 // RepositoryFile 返回 Git tree 中普通跟踪文件的受管路径，禁止访问 Git 元数据和根外路径。
@@ -134,6 +137,9 @@ func (l *Layout) UpdateStateFile() string { return l.paths.updateStateFile }
 
 // EnvironmentStateFile 返回环境状态文件路径。
 func (l *Layout) EnvironmentStateFile() string { return l.paths.environmentStateFile }
+
+// SourceCheckFile 返回待完成的受管源码核对标记。
+func (l *Layout) SourceCheckFile() string { return filepath.Join(l.StateDir(), "source-check.pending") }
 
 // RuntimeDir 返回 Runtime 受管运行目录。
 func (l *Layout) RuntimeDir() string { return l.paths.runtimeDir }

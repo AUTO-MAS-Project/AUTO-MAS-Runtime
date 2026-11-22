@@ -205,6 +205,15 @@ func TestDeferredStartup_ActivationIsIdempotent(t *testing.T) {
 	activator := &recordingActivator{}
 	supervisor := f.supervisor()
 	supervisor.deps.Activation = activator
+	checking := make(chan struct{})
+	supervisor.deps.VerifyPendingSource = func(ctx context.Context, _ string) (bool, error) {
+		if activator.calls.Load() != 1 {
+			t.Error("source inspection started before business activation")
+		}
+		close(checking)
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
@@ -227,6 +236,7 @@ func TestDeferredStartup_ActivationIsIdempotent(t *testing.T) {
 	if activator.calls.Load() != 1 {
 		t.Fatalf("activation calls = %d", activator.calls.Load())
 	}
+	waitFor(t, checking)
 	if !f.uv.options.DeferBusinessStart {
 		t.Fatal("deferred start was not passed to the child boundary")
 	}

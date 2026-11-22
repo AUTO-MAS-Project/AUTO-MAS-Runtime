@@ -89,6 +89,8 @@ type Dependencies struct {
 	Ranker *mirror.Ranker
 	// Relay 启动受监督期间常驻的回环中继（增补 2 C17 第 8 条）；nil 表示不起中继。
 	Relay RelayStarter
+	// VerifyPendingSource 只读核对日常准备留下的提交，返回是否发现损坏。
+	VerifyPendingSource func(context.Context, string) (bool, error)
 }
 
 // Timer 是可停止的重启等待计时器，避免 timer channel 在收口后泄漏。

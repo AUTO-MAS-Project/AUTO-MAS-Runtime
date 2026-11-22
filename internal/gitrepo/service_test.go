@@ -229,6 +229,9 @@ func TestService_SyncNoOpPreservesStableState(t *testing.T) {
 		LastSuccessful: state.Revision{Version: target.Version(), Commit: strings.Repeat("d", 40)},
 	}
 	service := newTestService(t, layout, reader, runtime, nil)
+	service.buildPlan = func(context.Context, mirror.Policy) (mirror.Plan, error) {
+		return mirror.Plan{}, errors.New("unexpected mirror probe for local workspace")
+	}
 	result, err := service.Sync(context.Background(), testSyncRequest(target))
 	if err != nil {
 		t.Fatalf("Sync() error = %v", err)
@@ -862,7 +865,9 @@ func newTestService(t *testing.T, layout *config.Layout, reader repositoryReader
 }
 
 func testSyncRequest(target Target) SyncRequest {
+	policy, _ := mirror.NewPolicy(mirror.PolicySpec{}) // 空配置始终是有效的默认策略。
 	return SyncRequest{
+		Policy:      policy,
 		UseCurrent:  true,
 		Target:      target,
 		OperationID: "01ARZ3NDEKTSV4RRFFQ69G5FAV",

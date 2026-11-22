@@ -91,6 +91,7 @@ func NewProductionManagedSupervisor(
 		Ranker:       configured.ranker,
 		Relay:        productionRelayStarter,
 	}
+	deps.VerifyPendingSource = repository.VerifyPendingSource
 	return NewManagedSupervisor(layout, deps)
 }
 

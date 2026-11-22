@@ -447,6 +447,7 @@ func (s *ManagedSupervisor) Supervise(ctx context.Context, request Request) (ret
 		return s.failAfterStarting(request, proc, tx, logger, gate, err, &processOwned, &txOwned, &loggerOwned)
 	}
 
+	logger = s.startSourceCheck(ctx, request, revision.Commit, logger)
 	select {
 	case <-ctx.Done():
 		cleanup := s.cleanupProcess(context.WithoutCancel(ctx), proc, tx, logger)

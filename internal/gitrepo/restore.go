@@ -26,26 +26,45 @@ type sourceRestore struct {
 	payload []byte
 }
 
-// Restore 以 Commit tree 为准恢复跟踪文件，所有目标 Blob 验证通过后才允许修改。
-func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (restored int, returnErr error) {
-	if ctx == nil || layout == nil || !validCommit(commit) || beforeWrite == nil {
-		return 0, errInvalidRepositoryRead
+func sourceTree(ctx context.Context, layout *config.Layout, commit string) (*git.Repository, *object.Tree, error) {
+	if ctx == nil || layout == nil || !validCommit(commit) {
+		return nil, nil, errInvalidRepositoryRead
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	repository, err := git.PlainOpen(layout.RepoDir())
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	if err := verifySourceObject(ctx, repository, plumbing.CommitObject, plumbing.NewHash(commit)); err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	objectCommit, err := repository.CommitObject(plumbing.NewHash(commit))
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	tree, err := objectCommit.Tree()
+	return repository, tree, err
+}
+
+func trackedSourceMatches(ctx context.Context, reader *filesystem.ManagedSourceReader, file *object.File, path string) (bool, error) {
+	if (file.Mode != filemode.Regular && file.Mode != filemode.Executable) || file.Size < 0 || file.Size > maxRestoredSourceBytes {
+		return false, errors.New("tracked source has unsupported mode or size")
+	}
+	actual, err := reader.Read(ctx, path, file.Size+1)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return int64(len(actual)) == file.Size && plumbing.ComputeHash(plumbing.BlobObject, actual) == file.Hash, nil
+}
+
+// Restore 以 Commit tree 为准核对跟踪文件。beforeWrite 为 nil 时只统计差异，不准备或写回文件。
+func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error) {
+	repository, tree, err := sourceTree(ctx, layout, commit)
 	if err != nil {
 		return 0, err
 	}
@@ -60,8 +79,8 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 	if err != nil {
 		return 0, err
 	}
-	defer func() { returnErr = errors.Join(returnErr, reader.Close()) }()
-	pending := make([]sourceRestore, 0)
+	var differences int
+	var pending []sourceRestore
 	err = tree.Files().ForEach(func(file *object.File) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -70,18 +89,16 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		if _, excluded := policy.exclusions[root]; excluded {
 			return nil
 		}
-		if (file.Mode != filemode.Regular && file.Mode != filemode.Executable) || file.Size < 0 || file.Size > maxRestoredSourceBytes {
-			return errors.New("tracked source has unsupported mode or size")
-		}
 		path, err := layout.RepositoryFile(file.Name)
 		if err != nil {
 			return err
 		}
-		actual, err := reader.Read(ctx, path, file.Size+1)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		match, err := trackedSourceMatches(ctx, reader, file, path)
+		if err != nil || match {
 			return err
 		}
-		if err == nil && int64(len(actual)) == file.Size && plumbing.ComputeHash(plumbing.BlobObject, actual) == file.Hash {
+		differences++
+		if beforeWrite == nil {
 			return nil
 		}
 		reader, err := file.Reader()
@@ -111,7 +128,7 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		return 0, errors.New("repository commit changed during source inspection")
 	}
 	if len(pending) == 0 {
-		return 0, nil
+		return differences, ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -180,21 +197,50 @@ func verifySourceObject(ctx context.Context, repository *git.Repository, kind pl
 
 func (s *Service) restoreOrFinishUnchanged(ctx context.Context, request SyncRequest, runtime syncRuntime, machine *protocol.LifecycleMachine, check CheckResult, environment state.EnvironmentState, logPath string) (result SyncResult, returnErr error) {
 	started := false
+	var files *filesystem.StateFiles
+	var previous *filesystem.StateFileSnapshot
 	lease, err := filesystem.PinManagedDirectory(ctx, s.layout, s.layout.RepoDir())
 	if err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
 	defer func() {
-		if closeErr := lease.Close(); closeErr != nil {
-			if started {
-				returnErr = errors.Join(returnErr, serviceCommittedStateWriteError(protocol.StageWorkspaceCleanup, closeErr))
-			} else {
-				returnErr = errors.Join(returnErr, closeErr)
+		var cleanupErr error
+		if files != nil {
+			if previous != nil && returnErr == nil {
+				cleanupCtx, cancel := serviceCleanupContext(ctx)
+				_, cleanupErr = files.RemoveTransactionIfUnchanged(cleanupCtx, *previous)
+				cancel()
 			}
+			cleanupErr = errors.Join(cleanupErr, files.Close())
+		}
+		if cleanupErr = errors.Join(cleanupErr, lease.Close()); cleanupErr != nil {
+			failure := serviceStateWriteError(protocol.StageWorkspaceCleanup, cleanupErr)
+			failure.committed = started
+			returnErr = errors.Join(returnErr, failure)
 		}
 	}()
 	if check.directoryIdentity == nil || !check.directoryIdentity.Equal(lease.Identity()) {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, filesystem.ErrIdentityChanged)
+	}
+	files, err = filesystem.NewStateFiles(ctx, s.layout)
+	if err != nil {
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+	}
+	prior, err := files.Read(ctx, filesystem.StateSourceCheck, filesystem.MaxStateFileBytes)
+	switch {
+	case err == nil:
+		previous = &prior
+	case !errors.Is(err, filesystem.ErrStateFileNotFound):
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+	case request.DeferSourceCheck && environment.Status == protocol.StateReadyToStart && environment.LastSuccessful.Version == check.Version && environment.LastSuccessful.Commit == check.Commit:
+		if match, inspectErr := s.startupInputsMatch(ctx, check.Commit); match && inspectErr == nil {
+			if _, err := files.WriteAtomic(ctx, filesystem.StateSourceCheck, []byte(check.Commit)); err != nil {
+				return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+			}
+			result, err := s.finishUnchanged(ctx, request, runtime, machine, check)
+			result.SourceCheckDeferred = true
+			return result, err
+		}
 	}
 	count, err := s.reader.Restore(ctx, s.layout, check.Commit, func() error {
 		broken, err := runtime.NewBrokenEnvironment(environment.LastSuccessful, state.BrokenEnvironment{TargetVersion: check.Version, Branch: check.Branch, Commit: check.Commit, Reason: state.ReasonRepositoryChanged, Stage: protocol.StageWorkspaceVerify, LogPath: logPath})

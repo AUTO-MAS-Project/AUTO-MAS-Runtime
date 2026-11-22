@@ -35,7 +35,7 @@ func sourceRestoreFixture(t *testing.T) (*config.Layout, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, text := range map[string]string{"uv.lock": "version = 1\n", "app/main.py": "original\n", "frontend/keep.txt": "excluded\n", "res/version.json": `{"version":"v1.0.0"}`} {
+	for name, text := range map[string]string{"uv.lock": "version = 1\n", ".python-version": "3.12.13\n", "pyproject.toml": "[project]\n", "main.py": "# entry\n", "app/main.py": "original\n", "app/utils/common/startup_timing.py": "# timing\n", "res/background.txt": "original\n", "frontend/keep.txt": "excluded\n", "res/version.json": `{"version":"v1.0.0"}`} {
 		path := filepath.Join(layout.RepoDir(), filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
@@ -172,7 +172,8 @@ func TestService_SyncRestoresTrackedFiles(t *testing.T) {
 	for _, useCurrent := range []bool{true, false} {
 		t.Run(map[bool]string{true: "early_noop", false: "fetched_same_commit"}[useCurrent], func(t *testing.T) {
 			layout, commit := sourceRestoreFixture(t)
-			if err := os.WriteFile(layout.UVLockFile(), []byte("broken"), 0o600); err != nil {
+			file := filepath.Join(layout.RepoDir(), "res", "background.txt")
+			if err := os.WriteFile(file, []byte("broken"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			runtime := newServiceTestRuntime()
@@ -186,9 +187,24 @@ func TestService_SyncRestoresTrackedFiles(t *testing.T) {
 			service.resolveRemote = func(context.Context, mirror.Plan, Target) (string, error) { return strings.Repeat("a", 40), nil }
 			request := testSyncRequest(mustServiceTarget(t, "v1.0.0"))
 			request.UseCurrent = useCurrent
+			if useCurrent {
+				request.DeferSourceCheck = true
+				if result, err := service.Sync(t.Context(), request); err != nil || !result.SourceCheckDeferred {
+					t.Fatalf("daily startup = %#v, %v", result, err)
+				}
+				if dirty, err := service.VerifyPendingSource(t.Context(), commit); !dirty || err != nil {
+					t.Fatalf("background check = %v, %v", dirty, err)
+				}
+				if data, err := os.ReadFile(file); err != nil || string(data) != "broken" {
+					t.Fatalf("source changed while running: %q, %v", data, err)
+				}
+			}
 			result, err := service.Sync(t.Context(), request)
 			if err != nil || !result.Changed || result.Status != protocol.StateEnvironmentBroken {
 				t.Fatalf("Sync() = %#v, %v, want restored broken", result, err)
+			}
+			if data, err := os.ReadFile(file); err != nil || string(data) != "original\n" {
+				t.Fatalf("source after restart: %q, %v", data, err)
 			}
 			wantFetch := 0
 			if !useCurrent {
@@ -259,5 +275,58 @@ func TestRestoreTrackedFiles_CancelBeforeReplace(t *testing.T) {
 	count, err := (goGitRepositoryReader{}).Restore(t.Context(), layout, commit, func() error { return nil })
 	if err != nil || count != 1 {
 		t.Fatalf("resumed restore = %d, %v", count, err)
+	}
+}
+
+func TestService_ForegroundSourceCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		marker bool
+		daily  bool
+	}{
+		{name: "startup_module", daily: true},
+		{name: "empty_marker", marker: true, daily: true},
+		{name: "explicit_sync", marker: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			layout, commit := sourceRestoreFixture(t)
+			runtime := newServiceTestRuntime()
+			runtime.environment = state.EnvironmentState{SchemaVersion: state.SchemaVersion, Status: protocol.StateReadyToStart, LastSuccessful: state.Revision{Version: "v1.0.0", Commit: commit}}
+			service := newTestService(t, layout, goGitRepositoryReader{}, runtime, nil)
+			request := testSyncRequest(mustServiceTarget(t, "v1.0.0"))
+			request.DeferSourceCheck = tc.daily
+			module := filepath.Join(layout.RepoDir(), "app", "utils", "common", "startup_timing.py")
+			if tc.marker {
+				if err := os.MkdirAll(layout.StateDir(), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				payload := []byte(commit)
+				if tc.daily {
+					payload = nil
+				}
+				if err := os.WriteFile(layout.SourceCheckFile(), payload, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Remove(module); err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.Sync(t.Context(), request)
+			wantRestored := !tc.marker
+			if err != nil || result.SourceCheckDeferred || result.Changed != wantRestored {
+				t.Fatalf("foreground sync = %#v, %v", result, err)
+			}
+			if got, err := os.ReadFile(module); err != nil || string(got) != "# timing\n" {
+				t.Fatalf("startup module = %q, %v", got, err)
+			}
+			if _, err := os.Stat(layout.SourceCheckFile()); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("marker stat = %v, want absent", err)
+			}
+			if tc.marker {
+				request.DeferSourceCheck = true
+				if result, err := service.Sync(t.Context(), request); err != nil || !result.SourceCheckDeferred {
+					t.Fatalf("next daily sync = %#v, %v", result, err)
+				}
+			}
+		})
 	}
 }

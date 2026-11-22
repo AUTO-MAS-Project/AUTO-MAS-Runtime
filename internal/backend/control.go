@@ -780,7 +780,15 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 	}
 	restartUsed := false
 	var restartFacts map[string]any
+	checkSource := modeForRequest(request) == ModeManaged
 	for {
+		if checkSource {
+			_, _, details := stateSnapshot.snapshot()
+			if !request.DeferBusinessStart || details["startupActivation"] == "active" {
+				attempt.logger = s.startSourceCheck(ctx, request, revision.Commit, attempt.logger)
+				checkSource = false
+			}
+		}
 		if fault := attempt.gate.Fault(); fault != nil {
 			if commandID, ok := shutdownLatchedBehindOutputFault(request.Control, fault); ok {
 				return errors.Join(fault, s.finishControlShutdown(ctx, request, attempt, stateSnapshot, commandID))
