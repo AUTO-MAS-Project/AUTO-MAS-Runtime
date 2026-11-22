@@ -334,7 +334,7 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		}
 		return SyncResult{}, serviceInvalidArgumentError(err)
 	}
-	plan, err := s.buildPlan(ctx, request.Policy)
+	plan, err := buildProductionPlan(ctx, request.Policy)
 	if err != nil {
 		if errors.Is(err, mirror.ErrPolicyRejected) {
 			return SyncResult{}, servicePolicyArgumentError(err)
@@ -447,7 +447,21 @@ func (s *Service) Sync(ctx context.Context, request SyncRequest) (result SyncRes
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceCheck, pendingErr))
 	}
 	prepared := pendingState.Command == "workspace stage" && pendingState.Stage == protocol.StageWorkspaceVerify
-	if !prepared && check.Healthy && check.Version == request.Target.Version() && check.Branch == request.Target.Branch() {
+	sameTarget := check.Healthy && check.Version == request.Target.Version() && check.Branch == request.Target.Branch()
+	// 本地恢复和启用已暂存版本都不消费远端源，只有查询或获取仓库才测速。
+	if !prepared && !plan.Offline() && !(sameTarget && request.UseCurrent) {
+		plan, err = s.buildPlan(ctx, request.Policy)
+		if err != nil {
+			failure := serviceInternalError(protocol.StageWorkspaceClone, err)
+			if isCancellation(ctx, err) {
+				failure = serviceCancelledError(protocol.StageWorkspaceClone, err)
+			} else if errors.Is(err, mirror.ErrPolicyRejected) {
+				failure = servicePolicyArgumentError(err)
+			}
+			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, failure)
+		}
+	}
+	if !prepared && sameTarget {
 		unchanged := request.UseCurrent || plan.Offline()
 		if !unchanged {
 			commit, err := s.resolveRemote(ctx, plan, request.Target)

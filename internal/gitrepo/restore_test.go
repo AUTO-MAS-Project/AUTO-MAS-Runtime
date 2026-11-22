@@ -184,7 +184,7 @@ func TestService_SyncRestoresTrackedFiles(t *testing.T) {
 			}
 			runtime.fetchResult = FetchResult{Revision: revision}
 			service.resolveRemote = func(context.Context, mirror.Plan, Target) (string, error) { return strings.Repeat("a", 40), nil }
-			request := testSyncRequest(mustServiceTarget(t, "v1.0.0"))
+			request := testSyncRequest(t, mustServiceTarget(t, "v1.0.0"))
 			request.UseCurrent = useCurrent
 			result, err := service.Sync(t.Context(), request)
 			if err != nil || !result.Changed || result.Status != protocol.StateEnvironmentBroken {
