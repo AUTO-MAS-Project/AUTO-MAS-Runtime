@@ -444,7 +444,7 @@ func (f *StateFiles) validateStateRemoveSnapshot(snapshot StateFileSnapshot) err
 		snapshot.owner != f.owner ||
 		!snapshot.kind.Valid() ||
 		snapshot.kind == StateEnvironment ||
-		snapshot.size <= 0 ||
+		(snapshot.size == 0 && snapshot.kind != StateSourceCheck) ||
 		snapshot.size != int64(len(snapshot.bytes)) ||
 		snapshot.digest != sha256.Sum256(snapshot.bytes) {
 		return ErrInvalidToken

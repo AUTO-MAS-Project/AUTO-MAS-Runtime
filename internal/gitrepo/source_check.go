@@ -4,32 +4,16 @@ import (
 	"context"
 	"errors"
 	"path"
+	"strings"
 
+	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 )
-
-// deferSourceCheck 在 mutation 锁下登记本轮核对；上次未完成则保留原有前台恢复。
-func (s *Service) deferSourceCheck(ctx context.Context, files *filesystem.StateFiles, commit string) (bool, *filesystem.StateFileSnapshot, error) {
-	prior, err := files.Read(ctx, filesystem.StateSourceCheck, filesystem.MaxStateFileBytes)
-	if err == nil {
-		return false, &prior, nil
-	}
-	if !errors.Is(err, filesystem.ErrStateFileNotFound) {
-		return false, nil, err
-	}
-
-	// 入口或环境输入损坏会使监督器根本无法启动，仍须在本次离线恢复。
-	match, err := s.startupInputsMatch(ctx, commit)
-	if err != nil || !match {
-		return false, nil, ctx.Err()
-	}
-	_, err = files.WriteAtomic(ctx, filesystem.StateSourceCheck, []byte(commit))
-	return err == nil, nil, err
-}
 
 func (s *Service) startupInputsMatch(ctx context.Context, commit string) (match bool, returnErr error) {
 	repo, tree, err := sourceTree(ctx, s.layout, commit)
@@ -66,6 +50,45 @@ func (s *Service) startupInputsMatch(ctx context.Context, commit string) (match 
 			return false, err
 		}
 		if ok, err := trackedSourceMatches(ctx, reader, file, path); !ok || err != nil {
+			return false, err
+		}
+	}
+	app, err := tree.Tree("app")
+	if err != nil {
+		return false, err
+	}
+	return s.startupModulesMatch(ctx, repo, app, reader, "app")
+}
+
+// startupModulesMatch 从当前提交枚举 Python 包，覆盖包初始化、传递导入和动态导入。
+func (s *Service) startupModulesMatch(ctx context.Context, repo *git.Repository, tree *object.Tree, reader *filesystem.ManagedSourceReader, prefix string) (bool, error) {
+	if err := verifySourceObject(ctx, repo, plumbing.TreeObject, tree.Hash); err != nil {
+		return false, err
+	}
+	for _, entry := range tree.Entries {
+		name := path.Join(prefix, entry.Name)
+		if entry.Mode == filemode.Dir {
+			child, err := tree.Tree(entry.Name)
+			if err != nil {
+				return false, err
+			}
+			if ok, err := s.startupModulesMatch(ctx, repo, child, reader, name); !ok || err != nil {
+				return false, err
+			}
+			continue
+		}
+		if !strings.EqualFold(path.Ext(name), ".py") {
+			continue
+		}
+		file, err := tree.TreeEntryFile(&entry)
+		if err != nil {
+			return false, err
+		}
+		target, err := s.layout.RepositoryFile(name)
+		if err != nil {
+			return false, err
+		}
+		if ok, err := trackedSourceMatches(ctx, reader, file, target); !ok || err != nil {
 			return false, err
 		}
 	}

@@ -222,16 +222,21 @@ func (s *Service) restoreOrFinishUnchanged(ctx context.Context, request SyncRequ
 	if check.directoryIdentity == nil || !check.directoryIdentity.Equal(lease.Identity()) {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, filesystem.ErrIdentityChanged)
 	}
-	if request.DeferSourceCheck && environment.Status == protocol.StateReadyToStart && environment.LastSuccessful.Version == check.Version && environment.LastSuccessful.Commit == check.Commit {
-		var deferred bool
-		files, err = filesystem.NewStateFiles(ctx, s.layout)
-		if err == nil {
-			deferred, previous, err = s.deferSourceCheck(ctx, files, check.Commit)
-		}
-		if err != nil {
-			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
-		}
-		if deferred {
+	files, err = filesystem.NewStateFiles(ctx, s.layout)
+	if err != nil {
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+	}
+	prior, err := files.Read(ctx, filesystem.StateSourceCheck, filesystem.MaxStateFileBytes)
+	switch {
+	case err == nil:
+		previous = &prior
+	case !errors.Is(err, filesystem.ErrStateFileNotFound):
+		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+	case request.DeferSourceCheck && environment.Status == protocol.StateReadyToStart && environment.LastSuccessful.Version == check.Version && environment.LastSuccessful.Commit == check.Commit:
+		if match, inspectErr := s.startupInputsMatch(ctx, check.Commit); match && inspectErr == nil {
+			if _, err := files.WriteAtomic(ctx, filesystem.StateSourceCheck, []byte(check.Commit)); err != nil {
+				return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+			}
 			result, err := s.finishUnchanged(ctx, request, runtime, machine, check)
 			result.SourceCheckDeferred = true
 			return result, err
