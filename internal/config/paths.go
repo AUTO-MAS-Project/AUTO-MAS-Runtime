@@ -135,6 +135,9 @@ func (l *Layout) UpdateStateFile() string { return l.paths.updateStateFile }
 // EnvironmentStateFile 返回环境状态文件路径。
 func (l *Layout) EnvironmentStateFile() string { return l.paths.environmentStateFile }
 
+// SourceCheckFile 返回待完成的受管源码核对标记。
+func (l *Layout) SourceCheckFile() string { return filepath.Join(l.StateDir(), "source-check.pending") }
+
 // RuntimeDir 返回 Runtime 受管运行目录。
 func (l *Layout) RuntimeDir() string { return l.paths.runtimeDir }
 

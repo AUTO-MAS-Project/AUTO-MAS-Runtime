@@ -53,6 +53,7 @@ type StageReporter func(protocol.Stage)
 // SyncRequest 描述一次 workspace sync 的外部依赖和稳定身份。
 type SyncRequest struct {
 	UseCurrent       bool
+	DeferSourceCheck bool
 	Target           Target
 	Policy           mirror.Policy
 	OperationID      string
@@ -86,10 +87,11 @@ type RemoteCheckResult struct {
 
 // SyncResult 是 workspace sync 的稳定业务结果。
 type SyncResult struct {
-	Revision         Revision
-	Changed          bool
-	Status           protocol.StateStatus
-	ControlCommandID string
+	Revision            Revision
+	Changed             bool
+	SourceCheckDeferred bool
+	Status              protocol.StateStatus
+	ControlCommandID    string
 }
 
 type lockFactory func(context.Context, *config.Layout) (mutationLockSet, error)

@@ -838,6 +838,8 @@ func (f *StateFiles) statePath(kind StateFileKind) (string, error) {
 		return f.layout.UpdateStateFile(), nil
 	case StateEnvironment:
 		return f.layout.EnvironmentStateFile(), nil
+	case StateSourceCheck:
+		return f.layout.SourceCheckFile(), nil
 	default:
 		return "", fmt.Errorf("%w: invalid state kind", ErrInvalidArgument)
 	}

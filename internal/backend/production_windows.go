@@ -63,12 +63,13 @@ func NewProductionManagedSupervisor(
 	}
 	stateStore := &lazyStateStore{layout: layout, clock: clock}
 	deps := Dependencies{
-		Lock:       newLazyLockSet(layout),
-		State:      stateStore,
-		Repository: productionRepository{service: repository},
-		Entry:      productionEntryChecker{layout: layout},
-		UV:         productionUV{runner: runner, expected: uv.FixedVersion},
-		Health:     health.NewChecker(health.Config{}),
+		Lock:                newLazyLockSet(layout),
+		State:               stateStore,
+		Repository:          productionRepository{service: repository},
+		VerifyPendingSource: repository.VerifyPendingSource,
+		Entry:               productionEntryChecker{layout: layout},
+		UV:                  productionUV{runner: runner, expected: uv.FixedVersion},
+		Health:              health.NewChecker(health.Config{}),
 		Logger: func(logCtx context.Context, request Request) (Logger, error) {
 			logger, loggerErr := logging.New(
 				logCtx,

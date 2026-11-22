@@ -201,13 +201,14 @@ func runBootstrap(
 	control := workspaceControlFromContext(ctx)
 	binding := &workspaceLogBinding{}
 	workspaceResult, err := workspace.Sync(ctx, gitrepo.SyncRequest{
-		UseCurrent:    target.Branch() != "dev" || ifNeeded,
-		Target:        target,
-		Policy:        deps.global.mirrorPolicy,
-		OperationID:   emitter.OperationID(),
-		PID:           uint32(os.Getpid()),
-		MutationLease: lease,
-		Emitter:       directWorkspaceEmitter{emitter: emitter, suppressWorkspaceStates: true},
+		UseCurrent:       target.Branch() != "dev" || ifNeeded,
+		DeferSourceCheck: ifNeeded && !reuseReadyEnvironment,
+		Target:           target,
+		Policy:           deps.global.mirrorPolicy,
+		OperationID:      emitter.OperationID(),
+		PID:              uint32(os.Getpid()),
+		MutationLease:    lease,
+		Emitter:          directWorkspaceEmitter{emitter: emitter, suppressWorkspaceStates: true},
 		LoggerFactory: func(loggerContext context.Context, commandName, operationID string) (gitrepo.OperationLogger, error) {
 			logger, loggerErr := deps.options.workspaceLoggerFactory(
 				loggerContext,
@@ -275,9 +276,11 @@ func runBootstrap(
 			if err := rollbackM5Preparation(emitter, machine, protocol.StageBootstrap, "当前运行环境已就绪"); err != nil {
 				return sessionSuccess{}, err
 			}
-			return sessionSuccess{message: "当前运行环境已就绪", status: string(protocol.StateReadyToStart), details: map[string]any{
-				"version": revision.Version(), "branch": revision.Branch(), "commit": revision.Commit(), "unchanged": true,
-			}}, nil
+			details := map[string]any{"version": revision.Version(), "branch": revision.Branch(), "commit": revision.Commit()}
+			if !workspaceResult.SourceCheckDeferred {
+				details["unchanged"] = true
+			}
+			return sessionSuccess{message: "当前运行环境已就绪", status: string(protocol.StateReadyToStart), details: details}, nil
 		}
 	}
 	if err := transitionM5State(emitter, machine, protocol.StagePythonCheck, protocol.StatePreparingPython, "正在准备受管 Python"); err != nil {

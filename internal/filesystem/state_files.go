@@ -22,13 +22,14 @@ const (
 	StateMutation    StateFileKind = "mutation"
 	StateUpdate      StateFileKind = "update"
 	StateEnvironment StateFileKind = "environment"
+	StateSourceCheck StateFileKind = "source-check"
 )
 
 func (k StateFileKind) String() string { return string(k) }
 
 func (k StateFileKind) Valid() bool {
 	switch k {
-	case StateBackend, StateMutation, StateUpdate, StateEnvironment:
+	case StateBackend, StateMutation, StateUpdate, StateEnvironment, StateSourceCheck:
 		return true
 	default:
 		return false

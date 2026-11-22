@@ -66,11 +66,13 @@ type Dependencies struct {
 	Lock       LockSet
 	State      StateStore
 	Repository RepositoryChecker
-	Entry      EntryChecker
-	UV         UVRunner
-	Health     HealthChecker
-	Logger     LoggerFactory
-	Clock      func() time.Time
+	// VerifyPendingSource 只读核对日常准备留下的提交，返回是否发现损坏。
+	VerifyPendingSource func(context.Context, string) (bool, error)
+	Entry               EntryChecker
+	UV                  UVRunner
+	Health              HealthChecker
+	Logger              LoggerFactory
+	Clock               func() time.Time
 	// WithStartupTimeout 创建启动工作预算作用域，默认使用 context.WithTimeoutCause。
 	WithStartupTimeout func(context.Context, time.Duration, error) (context.Context, context.CancelFunc)
 	UVPath             string

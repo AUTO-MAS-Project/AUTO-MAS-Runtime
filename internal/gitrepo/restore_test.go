@@ -35,7 +35,7 @@ func sourceRestoreFixture(t *testing.T) (*config.Layout, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, text := range map[string]string{"uv.lock": "version = 1\n", "app/main.py": "original\n", "frontend/keep.txt": "excluded\n", "res/version.json": `{"version":"v1.0.0"}`} {
+	for name, text := range map[string]string{"uv.lock": "version = 1\n", ".python-version": "3.12.13\n", "pyproject.toml": "[project]\n", "main.py": "# entry\n", "app/main.py": "original\n", "frontend/keep.txt": "excluded\n", "res/version.json": `{"version":"v1.0.0"}`} {
 		path := filepath.Join(layout.RepoDir(), filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
