@@ -6,9 +6,12 @@ import (
 	"strings"
 )
 
+// BackendCapabilitiesPath 是当前提交中可选的启动能力声明。
+const BackendCapabilitiesPath = "res/runtime-capabilities.json"
+
 // BackendCapabilitiesFile 返回所选源码仓库的 Runtime 能力清单路径。
 func BackendCapabilitiesFile(repoDir string) string {
-	return filepath.Join(repoDir, "res", "runtime-capabilities.json")
+	return filepath.Join(repoDir, BackendCapabilitiesPath)
 }
 
 // RepositoryFile 返回 Git tree 中普通跟踪文件的受管路径，禁止访问 Git 元数据和根外路径。

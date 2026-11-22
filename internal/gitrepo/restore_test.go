@@ -172,7 +172,8 @@ func TestService_SyncRestoresTrackedFiles(t *testing.T) {
 	for _, useCurrent := range []bool{true, false} {
 		t.Run(map[bool]string{true: "early_noop", false: "fetched_same_commit"}[useCurrent], func(t *testing.T) {
 			layout, commit := sourceRestoreFixture(t)
-			if err := os.WriteFile(layout.UVLockFile(), []byte("broken"), 0o600); err != nil {
+			file := filepath.Join(layout.RepoDir(), "app", "main.py")
+			if err := os.WriteFile(file, []byte("broken"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			runtime := newServiceTestRuntime()
@@ -184,11 +185,26 @@ func TestService_SyncRestoresTrackedFiles(t *testing.T) {
 			}
 			runtime.fetchResult = FetchResult{Revision: revision}
 			service.resolveRemote = func(context.Context, mirror.Plan, Target) (string, error) { return strings.Repeat("a", 40), nil }
-			request := testSyncRequest(t, mustServiceTarget(t, "v1.0.0"))
+			request := testSyncRequest(mustServiceTarget(t, "v1.0.0"))
 			request.UseCurrent = useCurrent
+			if useCurrent {
+				request.DeferSourceCheck = true
+				if result, err := service.Sync(t.Context(), request); err != nil || !result.SourceCheckDeferred {
+					t.Fatalf("daily startup = %#v, %v", result, err)
+				}
+				if dirty, err := service.VerifyPendingSource(t.Context(), commit); !dirty || err != nil {
+					t.Fatalf("background check = %v, %v", dirty, err)
+				}
+				if data, err := os.ReadFile(file); err != nil || string(data) != "broken" {
+					t.Fatalf("source changed while running: %q, %v", data, err)
+				}
+			}
 			result, err := service.Sync(t.Context(), request)
 			if err != nil || !result.Changed || result.Status != protocol.StateEnvironmentBroken {
 				t.Fatalf("Sync() = %#v, %v, want restored broken", result, err)
+			}
+			if data, err := os.ReadFile(file); err != nil || string(data) != "original\n" {
+				t.Fatalf("source after restart: %q, %v", data, err)
 			}
 			wantFetch := 0
 			if !useCurrent {

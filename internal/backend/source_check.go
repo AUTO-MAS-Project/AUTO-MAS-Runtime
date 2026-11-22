@@ -6,39 +6,36 @@ import (
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/process"
 )
 
-// sourceCheckLog 把后台读取的生命周期绑定到本次监督尝试；关闭日志前收回任务。
+// 后台检查使用本轮监督日志，必须在该日志关闭前退出。
 type sourceCheckLog struct {
 	Logger
-	cancel context.CancelFunc
-	done   <-chan struct{}
+	stop func()
 }
 
-func (l *sourceCheckLog) Close() error {
-	l.cancel()
-	<-l.done
-	return l.Logger.Close()
-}
+func (l sourceCheckLog) Close() error { l.stop(); return l.Logger.Close() }
 
-func (s *ManagedSupervisor) startSourceCheck(ctx context.Context, commit string, logger Logger) Logger {
-	verify := s.deps.VerifyPendingSource
-	if verify == nil {
+func (s *ManagedSupervisor) startSourceCheck(ctx context.Context, request Request, commit string, logger Logger) Logger {
+	if s.deps.VerifyPendingSource == nil {
 		return logger
 	}
-	work, cancel := context.WithCancel(ctx)
+	bind := context.WithCancel
+	if request.Control != nil {
+		bind = request.Control.WithTerminalCancellation
+	}
+	work, cancel := bind(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		dirty, err := verify(work, commit)
-		if work.Err() != nil {
+		dirty, err := s.deps.VerifyPendingSource(work, commit)
+		if work.Err() != nil || (!dirty && err == nil) {
 			return
 		}
-		message := "本轮受管源码检查结束"
+		message := "发现受管源码不一致，下次启动将离线复核和修复"
 		if err != nil {
 			message = "受管源码检查未完成：" + err.Error()
-		} else if dirty {
-			message = "发现受管源码不一致，下次启动将离线复核和修复"
 		}
+		// 日志失败不影响待修复标记。
 		_ = logger.Record(work, process.StreamRecord{Stream: "runtime", Fragment: message, EndOfLine: true})
 	}()
-	return &sourceCheckLog{Logger: logger, cancel: cancel, done: done}
+	return sourceCheckLog{Logger: logger, stop: func() { cancel(); <-done }}
 }

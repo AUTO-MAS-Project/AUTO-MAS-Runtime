@@ -785,7 +785,7 @@ func (s *ManagedSupervisor) superviseControlled(ctx context.Context, request Req
 		if checkSource {
 			_, _, details := stateSnapshot.snapshot()
 			if !request.DeferBusinessStart || details["startupActivation"] == "active" {
-				attempt.logger = s.startSourceCheck(ctx, revision.Commit, attempt.logger)
+				attempt.logger = s.startSourceCheck(ctx, request, revision.Commit, attempt.logger)
 				checkSource = false
 			}
 		}

@@ -62,24 +62,25 @@ func trackedSourceMatches(ctx context.Context, reader *filesystem.ManagedSourceR
 	return int64(len(actual)) == file.Size && plumbing.ComputeHash(plumbing.BlobObject, actual) == file.Hash, nil
 }
 
-// inspectTrackedSources 仅核对；差异回调不持有写能力，返回前释放扫描句柄。
-func inspectTrackedSources(ctx context.Context, layout *config.Layout, commit string, mismatch func(*object.File, string) error) (returnErr error) {
+// Restore 以 Commit tree 为准核对跟踪文件。beforeWrite 为 nil 时只统计差异，不准备或写回文件。
+func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error) {
 	repository, tree, err := sourceTree(ctx, layout, commit)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := verifySourceTrees(ctx, repository, tree); err != nil {
-		return err
+		return 0, err
 	}
 	policy, err := newCheckoutPolicy(repositoryCheckoutExclusions())
 	if err != nil {
-		return err
+		return 0, err
 	}
 	reader, err := filesystem.NewManagedSourceReader(ctx, layout)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer func() { returnErr = errors.Join(returnErr, reader.Close()) }()
+	var differences int
+	var pending []sourceRestore
 	err = tree.Files().ForEach(func(file *object.File) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -96,28 +97,10 @@ func inspectTrackedSources(ctx context.Context, layout *config.Layout, commit st
 		if err != nil || match {
 			return err
 		}
-		return mismatch(file, path)
-	})
-	if err != nil {
-		return fmt.Errorf("inspect tracked source: %w", err)
-	}
-	head, err := repository.Head()
-	if err != nil {
-		return err
-	}
-	if head.Hash().String() != commit {
-		return errors.New("repository commit changed during source inspection")
-	}
-	return ctx.Err()
-}
-
-// Restore 以 Commit tree 为准恢复跟踪文件，所有目标 Blob 验证通过后才允许修改。
-func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout, commit string, beforeWrite func() error) (int, error) {
-	if beforeWrite == nil {
-		return 0, errInvalidRepositoryRead
-	}
-	var pending []sourceRestore
-	err := inspectTrackedSources(ctx, layout, commit, func(file *object.File, path string) error {
+		differences++
+		if beforeWrite == nil {
+			return nil
+		}
 		reader, err := file.Reader()
 		if err != nil {
 			return err
@@ -132,11 +115,20 @@ func (goGitRepositoryReader) Restore(ctx context.Context, layout *config.Layout,
 		pending = append(pending, sourceRestore{path: path, payload: payload})
 		return nil
 	})
+	// 修复可能创建缺失目录或替换文件，不能保留扫描中的目录句柄。
+	err = errors.Join(err, reader.Close())
+	if err != nil {
+		return 0, fmt.Errorf("inspect tracked source: %w", err)
+	}
+	head, err := repository.Head()
 	if err != nil {
 		return 0, err
 	}
+	if head.Hash().String() != commit {
+		return 0, errors.New("repository commit changed during source inspection")
+	}
 	if len(pending) == 0 {
-		return 0, nil
+		return differences, ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -205,29 +197,37 @@ func verifySourceObject(ctx context.Context, repository *git.Repository, kind pl
 
 func (s *Service) restoreOrFinishUnchanged(ctx context.Context, request SyncRequest, runtime syncRuntime, machine *protocol.LifecycleMachine, check CheckResult, environment state.EnvironmentState, logPath string) (result SyncResult, returnErr error) {
 	started := false
+	var files *filesystem.StateFiles
+	var previous *filesystem.StateFileSnapshot
 	lease, err := filesystem.PinManagedDirectory(ctx, s.layout, s.layout.RepoDir())
 	if err != nil {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, err)
 	}
 	defer func() {
-		if closeErr := lease.Close(); closeErr != nil {
-			if started {
-				returnErr = errors.Join(returnErr, serviceCommittedStateWriteError(protocol.StageWorkspaceCleanup, closeErr))
-			} else {
-				returnErr = errors.Join(returnErr, closeErr)
+		var cleanupErr error
+		if files != nil {
+			if previous != nil && returnErr == nil {
+				cleanupCtx, cancel := serviceCleanupContext(ctx)
+				_, cleanupErr = files.RemoveTransactionIfUnchanged(cleanupCtx, *previous)
+				cancel()
 			}
+			cleanupErr = errors.Join(cleanupErr, files.Close())
+		}
+		if cleanupErr = errors.Join(cleanupErr, lease.Close()); cleanupErr != nil {
+			failure := serviceStateWriteError(protocol.StageWorkspaceCleanup, cleanupErr)
+			failure.committed = started
+			returnErr = errors.Join(returnErr, failure)
 		}
 	}()
 	if check.directoryIdentity == nil || !check.directoryIdentity.Equal(lease.Identity()) {
 		return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, filesystem.ErrIdentityChanged)
 	}
 	if request.DeferSourceCheck && environment.Status == protocol.StateReadyToStart && environment.LastSuccessful.Version == check.Version && environment.LastSuccessful.Commit == check.Commit {
-		files, err := filesystem.NewStateFiles(ctx, s.layout)
-		if err != nil {
-			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
+		var deferred bool
+		files, err = filesystem.NewStateFiles(ctx, s.layout)
+		if err == nil {
+			deferred, previous, err = s.deferSourceCheck(ctx, files, check.Commit)
 		}
-		defer func() { returnErr = errors.Join(returnErr, files.Close()) }()
-		deferred, previous, err := s.deferSourceCheck(ctx, files, check.Commit)
 		if err != nil {
 			return SyncResult{}, s.finishPreSwap(ctx, request, runtime, machine, serviceStateWriteError(protocol.StageWorkspaceVerify, err))
 		}
@@ -235,13 +235,6 @@ func (s *Service) restoreOrFinishUnchanged(ctx context.Context, request SyncRequ
 			result, err := s.finishUnchanged(ctx, request, runtime, machine, check)
 			result.SourceCheckDeferred = true
 			return result, err
-		}
-		if previous != nil {
-			defer func() {
-				if returnErr == nil {
-					_, returnErr = files.RemoveTransactionIfUnchanged(ctx, *previous)
-				}
-			}()
 		}
 	}
 	count, err := s.reader.Restore(ctx, s.layout, check.Commit, func() error {

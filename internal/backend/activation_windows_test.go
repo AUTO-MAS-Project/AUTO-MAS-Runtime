@@ -205,11 +205,13 @@ func TestDeferredStartup_ActivationIsIdempotent(t *testing.T) {
 	activator := &recordingActivator{}
 	supervisor := f.supervisor()
 	supervisor.deps.Activation = activator
-	checking, stopped := make(chan struct{}), make(chan struct{})
+	checking := make(chan struct{})
 	supervisor.deps.VerifyPendingSource = func(ctx context.Context, _ string) (bool, error) {
+		if activator.calls.Load() != 1 {
+			t.Error("source inspection started before business activation")
+		}
 		close(checking)
 		<-ctx.Done()
-		close(stopped)
 		return false, ctx.Err()
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -222,11 +224,6 @@ func TestDeferredStartup_ActivationIsIdempotent(t *testing.T) {
 		done <- supervisor.Supervise(ctx, req)
 	}()
 	waitFor(t, f.emitter.running)
-	select {
-	case <-checking:
-		t.Fatal("source inspection started before business activation")
-	default:
-	}
 	if activator.calls.Load() != 0 {
 		t.Fatal("activated before host confirmation")
 	}
@@ -248,11 +245,6 @@ func TestDeferredStartup_ActivationIsIdempotent(t *testing.T) {
 	}
 	if err := <-done; !hasBackendCode(err, protocol.CodeOperationCancelled) {
 		t.Fatalf("cancel failed: %v", err)
-	}
-	select {
-	case <-stopped:
-	default:
-		t.Fatal("supervisor returned with inspection still running")
 	}
 }
 

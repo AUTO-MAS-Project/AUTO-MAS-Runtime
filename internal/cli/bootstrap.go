@@ -201,14 +201,13 @@ func runBootstrap(
 	control := workspaceControlFromContext(ctx)
 	binding := &workspaceLogBinding{}
 	workspaceResult, err := workspace.Sync(ctx, gitrepo.SyncRequest{
-		UseCurrent:       target.Branch() != "dev" || ifNeeded,
-		DeferSourceCheck: ifNeeded && !reuseReadyEnvironment,
-		Target:           target,
-		Policy:           deps.global.mirrorPolicy,
-		OperationID:      emitter.OperationID(),
-		PID:              uint32(os.Getpid()),
-		MutationLease:    lease,
-		Emitter:          directWorkspaceEmitter{emitter: emitter, suppressWorkspaceStates: true},
+		UseCurrent:    target.Branch() != "dev" || ifNeeded,
+		Target:        target,
+		Policy:        deps.global.mirrorPolicy,
+		OperationID:   emitter.OperationID(),
+		PID:           uint32(os.Getpid()),
+		MutationLease: lease,
+		Emitter:       directWorkspaceEmitter{emitter: emitter, suppressWorkspaceStates: true},
 		LoggerFactory: func(loggerContext context.Context, commandName, operationID string) (gitrepo.OperationLogger, error) {
 			logger, loggerErr := deps.options.workspaceLoggerFactory(
 				loggerContext,
@@ -237,6 +236,7 @@ func runBootstrap(
 			}
 			return control.CommandID()
 		},
+		DeferSourceCheck: ifNeeded && !reuseReadyEnvironment,
 	})
 	if err != nil {
 		if committed := findCommittedOperationError(err); committed != nil {

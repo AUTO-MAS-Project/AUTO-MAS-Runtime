@@ -196,7 +196,7 @@ func TestService_SyncActualSwapInvalidatesReadyEnvironment(t *testing.T) {
 		return runtime.swapResult, nil
 	}
 	service := newTestService(t, layout, reader, runtime, nil)
-	result, err := service.Sync(context.Background(), testSyncRequest(t, target))
+	result, err := service.Sync(context.Background(), testSyncRequest(target))
 	if err != nil {
 		t.Fatalf("Sync() error = %v", err)
 	}
@@ -230,10 +230,9 @@ func TestService_SyncNoOpPreservesStableState(t *testing.T) {
 	}
 	service := newTestService(t, layout, reader, runtime, nil)
 	service.buildPlan = func(context.Context, mirror.Policy) (mirror.Plan, error) {
-		t.Fatal("healthy local workspace requested network mirror ranking")
-		return mirror.Plan{}, nil
+		return mirror.Plan{}, errors.New("unexpected mirror probe for local workspace")
 	}
-	result, err := service.Sync(context.Background(), testSyncRequest(t, target))
+	result, err := service.Sync(context.Background(), testSyncRequest(target))
 	if err != nil {
 		t.Fatalf("Sync() error = %v", err)
 	}
@@ -261,7 +260,7 @@ func TestService_SyncUsesExternalMutationLeaseWithoutClosingIt(t *testing.T) {
 	}
 	locks := &serviceTestLocks{}
 	externalLease := &serviceTestLease{}
-	request := testSyncRequest(t, target)
+	request := testSyncRequest(target)
 	request.MutationLease = externalLease
 	service := newTestService(t, layout, reader, runtime, locks)
 
@@ -296,7 +295,7 @@ func TestService_SyncRejectsRunningBackend(t *testing.T) {
 		t.Fatalf("newServiceWithDependencies() error = %v", err)
 	}
 	target := mustServiceTarget(t, "v1.0.0")
-	_, err = service.Sync(context.Background(), testSyncRequest(t, target))
+	_, err = service.Sync(context.Background(), testSyncRequest(target))
 	if err == nil {
 		t.Fatal("Sync() error = nil, want backend conflict")
 	}
@@ -367,7 +366,7 @@ func TestService_StateWriteFailureDoesNotReportSuccess(t *testing.T) {
 	runtime.swapResult = SwapResult{Revision: runtime.fetchResult.Revision, RepositoryActivated: true, MutationApplied: true, CleanupCompleted: true}
 	runtime.writeEnvironmentErr = errors.New("state write failed")
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
-	_, err := service.Sync(context.Background(), testSyncRequest(t, target))
+	_, err := service.Sync(context.Background(), testSyncRequest(target))
 	if err == nil {
 		t.Fatal("Sync() error = nil, want state write failure")
 	}
@@ -404,7 +403,7 @@ func TestService_ActiveCleanupDeadlineIsStateFailure(t *testing.T) {
 	}
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
-	_, err := service.Sync(t.Context(), testSyncRequest(t, target))
+	_, err := service.Sync(t.Context(), testSyncRequest(target))
 	assertCommittedGitrepoCode(t, err, protocol.CodeStateWriteFailed)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Sync() error = %v, want retained deadline cause", err)
@@ -443,7 +442,7 @@ func TestService_PartialSwapRecoversBeforeStableState(t *testing.T) {
 		}, nil
 	}
 	emitter := &recordingServiceEmitter{}
-	request := testSyncRequest(t, target)
+	request := testSyncRequest(target)
 	request.Emitter = emitter
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
@@ -476,7 +475,7 @@ func TestService_PartialSwapRecoveryFailureDoesNotEmitStableState(t *testing.T) 
 		return RecoveryResult{}, nil
 	}
 	emitter := &recordingServiceEmitter{}
-	request := testSyncRequest(t, target)
+	request := testSyncRequest(target)
 	request.Emitter = emitter
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
@@ -505,7 +504,7 @@ func TestService_StateWriteFailureOutranksPriorCleanupFailure(t *testing.T) {
 	runtime.writeEnvironmentErr = errors.New("state write failed")
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
-	_, err := service.Sync(t.Context(), testSyncRequest(t, target))
+	_, err := service.Sync(t.Context(), testSyncRequest(target))
 	assertGitrepoCode(t, err, protocol.CodeStateWriteFailed)
 	if !strings.Contains(err.Error(), "retired cleanup failed") {
 		t.Fatalf("Sync() error = %v, want retained cleanup cause", err)
@@ -541,7 +540,7 @@ func TestService_ActivatedRepositoryIgnoresLateCancellationDuringCommit(t *testi
 	}
 	service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
-	result, err := service.Sync(ctx, testSyncRequest(t, target))
+	result, err := service.Sync(ctx, testSyncRequest(target))
 	if err != nil {
 		t.Fatalf("Sync() error = %v", err)
 	}
@@ -602,7 +601,7 @@ func TestService_EarlyMutationTransactionFailureRollsBackStableState(t *testing.
 			runtime.newTransactionErr = test.newTransactionErr
 			runtime.writeTransactionErr = test.writeTransactionErr
 			emitter := &recordingServiceEmitter{}
-			request := testSyncRequest(t, target)
+			request := testSyncRequest(target)
 			request.Emitter = emitter
 			service := newTestService(t, layout, &serviceTestReader{err: errors.New("invalid active repository")}, runtime, nil)
 
@@ -865,12 +864,8 @@ func newTestService(t *testing.T, layout *config.Layout, reader repositoryReader
 	return service
 }
 
-func testSyncRequest(t *testing.T, target Target) SyncRequest {
-	t.Helper()
-	policy, err := mirror.NewPolicy(mirror.PolicySpec{})
-	if err != nil {
-		t.Fatal(err)
-	}
+func testSyncRequest(target Target) SyncRequest {
+	policy, _ := mirror.NewPolicy(mirror.PolicySpec{}) // 空配置始终是有效的默认策略。
 	return SyncRequest{
 		Policy:      policy,
 		UseCurrent:  true,

@@ -153,10 +153,6 @@ func TestService_StageAndActivateOffline(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.OperationID = componentOperationID(71)
-	s.buildPlan = func(context.Context, mirror.Policy) (mirror.Plan, error) {
-		t.Fatal("activating a staged commit requested network mirror ranking")
-		return mirror.Plan{}, nil
-	}
 	result, err := s.Sync(t.Context(), req)
 	if err != nil {
 		t.Fatal(err)

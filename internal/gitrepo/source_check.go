@@ -3,10 +3,12 @@ package gitrepo
 import (
 	"context"
 	"errors"
+	"path"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
+	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/config"
 	"github.com/AUTO-MAS-Project/AUTO-MAS-Runtime/internal/filesystem"
 )
 
@@ -42,7 +44,19 @@ func (s *Service) startupInputsMatch(ctx context.Context, commit string) (match 
 		return false, err
 	}
 	defer func() { returnErr = errors.Join(returnErr, reader.Close()) }()
-	for _, name := range [...]string{"main.py", ".python-version", "pyproject.toml", "uv.lock"} {
+	// 旧提交可没有能力声明；已声明的不能因磁盘文件损坏而跳过业务放行。
+	res, err := tree.Tree(path.Dir(config.BackendCapabilitiesPath))
+	if err != nil {
+		return false, err
+	}
+	if err := verifySourceObject(ctx, repo, plumbing.TreeObject, res.Hash); err != nil {
+		return false, err
+	}
+	inputs := []string{"main.py", ".python-version", "pyproject.toml", "uv.lock"}
+	if _, err := res.FindEntry(path.Base(config.BackendCapabilitiesPath)); !errors.Is(err, object.ErrEntryNotFound) {
+		inputs = append(inputs, config.BackendCapabilitiesPath)
+	}
+	for _, name := range inputs {
 		file, err := tree.File(name)
 		if err != nil {
 			return false, err
@@ -80,12 +94,9 @@ func (s *Service) VerifyPendingSource(ctx context.Context, commit string) (dirty
 		return false, err
 	}
 	defer func() { returnErr = errors.Join(returnErr, lease.Close()) }()
-	err = inspectTrackedSources(ctx, s.layout, commit, func(*object.File, string) error {
-		dirty = true
-		return nil
-	})
-	if err == nil && !dirty {
+	count, err := s.reader.Restore(ctx, s.layout, commit, nil)
+	if err == nil && count == 0 {
 		_, err = files.RemoveTransactionIfUnchanged(ctx, mark)
 	}
-	return dirty, err
+	return count != 0, err
 }
