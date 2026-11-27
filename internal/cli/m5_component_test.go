@@ -548,6 +548,11 @@ func writeM5ComponentFakeUVConfig(t *testing.T, layout *config.Layout) string {
 				"createDirectories": []string{filepath.Dir(pythonExecutable)},
 			},
 			{
+				"argumentsPrefix":  []string{"python", "find"},
+				"argumentsContain": []string{"--system"},
+				"exitCode":         2,
+			},
+			{
 				"argumentsPrefix": []string{"python", "find"},
 				"stdout":          []string{pythonExecutable},
 			},

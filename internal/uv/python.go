@@ -189,7 +189,7 @@ func ReadPythonSpec(ctx context.Context, layout *config.Layout, projectDir strin
 	return PythonSpec{Version: version, RequiresPython: requiresPython}, nil
 }
 
-// Prepare 检查 uv 的结构化 Python 清单、安装精确版本并复核可发现性。
+// Prepare 检查 uv 的结构化 Python 清单，复用或安装精确受管解释器。
 func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (PythonResult, error) {
 	if ctx == nil || s == nil || s.layout == nil || s.runner == nil {
 		return PythonResult{}, errors.New("python preparation request is invalid")
@@ -226,6 +226,15 @@ func (s *PythonService) Prepare(ctx context.Context, request PythonRequest) (Pyt
 	}
 	if err := s.checkSupported(ctx, runOptions, spec.Version); err != nil {
 		return PythonResult{}, err
+	}
+	if !request.Reinstall {
+		installed, err := s.probeInstalledPython(ctx, runOptions, spec.Version)
+		if err != nil {
+			return PythonResult{}, err
+		}
+		if installed {
+			return PythonResult{Spec: spec}, nil
+		}
 	}
 	target, err := mirror.NewTarget(mirror.TargetSpec{PythonVersion: spec.Version.String()})
 	if err != nil {
@@ -393,6 +402,21 @@ func (s *PythonService) checkSupported(
 		)
 	}
 	return nil
+}
+
+func (s *PythonService) probeInstalledPython(ctx context.Context, options RunOptions, version PythonVersion) (bool, error) {
+	// 禁用查询缓存，要求 uv 实际运行解释器核对精确版本，且不借用项目虚拟环境。
+	result, err := s.runner.Run(ctx, []string{
+		"python", "find", "cpython@" + version.String(), "--system", "--no-project",
+		"--managed-python", "--no-python-downloads", "--no-cache",
+	}, withOfflineUV(options))
+	if err != nil {
+		var failure *Error
+		if result.ExitCode <= 0 || !errors.As(err, &failure) || failure.Details()["failureKind"] != "nonzero_exit" {
+			return false, err
+		}
+	}
+	return result.ExitCode == 0, nil
 }
 
 func (s *PythonService) checkInstalled(

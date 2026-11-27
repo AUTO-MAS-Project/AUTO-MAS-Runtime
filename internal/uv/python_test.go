@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -305,6 +306,73 @@ func TestPython_SupportCheckReportsAbsentVersion(t *testing.T) {
 	assertPythonCode(t, err, protocol.CodePythonVersionUnsupported)
 }
 
+func TestPython_PrepareReusesInstalledInterpreter(t *testing.T) {
+	layout := newUVTestLayout(t)
+	projectDir := t.TempDir()
+	writePythonProject(t, projectDir, "3.12.13", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+	policy, err := mirror.NewPolicy(mirror.PolicySpec{Offline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakePythonRunner{
+		listOutput: `[{"version":"3.12.13"}]`,
+		reuseProbe: &fakeRunnerResponse{result: UVResult{Stdout: filepath.Join(layout.PythonDir(), "cpython-3.12.13", "python.exe")}},
+		installResults: []fakeRunnerResponse{{
+			result: UVResult{ExitCode: 2},
+			err:    errors.New("failed to create Python minor version link directory: os error 145"),
+		}},
+	}
+	service, err := NewPythonService(layout, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir, MirrorPolicy: policy})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v, want success with the installed interpreter", err)
+	}
+	if got := result.Spec.Version.String(); got != "3.12.13" {
+		t.Fatalf("Prepare() version = %q, want 3.12.13", got)
+	}
+	for _, call := range runner.calls {
+		if call.args[1] == "install" {
+			t.Fatalf("Prepare() invoked the installer for a usable interpreter: %v", call.args)
+		}
+	}
+}
+
+func TestPython_PreparePreservesProbeFailure(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "execution failure", err: errors.New("could not start uv")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			layout := newUVTestLayout(t)
+			projectDir := t.TempDir()
+			writePythonProject(t, projectDir, "3.12.13", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
+			runner := &fakePythonRunner{
+				listOutput: `[{"version":"3.12.13"}]`,
+				reuseProbe: &fakeRunnerResponse{err: test.err},
+			}
+			service, err := NewPythonService(layout, runner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir})
+			if !errors.Is(err, test.err) {
+				t.Fatalf("Prepare() error = %v, want %v", err, test.err)
+			}
+			for _, call := range runner.calls {
+				if call.args[1] == "install" {
+					t.Fatalf("Prepare() invoked the installer after the probe failed: %v", call.args)
+				}
+			}
+		})
+	}
+}
+
 func TestPython_InstallArguments(t *testing.T) {
 	projectDir := t.TempDir()
 	writePythonProject(t, projectDir, "3.12.10", "[project]\nrequires-python = \">=3.12,<3.13\"\n")
@@ -328,23 +396,23 @@ func TestPython_InstallArguments(t *testing.T) {
 	if got, want := result.Spec.Version.String(), "3.12.10"; got != want {
 		t.Fatalf("Prepare() version = %q, want %q", got, want)
 	}
-	if got, want := len(runner.calls), 3; got != want {
+	if got, want := len(runner.calls), 4; got != want {
 		t.Fatalf("runner call count = %d, want %d", got, want)
 	}
 	wantInstall := []string{
 		"python", "install", "3.12.10",
 		"--managed-python", "--install-dir", layout.PythonDir(), "--no-bin", "--no-registry",
 	}
-	if !reflect.DeepEqual(runner.calls[1].args, wantInstall) {
-		t.Fatalf("install args = %#v, want %#v", runner.calls[1].args, wantInstall)
+	if !reflect.DeepEqual(runner.calls[2].args, wantInstall) {
+		t.Fatalf("install args = %#v, want %#v", runner.calls[2].args, wantInstall)
 	}
-	if got, want := runner.calls[1].options.PythonInstallDir, layout.PythonDir(); got != want {
+	if got, want := runner.calls[2].options.PythonInstallDir, layout.PythonDir(); got != want {
 		t.Fatalf("install PythonInstallDir = %q, want %q", got, want)
 	}
-	if got, want := runner.calls[1].options.ProjectEnvDir, layout.VenvDir(); got != want {
+	if got, want := runner.calls[2].options.ProjectEnvDir, layout.VenvDir(); got != want {
 		t.Fatalf("install ProjectEnvDir = %q, want %q", got, want)
 	}
-	if got, want := runner.calls[2].args, []string{
+	if got, want := runner.calls[3].args, []string{
 		"python", "find", "3.12.10", "--managed-python", "--no-python-downloads",
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("find args = %#v, want %#v", got, want)
@@ -362,6 +430,7 @@ func TestPython_ReinstallArguments(t *testing.T) {
 	runner := &fakePythonRunner{
 		listOutput: `[{"version":"3.12.10"}]`,
 		findOutput: "C:/runtime/python/3.12.10/python.exe\n",
+		reuseProbe: &fakeRunnerResponse{result: UVResult{Stdout: "C:/runtime/python/3.12.10/python.exe\n"}},
 	}
 	service, err := NewPythonService(layout, runner)
 	if err != nil {
@@ -404,14 +473,14 @@ func TestPython_MirrorPolicyRotatesSources(t *testing.T) {
 	if _, err := service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir, MirrorPolicy: policy}); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if got, want := len(runner.calls), 4; got != want {
+	if got, want := len(runner.calls), 5; got != want {
 		t.Fatalf("runner calls = %d, want %d", got, want)
 	}
-	if got, want := runner.calls[1].options.Environment[uvPythonInstallMirrorEnv],
+	if got, want := runner.calls[2].options.Environment[uvPythonInstallMirrorEnv],
 		"https://releases.astral.sh/github/python-build-standalone/releases/download"; got != want {
 		t.Fatalf("first Python mirror = %q, want %q", got, want)
 	}
-	if got, want := runner.calls[2].options.Environment[uvPythonInstallMirrorEnv],
+	if got, want := runner.calls[3].options.Environment[uvPythonInstallMirrorEnv],
 		"https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"; got != want {
 		t.Fatalf("second Python mirror = %q, want %q", got, want)
 	}
@@ -440,10 +509,10 @@ func TestPython_OfflineFailureMapsToNetworkUnavailable(t *testing.T) {
 	}
 	_, err = service.Prepare(t.Context(), PythonRequest{ProjectDir: projectDir, MirrorPolicy: policy})
 	assertPythonCode(t, err, protocol.CodeNetworkUnavailable)
-	if got := runner.calls[1].options.Environment[uvOfflineEnv]; got != "1" {
+	if got := runner.calls[2].options.Environment[uvOfflineEnv]; got != "1" {
 		t.Fatalf("offline environment = %q, want 1", got)
 	}
-	if got := runner.calls[1].options.Environment[uvPythonInstallMirrorEnv]; got != "" {
+	if got := runner.calls[2].options.Environment[uvPythonInstallMirrorEnv]; got != "" {
 		t.Fatalf("offline Python mirror = %q, want empty", got)
 	}
 }
@@ -458,6 +527,7 @@ type fakePythonRunner struct {
 	listResult     UVResult
 	listErr        error
 	findOutput     string
+	reuseProbe     *fakeRunnerResponse
 	installResults []fakeRunnerResponse
 	calls          []fakePythonCall
 }
@@ -477,6 +547,13 @@ func (r *fakePythonRunner) Run(_ context.Context, args []string, options RunOpti
 		r.installResults = r.installResults[1:]
 		return response.result, response.err
 	case "find":
+		if slices.Contains(args, "--system") {
+			if r.reuseProbe != nil {
+				return r.reuseProbe.result, r.reuseProbe.err
+			}
+			return UVResult{ExitCode: 2}, newError(protocol.CodeUVExecFailed, protocol.StagePythonCheck,
+				"uv 执行失败", map[string]any{"failureKind": "nonzero_exit"}, errors.New("interpreter unavailable"))
+		}
 		return UVResult{Stdout: r.findOutput}, nil
 	default:
 		return UVResult{}, errors.New("unexpected fake uv command")
